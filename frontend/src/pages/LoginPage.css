@@ -1,0 +1,293 @@
+.nmts-login-page {
+  position: relative;
+  min-height: 100vh;
+  width: 100%;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  padding: 28px 18px;
+  background-image: url('../assets/nmts-login-background.jpg');
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  isolation: isolate;
+}
+
+.nmts-login-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(circle at 50% 44%, rgba(84, 154, 35, 0.08), transparent 30%),
+    linear-gradient(180deg, rgba(0, 0, 0, 0.08), rgba(0, 0, 0, 0.22));
+}
+
+.nmts-login-shell {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.nmts-login-card {
+  position: relative;
+  width: min(430px, 92vw);
+  min-height: 690px;
+  border-radius: 32px;
+  border: 1px solid rgba(128, 214, 65, 0.62);
+  background:
+    linear-gradient(145deg, rgba(31, 34, 33, 0.95), rgba(7, 10, 10, 0.97)),
+    rgba(9, 12, 11, 0.94);
+  box-shadow:
+    0 34px 80px rgba(0, 0, 0, 0.65),
+    0 0 0 1px rgba(117, 193, 58, 0.13) inset,
+    0 0 32px rgba(99, 186, 40, 0.10);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  overflow: hidden;
+}
+
+.nmts-login-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.13), transparent 24%, transparent 72%, rgba(113, 204, 49, 0.06)),
+    radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.08), transparent 33%);
+}
+
+.nmts-login-card-glow {
+  position: absolute;
+  width: 260px;
+  height: 260px;
+  top: -170px;
+  left: 50%;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: rgba(114, 202, 51, 0.18);
+  filter: blur(70px);
+  pointer-events: none;
+}
+
+.nmts-login-content {
+  position: relative;
+  z-index: 1;
+  min-height: 690px;
+  padding: 34px 45px 30px;
+  display: flex;
+  flex-direction: column;
+}
+
+.nmts-login-brand {
+  height: 260px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.nmts-login-logo {
+  width: 250px;
+  max-width: 100%;
+  height: auto;
+  object-fit: contain;
+  filter: drop-shadow(0 14px 20px rgba(0, 0, 0, 0.55));
+  transform: scale(1.18);
+}
+
+.nmts-login-header {
+  text-align: center;
+  margin-top: -10px;
+  margin-bottom: 26px;
+}
+
+.nmts-login-header h1 {
+  margin: 0;
+  color: #f7f8f7;
+  font-size: clamp(27px, 3vw, 34px);
+  line-height: 1.15;
+  font-weight: 600;
+  letter-spacing: -0.7px;
+  text-shadow: 0 3px 18px rgba(0, 0, 0, 0.45);
+}
+
+.nmts-login-header h1 span {
+  color: #7bc943;
+  font-weight: 700;
+}
+
+.nmts-login-header p {
+  margin: 8px 0 0;
+  color: rgba(239, 242, 239, 0.82);
+  font-size: 16px;
+  font-weight: 400;
+  letter-spacing: 0.05px;
+}
+
+.nmts-title-accent {
+  width: 54px;
+  height: 2px;
+  margin: 14px auto 0;
+  background: linear-gradient(90deg, transparent, #77c63d, transparent);
+  box-shadow: 0 0 12px rgba(117, 201, 57, 0.45);
+}
+
+.nmts-login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 17px;
+}
+
+.nmts-login-field {
+  height: 58px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 17px;
+  border-radius: 9px;
+  border: 1px solid rgba(181, 189, 184, 0.35);
+  background: linear-gradient(180deg, rgba(13, 16, 16, 0.76), rgba(22, 25, 24, 0.82));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  transition: border-color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
+}
+
+.nmts-login-field:focus-within {
+  border-color: #78c841;
+  box-shadow: 0 0 0 3px rgba(120, 200, 65, 0.13), 0 0 20px rgba(102, 190, 42, 0.10);
+  transform: translateY(-1px);
+}
+
+.nmts-field-icon {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  color: rgba(250, 252, 250, 0.92);
+  stroke-width: 1.7;
+}
+
+.nmts-login-field input {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #1e6444;
+  font-size: 16px;
+  font-weight: 400;
+  padding-left: 12px;
+}
+
+.nmts-login-field input::placeholder {
+  color: rgba(26, 81, 37, 0.539);
+}
+
+.nmts-login-button {
+  position: relative;
+  width: 100% !important;
+  height: 60px !important;
+  margin-top: 8px;
+  border: 1px solid rgba(153, 226, 89, 0.42) !important;
+  border-radius: 9px !important;
+  background: linear-gradient(110deg, #73c637 0%, #55aa23 52%, #4a991e 100%) !important;
+  color: white !important;
+  font-size: 20px !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.1px;
+  box-shadow: 0 13px 30px rgba(55, 127, 14, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
+  transition: transform 180ms ease, filter 180ms ease, box-shadow 180ms ease !important;
+}
+
+.nmts-login-button:hover:not(:disabled) {
+  transform: translateY(-2px);
+  filter: brightness(1.08);
+  box-shadow: 0 17px 36px rgba(55, 127, 14, 0.36), inset 0 1px 0 rgba(255, 255, 255, 0.28) !important;
+}
+
+.nmts-login-button:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.nmts-login-button:disabled {
+  opacity: 0.72;
+  cursor: wait;
+}
+
+.nmts-login-arrow {
+  position: absolute;
+  right: 18px;
+  width: 21px;
+  height: 21px;
+  stroke-width: 1.8;
+}
+
+.nmts-login-footer {
+  margin-top: auto;
+  padding-top: 30px;
+  text-align: center;
+  color: rgba(211, 216, 212, 0.56);
+  font-size: 13px;
+  letter-spacing: 0.05px;
+}
+
+@media (max-width: 700px) {
+  .nmts-login-page {
+    padding: 18px 14px;
+    background-position: center;
+  }
+
+  .nmts-login-card,
+  .nmts-login-content {
+    min-height: 640px;
+  }
+
+  .nmts-login-card {
+    border-radius: 26px;
+  }
+
+  .nmts-login-content {
+    padding: 28px 26px 24px;
+  }
+
+  .nmts-login-brand {
+    height: 225px;
+  }
+
+  .nmts-login-logo {
+    width: 260px;
+  }
+
+  .nmts-login-header {
+    margin-bottom: 23px;
+  }
+}
+
+@media (max-height: 760px) and (min-width: 701px) {
+  .nmts-login-page {
+    padding: 16px;
+  }
+
+  .nmts-login-card,
+  .nmts-login-content {
+    min-height: 620px;
+  }
+
+  .nmts-login-content {
+    padding-top: 22px;
+  }
+
+  .nmts-login-brand {
+    height: 215px;
+  }
+
+  .nmts-login-logo {
+    width: 255px;
+  }
+
+  .nmts-login-header {
+    margin-bottom: 20px;
+  }
+}
