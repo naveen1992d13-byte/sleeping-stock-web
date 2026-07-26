@@ -1,0 +1,230 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Public+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+    margin: 0;
+    font-family: 'Public Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+    font-family: 'JetBrains Mono', source-code-pro, Menlo, Monaco, Consolas, 'Courier New', monospace;
+}
+
+/* Emerald Green Theme Overrides */
+[data-state="active"],
+button[data-state="active"],
+[role="tab"][data-state="active"] {
+    background-color: #059669 !important;
+    color: white !important;
+}
+
+/* Radix UI tabs override */
+[role="tablist"] button[data-state="active"] {
+    background-color: #059669 !important;
+    color: white !important;
+}
+
+/* Card borders override */
+.border-l-accent, .border-accent {
+    border-color: #059669 !important;
+}
+
+.bg-card {
+    background-color: #FFFFFF !important;
+}
+
+input, textarea, select {
+    background-color: #FFFFFF !important;
+    border-color: #D1D5DB !important;
+}
+
+/* Emerald theme custom classes */
+.bg-emerald-panel {
+    background-color: #34D399;
+}
+
+.bg-emerald-header {
+    background-color: #A7F3D0;
+}
+
+.bg-emerald-body {
+    background-color: #D1FAE5;
+}
+
+.text-emerald-dark {
+    color: #047857;
+}
+
+.border-emerald-subtle {
+    border-color: #D1D5DB;
+}
+
+@layer base {
+    :root {
+        --background: 249 250 251;
+        --foreground: 17 24 39;
+        --card: 255 255 255;
+        --card-foreground: 17 24 39;
+        --popover: 255 255 255;
+        --popover-foreground: 17 24 39;
+        --primary: 5 150 105;
+        --primary-foreground: 255 255 255;
+        --secondary: 31 41 59;
+        --secondary-foreground: 255 255 255;
+        --muted: 243 244 246;
+        --muted-foreground: 107 114 128;
+        --accent: 16 185 129;
+        --accent-foreground: 255 255 255;
+        --destructive: 197 89 89;
+        --destructive-foreground: 255 255 255;
+        --border: 209 213 219;
+        --input: 209 213 219;
+        --ring: 5 150 105;
+        --radius: 0.75rem;
+    }
+
+    .dark {
+        --background: 11 17 32;
+        --foreground: 248 250 252;
+        --card: 30 41 59;
+        --card-foreground: 248 250 252;
+        --popover: 30 41 59;
+        --popover-foreground: 248 250 252;
+        --primary: 206 72 51;
+        --primary-foreground: 0 0 100;
+        --secondary: 142 84 68;
+        --secondary-foreground: 0 0 100;
+        --muted: 51 65 85;
+        --muted-foreground: 148 163 184;
+        --accent: 51 65 85;
+        --accent-foreground: 248 250 252;
+        --destructive: 0 62.8 30.6;
+        --destructive-foreground: 0 0 98;
+        --border: 51 65 85;
+        --input: 51 65 85;
+        --ring: 206 72 51;
+    }
+}
+
+@layer base {
+    * {
+        @apply border-border;
+    }
+    body {
+        @apply bg-background text-foreground;
+    }
+}
+
+@layer base {
+    [data-debug-wrapper="true"] {
+        display: contents !important;
+    }
+
+    [data-debug-wrapper="true"] > * {
+        margin-left: inherit;
+        margin-right: inherit;
+        margin-top: inherit;
+        margin-bottom: inherit;
+        padding-left: inherit;
+        padding-right: inherit;
+        padding-top: inherit;
+        padding-bottom: inherit;
+        column-gap: inherit;
+        row-gap: inherit;
+        gap: inherit;
+        border-left-width: inherit;
+        border-right-width: inherit;
+        border-top-width: inherit;
+        border-bottom-width: inherit;
+        border-left-style: inherit;
+        border-right-style: inherit;
+        border-top-style: inherit;
+        border-bottom-style: inherit;
+        border-left-color: inherit;
+        border-right-color: inherit;
+        border-top-color: inherit;
+        border-bottom-color: inherit;
+    }
+}
+
+/* NMTS single global processing overlay */
+.nmts-processing-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 99999;
+    display: grid;
+    place-items: center;
+    padding: 20px;
+    background: rgba(238, 242, 239, 0.58);
+    backdrop-filter: blur(7px) saturate(112%);
+    -webkit-backdrop-filter: blur(7px) saturate(112%);
+}
+
+.nmts-processing-card {
+    width: min(360px, calc(100vw - 36px));
+    border: 1px solid rgba(255,255,255,0.82);
+    border-radius: 26px;
+    padding: 24px 25px 21px;
+    text-align: center;
+    color: #1f2937;
+    background: linear-gradient(145deg, rgba(255,255,255,0.90), rgba(241,246,243,0.82));
+    box-shadow: 0 24px 75px rgba(31, 41, 55, 0.20), inset 0 1px 0 rgba(255,255,255,0.9);
+}
+
+.nmts-processing-ring {
+    --nmts-progress: 85deg;
+    width: 206px;
+    height: 206px;
+    margin: 0 auto 15px;
+    padding: 8px;
+    border-radius: 999px;
+    background: conic-gradient(from 0deg, #69bd27 0deg, #b8f36a var(--nmts-progress), rgba(82,99,88,0.18) var(--nmts-progress), rgba(82,99,88,0.18) 360deg);
+    box-shadow: 0 0 25px rgba(101, 190, 48, 0.27);
+    animation: nmts-ring-rotate 1.75s linear infinite;
+}
+
+.nmts-processing-ring.has-progress { animation: none; }
+.nmts-processing-ring.has-progress .nmts-processing-logo-wrap { animation: none; }
+.nmts-processing-logo-wrap {
+    animation: nmts-ring-counter 1.75s linear infinite;
+    width: 100%;
+    height: 100%;
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+    border-radius: 999px;
+    background: radial-gradient(circle at 50% 42%, rgba(255,255,255,0.96), rgba(228,235,230,0.90));
+    border: 1px solid rgba(88,110,95,0.26);
+}
+.nmts-processing-logo {
+    width: 156px;
+    height: 156px;
+    object-fit: contain;
+    animation: nmts-logo-glow 1.55s ease-in-out infinite;
+    filter: drop-shadow(0 0 8px rgba(100,190,44,0.35));
+}
+.nmts-processing-card h2 { margin: 0; font-size: 24px; line-height: 1.2; font-weight: 800; letter-spacing: -0.02em; color: #27332c; }
+.nmts-processing-message { margin: 8px auto 0; max-width: 285px; font-size: 14px; line-height: 1.5; color: #5c6a61; }
+.nmts-processing-percent { margin-top: 11px; font-size: 20px; font-weight: 800; color: #4f9c1f; }
+.nmts-processing-track { position: relative; height: 6px; overflow: hidden; margin: 17px 3px 0; border-radius: 999px; background: rgba(83,104,90,0.13); }
+.nmts-processing-track span { display: block; width: 42%; height: 100%; border-radius: inherit; background: linear-gradient(90deg,#6abf2b,#b6ef70,#65b72a); box-shadow: 0 0 12px rgba(91,180,38,.45); animation: nmts-track-move 1.4s ease-in-out infinite; }
+.nmts-processing-ring.has-progress ~ .nmts-processing-track span { animation: none; }
+.nmts-processing-note { margin: 15px 0 0; font-size: 12px; color: #7a867f; }
+@keyframes nmts-ring-rotate { to { transform: rotate(360deg); } }
+@keyframes nmts-ring-counter { to { transform: rotate(-360deg); } }
+@keyframes nmts-logo-glow { 0%,100% { opacity:.66; transform:scale(.975); filter:drop-shadow(0 0 3px rgba(100,190,44,.18)); } 50% { opacity:1; transform:scale(1.018); filter:drop-shadow(0 0 14px rgba(100,190,44,.52)); } }
+@keyframes nmts-track-move { 0% { transform:translateX(-115%); } 50% { transform:translateX(75%); } 100% { transform:translateX(245%); } }
+@media (max-width: 480px) {
+    .nmts-processing-card { width:min(326px,calc(100vw - 28px)); padding:21px 20px 18px; border-radius:23px; }
+    .nmts-processing-ring { width:178px; height:178px; }
+    .nmts-processing-logo { width:136px; height:136px; }
+    .nmts-processing-card h2 { font-size:22px; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .nmts-processing-ring, .nmts-processing-logo, .nmts-processing-track span { animation-duration: 3s; }
+}
