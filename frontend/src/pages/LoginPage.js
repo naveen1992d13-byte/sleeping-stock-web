@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useAuth } from '@/App';
+import { useAuth } from '@/App.js';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { User, Key, ArrowRight } from 'lucide-react';

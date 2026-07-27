@@ -12,7 +12,7 @@ import {
   Activity,
 } from "lucide-react";
 import { Button } from "../components/ui/button";
-import { useAuth } from "../App";
+import { useAuth } from '../App.js';
 
 function CountUp({ value }) {
   const [count, setCount] = useState(0);

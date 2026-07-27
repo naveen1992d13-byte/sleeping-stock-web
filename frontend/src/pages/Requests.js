@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import axios from 'axios';
-import { API } from '@/App';
+import { API } from '@/App.js';
 import { Button } from '@/components/ui/button';
 import { ClipboardList, RefreshCw, Search, Send, Ban, ChevronDown, ChevronRight, ArrowRight, Package, Printer } from 'lucide-react';
 import { toast } from 'sonner';

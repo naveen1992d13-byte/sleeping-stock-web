@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import axios from 'axios';
-import { API, useAuth } from '../App';
+import { API, useAuth } from '../App.js';
 import { Smartphone, Download, Ban, Trash2, ScanLine, Copy, ClipboardCheck, Camera, History, Eye, Plus, Upload, X, UserPlus, RefreshCw, Settings2, QrCode, CheckCircle2 } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { toast } from 'sonner';
