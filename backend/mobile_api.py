@@ -36,7 +36,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict
 from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
 logger = logging.getLogger("nmts.mobile")
 
@@ -151,6 +151,18 @@ def _generate_manual_code() -> str:
     return "".join(random.choices(string.digits, k=6))
 
 
+def _normalize_mobile_number(value: str) -> str:
+    """Store and compare Indian mobile numbers in a single 10-digit form."""
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    if not re.fullmatch(r"[6-9][0-9]{9}", digits):
+        raise HTTPException(400, "Enter a valid 10-digit mobile number")
+    return digits
+
+
 
 
 def _public_api_base_url(request: Request) -> str:
@@ -234,12 +246,16 @@ class MobileUserResponse(BaseModel):
 
 
 class PairingGenerateRequest(BaseModel):
-    mobile_user_id: str
-    branch: Optional[str] = None  # required for admin; ignored (forced) for user role
+    pairing_type: str = "NEW"  # NEW or REPAIR
+    mobile_user_id: Optional[str] = None
+    brand_name: Optional[str] = None
+    dealer_name: Optional[str] = None
+    branch: Optional[str] = None
 
 
 class PairingVerifyRequest(BaseModel):
-    mobile_user_id: str
+    mobile_user_id: Optional[str] = None
+    pairing_type: Optional[str] = None
     pairing_code: str
     pairing_token: Optional[str] = None
     device_user_name: str
@@ -248,6 +264,12 @@ class PairingVerifyRequest(BaseModel):
     device_info: Optional[str] = None
     app_version: Optional[str] = None
     push_token: Optional[str] = None
+
+
+class MobileUserBranchUpdate(BaseModel):
+    brand_name: Optional[str] = None
+    dealer_name: Optional[str] = None
+    branch: str
 
 
 class DeviceStatusUpdate(BaseModel):
@@ -349,14 +371,22 @@ async def create_mobile_user(payload: MobileUserCreate, current_user: UserRespon
         brand, dealer, branch = current_user.brand, current_user.group, current_user.location
         _require_scope_selected(brand, dealer, branch)
 
-    if not re.match(r"^[0-9+][0-9+\-\s]{6,14}$", payload.mobile_number or ""):
-        raise HTTPException(400, "Invalid mobile number")
+    normalized_mobile = _normalize_mobile_number(payload.mobile_number)
+    existing = await db.mobile_users.find_one({"normalized_mobile_number": normalized_mobile}, {"_id": 0})
+    if existing:
+        raise HTTPException(status_code=409, detail={
+            "code": "MOBILE_USER_ALREADY_EXISTS",
+            "message": "This mobile number already has a Mobile User ID. Use Re-pair.",
+            "mobile_user_id": existing.get("mobile_user_id"),
+            "re_pair_required": True,
+        })
 
     mobile_user_id = await generate_mobile_user_id(branch)
     doc = {
         "mobile_user_id": mobile_user_id,
         "name": payload.name,
-        "mobile_number": payload.mobile_number,
+        "mobile_number": normalized_mobile,
+        "normalized_mobile_number": normalized_mobile,
         "brand_name": brand,
         "dealer_name": dealer,
         "branch": branch,
@@ -417,61 +447,112 @@ async def set_mobile_user_status(mobile_user_id: str, payload: DeviceStatusUpdat
     return {"message": f"Mobile user set to {payload.status}"}
 
 
+@router.put("/users/{mobile_user_id}/branch")
+async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBranchUpdate, current_user: UserResponse = Depends(_web_current_user)):
+    user_doc = await db.mobile_users.find_one({"mobile_user_id": mobile_user_id}, {"_id": 0})
+    if not user_doc:
+        raise HTTPException(404, "Mobile user not found")
+
+    if current_user.role == "master":
+        brand = payload.brand_name or user_doc.get("brand_name")
+        dealer = payload.dealer_name or user_doc.get("dealer_name")
+        branch = payload.branch
+    elif current_user.role == "admin":
+        if user_doc.get("brand_name") != current_user.brand or user_doc.get("dealer_name") != current_user.group:
+            raise HTTPException(403, "Mobile user is outside your Brand/Dealer scope")
+        brand, dealer, branch = current_user.brand, current_user.group, payload.branch
+    else:
+        raise HTTPException(403, "Only Master/Admin can change a mobile user's branch")
+    _require_scope_selected(brand, dealer, branch)
+
+    await db.mobile_users.update_one({"mobile_user_id": mobile_user_id}, {"$set": {
+        "brand_name": brand, "dealer_name": dealer, "branch": branch,
+        "updated_at": _now_iso(), "branch_changed_at": _now_iso(),
+        "branch_changed_by": current_user.id,
+    }})
+    await db.mobile_sessions.delete_many({"mobile_user_id": mobile_user_id})
+    # Any unused Re-pair QR generated for the old scope must stop working.
+    await db.mobile_pairing_codes.update_many(
+        {"mobile_user_id": mobile_user_id, "pairing_type": "REPAIR", "used": False},
+        {"$set": {"used": True, "used_at": _now_iso(), "invalidated_reason": "branch_changed"}},
+    )
+    await db.mobile_devices.update_many(
+        {"mobile_user_id": mobile_user_id, "status": "active"},
+        {"$set": {"status": "inactive", "inactive_reason": "branch_changed", "updated_at": _now_iso()}},
+    )
+    await db.mobile_users.update_one({"mobile_user_id": mobile_user_id}, {"$set": {"active_device_count": 0}})
+    await _audit(current_user, "mobile_user_branch_changed", mobile_user_id, {"brand_name": brand, "dealer_name": dealer, "branch": branch})
+    return {"message": "Branch updated. Generate a Re-pair QR for this user.", "mobile_user_id": mobile_user_id, "branch": branch}
+
+
 # ==================== PAIRING (WEB generates code, MOBILE consumes it) ====================
 
 @router.post("/pairing/generate")
 async def generate_pairing_code(request: Request, payload: PairingGenerateRequest, current_user: UserResponse = Depends(_web_current_user)):
-    mobile_user = await db.mobile_users.find_one({"mobile_user_id": payload.mobile_user_id}, {"_id": 0})
-    if not mobile_user:
-        raise HTTPException(404, "Mobile user not found")
-    if mobile_user.get("status") != "active":
-        raise HTTPException(400, "Mobile user is inactive")
+    pairing_type = (payload.pairing_type or "NEW").strip().upper()
+    if pairing_type not in ("NEW", "REPAIR"):
+        raise HTTPException(400, "pairing_type must be NEW or REPAIR")
+
+    mobile_user = None
+    if pairing_type == "REPAIR":
+        if not payload.mobile_user_id:
+            raise HTTPException(400, "Mobile User ID is required for Re-pair")
+        mobile_user = await db.mobile_users.find_one({"mobile_user_id": payload.mobile_user_id.strip().upper()}, {"_id": 0})
+        if not mobile_user:
+            raise HTTPException(404, "Mobile user not found")
+        if mobile_user.get("status") != "active":
+            raise HTTPException(400, "Mobile user is inactive")
 
     if current_user.role == "master":
-        branch = payload.branch or mobile_user["branch"]
+        brand = payload.brand_name or (mobile_user or {}).get("brand_name")
+        dealer = payload.dealer_name or (mobile_user or {}).get("dealer_name")
+        branch = payload.branch or (mobile_user or {}).get("branch")
     elif current_user.role == "admin":
-        if mobile_user["brand_name"] != current_user.brand or mobile_user["dealer_name"] != current_user.group:
+        brand, dealer = current_user.brand, current_user.group
+        branch = payload.branch or (mobile_user or {}).get("branch")
+        if mobile_user and (mobile_user.get("brand_name") != brand or mobile_user.get("dealer_name") != dealer):
             raise HTTPException(403, "Mobile user is outside your Brand/Dealer scope")
-        branch = payload.branch
-        _require_scope_selected(current_user.brand, current_user.group, branch)
     else:
-        if mobile_user["branch"] != current_user.location:
+        brand, dealer, branch = current_user.brand, current_user.group, current_user.location
+        if pairing_type == "REPAIR" and mobile_user.get("branch") != branch:
             raise HTTPException(403, "Mobile user is outside your assigned Branch")
-        branch = current_user.location
+    _require_scope_selected(brand, dealer, branch)
 
     raw_code = _generate_manual_code()
     raw_pairing_token = _new_raw_token()
+    target_id = mobile_user.get("mobile_user_id") if mobile_user else None
     pairing_doc = {
+        "pairing_type": pairing_type,
         "pairing_code": raw_code,
         "pairing_token_hash": _hash_token(raw_pairing_token),
-        "mobile_user_id": mobile_user["mobile_user_id"],
-        "brand_name": mobile_user["brand_name"],
-        "dealer_name": mobile_user["dealer_name"],
+        "mobile_user_id": target_id,
+        "brand_name": brand,
+        "dealer_name": dealer,
         "branch": branch,
         "created_by_user_id": current_user.id,
         "created_by_name": current_user.username,
         "created_at": _now_iso(),
-        # Stored as a real BSON datetime (not ISO string) so the Mongo TTL
-        # index in ensure_mobile_indexes() can expire it automatically.
         "expires_at": _now() + timedelta(minutes=PAIRING_CODE_TTL_MINUTES),
         "used": False,
         "used_at": None,
     }
-    # Invalidate any earlier unused code for this mobile user first.
-    await db.mobile_pairing_codes.update_many(
-        {"mobile_user_id": mobile_user["mobile_user_id"], "used": False},
-        {"$set": {"used": True, "used_at": _now_iso(), "invalidated_reason": "superseded"}},
-    )
+    invalidate_query = {"used": False}
+    if pairing_type == "REPAIR":
+        invalidate_query.update({"pairing_type": "REPAIR", "mobile_user_id": target_id})
+    else:
+        invalidate_query.update({"pairing_type": "NEW", "brand_name": brand, "dealer_name": dealer, "branch": branch})
+    await db.mobile_pairing_codes.update_many(invalidate_query, {"$set": {"used": True, "used_at": _now_iso(), "invalidated_reason": "superseded"}})
     await db.mobile_pairing_codes.insert_one(dict(pairing_doc))
-    await _audit(current_user, "generate_pairing_code", mobile_user["mobile_user_id"], {"branch": branch})
+    await _audit(current_user, f"generate_{pairing_type.lower()}_pairing_code", target_id or branch, {"branch": branch})
 
     expires_at_iso = pairing_doc["expires_at"].isoformat()
     api_base_url = _public_api_base_url(request)
     qr_payload = {
         "issuer": "NMTS_SLEEPING_STOCK_PAIRING",
-        "version": 2,
+        "version": 3,
+        "pairing_type": pairing_type,
         "api_base_url": api_base_url,
-        "mobile_user_id": mobile_user["mobile_user_id"],
+        "mobile_user_id": target_id,
         "pairing_code": raw_code,
         "pairing_token": raw_pairing_token,
         "expires_at": expires_at_iso,
@@ -482,115 +563,97 @@ async def generate_pairing_code(request: Request, payload: PairingGenerateReques
     qr_image = qr.make_image(fill_color="black", back_color="white")
     qr_buffer = BytesIO()
     qr_image.save(qr_buffer, format="PNG")
-    qr_code_data_url = "data:image/png;base64," + base64.b64encode(qr_buffer.getvalue()).decode("ascii")
-    return {
-        "pairing_code": raw_code,
-        "pairing_token": raw_pairing_token,
-        "expires_at": expires_at_iso,
-        "api_base_url": api_base_url,
-        "qr_payload": qr_payload,
-        "qr_code_data_url": qr_code_data_url,
-    }
+    return {"pairing_type": pairing_type, "mobile_user_id": target_id, "pairing_code": raw_code, "pairing_token": raw_pairing_token, "expires_at": expires_at_iso, "api_base_url": api_base_url, "qr_payload": qr_payload, "qr_code_data_url": "data:image/png;base64," + base64.b64encode(qr_buffer.getvalue()).decode("ascii")}
 
 
 @router.post("/pairing/verify")
 async def verify_pairing_and_register_device(payload: PairingVerifyRequest):
-    """Called by the mobile app (unauthenticated — this IS the login).
-
-    All validation happens before the one-time code is atomically consumed.
-    QR pairing additionally requires the random token embedded only in the
-    website-generated QR payload. Manual-code pairing remains supported by
-    omitting pairing_token.
-    """
     now = _now()
-    lookup = {
-        "mobile_user_id": payload.mobile_user_id.strip().upper(),
-        "pairing_code": payload.pairing_code.strip(),
-        "used": False,
-    }
-    pairing_doc = await db.mobile_pairing_codes.find_one(lookup, {"_id": 0})
+    normalized_mobile = _normalize_mobile_number(payload.device_user_mobile)
+    if not payload.device_user_name.strip():
+        raise HTTPException(400, "Device user name is required")
+
+    # QR pairing uses the high-entropy token as the primary lookup key. A short
+    # 6-digit code can legitimately collide across branches, so looking up by
+    # code alone could select another branch's record.
+    if payload.pairing_token:
+        lookup = {
+            "pairing_token_hash": _hash_token(payload.pairing_token),
+            "pairing_code": payload.pairing_code.strip(),
+            "used": False,
+        }
+        pairing_doc = await db.mobile_pairing_codes.find_one(lookup, {"_id": 0})
+    else:
+        # Backward-compatible manual-code path. Reject an ambiguous code rather
+        # than pairing the device to an arbitrary branch.
+        matches = await db.mobile_pairing_codes.find(
+            {"pairing_code": payload.pairing_code.strip(), "used": False}, {"_id": 0}
+        ).limit(2).to_list(2)
+        if len(matches) > 1:
+            raise HTTPException(409, "Pairing code is ambiguous. Scan the QR code instead.")
+        pairing_doc = matches[0] if matches else None
     if not pairing_doc:
         raise HTTPException(400, "Invalid or already-used pairing code")
-
     expires_at = pairing_doc["expires_at"]
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if now > expires_at:
         raise HTTPException(400, "Pairing code has expired — request a new code")
-
-    # When the request came from QR scanning, prove that it contains the
-    # unguessable token generated and stored by this NMTS website.
     if payload.pairing_token:
         expected_hash = pairing_doc.get("pairing_token_hash") or ""
         if not expected_hash or _hash_token(payload.pairing_token) != expected_hash:
             raise HTTPException(400, "This is not a valid NMTS pairing QR code")
 
-    mobile_user = await db.mobile_users.find_one(
-        {"mobile_user_id": lookup["mobile_user_id"]}, {"_id": 0}
-    )
-    if not mobile_user or mobile_user.get("status") != "active":
-        raise HTTPException(403, "Mobile user is inactive")
-    if not payload.device_user_name.strip():
-        raise HTTPException(400, "Device user name is required")
-    if not re.match(r"^[0-9+][0-9+\-\s]{6,14}$", payload.device_user_mobile or ""):
-        raise HTTPException(400, "Invalid device user mobile number")
+    pairing_type = (pairing_doc.get("pairing_type") or payload.pairing_type or ("REPAIR" if pairing_doc.get("mobile_user_id") else "NEW")).upper()
+    if pairing_type == "NEW":
+        existing = await db.mobile_users.find_one({"normalized_mobile_number": normalized_mobile}, {"_id": 0})
+        if not existing:
+            existing = await db.mobile_users.find_one({"mobile_number": normalized_mobile}, {"_id": 0})
+        if existing:
+            raise HTTPException(status_code=409, detail={"code": "MOBILE_USER_ALREADY_EXISTS", "message": "Mobile User ID already created for this mobile number. Ask Admin to generate a Re-pair QR.", "mobile_user_id": existing.get("mobile_user_id"), "re_pair_required": True})
+        mobile_user_id = await generate_mobile_user_id(pairing_doc["branch"])
+        mobile_user = {
+            "mobile_user_id": mobile_user_id, "name": payload.device_user_name.strip(),
+            "mobile_number": normalized_mobile, "normalized_mobile_number": normalized_mobile,
+            "brand_name": pairing_doc["brand_name"], "dealer_name": pairing_doc["dealer_name"], "branch": pairing_doc["branch"],
+            "status": "active", "created_by_user_id": pairing_doc.get("created_by_user_id", ""),
+            "created_by_name": pairing_doc.get("created_by_name", ""), "created_by_role": "pairing",
+            "created_at": now.isoformat(), "updated_at": now.isoformat(), "paired_device_count": 0, "active_device_count": 0, "last_active_at": None,
+        }
+        try:
+            await db.mobile_users.insert_one(dict(mobile_user))
+        except DuplicateKeyError:
+            existing = await db.mobile_users.find_one({"normalized_mobile_number": normalized_mobile}, {"_id": 0})
+            raise HTTPException(status_code=409, detail={"code": "MOBILE_USER_ALREADY_EXISTS", "message": "Mobile User ID already created. Use Re-pair.", "mobile_user_id": (existing or {}).get("mobile_user_id"), "re_pair_required": True})
+    else:
+        target_id = (pairing_doc.get("mobile_user_id") or payload.mobile_user_id or "").strip().upper()
+        mobile_user = await db.mobile_users.find_one({"mobile_user_id": target_id}, {"_id": 0})
+        if not mobile_user or mobile_user.get("status") != "active":
+            raise HTTPException(403, "Mobile user is inactive or not found")
+        stored_mobile = mobile_user.get("normalized_mobile_number") or _normalize_mobile_number(mobile_user.get("mobile_number", ""))
+        if stored_mobile != normalized_mobile:
+            raise HTTPException(409, "Entered mobile number does not match this Re-pair QR")
+        await db.mobile_sessions.delete_many({"mobile_user_id": target_id})
+        await db.mobile_devices.update_many({"mobile_user_id": target_id, "status": "active"}, {"$set": {"status": "inactive", "inactive_reason": "repaired", "updated_at": now.isoformat()}})
+        await db.mobile_users.update_one({"mobile_user_id": target_id}, {"$set": {"active_device_count": 0, "updated_at": now.isoformat()}})
 
-    # Consume only after every validation has passed. The filter closes the
-    # race window: exactly one concurrent request can change used=False.
-    consume_filter = dict(lookup)
+    consume_filter = {"pairing_code": pairing_doc["pairing_code"], "used": False}
     if payload.pairing_token:
         consume_filter["pairing_token_hash"] = pairing_doc["pairing_token_hash"]
-    consumed = await db.mobile_pairing_codes.find_one_and_update(
-        consume_filter,
-        {"$set": {"used": True, "used_at": now.isoformat()}},
-        return_document=ReturnDocument.AFTER,
-    )
+    consumed = await db.mobile_pairing_codes.find_one_and_update(consume_filter, {"$set": {"used": True, "used_at": now.isoformat()}}, return_document=ReturnDocument.AFTER)
     if not consumed:
+        if pairing_type == "NEW":
+            await db.mobile_users.delete_one({"mobile_user_id": mobile_user["mobile_user_id"], "paired_device_count": 0})
         raise HTTPException(409, "Pairing code was already used by another device")
 
     device_id = str(uuid.uuid4())
     raw_session_token = _new_raw_token()
-    device_doc = {
-        "device_id": device_id,
-        "mobile_user_id": mobile_user["mobile_user_id"],
-        "device_user_name": payload.device_user_name.strip(),
-        "device_user_mobile": payload.device_user_mobile.strip(),
-        "device_name": payload.device_name,
-        "device_info": payload.device_info or "",
-        "push_token": payload.push_token or "",
-        "paired_at": now.isoformat(),
-        "last_active_at": now.isoformat(),
-        "app_version": payload.app_version or "",
-        "status": "active",
-        "brand_name": pairing_doc["brand_name"],
-        "dealer_name": pairing_doc["dealer_name"],
-        "branch": pairing_doc["branch"],
-        "session_token_hash": _hash_token(raw_session_token),
-    }
+    device_doc = {"device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "device_user_name": payload.device_user_name.strip(), "device_user_mobile": normalized_mobile, "device_name": payload.device_name, "device_info": payload.device_info or "", "push_token": payload.push_token or "", "paired_at": now.isoformat(), "last_active_at": now.isoformat(), "app_version": payload.app_version or "", "status": "active", "brand_name": mobile_user["brand_name"], "dealer_name": mobile_user["dealer_name"], "branch": mobile_user["branch"], "session_token_hash": _hash_token(raw_session_token)}
     await db.mobile_devices.insert_one(dict(device_doc))
-    await db.mobile_sessions.insert_one({
-        "session_token_hash": device_doc["session_token_hash"],
-        "device_id": device_id,
-        "mobile_user_id": mobile_user["mobile_user_id"],
-        "created_at": now.isoformat(),
-    })
-    await db.mobile_users.update_one(
-        {"mobile_user_id": mobile_user["mobile_user_id"]},
-        {"$inc": {"paired_device_count": 1, "active_device_count": 1}},
-    )
-    await _audit(None, "device_paired", mobile_user["mobile_user_id"], {"device_id": device_id}, actor_override=mobile_user["mobile_user_id"])
-
-    return {
-        "session_token": raw_session_token,
-        "device_id": device_id,
-        "mobile_user_id": mobile_user["mobile_user_id"],
-        "name": payload.device_user_name.strip(),
-        "device_user_name": payload.device_user_name.strip(),
-        "device_user_mobile": payload.device_user_mobile.strip(),
-        "brand_name": device_doc["brand_name"],
-        "dealer_name": device_doc["dealer_name"],
-        "branch": device_doc["branch"],
-    }
+    await db.mobile_sessions.insert_one({"session_token_hash": device_doc["session_token_hash"], "device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "created_at": now.isoformat()})
+    await db.mobile_users.update_one({"mobile_user_id": mobile_user["mobile_user_id"]}, {"$inc": {"paired_device_count": 1}, "$set": {"active_device_count": 1, "last_active_at": now.isoformat(), "updated_at": now.isoformat()}})
+    await _audit(None, "device_repaired" if pairing_type == "REPAIR" else "device_paired", mobile_user["mobile_user_id"], {"device_id": device_id}, actor_override=mobile_user["mobile_user_id"])
+    return {"session_token": raw_session_token, "device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "name": payload.device_user_name.strip(), "device_user_name": payload.device_user_name.strip(), "device_user_mobile": normalized_mobile, "brand_name": device_doc["brand_name"], "dealer_name": device_doc["dealer_name"], "branch": device_doc["branch"], "pairing_type": pairing_type}
 
 
 @router.get("/session/validate")
@@ -624,13 +687,23 @@ async def register_push_token(payload: PushTokenRegisterRequest, session=Depends
 # ==================== DEVICE MANAGEMENT (WEB SIDE) ====================
 
 @router.get("/devices")
-async def list_devices(mobile_user_id: Optional[str] = None, current_user: UserResponse = Depends(_web_current_user)):
-    q = {}
+async def list_devices(
+    mobile_user_id: Optional[str] = None,
+    brand_name: Optional[str] = None,
+    dealer_name: Optional[str] = None,
+    branch: Optional[str] = None,
+    current_user: UserResponse = Depends(_web_current_user),
+):
     if mobile_user_id:
-        q["mobile_user_id"] = mobile_user_id
+        owner = await db.mobile_users.find_one({"mobile_user_id": mobile_user_id}, {"_id": 0})
+        if not owner:
+            raise HTTPException(404, "Mobile user not found")
+        allowed = _scoped_query_for_user(current_user, owner.get("brand_name"), owner.get("dealer_name"), owner.get("branch"))
+        if any(owner.get(k) != v for k, v in allowed.items()):
+            raise HTTPException(403, "Mobile user is outside your scope")
+        q = {"mobile_user_id": mobile_user_id}
     else:
-        scope = _scoped_query_for_user(current_user)
-        q = scope
+        q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
     rows = await db.mobile_devices.find(q, {"_id": 0, "session_token_hash": 0}).sort("paired_at", -1).to_list(5000)
     return rows
 
@@ -1038,6 +1111,25 @@ async def _audit(current_user, action: str, target: str, details: dict, actor_ov
 async def ensure_mobile_indexes():
     await db.mobile_users.create_index([("mobile_user_id", 1)], unique=True)
     await db.mobile_users.create_index([("mobile_number", 1)])
+    # Backfill normalized numbers for older records before enforcing uniqueness.
+    legacy_users = await db.mobile_users.find(
+        {"$or": [{"normalized_mobile_number": {"$exists": False}}, {"normalized_mobile_number": ""}]},
+        {"_id": 1, "mobile_number": 1},
+    ).to_list(100000)
+    for legacy_user in legacy_users:
+        try:
+            normalized = _normalize_mobile_number(legacy_user.get("mobile_number", ""))
+            duplicate = await db.mobile_users.find_one({"normalized_mobile_number": normalized, "_id": {"$ne": legacy_user["_id"]}}, {"_id": 1})
+            if duplicate:
+                logger.error("Legacy duplicate mobile number detected: %s", normalized)
+                continue
+            await db.mobile_users.update_one({"_id": legacy_user["_id"]}, {"$set": {"normalized_mobile_number": normalized, "mobile_number": normalized}})
+        except HTTPException:
+            logger.warning("Legacy mobile user has an invalid mobile number: %s", legacy_user.get("_id"))
+    try:
+        await db.mobile_users.create_index([("normalized_mobile_number", 1)], unique=True, sparse=True, name="uq_mobile_number")
+    except (DuplicateKeyError, OperationFailure) as exc:
+        logger.error("Cannot create unique mobile-number index: %s", exc)
     await db.mobile_users.create_index([("brand_name", 1), ("dealer_name", 1), ("branch", 1)])
     await db.mobile_users.create_index([("created_by_user_id", 1)])
 
