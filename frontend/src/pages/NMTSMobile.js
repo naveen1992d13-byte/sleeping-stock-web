@@ -1,8 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import axios from 'axios';
-import { API, useAuth } from '../App.js';
-import { Smartphone, Download, Ban, Trash2, ScanLine, Copy, ClipboardCheck, Camera, History, Eye, Plus, Upload, X, UserPlus, RefreshCw, Settings2, QrCode, CheckCircle2 } from 'lucide-react';
+import { API, useAuth } from '../App';
+import { Smartphone, Download, Ban, Trash2, ScanLine, Copy, ClipboardCheck, Camera, History, Eye, Plus, Upload, X, RefreshCw, Settings2, QrCode, CheckCircle2, ArrowRightLeft } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { toast } from 'sonner';
 
@@ -36,8 +36,6 @@ export default function NMTSMobile(){
   // ==================== Mobile User Management (new model) ====================
   const [mobileUsers,setMobileUsers]=useState([]);
   const [devices,setDevices]=useState([]);
-  const [newUserName,setNewUserName]=useState('');
-  const [newUserMobile,setNewUserMobile]=useState('');
   const [creatingUser,setCreatingUser]=useState(false);
   const [pairingFor,setPairingFor]=useState(null); // mobile_user_id currently generating a code for
   const [pairingResult,setPairingResult]=useState(null); // { mobile_user_id, pairing_code, qr_payload, expires_at }
@@ -70,7 +68,8 @@ export default function NMTSMobile(){
   };
   const loadDevices=async()=>{
     try{
-      const r=await axios.get(`${API}/mobile/devices`);
+      const params = isMaster ? {brand_name:brand,dealer_name:dealer,branch} : (user?.role==='admin' ? {branch} : {});
+      const r=await axios.get(`${API}/mobile/devices`,{params});
       setDevices(r.data||[]);
     }catch(e){toast.error(e.response?.data?.detail||'Device list load failed')}
   };
@@ -89,19 +88,15 @@ export default function NMTSMobile(){
     /* eslint-disable-next-line */
   },[scopeBrand,scopeDealer,scopeBranch,user?.id]);
 
-  const createMobileUser=async()=>{
-    if(user?.role!=='user' && !scopeReady) return toast.error('Select an exact Brand, Dealer and Branch in the Dashboard filter first');
-    if(!clean(newUserName)||!clean(newUserMobile)) return toast.error('Enter Name and Mobile Number');
+  const generateNewPairing=async()=>{
+    if(!scopeReady) return toast.error('Select an exact Brand, Dealer and Branch in the Dashboard filter first');
     setCreatingUser(true);
     try{
-      const payload = isMaster
-        ? {name:newUserName,mobile_number:newUserMobile,brand_name:brand,dealer_name:dealer,branch}
-        : (user?.role==='admin' ? {name:newUserName,mobile_number:newUserMobile,branch} : {name:newUserName,mobile_number:newUserMobile});
-      const r=await axios.post(`${API}/mobile/users`,payload);
-      toast.success(`Mobile User ${r.data.mobile_user_id} created`);
-      setNewUserName('');setNewUserMobile('');
-      loadMobileUsers();
-    }catch(e){toast.error(e.response?.data?.detail||'Mobile user creation failed')}
+      const payload = {pairing_type:'NEW',brand_name:brand,dealer_name:dealer,branch};
+      const r=await axios.post(`${API}/mobile/pairing/generate`,payload);
+      setPairingResult(r.data);
+      toast.success('New-user pairing QR generated — valid for 10 minutes');
+    }catch(e){const d=e.response?.data?.detail;toast.error(typeof d==='string'?d:(d?.message||'Pairing code generation failed'))}
     finally{setCreatingUser(false)}
   };
 
@@ -114,14 +109,23 @@ export default function NMTSMobile(){
   };
 
   const generatePairing=async(mu)=>{
-    if(user?.role!=='user' && !exact(branch)) return toast.error('Select an exact Branch in the Dashboard filter before generating a pairing code');
     setPairingFor(mu.mobile_user_id);
     try{
-      const r=await axios.post(`${API}/mobile/pairing/generate`,{mobile_user_id:mu.mobile_user_id,branch});
+      const r=await axios.post(`${API}/mobile/pairing/generate`,{pairing_type:'REPAIR',mobile_user_id:mu.mobile_user_id,brand_name:mu.brand_name,dealer_name:mu.dealer_name,branch:mu.branch});
       setPairingResult({mobile_user_id:mu.mobile_user_id,...r.data});
-      toast.success('Pairing code generated — valid for 10 minutes, one-time use');
-    }catch(e){toast.error(e.response?.data?.detail||'Pairing code generation failed')}
+      toast.success('Re-pair QR generated — same Mobile User ID will be reused');
+    }catch(e){const d=e.response?.data?.detail;toast.error(typeof d==='string'?d:(d?.message||'Re-pair code generation failed'))}
     finally{setPairingFor(null)}
+  };
+
+  const changeBranch=async(mu)=>{
+    if(!scopeReady) return toast.error('Select the new Brand / Dealer / Branch in the Dashboard filter first');
+    if(!window.confirm(`Move ${mu.mobile_user_id} from ${mu.branch} to ${branch}? Existing mobile session will be logged out.`)) return;
+    try{
+      const r=await axios.put(`${API}/mobile/users/${mu.mobile_user_id}/branch`,{brand_name:brand,dealer_name:dealer,branch});
+      toast.success(r.data?.message||'Branch updated');
+      loadMobileUsers();loadDevices();
+    }catch(e){const d=e.response?.data?.detail;toast.error(typeof d==='string'?d:(d?.message||'Branch change failed'))}
   };
 
   const setDeviceStatus=async(d,status)=>{
@@ -167,11 +171,10 @@ export default function NMTSMobile(){
     {!scopeReady && user?.role!=='user' && <div className="border border-amber-300 bg-amber-50 p-3 rounded-lg text-amber-800">Select an exact Brand, Dealer and Branch in the Dashboard filter. Mobile User creation, pairing, and Perpetual Stock all use only that selected scope.</div>}
 
     {section==='mobile'&&<div className="space-y-5">
-      {canManage && <Card title="Onboard a Mobile User"><div className="grid md:grid-cols-3 gap-3 items-end">
-        <div><label className="text-xs text-gray-500 block mb-1">Name</label><input className="border rounded h-10 px-3 w-full" value={newUserName} onChange={e=>setNewUserName(e.target.value)} placeholder="Full name"/></div>
-        <div><label className="text-xs text-gray-500 block mb-1">Mobile Number</label><input className="border rounded h-10 px-3 w-full" value={newUserMobile} onChange={e=>setNewUserMobile(e.target.value)} placeholder="10-digit mobile number"/></div>
-        <Button onClick={createMobileUser} disabled={creatingUser}><UserPlus className="h-4 w-4 mr-2"/>{creatingUser?'Creating...':'Create Mobile User'}</Button>
-      </div>{isMaster && <p className="text-xs text-gray-500 mt-2">Uses the Dashboard's Brand / Dealer / Branch selection above.</p>}</Card>}
+      {canManage && <Card title="Pair a New Mobile User"><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        <div><p className="font-medium">Generate one-time QR for the selected Brand / Dealer / Branch.</p><p className="text-xs text-gray-500 mt-1">The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.</p></div>
+        <Button onClick={generateNewPairing} disabled={creatingUser||!scopeReady}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button>
+      </div></Card>}
 
       {pairingResult && <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/75 backdrop-blur-sm p-4" onMouseDown={()=>setPairingResult(null)}>
         <div className="relative w-full max-w-[720px] overflow-hidden rounded-[28px] border border-white/20 bg-gradient-to-b from-[#1b1d1c] to-[#080a09] p-6 md:p-8 text-white shadow-2xl" onMouseDown={e=>e.stopPropagation()}>
@@ -180,7 +183,7 @@ export default function NMTSMobile(){
             <img src="/sleeping-stock-logo-transparent.png" alt="Sleeping Stock" className="h-20 w-20 object-contain"/>
             <div><div className="text-3xl font-black tracking-tight"><span className="text-white">Sleeping</span><span className="text-lime-400">Stock</span></div><div className="text-sm text-gray-300">Non moving Tracking System</div></div>
           </div>
-          <div className="mt-5 text-center"><h2 className="text-3xl md:text-4xl font-black">Pair Your <span className="text-lime-400">Device</span></h2><p className="mt-2 text-sm md:text-base text-gray-300">Use Sleeping Stock Mobile to scan this code or enter the manual code below.</p></div>
+          <div className="mt-5 text-center"><h2 className="text-3xl md:text-4xl font-black">{pairingResult.pairing_type==='REPAIR'?'Re-pair':'Pair'} Your <span className="text-lime-400">Device</span></h2><p className="mt-2 text-sm md:text-base text-gray-300">{pairingResult.pairing_type==='REPAIR'?`Existing ID ${pairingResult.mobile_user_id} will be reused.`:'Name and mobile number are entered in the app.'}</p></div>
           <div className="mx-auto mt-6 w-fit rounded-[24px] border border-lime-400/70 bg-white p-4 shadow-[0_0_35px_rgba(163,230,53,0.35)]">
             {pairingResult.qr_code_data_url ? <img src={pairingResult.qr_code_data_url} alt="Device pairing QR code" className="h-[300px] w-[300px] md:h-[380px] md:w-[380px] image-render-pixel"/> : <div className="flex h-[300px] w-[300px] items-center justify-center text-black">QR image unavailable</div>}
           </div>
@@ -199,7 +202,8 @@ export default function NMTSMobile(){
           <td>{mu.paired_device_count||0}</td><td>{mu.active_device_count||0}</td><td>{mu.last_active_at?fmt(mu.last_active_at):'-'}</td>
           <td><span className={`px-2 py-1 rounded text-xs ${mu.status==='active'?'bg-green-100 text-green-700':'bg-gray-200 text-gray-600'}`}>{mu.status}</span></td>
           <td><div className="flex gap-2 flex-wrap">
-            <Button size="sm" variant="outline" onClick={()=>generatePairing(mu)} disabled={pairingFor===mu.mobile_user_id || mu.status!=='active'}><QrCode className="h-4 w-4"/></Button>
+            <Button size="sm" variant="outline" title="Generate Re-pair QR" onClick={()=>generatePairing(mu)} disabled={pairingFor===mu.mobile_user_id || mu.status!=='active'}><RefreshCw className="h-4 w-4"/></Button>
+            <Button size="sm" variant="outline" title="Move to currently selected branch" onClick={()=>changeBranch(mu)} disabled={!scopeReady}><ArrowRightLeft className="h-4 w-4"/></Button>
             <Button size="sm" variant="outline" onClick={()=>toggleUserStatus(mu)}>{mu.status==='active'?<Ban className="h-4 w-4"/>:<CheckCircle2 className="h-4 w-4"/>}</Button>
           </div></td>
         </tr>)}

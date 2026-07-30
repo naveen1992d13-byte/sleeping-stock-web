@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { useOutletContext } from "react-router-dom";
 import { Button } from "../components/ui/button";
-import { useAuth } from '../App.js';
+import { useAuth } from "../App";
 import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
 
 const API = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8000";

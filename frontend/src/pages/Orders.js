@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import * as XLSX from 'xlsx';
-import { API, useAuth } from '@/App.js';
+import { API, useAuth } from '@/App';
 import { useOutletContext } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
-import { API, useAuth } from '../App.js';
+import { API, useAuth } from '../App';
 import { toast } from 'sonner';
 import { BarChart3, Boxes, Clock3, IndianRupee, ClipboardList, FileSpreadsheet, GitPullRequest, Building2, Warehouse, Network, ArrowLeftRight, CircleAlert, Download, X, Upload, Search, CheckCircle2 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line, PieChart, Pie, Cell, Legend } from 'recharts';
