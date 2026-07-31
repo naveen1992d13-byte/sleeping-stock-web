@@ -5263,7 +5263,11 @@ def _verification_scope_query(current_user: UserResponse, brand: str = None, dea
         if current_user.group: query["dealer_name"] = _exact_ci(current_user.group)
         if exact(branch): query["branch"] = _exact_ci(branch)
     else:
-        query["verified_by"] = current_user.id
+        # Normal users must see every verification record for their assigned
+        # branch, including records uploaded by paired mobile users.
+        if current_user.brand: query["brand_name"] = _exact_ci(current_user.brand)
+        if current_user.group: query["dealer_name"] = _exact_ci(current_user.group)
+        if current_user.location: query["branch"] = _exact_ci(current_user.location)
     return query
 
 
@@ -5442,6 +5446,78 @@ async def list_mobile_stock_verification_sessions(
     return await db.stock_verification_sessions.find(query, {"_id": 0}).sort("created_at", -1).to_list(length=10000)
 
 
+@api_router.get("/mobile/perpetual-stock/export-all/excel")
+async def export_all_mobile_stock_verifications(
+    brand: str = None, dealer: str = None, branch: str = None,
+    date_from: str = None, date_to: str = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    from fastapi.responses import StreamingResponse
+    """Download the complete permitted Perpetual Stock list.
+
+    Master: all brands/dealers/branches (optional dashboard filters).
+    Admin: fixed brand/dealer and every branch (optional branch filter).
+    User: own branch only.
+    """
+    query = {}
+    exact = lambda value: value and value != "N/A" and not str(value).startswith("All ")
+    if current_user.role == "master":
+        if exact(brand): query["brand_name"] = _exact_ci(brand)
+        if exact(dealer): query["dealer_name"] = _exact_ci(dealer)
+        if exact(branch): query["branch"] = _exact_ci(branch)
+    elif current_user.role == "admin":
+        if current_user.brand: query["brand_name"] = _exact_ci(current_user.brand)
+        if current_user.group: query["dealer_name"] = _exact_ci(current_user.group)
+        if exact(branch): query["branch"] = _exact_ci(branch)
+    else:
+        if current_user.brand: query["brand_name"] = _exact_ci(current_user.brand)
+        if current_user.group: query["dealer_name"] = _exact_ci(current_user.group)
+        if current_user.location: query["branch"] = _exact_ci(current_user.location)
+
+    if date_from or date_to:
+        created = {}
+        if date_from:
+            created["$gte"] = datetime.fromisoformat(date_from).replace(tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(timezone.utc)
+        if date_to:
+            created["$lt"] = (datetime.fromisoformat(date_to).replace(tzinfo=ZoneInfo("Asia/Kolkata")) + timedelta(days=1)).astimezone(timezone.utc)
+        query["created_at"] = created
+
+    rows = await db.stock_verifications.find(query, {"_id": 0}).sort("created_at", -1).to_list(length=200000)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Perpetual Stock"
+    headers = ["Date","Session ID","Brand","Dealer / Group","Branch","Verified By","Mobile User ID","Part Number","Part Name","MAV","System Qty","Physical Qty","Difference","Shortage Qty","Excess Qty","Shortage Value","Excess Value","System / PIN Location","Physical Location","Verification Status","Correction Status","Correction Method","Correction Remarks","Corrected By","Corrected At","New / Unlisted Part","Entry Method","Source","Remarks"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+        cell.fill = openpyxl.styles.PatternFill(start_color="16A34A", end_color="16A34A", fill_type="solid")
+    for item in rows:
+        created = item.get("created_at") or item.get("verified_at")
+        if isinstance(created, datetime):
+            created = created.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%d-%m-%Y %I:%M %p")
+        ws.append([
+            created, item.get("session_id"), item.get("brand_name"), item.get("dealer_name"), item.get("branch"),
+            item.get("verified_by_name") or item.get("verified_user"), item.get("mobile_user_id"), item.get("part_number"),
+            item.get("part_name"), item.get("mav", 0), item.get("system_quantity", 0), item.get("physical_quantity", 0),
+            item.get("difference", 0), item.get("shortage_qty", 0), item.get("excess_qty", 0), item.get("shortage_value", 0),
+            item.get("excess_value", 0), item.get("pin_location") or item.get("system_location"),
+            item.get("physical_location") or item.get("scanned_location") or item.get("location"),
+            item.get("overall_status") or item.get("verification_status") or item.get("quantity_status"),
+            item.get("correction_status"), item.get("correction_method"), item.get("correction_remarks"),
+            item.get("correction_updated_by_name"), item.get("correction_updated_at"),
+            "Yes" if item.get("is_new_part") else "No", item.get("entry_method"), item.get("source") or "WEB",
+            item.get("remarks") or item.get("remark"),
+        ])
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for col in ws.columns:
+        width = min(max(len(str(cell.value or "")) for cell in col) + 2, 42)
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col[0].column)].width = width
+    output = BytesIO(); wb.save(output); output.seek(0)
+    filename = "perpetual_stock_master.xlsx" if current_user.role == "master" else ("perpetual_stock_admin.xlsx" if current_user.role == "admin" else "perpetual_stock_branch.xlsx")
+    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
 @api_router.get("/mobile/perpetual-stock/sessions/{session_id}")
 async def get_mobile_stock_verification_session(session_id: str, current_user: UserResponse = Depends(get_current_user)):
     session = await db.stock_verification_sessions.find_one({"session_id": session_id}, {"_id": 0})
@@ -5471,13 +5547,13 @@ async def export_mobile_stock_verification_session(session_id: str, current_user
         summary.cell(r, 1, label).font = openpyxl.styles.Font(bold=True)
         summary.cell(r, 2, value)
     details = wb.create_sheet("Details")
-    headers = ["Part Number","Part Name","MAV","System Qty","Physical Qty","Difference","Shortage Qty","Excess Qty","Shortage Value","Excess Value","PIN Location","Status","Remarks"]
+    headers = ["Part Number","Part Name","MAV","System Qty","Physical Qty","Difference","Shortage Qty","Excess Qty","Shortage Value","Excess Value","PIN Location","Physical Location","Status","Correction Status","Correction Method","Correction Remarks","Corrected By","Corrected At","New / Unlisted Part","Entry Method","Source","Remarks"]
     details.append(headers)
     for cell in details[1]:
         cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
         cell.fill = openpyxl.styles.PatternFill(start_color="16A34A", end_color="16A34A", fill_type="solid")
     for item in data.get("items", []):
-        details.append([item.get("part_number"), item.get("part_name"), item.get("mav",0), item.get("system_quantity",0), item.get("physical_quantity",0), item.get("difference",0), item.get("shortage_qty",0), item.get("excess_qty",0), item.get("shortage_value",0), item.get("excess_value",0), item.get("pin_location") or item.get("system_location"), item.get("overall_status"), item.get("remarks")])
+        details.append([item.get("part_number"), item.get("part_name"), item.get("mav",0), item.get("system_quantity",0), item.get("physical_quantity",0), item.get("difference",0), item.get("shortage_qty",0), item.get("excess_qty",0), item.get("shortage_value",0), item.get("excess_value",0), item.get("pin_location") or item.get("system_location"), item.get("physical_location") or item.get("scanned_location"), item.get("overall_status"), item.get("correction_status"), item.get("correction_method"), item.get("correction_remarks"), item.get("correction_updated_by_name"), item.get("correction_updated_at"), "Yes" if item.get("is_new_part") else "No", item.get("entry_method"), item.get("source") or "WEB", item.get("remarks") or item.get("remark")])
     for ws in (summary, details):
         for col in ws.columns:
             width = min(max(len(str(c.value or "")) for c in col) + 2, 40)

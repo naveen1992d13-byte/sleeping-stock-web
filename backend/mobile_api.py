@@ -30,6 +30,7 @@ import base64
 from io import BytesIO
 import qrcode
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
@@ -1007,52 +1008,201 @@ async def submit_part_response(payload: RequestPartResponse, session=Depends(get
 
 # ==================== STOCK VERIFICATION (MOBILE) ====================
 
+def _mobile_stock_qty(product: dict) -> float:
+    for field in ("available_qty_number", "available_quantity", "available_qty", "quantity"):
+        value = (product or {}).get(field)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def _mobile_entry_method(value: str) -> str:
+    normalized = re.sub(r"[^A-Z0-9]+", "_", str(value or "MANUAL").strip().upper()).strip("_")
+    aliases = {"CAMERA": "CAMERA_OCR", "OCR": "CAMERA_OCR", "CAMERAOCR": "CAMERA_OCR", "MANUAL_ENTRY": "MANUAL"}
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"MANUAL", "CAMERA_OCR"}:
+        # Keep the current APK backward compatible: an old/unknown value must
+        # not block offline verification uploads.
+        normalized = "MANUAL"
+    return normalized
+
+
+
+
+async def _mirror_mobile_verification_to_web(doc: dict):
+    """Idempotently expose a mobile snapshot to website-only correction flows."""
+    session_id = doc.get("session_id")
+    if not session_id:
+        raise HTTPException(500, "Verification session ID is missing")
+
+    clean_doc = {k: v for k, v in dict(doc).items() if k != "_id"}
+    await db.stock_verifications.update_one(
+        {"id": clean_doc["id"]}, {"$setOnInsert": clean_doc}, upsert=True
+    )
+
+    # Recalculate exact totals rather than incrementing. This makes retries and
+    # recovery after a partial write safe and prevents doubled session totals.
+    totals = await db.stock_verifications.aggregate([
+        {"$match": {"session_id": session_id}},
+        {"$group": {
+            "_id": None, "total_items": {"$sum": 1},
+            "total_shortage_qty": {"$sum": {"$ifNull": ["$shortage_qty", 0]}},
+            "total_shortage_value": {"$sum": {"$ifNull": ["$shortage_value", 0]}},
+            "total_excess_qty": {"$sum": {"$ifNull": ["$excess_qty", 0]}},
+            "total_excess_value": {"$sum": {"$ifNull": ["$excess_value", 0]}},
+        }},
+    ]).to_list(1)
+    summary = totals[0] if totals else {
+        "total_items": 0, "total_shortage_qty": 0, "total_shortage_value": 0,
+        "total_excess_qty": 0, "total_excess_value": 0,
+    }
+    summary.pop("_id", None)
+    created_at = clean_doc.get("created_at") or clean_doc.get("verified_at") or _now()
+    await db.stock_verification_sessions.update_one(
+        {"session_id": session_id},
+        {
+            "$setOnInsert": {
+                "id": str(uuid.uuid4()), "session_id": session_id, "created_at": created_at, "date": created_at,
+                "brand_name": clean_doc.get("brand_name", ""), "dealer_name": clean_doc.get("dealer_name", ""),
+                "branch": clean_doc.get("branch", ""), "verified_by": clean_doc.get("verified_by", ""),
+                "verified_by_name": clean_doc.get("verified_by_name") or clean_doc.get("verified_user", ""),
+                "status": "submitted", "information_only": True, "affects_stock": False, "source": "MOBILE",
+            },
+            "$set": {**summary, "updated_at": _now()},
+        },
+        upsert=True,
+    )
+
+
 @router.post("/stock-verification")
 async def submit_stock_verification(payload: StockVerificationSubmit, session=Depends(get_device_session)):
-    if payload.entry_method not in ("MANUAL", "CAMERA_OCR"):
-        raise HTTPException(400, "entry_method must be MANUAL or CAMERA_OCR")
-    # Remark is optional for both entry methods per Part 15 — no mandatory check.
+    # Information-only physical snapshot. Unknown/unlisted parts are valid and
+    # must be visible in the website correction and Excel workflows.
+    clean_part = re.sub(r"\s+", "", str(payload.part_number or "").strip().upper())
+    if not clean_part:
+        raise HTTPException(400, "Part number is required")
+
+    try:
+        physical_qty = float(payload.physical_qty or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Physical quantity must be a valid number")
+    if physical_qty < 0:
+        raise HTTPException(400, "Physical quantity cannot be negative")
+
+    entry_method = _mobile_entry_method(payload.entry_method)
+    device_id = session["device"]["device_id"]
+    mobile_user_id = session["mobile_user"]["mobile_user_id"]
+    now = _now()
+    india_day = now.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%Y%m%d")
+    session_id = f"MPS{mobile_user_id}{india_day}"
 
     if payload.client_id:
         existing = await db.stock_verification_history.find_one(
-            {"device_id": session["device"]["device_id"], "client_id": payload.client_id},
-            {"_id": 0, "id": 1},
+            {"device_id": device_id, "client_id": payload.client_id}, {"_id": 0}
         )
         if existing:
-            # Already recorded from an earlier sync attempt whose response was
-            # lost — return success again instead of inserting a duplicate.
-            return {"message": "Verification recorded", "id": existing["id"], "duplicate": True}
+            # Repair/complete a previous partial sync before acknowledging the
+            # retry. This handles a lost response or a failure after history
+            # insertion without creating duplicate website rows or totals.
+            existing.setdefault("session_id", session_id)
+            existing.setdefault("source", "MOBILE")
+            existing.setdefault("information_only", True)
+            existing.setdefault("affects_stock", False)
+            await _mirror_mobile_verification_to_web(existing)
+            return {
+                "success": True, "message": "Verification recorded", "id": existing["id"],
+                "verification_id": existing["id"], "duplicate": True,
+                "system_qty": existing.get("system_quantity", 0),
+                "physical_qty": existing.get("physical_quantity", 0),
+                "difference_qty": existing.get("difference", 0),
+                "verification_status": existing.get("verification_status") or existing.get("quantity_status"),
+                "part_found_in_system": existing.get("part_found_in_system", False),
+            }
 
     system_record = await db.products.find_one(
         {
-            "part_number": payload.part_number,
+            "part_number": {"$regex": f"^{re.escape(clean_part)}$", "$options": "i"},
             "brand_name": session["brand_name"],
             "dealer_name": session["dealer_name"],
             "branch": session["branch"],
         },
-        {"_id": 0, "part_name": 1, "quantity": 1},
+        {"_id": 0}, sort=[("updated_at", -1)],
     )
+    system_qty = _mobile_stock_qty(system_record)
+    difference = physical_qty - system_qty
+    part_found = bool(system_record)
+    quantity_status = "matched" if difference == 0 else ("shortage" if difference < 0 else "excess")
+    verification_status = "NEW_PART_FOUND" if (not part_found and physical_qty > 0) else quantity_status.upper()
+    system_location = str((system_record or {}).get("loc") or (system_record or {}).get("LOC") or (system_record or {}).get("location") or "").strip()
+    physical_location = str(payload.location or "").strip()
+    location_status = "matched" if system_location.casefold() == physical_location.casefold() else "mismatch"
+    if quantity_status == "matched" and location_status == "matched":
+        overall_status = "matched"
+    elif quantity_status != "matched" and location_status != "matched":
+        overall_status = "quantity_and_location_mismatch"
+    elif quantity_status != "matched":
+        overall_status = "quantity_mismatch"
+    else:
+        overall_status = "location_mismatch"
+    correction_status = "not_required" if overall_status == "matched" else "pending"
+    try:
+        mav = float((system_record or {}).get("mav") or (system_record or {}).get("MAV") or (system_record or {}).get("unit_value") or (system_record or {}).get("value") or 0)
+    except (TypeError, ValueError):
+        mav = 0.0
+    shortage_qty = abs(difference) if difference < 0 else 0.0
+    excess_qty = difference if difference > 0 else 0.0
 
     doc = {
-        "id": str(uuid.uuid4()),
-        "client_id": payload.client_id,
-        "part_number": payload.part_number,
-        "part_name": (system_record or {}).get("part_name", ""),
-        "system_quantity": (system_record or {}).get("quantity"),
-        "physical_quantity": payload.physical_qty,
-        "location": payload.location or "",
-        "remark": payload.remark or "",
-        "entry_method": payload.entry_method,
-        "verified_user": session["mobile_user"]["name"],
-        "mobile_user_id": session["mobile_user"]["mobile_user_id"],
-        "device_id": session["device"]["device_id"],
-        "brand_name": session["brand_name"],
-        "dealer_name": session["dealer_name"],
-        "branch": session["branch"],
-        "verified_at": _now_iso(),
+        "id": str(uuid.uuid4()), "session_id": session_id, "client_id": payload.client_id,
+        "part_number": (system_record or {}).get("part_number") or clean_part,
+        "part_name": (system_record or {}).get("part_name") or (system_record or {}).get("description") or "",
+        "product_id": (system_record or {}).get("id"), "mav": mav,
+        "system_quantity": system_qty, "physical_quantity": physical_qty, "difference": difference,
+        "shortage_qty": shortage_qty, "excess_qty": excess_qty,
+        "shortage_value": shortage_qty * mav, "excess_value": excess_qty * mav,
+        "quantity_status": quantity_status, "verification_status": verification_status,
+        "part_found_in_system": part_found, "is_new_part": not part_found,
+        "system_location": system_location, "pin_location": system_location,
+        "physical_location": physical_location, "scanned_location": physical_location,
+        "location": physical_location, "location_status": location_status, "overall_status": overall_status,
+        "remarks": payload.remark or "", "remark": payload.remark or "", "entry_method": entry_method,
+        "verified_user": session["mobile_user"]["name"], "verified_by": mobile_user_id,
+        "verified_by_name": session["mobile_user"]["name"], "mobile_user_id": mobile_user_id,
+        "device_id": device_id, "brand_name": session["brand_name"], "dealer_name": session["dealer_name"],
+        "branch": session["branch"], "snapshot_at": now, "created_at": now, "verified_at": now,
+        "status": "submitted", "correction_status": correction_status, "correction_method": "",
+        "correction_remarks": "", "information_only": True, "affects_stock": False, "source": "MOBILE",
     }
-    await db.stock_verification_history.insert_one(dict(doc))
-    return {"message": "Verification recorded", "id": doc["id"], "duplicate": False}
+    try:
+        await db.stock_verification_history.insert_one(dict(doc))
+    except DuplicateKeyError:
+        existing = await db.stock_verification_history.find_one(
+            {"device_id": device_id, "client_id": payload.client_id}, {"_id": 0}
+        )
+        if existing:
+            existing.setdefault("session_id", session_id)
+            await _mirror_mobile_verification_to_web(existing)
+            return {
+                "success": True, "message": "Verification recorded", "id": existing["id"],
+                "verification_id": existing["id"], "duplicate": True,
+                "system_qty": existing.get("system_quantity", 0),
+                "physical_qty": existing.get("physical_quantity", 0),
+                "difference_qty": existing.get("difference", 0),
+                "verification_status": existing.get("verification_status") or existing.get("quantity_status"),
+                "part_found_in_system": existing.get("part_found_in_system", False),
+            }
+        raise
+
+    await _mirror_mobile_verification_to_web(doc)
+    return {
+        "success": True, "message": "Verification recorded", "id": doc["id"], "verification_id": doc["id"],
+        "duplicate": False, "system_qty": system_qty, "physical_qty": physical_qty,
+        "difference_qty": difference, "verification_status": verification_status,
+        "part_found_in_system": part_found,
+    }
 
 
 @router.get("/stock-verification/history")
