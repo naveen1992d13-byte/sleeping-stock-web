@@ -5303,7 +5303,7 @@ async def lookup_mobile_stock_snapshot(
     return {
         "product_id": product.get("id"),
         "part_number": product.get("part_number") or clean_part,
-        "part_name": product.get("part_name") or product.get("item_name") or product.get("description") or "",
+        "part_name": _resolve_verification_part_name(product),
         "system_quantity": _stock_snapshot_quantity(product),
         "system_location": bin_location,
         "pin_location": bin_location,
@@ -5316,19 +5316,68 @@ async def lookup_mobile_stock_snapshot(
     }
 
 
-async def _next_perpetual_session_id(brand_name: str) -> str:
-    brand_code = await resolve_brand_code_for_upload(brand_name)
-    brand_code = re.sub(r"[^A-Za-z0-9]", "", str(brand_code or "XX")).upper() or "XX"
+async def _next_mops_verification_session_id() -> str:
+    """MOPS + YYMMDD (IST) + 4-digit daily sequence. Atomic via db.counters."""
     india_now = datetime.now(ZoneInfo("Asia/Kolkata"))
-    date_key = india_now.strftime("%Y%m%d")
-    counter_id = f"perpetual_session_{brand_code}_{date_key}"
+    date_key = india_now.strftime("%y%m%d")
+    counter_id = f"mops_verification_session_{date_key}"
     counter = await db.counters.find_one_and_update(
         {"_id": counter_id},
-        {"$inc": {"seq": 1}, "$setOnInsert": {"date_key": date_key, "brand_code": brand_code}},
+        {"$inc": {"seq": 1}, "$setOnInsert": {"date_key": date_key}},
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
-    return f"PS{brand_code}{date_key}{int(counter.get('seq', 1)):04d}"
+    seq = int(counter.get("seq", 1))
+    if seq > 9999:
+        raise HTTPException(status_code=500, detail="Daily MOPS verification session serial exhausted")
+    return f"MOPS{date_key}{seq:04d}"
+
+
+async def _next_perpetual_session_id(brand_name: str = "") -> str:
+    """Verification session IDs for Perpetual Stock (web upload and mobile mirror)."""
+    return await _next_mops_verification_session_id()
+
+
+def _resolve_verification_part_name(product: dict) -> str:
+    if not product:
+        return ""
+    return str(
+        product.get("part_name")
+        or product.get("item_name")
+        or product.get("description")
+        or product.get("part_description")
+        or ""
+    ).strip()
+
+
+async def _enrich_verification_item_part_name(item: dict) -> dict:
+    """API-only enrichment for legacy rows missing part_name (no MongoDB bulk update)."""
+    if not item:
+        return item
+    if str(item.get("part_name") or "").strip():
+        return item
+    part_number = str(item.get("part_number") or "").strip()
+    brand_name = item.get("brand_name")
+    dealer_name = item.get("dealer_name")
+    branch = item.get("branch")
+    if not (part_number and brand_name and dealer_name and branch):
+        return item
+    product = await db.products.find_one(
+        {
+            "brand_name": brand_name,
+            "dealer_name": dealer_name,
+            "branch": branch,
+            "part_number": {"$regex": f"^{re.escape(part_number)}$", "$options": "i"},
+        },
+        {"_id": 0},
+        sort=[("updated_at", -1)],
+    )
+    resolved = _resolve_verification_part_name(product)
+    if not resolved:
+        return item
+    enriched = dict(item)
+    enriched["part_name"] = resolved
+    return enriched
 
 
 def _verification_calculations(system_qty: float, physical_qty: float, mav: float):
@@ -5372,7 +5421,7 @@ async def _build_verification_record(item, scope_query, current_user, session_id
     return {
         "id": str(uuid.uuid4()), "session_id": session_id,
         "part_number": product.get("part_number") or clean_part,
-        "part_name": product.get("part_name") or product.get("item_name") or product.get("description") or "",
+        "part_name": _resolve_verification_part_name(product),
         "product_id": product.get("id"), "mav": mav,
         "system_quantity": system_qty, "physical_quantity": physical_qty,
         **calculations,
@@ -5527,7 +5576,8 @@ async def get_mobile_stock_verification_session(session_id: str, current_user: U
     if scope and not await db.stock_verification_sessions.find_one({"session_id": session_id, **scope}, {"_id": 0, "session_id": 1}):
         raise HTTPException(status_code=403, detail="Verification session is outside your permitted scope")
     items = await db.stock_verifications.find({"session_id": session_id}, {"_id": 0}).sort("created_at", 1).to_list(length=10000)
-    return {**session, "items": items}
+    enriched_items = [await _enrich_verification_item_part_name(item) for item in items]
+    return {**session, "items": enriched_items}
 
 
 @api_router.get("/mobile/perpetual-stock/sessions/{session_id}/excel")
@@ -5609,7 +5659,7 @@ async def create_mobile_stock_verification(payload: StockVerificationCreate, cur
     record = {
         "id": str(uuid.uuid4()),
         "part_number": product.get("part_number") or clean_part,
-        "part_name": product.get("part_name") or product.get("description") or "",
+        "part_name": _resolve_verification_part_name(product),
         "product_id": product.get("id"),
         "system_quantity": system_qty,
         "physical_quantity": physical_qty,
@@ -5700,7 +5750,15 @@ try:
     from . import mobile_api
 except ImportError:
     import mobile_api
-mobile_api.init_mobile_api(db, get_current_user, UserResponse, pwd_context, _request_center_transition, _notify_request_status_change)
+mobile_api.init_mobile_api(
+    db,
+    get_current_user,
+    UserResponse,
+    pwd_context,
+    _request_center_transition,
+    _notify_request_status_change,
+    _next_mops_verification_session_id,
+)
 api_router.include_router(mobile_api.router)
 
 app.include_router(api_router)
