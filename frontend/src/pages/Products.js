@@ -143,7 +143,7 @@ export function Products() {
       if (stockStatus && stockStatus !== 'all') params.append('stock_status', stockStatus);
       await authenticatedDownload(`${API}/product-hub/export/branch?${params.toString()}`, `ProductHub_${branchName}.xlsx`);
       toast.success('Branch export downloaded');
-    } catch (e) { toast.error(e.response?.data?.detail || 'Export failed', { id: toastId }); }
+    } catch (e) { toast.error(e.response?.data?.detail || 'Export failed'); }
     finally { setExporting(false); }
   };
 
@@ -230,7 +230,7 @@ export function Products() {
               <tr key={p.id || i} className="border-b" style={{ backgroundColor: i % 2 ? '#fff' : COLORS.soft }}>
                 <td className="p-3 font-bold whitespace-nowrap" style={{ color: COLORS.dark }}>{p.part_number || p.part_no || '-'}</td>
                 <td className="p-3 whitespace-nowrap">{p.item_name || p.part_name || p.description || '-'}</td>
-                <td className="p-3 whitespace-nowrap">{p.location || p.loc || p.bin_location || '-'}</td>
+                <td className="p-3 whitespace-nowrap">{p.loc || p.bin_location || p.pin_location || p.location || '-'}</td>
                 <td className="p-3 whitespace-nowrap">{Number(p.available_qty_number ?? p.quantity ?? p.available_qty ?? p.on_hand ?? 0).toLocaleString('en-IN')}</td>
                 <td className="p-3 whitespace-nowrap">{p.last_receipt_date || p.receipt_date || p.last_purchase_date || '-'}</td>
                 <td className="p-3 whitespace-nowrap">{p.last_sales_date || p.sales_date || p.last_sale_date || '-'}</td>
