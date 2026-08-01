@@ -50,6 +50,7 @@ UserResponse = None
 pwd_context = None
 request_center_transition = None
 notify_request_status_change = None
+next_mops_verification_session_id = None
 _mobile_web_security = HTTPBearer()
 
 
@@ -70,14 +71,15 @@ DEFAULT_NOTIFICATION_INTERVAL_MINUTES = 30
 SKIP_LIMIT = 2  # first two alerts may be skipped; third cannot
 
 
-def init_mobile_api(_db, _get_current_user, _UserResponse, _pwd_context, _request_center_transition=None, _notify_request_status_change=None):
-    global db, get_current_user, UserResponse, pwd_context, request_center_transition, notify_request_status_change
+def init_mobile_api(_db, _get_current_user, _UserResponse, _pwd_context, _request_center_transition=None, _notify_request_status_change=None, _next_mops_verification_session_id=None):
+    global db, get_current_user, UserResponse, pwd_context, request_center_transition, notify_request_status_change, next_mops_verification_session_id
     db = _db
     get_current_user = _get_current_user
     UserResponse = _UserResponse
     pwd_context = _pwd_context
     request_center_transition = _request_center_transition
     notify_request_status_change = _notify_request_status_change
+    next_mops_verification_session_id = _next_mops_verification_session_id
 
 
 class _MobileActingUser:
@@ -1020,6 +1022,18 @@ def _normalize_part_number(part_number: str) -> str:
     return re.sub(r"\s+", "", str(part_number or "").strip()).upper()
 
 
+def resolve_product_part_name(product: dict) -> str:
+    if not product:
+        return ""
+    return str(
+        product.get("part_name")
+        or product.get("item_name")
+        or product.get("description")
+        or product.get("part_description")
+        or ""
+    ).strip()
+
+
 def _product_pin_location(product: dict) -> str:
     if not product:
         return ""
@@ -1065,7 +1079,7 @@ def build_perpetual_lookup_payload(
         mav = 0.0
     return {
         "part_number": product.get("part_number") or clean_part,
-        "part_name": product.get("part_name") or product.get("item_name") or product.get("description") or "",
+        "part_name": resolve_product_part_name(product),
         "system_quantity": _mobile_stock_qty(product),
         "mav": mav,
         "pin_location": pin,
@@ -1159,18 +1173,16 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
     device_id = session["device"]["device_id"]
     mobile_user_id = session["mobile_user"]["mobile_user_id"]
     now = _now()
-    india_day = now.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%Y%m%d")
-    session_id = f"MPS{mobile_user_id}{india_day}"
 
     if payload.client_id:
         existing = await db.stock_verification_history.find_one(
             {"device_id": device_id, "client_id": payload.client_id}, {"_id": 0}
         )
         if existing:
-            # Repair/complete a previous partial sync before acknowledging the
-            # retry. This handles a lost response or a failure after history
-            # insertion without creating duplicate website rows or totals.
-            existing.setdefault("session_id", session_id)
+            if not existing.get("session_id"):
+                if next_mops_verification_session_id is None:
+                    raise HTTPException(status_code=500, detail="Verification session ID generator is not initialized")
+                existing["session_id"] = await next_mops_verification_session_id()
             existing.setdefault("source", "MOBILE")
             existing.setdefault("information_only", True)
             existing.setdefault("affects_stock", False)
@@ -1178,12 +1190,17 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
             return {
                 "success": True, "message": "Verification recorded", "id": existing["id"],
                 "verification_id": existing["id"], "duplicate": True,
+                "session_id": existing.get("session_id"),
                 "system_qty": existing.get("system_quantity", 0),
                 "physical_qty": existing.get("physical_quantity", 0),
                 "difference_qty": existing.get("difference", 0),
                 "verification_status": existing.get("verification_status") or existing.get("quantity_status"),
                 "part_found_in_system": existing.get("part_found_in_system", False),
             }
+
+    if next_mops_verification_session_id is None:
+        raise HTTPException(status_code=500, detail="Verification session ID generator is not initialized")
+    session_id = await next_mops_verification_session_id()
 
     system_record, clean_part = await find_scoped_product(
         payload.part_number, session["brand_name"], session["dealer_name"], session["branch"]
@@ -1217,7 +1234,7 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
     doc = {
         "id": str(uuid.uuid4()), "session_id": session_id, "client_id": payload.client_id,
         "part_number": (system_record or {}).get("part_number") or clean_part,
-        "part_name": (system_record or {}).get("part_name") or (system_record or {}).get("description") or "",
+        "part_name": resolve_product_part_name(system_record or {}),
         "product_id": (system_record or {}).get("id"), "mav": mav,
         "system_quantity": system_qty, "physical_quantity": physical_qty, "difference": difference,
         "shortage_qty": shortage_qty, "excess_qty": excess_qty,
@@ -1258,6 +1275,7 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
     await _mirror_mobile_verification_to_web(doc)
     return {
         "success": True, "message": "Verification recorded", "id": doc["id"], "verification_id": doc["id"],
+        "session_id": session_id,
         "duplicate": False, "system_qty": system_qty, "physical_qty": physical_qty,
         "difference_qty": difference, "verification_status": verification_status,
         "part_found_in_system": part_found,
