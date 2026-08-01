@@ -50,7 +50,6 @@ UserResponse = None
 pwd_context = None
 request_center_transition = None
 notify_request_status_change = None
-next_mops_verification_session_id = None
 _mobile_web_security = HTTPBearer()
 
 
@@ -71,15 +70,14 @@ DEFAULT_NOTIFICATION_INTERVAL_MINUTES = 30
 SKIP_LIMIT = 2  # first two alerts may be skipped; third cannot
 
 
-def init_mobile_api(_db, _get_current_user, _UserResponse, _pwd_context, _request_center_transition=None, _notify_request_status_change=None, _next_mops_verification_session_id=None):
-    global db, get_current_user, UserResponse, pwd_context, request_center_transition, notify_request_status_change, next_mops_verification_session_id
+def init_mobile_api(_db, _get_current_user, _UserResponse, _pwd_context, _request_center_transition=None, _notify_request_status_change=None):
+    global db, get_current_user, UserResponse, pwd_context, request_center_transition, notify_request_status_change
     db = _db
     get_current_user = _get_current_user
     UserResponse = _UserResponse
     pwd_context = _pwd_context
     request_center_transition = _request_center_transition
     notify_request_status_change = _notify_request_status_change
-    next_mops_verification_session_id = _next_mops_verification_session_id
 
 
 class _MobileActingUser:
@@ -1113,6 +1111,76 @@ def _mobile_entry_method(value: str) -> str:
 
 
 
+async def _get_or_create_mobile_daily_verification_session(
+    mobile_user_id: str,
+    device_id: str,
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+) -> str:
+    """One ACTIVE session per mobile user + brand + dealer + branch + IST calendar day."""
+    india_now = _now().astimezone(ZoneInfo("Asia/Kolkata"))
+    verification_date = india_now.strftime("%Y-%m-%d")
+    date_key = india_now.strftime("%Y%m%d")
+    scope = {
+        "session_kind": "mobile_daily",
+        "verification_date": verification_date,
+        "mobile_user_id": mobile_user_id,
+        "brand_id": brand_name,
+        "dealer_id": dealer_name,
+        "branch_id": branch,
+        "status": "ACTIVE",
+    }
+    existing = await db.stock_verification_sessions.find_one(scope, {"_id": 0, "session_id": 1})
+    if existing and existing.get("session_id"):
+        await db.stock_verification_sessions.update_one(
+            {"session_id": existing["session_id"]},
+            {"$set": {"updated_at": _now(), "device_id": device_id}},
+        )
+        return existing["session_id"]
+
+    counter = await db.counters.find_one_and_update(
+        {"_id": f"ses_verification_session_{date_key}"},
+        {"$inc": {"seq": 1}, "$setOnInsert": {"date_key": date_key}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    seq = int(counter.get("seq", 1))
+    if seq > 9999:
+        raise HTTPException(status_code=500, detail="Daily SES verification session serial exhausted")
+    session_id = f"SES{date_key}{seq:04d}"
+    now = _now()
+    session_doc = {
+        "id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "session_kind": "mobile_daily",
+        "verification_date": verification_date,
+        "mobile_user_id": mobile_user_id,
+        "brand_id": brand_name,
+        "dealer_id": dealer_name,
+        "branch_id": branch,
+        "brand_name": brand_name,
+        "dealer_name": dealer_name,
+        "branch": branch,
+        "device_id": device_id,
+        "status": "ACTIVE",
+        "total_items": 0,
+        "source": "MOBILE",
+        "information_only": True,
+        "affects_stock": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        await db.stock_verification_sessions.insert_one(session_doc)
+    except DuplicateKeyError:
+        raced = await db.stock_verification_sessions.find_one(scope, {"_id": 0, "session_id": 1})
+        if raced and raced.get("session_id"):
+            return raced["session_id"]
+        raise
+    return session_id
+
+
 async def _mirror_mobile_verification_to_web(doc: dict):
     """Idempotently expose a mobile snapshot to website-only correction flows."""
     session_id = doc.get("session_id")
@@ -1180,9 +1248,13 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
         )
         if existing:
             if not existing.get("session_id"):
-                if next_mops_verification_session_id is None:
-                    raise HTTPException(status_code=500, detail="Verification session ID generator is not initialized")
-                existing["session_id"] = await next_mops_verification_session_id()
+                existing["session_id"] = await _get_or_create_mobile_daily_verification_session(
+                    mobile_user_id,
+                    device_id,
+                    session["brand_name"],
+                    session["dealer_name"],
+                    session["branch"],
+                )
             existing.setdefault("source", "MOBILE")
             existing.setdefault("information_only", True)
             existing.setdefault("affects_stock", False)
@@ -1198,9 +1270,13 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
                 "part_found_in_system": existing.get("part_found_in_system", False),
             }
 
-    if next_mops_verification_session_id is None:
-        raise HTTPException(status_code=500, detail="Verification session ID generator is not initialized")
-    session_id = await next_mops_verification_session_id()
+    session_id = await _get_or_create_mobile_daily_verification_session(
+        mobile_user_id,
+        device_id,
+        session["brand_name"],
+        session["dealer_name"],
+        session["branch"],
+    )
 
     system_record, clean_part = await find_scoped_product(
         payload.part_number, session["brand_name"], session["dealer_name"], session["branch"]
@@ -1419,6 +1495,21 @@ async def ensure_mobile_indexes():
         unique=True,
         partialFilterExpression={"client_id": {"$type": "string"}},
     )
+    try:
+        await db.stock_verification_sessions.create_index(
+            [
+                ("verification_date", 1),
+                ("mobile_user_id", 1),
+                ("brand_id", 1),
+                ("dealer_id", 1),
+                ("branch_id", 1),
+            ],
+            unique=True,
+            name="uq_mobile_daily_verification_session",
+            partialFilterExpression={"session_kind": "mobile_daily", "status": "ACTIVE"},
+        )
+    except (DuplicateKeyError, OperationFailure) as exc:
+        logger.error("Cannot create mobile daily verification session index: %s", exc)
 
     await db.mobile_audit_logs.create_index([("created_at", -1)])
     await db.mobile_audit_logs.create_index([("target", 1)])

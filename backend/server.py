@@ -5757,7 +5757,6 @@ mobile_api.init_mobile_api(
     pwd_context,
     _request_center_transition,
     _notify_request_status_change,
-    _next_mops_verification_session_id,
 )
 api_router.include_router(mobile_api.router)
 
