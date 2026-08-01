@@ -3079,7 +3079,6 @@ async def _build_upload_context_v2(current_user: UserResponse):
         "dealer_name": dealer_name,
         "dealer_code": dealer_name or (current_user.user_id or current_user.id),
         "branch": branch_name,
-        "location": branch_name,
         "uploaded_user_name": current_user.username,
         "uploaded_user_id": current_user.id,
         "uploaded_by": current_user.id,
@@ -3292,6 +3291,12 @@ async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends
             qty_num = float(item.get("available_qty_number", item.get("quantity", 0)) or 0)
             unit_val_num = float(item.get("unit_value_number", item.get("mav_value", 0)) or 0)
             total_val_num = float(item.get("total_value_number", qty_num * unit_val_num) or 0)
+            # Legacy upload_items may carry branch name in `location`; keep bin LOC in loc/bin_location only.
+            if (doc.get("loc") or doc.get("bin_location")) and doc.get("location") is not None:
+                branch_meta = str(doc.get("branch") or "").strip()
+                location_meta = str(doc.get("location") or "").strip()
+                if branch_meta and location_meta.casefold() == branch_meta.casefold():
+                    doc.pop("location", None)
             doc.update({
                 "id": str(uuid.uuid4()),
                 "upload_id": upload_id,
@@ -5292,14 +5297,9 @@ async def lookup_mobile_stock_snapshot(
             detail=f"Part {clean_part} was not found under the selected Brand / Dealer / Branch",
         )
 
-    bin_location = str(
-        product.get("loc")
-        or product.get("LOC")
-        or product.get("bin_location")
-        or product.get("location")
-        or product.get("rack_location")
-        or ""
-    ).strip()
+    from mobile_api import _product_pin_location
+
+    bin_location = _product_pin_location(product)
     return {
         "product_id": product.get("id"),
         "part_number": product.get("part_number") or clean_part,

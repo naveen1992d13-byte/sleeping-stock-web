@@ -1008,6 +1008,73 @@ async def submit_part_response(payload: RequestPartResponse, session=Depends(get
 
 # ==================== STOCK VERIFICATION (MOBILE) ====================
 
+_PUBLISHED_STATUS_CANONICAL = "Published"
+
+
+def _published_status_filter() -> dict:
+    """Canonical publish flag is 'Published'; accept lowercase only for legacy rows."""
+    return {"$in": [_PUBLISHED_STATUS_CANONICAL, "published"]}
+
+
+def _normalize_part_number(part_number: str) -> str:
+    return re.sub(r"\s+", "", str(part_number or "").strip()).upper()
+
+
+def _product_pin_location(product: dict) -> str:
+    if not product:
+        return ""
+    return str(
+        product.get("loc")
+        or product.get("LOC")
+        or product.get("bin_location")
+        or product.get("pin_location")
+        or product.get("rack_location")
+        or product.get("location")
+        or ""
+    ).strip()
+
+
+async def find_scoped_product(part_number: str, brand_name: str, dealer_name: str, branch: str):
+    clean_part = _normalize_part_number(part_number)
+    if not clean_part:
+        return None, clean_part
+    query = {
+        "brand_name": brand_name,
+        "dealer_name": dealer_name,
+        "branch": branch,
+        "part_number": {"$regex": f"^{re.escape(clean_part)}$", "$options": "i"},
+    }
+    product = await db.products.find_one(query, {"_id": 0}, sort=[("updated_at", -1)])
+    return product, clean_part
+
+
+def build_perpetual_lookup_payload(
+    product: dict, clean_part: str, brand_name: str, dealer_name: str, branch: str
+) -> dict:
+    pin = _product_pin_location(product)
+    try:
+        mav = float(
+            product.get("mav")
+            or product.get("MAV")
+            or product.get("mav_value")
+            or product.get("unit_value")
+            or product.get("value")
+            or 0
+        )
+    except (TypeError, ValueError):
+        mav = 0.0
+    return {
+        "part_number": product.get("part_number") or clean_part,
+        "part_name": product.get("part_name") or product.get("item_name") or product.get("description") or "",
+        "system_quantity": _mobile_stock_qty(product),
+        "mav": mav,
+        "pin_location": pin,
+        "branch": product.get("branch") or branch,
+        "brand": product.get("brand_name") or brand_name,
+        "dealer": product.get("dealer_name") or dealer_name,
+    }
+
+
 def _mobile_stock_qty(product: dict) -> float:
     for field in ("available_qty_number", "available_quantity", "available_qty", "quantity"):
         value = (product or {}).get(field)
@@ -1081,10 +1148,6 @@ async def _mirror_mobile_verification_to_web(doc: dict):
 async def submit_stock_verification(payload: StockVerificationSubmit, session=Depends(get_device_session)):
     # Information-only physical snapshot. Unknown/unlisted parts are valid and
     # must be visible in the website correction and Excel workflows.
-    clean_part = re.sub(r"\s+", "", str(payload.part_number or "").strip().upper())
-    if not clean_part:
-        raise HTTPException(400, "Part number is required")
-
     try:
         physical_qty = float(payload.physical_qty or 0)
     except (TypeError, ValueError):
@@ -1122,21 +1185,17 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
                 "part_found_in_system": existing.get("part_found_in_system", False),
             }
 
-    system_record = await db.products.find_one(
-        {
-            "part_number": {"$regex": f"^{re.escape(clean_part)}$", "$options": "i"},
-            "brand_name": session["brand_name"],
-            "dealer_name": session["dealer_name"],
-            "branch": session["branch"],
-        },
-        {"_id": 0}, sort=[("updated_at", -1)],
+    system_record, clean_part = await find_scoped_product(
+        payload.part_number, session["brand_name"], session["dealer_name"], session["branch"]
     )
+    if not clean_part:
+        raise HTTPException(400, "Part number is required")
     system_qty = _mobile_stock_qty(system_record)
     difference = physical_qty - system_qty
     part_found = bool(system_record)
     quantity_status = "matched" if difference == 0 else ("shortage" if difference < 0 else "excess")
     verification_status = "NEW_PART_FOUND" if (not part_found and physical_qty > 0) else quantity_status.upper()
-    system_location = str((system_record or {}).get("loc") or (system_record or {}).get("LOC") or (system_record or {}).get("location") or "").strip()
+    system_location = _product_pin_location(system_record or {})
     physical_location = str(payload.location or "").strip()
     location_status = "matched" if system_location.casefold() == physical_location.casefold() else "mismatch"
     if quantity_status == "matched" and location_status == "matched":
@@ -1218,6 +1277,26 @@ async def stock_verification_history(
     return rows
 
 
+# ==================== PERPETUAL STOCK LOOKUP (MOBILE DEVICE) ====================
+
+@router.get("/perpetual-stock/device-lookup")
+async def perpetual_stock_device_lookup(part_number: str, session=Depends(get_device_session)):
+    """Perpetual Stock part snapshot for paired devices. Scope comes only from the device session."""
+    product, clean_part = await find_scoped_product(
+        part_number, session["brand_name"], session["dealer_name"], session["branch"]
+    )
+    if not clean_part:
+        raise HTTPException(status_code=400, detail="Part number is required")
+    if not product:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Part {clean_part} was not found under your paired Brand / Dealer / Branch",
+        )
+    return build_perpetual_lookup_payload(
+        product, clean_part, session["brand_name"], session["dealer_name"], session["branch"]
+    )
+
+
 # ==================== STOCK SEARCH (MOBILE) ====================
 
 @router.get("/stock-search")
@@ -1232,7 +1311,7 @@ async def stock_search(part_numbers: str, session=Depends(get_device_session)):
         "dealer_name": session["dealer_name"],
         "branch": session["branch"],
         "part_number": {"$in": parts},
-        "publish_status": "published",
+        "publish_status": _published_status_filter(),
         "is_active_today": True,
     }
     rows = await db.products.find(q, {"_id": 0}).to_list(2000)
