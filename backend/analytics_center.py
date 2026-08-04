@@ -289,6 +289,367 @@ def _prev_date_key(dk: str) -> str:
     return (d - timedelta(days=1)).strftime("%Y%m%d")
 
 
+def _iso_to_date_key(iso: str) -> str:
+    return (iso or "").replace("-", "")[:8]
+
+
+def _nullable_pct(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+    if current is None or previous is None:
+        return None
+    return _pct_change(current, previous)
+
+
+def _sum_map(part_map: Dict) -> Tuple[float, float]:
+    v = sum(_num(x.get("value")) for x in part_map.values())
+    q = sum(_num(x.get("qty")) for x in part_map.values())
+    return v, q
+
+
+def _filter_map_branches(part_map: Dict, allowed: Optional[set]) -> Dict:
+    if not allowed:
+        return {}
+    return {k: v for k, v in part_map.items() if k[2] in allowed}
+
+
+async def _expected_branch_names(scope: dict, current_user) -> List[str]:
+    if scope.get("branch"):
+        return [_text(scope["branch"])]
+    if (current_user.role or "").lower() == "user":
+        return [_text(current_user.location)]
+    q: dict = {"$or": [{"status": "active"}, {"status": {"$exists": False}}, {"status": None}, {"status": ""}]}
+    if scope.get("brand"):
+        rx = {"$regex": f"^{re.escape(scope['brand'])}$", "$options": "i"}
+        q = _and(q, {"$or": [{"brand": rx}, {"brand_name": rx}, {"brandName": rx}]})
+    if scope.get("dealer"):
+        rx = {"$regex": f"^{re.escape(scope['dealer'])}$", "$options": "i"}
+        q = _and(q, {"$or": [{"dealer": rx}, {"dealer_name": rx}, {"dealerName": rx}]})
+    rows = await db.branches.find(q, {"_id": 0, "name": 1}).sort("name", 1).to_list(5000)
+    names = sorted({_text(r.get("name")) for r in rows if _text(r.get("name"))})
+    if names:
+        return names
+    if (current_user.role or "").lower() == "admin":
+        return [_text(current_user.location)] if _text(current_user.location) else []
+    return []
+
+
+async def _uploaded_branches_by_date(scope: dict, date_keys: List[str]) -> Tuple[Dict[str, set], Dict[str, Dict[str, dict]]]:
+    """Branch-day upload detection from batch_summaries with published-products fallback."""
+    uploaded: Dict[str, set] = defaultdict(set)
+    meta: Dict[str, Dict[str, dict]] = defaultdict(dict)
+    if not date_keys:
+        return uploaded, meta
+    q = _and(_query(scope), {"active_date_key": {"$in": date_keys}})
+    for row in await db.batch_summaries.find(q, {"_id": 0}).to_list(50000):
+        dk = _text(row.get("active_date_key"))
+        br = _text(row.get("branch"))
+        if not dk or not br:
+            continue
+        uploaded[dk].add(br.casefold())
+        meta[dk][br.casefold()] = {
+            "branch": br,
+            "published_at": row.get("published_at"),
+            "total_value": _num(row.get("total_value")),
+        }
+    pipeline = [
+        {"$match": _and(_query(scope), {"publish_status": "Published", "active_date_key": {"$in": date_keys}})},
+        {"$group": {"_id": {"date": "$active_date_key", "branch": "$branch"}, "rows": {"$sum": 1}}},
+    ]
+    for row in await db.products.aggregate(pipeline).to_list(50000):
+        dk = _text(row.get("_id", {}).get("date"))
+        br = _text(row.get("_id", {}).get("branch"))
+        if dk and br:
+            uploaded[dk].add(br.casefold())
+            meta[dk].setdefault(
+                br.casefold(),
+                {"branch": br, "published_at": None, "total_value": None},
+            )
+    return uploaded, meta
+
+
+async def _snapshots_enabled() -> bool:
+    try:
+        return await db.analytics_stock_daily_snapshots.estimated_document_count() > 0
+    except Exception:
+        return False
+
+
+async def _aggregate_parts_for_dates(
+    date_keys: List[str],
+    scope: dict,
+    category: Optional[str],
+    use_snapshots: bool,
+) -> Dict[str, Dict[Tuple[str, str, str, str], dict]]:
+    if not date_keys:
+        return {}
+    if use_snapshots:
+        snap_keys = []
+        for dk in date_keys:
+            snap_keys.append(dk)
+            if len(dk) == 8:
+                snap_keys.append(f"{dk[0:4]}-{dk[4:6]}-{dk[6:8]}")
+        q = {"snapshot_date_ist": {"$in": list(set(snap_keys))}}
+        if scope.get("brand"):
+            q["brand_name"] = scope["brand"]
+        if scope.get("dealer"):
+            q["dealer_name"] = scope["dealer"]
+        if scope.get("branch"):
+            q["branch_name"] = scope["branch"]
+        rows = await db.analytics_stock_daily_snapshots.find(q, {"_id": 0}).to_list(500000)
+        if rows:
+            by_date: Dict[str, Dict[Tuple[str, str, str, str], dict]] = defaultdict(dict)
+            for r in rows:
+                raw = _text(r.get("snapshot_date_ist")).replace("-", "")[:8]
+                pk = (
+                    _text(r.get("brand_name")).casefold(),
+                    _text(r.get("dealer_name")).casefold(),
+                    _text(r.get("branch_name")).casefold(),
+                    _text(r.get("part_number")).casefold(),
+                )
+                qty = _num(r.get("available_qty"))
+                unit = _num(r.get("unit_value"))
+                by_date[raw][pk] = {
+                    "brand_name": r.get("brand_name"),
+                    "dealer_name": r.get("dealer_name"),
+                    "branch": r.get("branch_name"),
+                    "part_number": r.get("part_number"),
+                    "part_name": r.get("part_name"),
+                    "part_category": r.get("category"),
+                    "qty": qty,
+                    "unit": unit,
+                    "value": _num(r.get("total_value"), qty * unit),
+                }
+            return by_date
+    return await _aggregate_latest_parts_for_date_keys(date_keys, scope, category)
+
+
+def _day_upload_status(
+    dk: str,
+    uploaded_by_date: Dict[str, set],
+    expected_branches: List[str],
+    consolidated: bool,
+) -> dict:
+    expected = len(expected_branches)
+    exp_cf = {_text(b).casefold() for b in expected_branches}
+    up = uploaded_by_date.get(dk, set())
+    up_in_scope = up & exp_cf if exp_cf else up
+    uploaded_count = len(up_in_scope)
+    missing = sorted([b for b in expected_branches if b.casefold() not in up_in_scope])
+    uploaded_names = sorted([b for b in expected_branches if b.casefold() in up_in_scope])
+    if expected == 0:
+        status = "NO_UPLOAD"
+    elif uploaded_count == 0:
+        status = "NO_UPLOAD"
+    elif not consolidated:
+        status = "AVAILABLE"
+    elif uploaded_count >= expected:
+        status = "AVAILABLE"
+    else:
+        status = "PARTIAL_UPLOAD"
+    cov = _safe_pct(uploaded_count, expected) if expected else 0.0
+    return {
+        "data_status": status,
+        "uploaded_branch_count": uploaded_count,
+        "expected_branch_count": expected,
+        "missing_branch_count": max(0, expected - uploaded_count),
+        "coverage_percentage": cov,
+        "uploaded_branches": uploaded_names,
+        "missing_branches": missing,
+        "allowed_branch_keys": up_in_scope,
+    }
+
+
+async def _find_last_upload_before(before_dk: str, scope: dict, expected_branches: List[str], consolidated: bool) -> Optional[str]:
+    q = _and(_query(scope), {"active_date_key": {"$lt": before_dk}})
+    keys = sorted(set(await db.batch_summaries.distinct("active_date_key", q)), reverse=True)
+    if not keys:
+        pipeline = [
+            {"$match": _and(_query(scope), {"publish_status": "Published", "active_date_key": {"$lt": before_dk}})},
+            {"$group": {"_id": "$active_date_key"}},
+        ]
+        keys = sorted([r["_id"] for r in await db.products.aggregate(pipeline).to_list(5000)], reverse=True)
+    for dk in keys:
+        up, _ = await _uploaded_branches_by_date(scope, [dk])
+        st = _day_upload_status(dk, up, expected_branches, consolidated)
+        if st["data_status"] in {"AVAILABLE", "PARTIAL_UPLOAD"}:
+            return dk
+    return None
+
+
+def _comparison_type_for(prev_dk: Optional[str], curr_dk: str) -> str:
+    if not prev_dk:
+        return "NO_PREVIOUS_UPLOAD"
+    if prev_dk == _prev_date_key(curr_dk):
+        return "PREVIOUS_DAY"
+    return "LAST_AVAILABLE_UPLOAD"
+
+
+def _comparison_label(comparison_type: str) -> str:
+    return {
+        "PREVIOUS_DAY": "Previous Day",
+        "LAST_AVAILABLE_UPLOAD": "Last Upload",
+        "NO_PREVIOUS_UPLOAD": "No Previous Upload",
+    }.get(comparison_type, "No Previous Upload")
+
+
+def _empty_daily_row(dk: str, status_info: dict) -> dict:
+    return {
+        "date": _date_key_to_iso(dk),
+        "data_status": status_info["data_status"],
+        "stock_value": None,
+        "stock_quantity": None,
+        "added_value": None,
+        "reduced_value": None,
+        "net_change": None,
+        "change_pct": None,
+        "comparison_date": None,
+        "comparison_type": None,
+        "comparison_label": None,
+        "uploaded_branch_count": status_info["uploaded_branch_count"],
+        "expected_branch_count": status_info["expected_branch_count"],
+        "missing_branch_count": status_info["missing_branch_count"],
+        "coverage_percentage": status_info["coverage_percentage"],
+        "uploaded_branches": status_info["uploaded_branches"],
+        "missing_branches": status_info["missing_branches"],
+    }
+
+
+async def _build_daily_stock_series(
+    scope: dict,
+    date_keys: List[str],
+    category: Optional[str],
+    aging_type: str,
+    metric_type: str,
+    current_user,
+) -> dict:
+    expected_branches = await _expected_branch_names(scope, current_user)
+    consolidated = not bool(scope.get("branch"))
+    uploaded_by_date, upload_meta = await _uploaded_branches_by_date(scope, date_keys)
+    use_snap = await _snapshots_enabled()
+    prior_key = await _find_last_upload_before(date_keys[0], scope, expected_branches, consolidated)
+    load_keys = list(date_keys)
+    if prior_key and prior_key not in load_keys:
+        load_keys.append(prior_key)
+    if prior_key and prior_key not in load_keys:
+        load_keys.append(prior_key)
+    by_date = await _aggregate_parts_for_dates(load_keys, scope, category, use_snap)
+    if prior_key:
+        up_prior, meta_prior = await _uploaded_branches_by_date(scope, [prior_key])
+        for dk, branches in up_prior.items():
+            uploaded_by_date[dk] = uploaded_by_date.get(dk, set()) | branches
+        for dk, m in meta_prior.items():
+            upload_meta[dk] = {**upload_meta.get(dk, {}), **m}
+
+    last_avail_key: Optional[str] = prior_key
+    if prior_key:
+        prior_status = _day_upload_status(prior_key, uploaded_by_date, expected_branches, consolidated)
+        last_avail_map = _filter_map_branches(by_date.get(prior_key, {}), prior_status["allowed_branch_keys"])
+    else:
+        last_avail_map = {}
+
+    daily: List[dict] = []
+    full_days = partial_days = no_days = 0
+    uploaded_branch_days = 0
+    expected_branch_days = len(date_keys) * max(len(expected_branches), 1 if not consolidated else len(expected_branches) or 1)
+
+    period_added = period_reduced = 0.0
+    for dk in date_keys:
+        status_info = _day_upload_status(dk, uploaded_by_date, expected_branches, consolidated)
+        if status_info["data_status"] == "NO_UPLOAD":
+            no_days += 1
+            daily.append(_empty_daily_row(dk, status_info))
+            continue
+        if status_info["data_status"] == "PARTIAL_UPLOAD":
+            partial_days += 1
+        else:
+            full_days += 1
+        uploaded_branch_days += status_info["uploaded_branch_count"]
+        curr_map = _filter_map_branches(by_date.get(dk, {}), status_info["allowed_branch_keys"])
+        stock_v, stock_q = _sum_map(curr_map)
+        row = _empty_daily_row(dk, status_info)
+        row["stock_value"] = stock_v
+        row["stock_quantity"] = stock_q
+        if last_avail_key and last_avail_map is not None:
+            mv = _compute_day_movement(last_avail_map, curr_map, aging_type, metric_type)
+            ctype = _comparison_type_for(last_avail_key, dk)
+            row["comparison_date"] = _date_key_to_iso(last_avail_key)
+            row["comparison_type"] = ctype
+            row["comparison_label"] = _comparison_label(ctype)
+            row["added_value"] = mv["added_value"]
+            row["reduced_value"] = mv["reduced_value"]
+            row["net_change"] = mv["net_change_value"]
+            row["added_quantity"] = mv["added_qty"]
+            row["reduced_quantity"] = mv["reduced_qty"]
+            row["net_change_quantity"] = mv["net_change_qty"]
+            row["change_pct"] = _nullable_pct(stock_v, mv["opening_value"])
+            period_added += mv["added_value"]
+            period_reduced += mv["reduced_value"]
+        else:
+            row["comparison_type"] = "NO_PREVIOUS_UPLOAD"
+            row["comparison_label"] = _comparison_label("NO_PREVIOUS_UPLOAD")
+        daily.append(row)
+        last_avail_key = dk
+        last_avail_map = curr_map
+
+    if not consolidated:
+        coverage_pct = _safe_pct(full_days, len(date_keys)) if date_keys else 0.0
+    else:
+        coverage_pct = _safe_pct(uploaded_branch_days, expected_branch_days) if expected_branch_days else 0.0
+
+    coverage = {
+        "total_calendar_days": len(date_keys),
+        "full_upload_days": full_days,
+        "partial_upload_days": partial_days,
+        "no_upload_days": no_days,
+        "coverage_percentage": coverage_pct,
+        "uploaded_branch_day_records": uploaded_branch_days,
+        "expected_branch_day_records": expected_branch_days,
+    }
+
+    last_row = daily[-1] if daily else None
+    last_avail = None
+    for r in reversed(daily):
+        if r["data_status"] in {"AVAILABLE", "PARTIAL_UPLOAD"}:
+            last_avail = r
+            break
+
+    summary = {
+        "data_status": last_row["data_status"] if last_row else "NO_UPLOAD",
+        "current_stock_value": last_row["stock_value"] if last_row and last_row["data_status"] != "NO_UPLOAD" else None,
+        "current_stock_quantity": last_row["stock_quantity"] if last_row and last_row["data_status"] != "NO_UPLOAD" else None,
+        "previous_available_stock_value": None,
+        "stock_added_value": last_row["added_value"] if last_row else None,
+        "stock_reduced_value": last_row["reduced_value"] if last_row else None,
+        "net_change_value": last_row["net_change"] if last_row else None,
+        "change_pct_value": last_row["change_pct"] if last_row else None,
+        "comparison_date": last_row.get("comparison_date") if last_row else None,
+        "comparison_type": last_row.get("comparison_type") if last_row else None,
+        "comparison_label": last_row.get("comparison_label") if last_row else None,
+        "last_available_upload_date": last_avail["date"] if last_avail else None,
+        "last_available_stock_value": last_avail["stock_value"] if last_avail else None,
+        "period_added_value": period_added if last_row and last_row["data_status"] != "NO_UPLOAD" else None,
+        "period_reduced_value": period_reduced if last_row and last_row["data_status"] != "NO_UPLOAD" else None,
+    }
+    if last_row:
+        for k in ("uploaded_branch_count", "expected_branch_count", "missing_branch_count", "coverage_percentage"):
+            summary[k] = last_row.get(k)
+    if last_row and last_row.get("comparison_date") and last_row["stock_value"] is not None:
+        # previous available from comparison row
+        comp_key = _iso_to_date_key(last_row["comparison_date"])
+        comp_map = _filter_map_branches(by_date.get(comp_key, {}), _day_upload_status(comp_key, uploaded_by_date, expected_branches, consolidated)["allowed_branch_keys"])
+        summary["previous_available_stock_value"], _ = _sum_map(comp_map)
+
+    return {
+        "daily": daily,
+        "coverage": coverage,
+        "summary": summary,
+        "by_date_parts": by_date,
+        "upload_meta": upload_meta,
+        "uploaded_by_date": uploaded_by_date,
+        "expected_branches": expected_branches,
+        "consolidated": consolidated,
+    }
+
+
 async def _orders_query(scope: dict, start: datetime, end: datetime):
     q = _and(_query(scope, ("brand_name", "dealer_name", "branch")), rc._date_clause(["created_at"], start, end))
     return await db.order_headers.find(q, {"_id": 0}).to_list(200000)
@@ -383,19 +744,18 @@ async def analytics_categories(
     _, _, date_keys, _, _, _ = _common_params(from_date, to_date)
     if not date_keys:
         return {"categories": []}
-    last_key = date_keys[-1]
-    q = _and(_query(scope), {"publish_status": "Published", "active_date_key": last_key})
-    pipeline = [
-        {"$match": q},
-        {
-            "$group": {
-                "_id": {"$ifNull": ["$part_category", {"$ifNull": ["$category", "Uncategorized"]}]},
-            }
-        },
-        {"$sort": {"_id": 1}},
-    ]
-    rows = await db.products.aggregate(pipeline).to_list(5000)
-    cats = sorted({_text(r.get("_id"), "Uncategorized") for r in rows if _text(r.get("_id"))})
+    ctx = await _build_daily_stock_series(scope, date_keys, None, "purchase", "value", current_user)
+    last_avail = None
+    for row in reversed(ctx["daily"]):
+        if row["data_status"] in {"AVAILABLE", "PARTIAL_UPLOAD"}:
+            last_avail = row
+            break
+    if not last_avail:
+        return {"categories": []}
+    dk = _iso_to_date_key(last_avail["date"])
+    status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
+    part_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
+    cats = sorted({_row_category(v) for v in part_map.values()})
     return {"categories": cats}
 
 
@@ -418,35 +778,9 @@ async def analytics_overall(
     start, end, date_keys, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
-    by_date = await _aggregate_latest_parts_for_date_keys(date_keys, scope, category)
-    prev_key = _prev_date_key(date_keys[0])
-    by_date_with_prev = await _aggregate_latest_parts_for_date_keys([prev_key] + date_keys, scope, category)
-    prev_map = by_date_with_prev.get(prev_key, {})
-    daily_series = []
-    period_added_v = period_reduced_v = 0.0
-    for dk in date_keys:
-        pkey = _prev_date_key(dk)
-        prev_m = by_date_with_prev.get(pkey, prev_map if dk == date_keys[0] else by_date_with_prev.get(_prev_date_key(dk), {}))
-        curr_m = by_date.get(dk, {})
-        mv = _compute_day_movement(prev_m, curr_m, aging_type, metric_type)
-        period_added_v += mv["added_value"]
-        period_reduced_v += mv["reduced_value"]
-        daily_series.append(
-            {
-                "date": _date_key_to_iso(dk),
-                "closing_stock_value": mv["closing_value"],
-                "closing_stock_qty": mv["closing_qty"],
-            }
-        )
-        prev_map = curr_m
-
-    last_dk = date_keys[-1]
-    prev_period_key = _prev_date_key(date_keys[0])
-    curr_closing = sum(x["value"] for x in by_date.get(last_dk, {}).values())
-    prev_day_key = _prev_date_key(last_dk)
-    prev_day_val = sum(x["value"] for x in by_date_with_prev.get(prev_day_key, {}).values())
-    comp_prev_val = sum(x["value"] for x in by_date_with_prev.get(prev_period_key, {}).values())
-    comparison_base = prev_day_val if from_date == to_date else comp_prev_val
+    ctx = await _build_daily_stock_series(scope, date_keys, category, aging_type, metric_type, current_user)
+    daily = ctx["daily"]
+    stk = ctx["summary"]
 
     orders = await _orders_query(scope, start, end)
     reqs = await _requests_query(scope, start, end, "raised")
@@ -461,29 +795,48 @@ async def analytics_overall(
     requested_v = sum(_request_unit(r) * _requested_qty(r) for r in reqs)
     accepted_v = sum(_request_unit(r) * _approved_qty(r) for r in reqs)
 
-    for pt in daily_series:
+    daily_series = []
+    for pt in daily:
         d_iso = pt["date"]
-        day_orders = [_num(o.get("total_order_value")) for o in orders if (_dt(o.get("created_at")) or start).date().isoformat() == d_iso]
-        pt["order_value"] = sum(day_orders)
+        day_orders = sum(_num(o.get("total_order_value")) for o in orders if (_dt(o.get("created_at")) or start).date().isoformat() == d_iso)
         day_reqs = [r for r in reqs if (_dt(r.get("requested_at") or r.get("created_at")) or start).date().isoformat() == d_iso]
-        pt["accepted_request_value"] = sum(_request_unit(r) * _approved_qty(r) for r in day_reqs)
+        closing = pt["stock_value"] if pt["data_status"] != "NO_UPLOAD" else None
+        daily_series.append(
+            {
+                **pt,
+                "closing_stock_value": closing,
+                "closing_stock_qty": pt["stock_quantity"],
+                "order_value": day_orders,
+                "accepted_request_value": sum(_request_unit(r) * _approved_qty(r) for r in day_reqs),
+            }
+        )
 
-    net = curr_closing - comparison_base
     return {
         "scope": scope,
+        "data_coverage": ctx["coverage"],
         "summary": {
-            "current_stock_value": curr_closing,
-            "previous_stock_value": comparison_base,
-            "stock_added_value": period_added_v,
-            "stock_reduced_value": period_reduced_v,
-            "net_change_value": net,
-            "change_pct_value": _pct_change(curr_closing, comparison_base),
+            "current_stock_value": stk.get("current_stock_value"),
+            "current_stock_quantity": stk.get("current_stock_quantity"),
+            "previous_stock_value": stk.get("previous_available_stock_value"),
+            "stock_added_value": stk.get("stock_added_value"),
+            "stock_reduced_value": stk.get("stock_reduced_value"),
+            "net_change_value": stk.get("net_change_value"),
+            "change_pct_value": stk.get("change_pct_value"),
+            "comparison_date": stk.get("comparison_date"),
+            "comparison_type": stk.get("comparison_type"),
+            "comparison_label": stk.get("comparison_label"),
+            "data_status": stk.get("data_status"),
+            "last_available_upload_date": stk.get("last_available_upload_date"),
+            "last_available_stock_value": stk.get("last_available_stock_value"),
             "total_order_value": order_value,
             "nmts_sourced_value": nmts_v,
             "total_requested_value": requested_v,
             "total_accepted_value": accepted_v,
+            "uploaded_branch_count": stk.get("uploaded_branch_count"),
+            "expected_branch_count": stk.get("expected_branch_count"),
+            "missing_branch_count": stk.get("missing_branch_count"),
+            "coverage_percentage": stk.get("coverage_percentage"),
         },
-        "comparison": {"mode": "previous_day" if from_date == to_date else "previous_period", "previous_value": comparison_base},
         "series": daily_series,
     }
 
@@ -507,7 +860,7 @@ async def analytics_stock_trend(
     _, _, date_keys, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
-    payload = await _stock_trend_payload(scope, date_keys, aging_type, metric_type, category)
+    payload = await _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user)
     return payload
 
 
@@ -530,45 +883,52 @@ async def analytics_category_trend(
     _, _, date_keys, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
-    if not date_keys:
-        return {"categories": []}
-    last = date_keys[-1]
-    first_prev = _prev_date_key(date_keys[0])
-    by_date = await _aggregate_latest_parts_for_date_keys([first_prev] + date_keys, scope, None)
-    cats: Dict[str, dict] = defaultdict(lambda: {"current_value": 0.0, "current_qty": 0.0, "added_value": 0.0, "reduced_value": 0.0, "daily": []})
-    for dk in date_keys:
-        pk = _prev_date_key(dk)
-        mv = _compute_day_movement(by_date.get(pk, {}), by_date.get(dk, {}), aging_type, metric_type)
-        per_cat = defaultdict(lambda: {"added": 0.0, "reduced": 0.0, "closing": 0.0})
-        for line in mv["lines"]:
-            c = line["category"]
-            per_cat[c]["added"] += line["added_value"] if metric_type == "value" else line["added_qty"]
-            per_cat[c]["reduced"] += line["reduced_value"] if metric_type == "value" else line["reduced_qty"]
-        for pk_part, row in by_date.get(dk, {}).items():
-            c = _row_category(row)
-            per_cat[c]["closing"] += row["value"] if metric_type == "value" else row["qty"]
-        for c, vals in per_cat.items():
-            cats[c]["daily"].append({"date": _date_key_to_iso(dk), **vals})
-    for pk_part, row in by_date.get(last, {}).items():
-        c = _row_category(row)
-        if category and c.lower() != category.lower():
+    ctx = await _build_daily_stock_series(scope, date_keys, category, aging_type, metric_type, current_user)
+    use_value = metric_type == "value"
+    last_avail_key = None
+    last_avail_map: Dict = {}
+    cats: Dict[str, dict] = defaultdict(lambda: {"current_value": None, "current_qty": None, "added_value": None, "reduced_value": None, "daily": []})
+    for pt in ctx["daily"]:
+        dk = _iso_to_date_key(pt["date"])
+        if pt["data_status"] == "NO_UPLOAD":
+            for c in cats:
+                cats[c]["daily"].append({"date": pt["date"], "data_status": "NO_UPLOAD", "closing": None, "added": None, "reduced": None})
             continue
-        cats[c]["current_value"] += row["value"]
-        cats[c]["current_qty"] += row["qty"]
-    for dk in date_keys:
-        pk = _prev_date_key(dk)
-        mv = _compute_day_movement(by_date.get(pk, {}), by_date.get(dk, {}), aging_type, metric_type)
-        for line in mv["lines"]:
-            c = line["category"]
+        status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
+        curr_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
+        per_cat = defaultdict(lambda: {"added": None, "reduced": None, "closing": None, "data_status": pt["data_status"]})
+        for row in curr_map.values():
+            c = _row_category(row)
             if category and c.lower() != category.lower():
                 continue
-            cats[c]["added_value"] += line["added_value"]
-            cats[c]["reduced_value"] += line["reduced_value"]
+            per_cat[c]["closing"] = (per_cat[c]["closing"] or 0) + (row["value"] if use_value else row["qty"])
+        if last_avail_key and last_avail_map:
+            mv = _compute_day_movement(last_avail_map, curr_map, aging_type, metric_type)
+            for line in mv["lines"]:
+                c = line["category"]
+                if category and c.lower() != category.lower():
+                    continue
+                per_cat[c]["added"] = (per_cat[c]["added"] or 0) + (line["added_value"] if use_value else line["added_qty"])
+                per_cat[c]["reduced"] = (per_cat[c]["reduced"] or 0) + (line["reduced_value"] if use_value else line["reduced_qty"])
+        for c, vals in per_cat.items():
+            cats[c]["daily"].append({"date": pt["date"], **vals, "comparison_type": pt.get("comparison_type")})
+            if pt["date"] == ctx["daily"][-1]["date"]:
+                cats[c]["current_value"] = vals["closing"] if use_value else vals["closing"]
+                cats[c]["current_qty"] = vals["closing"] if not use_value else None
+            if vals.get("added") is not None:
+                cats[c]["added_value"] = (cats[c]["added_value"] or 0) + vals["added"]
+            if vals.get("reduced") is not None:
+                cats[c]["reduced_value"] = (cats[c]["reduced_value"] or 0) + vals["reduced"]
+        last_avail_key = dk
+        last_avail_map = curr_map
     out = []
     for name, data in sorted(cats.items()):
         if category and name.lower() != category.lower():
             continue
-        opening_est = data["current_value"] - data["added_value"] + data["reduced_value"]
+        cv = data["current_value"]
+        net = None
+        if data["added_value"] is not None and data["reduced_value"] is not None:
+            net = data["added_value"] - data["reduced_value"]
         out.append(
             {
                 "category": name,
@@ -576,12 +936,14 @@ async def analytics_category_trend(
                 "current_qty": data["current_qty"],
                 "added_value": data["added_value"],
                 "reduced_value": data["reduced_value"],
-                "net_change": data["added_value"] - data["reduced_value"],
-                "change_pct": _pct_change(data["current_value"], opening_est),
+                "net_change": net,
+                "data_status": ctx["summary"].get("data_status"),
+                "comparison_type": ctx["summary"].get("comparison_type"),
+                "comparison_label": ctx["summary"].get("comparison_label"),
                 "daily": data["daily"],
             }
         )
-    return {"categories": out}
+    return {"categories": out, "data_coverage": ctx["coverage"]}
 
 
 @router.get("/aging-trend")
@@ -604,36 +966,65 @@ async def analytics_aging_trend(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
     if not date_keys:
-        return {"buckets": [], "stacked": [], "daily": []}
-    last = date_keys[-1]
-    extended = date_keys
-    by_date = await _aggregate_latest_parts_for_date_keys(extended, scope, category)
-    bucket_totals = {b: {"value": 0.0, "qty": 0.0} for b in BUCKETS}
-    stacked = defaultdict(lambda: {b: 0.0 for b in BUCKETS})
-    for row in by_date.get(last, {}).values():
-        days = _aging_days_row(row, aging_type)
-        b = _bucket(days) or BUCKETS[0]
-        bucket_totals[b]["value"] += row["value"]
-        bucket_totals[b]["qty"] += row["qty"]
-        cat = _row_category(row)
-        metric = row["value"] if metric_type == "value" else row["qty"]
-        stacked[cat][b] += metric
-    cat_total = sum(x["value"] if metric_type == "value" else x["qty"] for x in by_date.get(last, {}).values()) or 1.0
+        return {"buckets": [], "stacked": [], "daily": [], "data_coverage": {}}
+    ctx = await _build_daily_stock_series(scope, date_keys, category, aging_type, metric_type, current_user)
+    use_value = metric_type == "value"
+    last_row = ctx["daily"][-1]
+    bucket_totals = {b: {"value": None, "quantity": None} for b in BUCKETS}
+    stacked = defaultdict(lambda: {b: None for b in BUCKETS})
+    if last_row["data_status"] != "NO_UPLOAD":
+        dk = _iso_to_date_key(last_row["date"])
+        status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
+        curr_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
+        bucket_totals = {b: {"value": 0.0, "quantity": 0.0} for b in BUCKETS}
+        stacked = defaultdict(lambda: {b: 0.0 for b in BUCKETS})
+        for row in curr_map.values():
+            days = _aging_days_row(row, aging_type)
+            b = _bucket(days) or BUCKETS[0]
+            bucket_totals[b]["value"] += row["value"]
+            bucket_totals[b]["quantity"] += row["qty"]
+            cat = _row_category(row)
+            metric = row["value"] if use_value else row["qty"]
+            stacked[cat][b] += metric
+        cat_total = sum(x["value"] if use_value else x["qty"] for x in curr_map.values()) or 1.0
+    else:
+        cat_total = 1.0
     buckets_out = []
     for b in BUCKETS:
         v = bucket_totals[b]["value"]
-        q = bucket_totals[b]["qty"]
-        m = v if metric_type == "value" else q
-        buckets_out.append({"bucket": b, "value": v, "quantity": q, "pct_of_total": _safe_pct(m, cat_total)})
+        q = bucket_totals[b]["quantity"]
+        m = v if use_value else q
+        buckets_out.append(
+            {
+                "bucket": b,
+                "value": v,
+                "quantity": q,
+                "pct_of_total": _safe_pct(m, cat_total) if m is not None else None,
+                "data_status": last_row["data_status"],
+            }
+        )
     stacked_out = [{"category": c, **{b: stacked[c][b] for b in BUCKETS}} for c in sorted(stacked.keys())]
     daily = []
-    for dk in date_keys:
+    for pt in ctx["daily"]:
+        if pt["data_status"] == "NO_UPLOAD":
+            daily.append({"date": pt["date"], "data_status": "NO_UPLOAD", **{b: None for b in BUCKETS}})
+            continue
+        dk = _iso_to_date_key(pt["date"])
+        status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
+        curr_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
         day_buckets = {b: 0.0 for b in BUCKETS}
-        for row in by_date.get(dk, {}).values():
+        for row in curr_map.values():
             b = _bucket(_aging_days_row(row, aging_type)) or BUCKETS[0]
-            day_buckets[b] += row["value"] if metric_type == "value" else row["qty"]
-        daily.append({"date": _date_key_to_iso(dk), **{b: day_buckets[b] for b in BUCKETS}})
-    return {"buckets": buckets_out, "stacked": stacked_out, "daily": daily}
+            day_buckets[b] += row["value"] if use_value else row["qty"]
+        daily.append({"date": pt["date"], "data_status": pt["data_status"], **{b: day_buckets[b] for b in BUCKETS}})
+    return {
+        "buckets": buckets_out,
+        "stacked": stacked_out,
+        "daily": daily,
+        "data_coverage": ctx["coverage"],
+        "comparison_type": ctx["summary"].get("comparison_type"),
+        "comparison_label": ctx["summary"].get("comparison_label"),
+    }
 
 
 @router.get("/order-saving")
@@ -772,39 +1163,53 @@ async def analytics_request_acceptance(
     }
 
 
-async def _stock_trend_payload(scope, date_keys, aging_type, metric_type, category):
-    extended = [_prev_date_key(date_keys[0])] + date_keys
-    by_date = await _aggregate_latest_parts_for_date_keys(extended, scope, category)
+async def _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user):
+    ctx = await _build_daily_stock_series(scope, date_keys, category, aging_type, metric_type, current_user)
+    use_value = metric_type == "value"
     series = []
-    opening_period = closing_period = added_period = reduced_period = 0.0
-    for i, dk in enumerate(date_keys):
-        pk = _prev_date_key(dk)
-        mv = _compute_day_movement(by_date.get(pk, {}), by_date.get(dk, {}), aging_type, metric_type)
-        if i == 0:
-            opening_period = mv["opening_value"] if metric_type == "value" else mv["opening_qty"]
-        closing_period = mv["closing_value"] if metric_type == "value" else mv["closing_qty"]
-        added_period += mv["metric_added"]
-        reduced_period += mv["metric_reduced"]
+    for pt in ctx["daily"]:
+        if pt["data_status"] == "NO_UPLOAD":
+            series.append({**pt, "opening": None, "added": None, "reduced": None, "closing": None, "net_change": None, "change_pct": None})
+            continue
+        opening = None
+        if pt.get("comparison_date"):
+            comp_key = _iso_to_date_key(pt["comparison_date"])
+            comp_status = _day_upload_status(comp_key, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
+            comp_map = _filter_map_branches(ctx["by_date_parts"].get(comp_key, {}), comp_status["allowed_branch_keys"])
+            ov, oq = _sum_map(comp_map)
+            opening = ov if use_value else oq
         series.append(
             {
-                "date": _date_key_to_iso(dk),
-                "opening": mv["opening_value"] if metric_type == "value" else mv["opening_qty"],
-                "added": mv["metric_added"],
-                "reduced": mv["metric_reduced"],
-                "closing": mv["closing_value"] if metric_type == "value" else mv["closing_qty"],
-                "net_change": mv["metric_net"],
-                "change_pct": mv["change_pct_value"] if metric_type == "value" else mv["change_pct_qty"],
+                **pt,
+                "opening": opening,
+                "added": pt["added_value"] if use_value else pt.get("added_quantity"),
+                "reduced": pt["reduced_value"] if use_value else pt.get("reduced_quantity"),
+                "closing": pt["stock_value"] if use_value else pt["stock_quantity"],
+                "net_change": pt["net_change"] if use_value else pt.get("net_change_quantity"),
+                "change_pct": pt["change_pct"],
             }
         )
+    stk = ctx["summary"]
     return {
+        "data_coverage": ctx["coverage"],
         "summary": {
-            "current_total": closing_period,
-            "opening": opening_period,
-            "closing": closing_period,
-            "added": added_period,
-            "reduced": reduced_period,
-            "net_change": closing_period - opening_period,
-            "change_pct": _pct_change(closing_period, opening_period),
+            "data_status": stk.get("data_status"),
+            "current_total": stk.get("current_stock_value") if use_value else stk.get("current_stock_quantity"),
+            "opening": stk.get("previous_available_stock_value"),
+            "closing": stk.get("current_stock_value") if use_value else stk.get("current_stock_quantity"),
+            "added": stk.get("stock_added_value"),
+            "reduced": stk.get("stock_reduced_value"),
+            "net_change": stk.get("net_change_value"),
+            "change_pct": stk.get("change_pct_value"),
+            "comparison_date": stk.get("comparison_date"),
+            "comparison_type": stk.get("comparison_type"),
+            "comparison_label": stk.get("comparison_label"),
+            "last_available_upload_date": stk.get("last_available_upload_date"),
+            "last_available_stock_value": stk.get("last_available_stock_value"),
+            "uploaded_branch_count": stk.get("uploaded_branch_count"),
+            "expected_branch_count": stk.get("expected_branch_count"),
+            "missing_branch_count": stk.get("missing_branch_count"),
+            "coverage_percentage": stk.get("coverage_percentage"),
         },
         "series": series,
     }
@@ -829,24 +1234,33 @@ async def analytics_stock_movement(
     _, _, date_keys, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
-    data = await _stock_trend_payload(scope, date_keys, aging_type, metric_type, category)
-    series = [
-        {
-            "date": p["date"],
-            "added": p["added"],
-            "reduced": p["reduced"],
-            "net": p["net_change"],
-            "closing": p["closing"],
-        }
-        for p in data.get("series", [])
-    ]
+    data = await _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user)
+    series = []
+    for p in data.get("series", []):
+        series.append(
+            {
+                **p,
+                "added": p.get("added"),
+                "reduced": p.get("reduced"),
+                "net": p.get("net_change"),
+                "closing": p.get("closing"),
+            }
+        )
     sm = data.get("summary", {})
     return {
+        "data_coverage": data.get("data_coverage"),
         "summary": {
-            "period_added": sm.get("added", 0),
-            "period_reduced": sm.get("reduced", 0),
-            "net_change": sm.get("net_change", 0),
-            "closing": sm.get("closing", 0),
+            "data_status": sm.get("data_status"),
+            "period_added": sm.get("added"),
+            "period_reduced": sm.get("reduced"),
+            "net_change": sm.get("net_change"),
+            "closing": sm.get("closing"),
+            "comparison_type": sm.get("comparison_type"),
+            "comparison_label": sm.get("comparison_label"),
+            "uploaded_branch_count": sm.get("uploaded_branch_count"),
+            "expected_branch_count": sm.get("expected_branch_count"),
+            "missing_branch_count": sm.get("missing_branch_count"),
+            "coverage_percentage": sm.get("coverage_percentage"),
         },
         "series": series,
     }
@@ -879,13 +1293,67 @@ async def analytics_drilldown(
     page = max(1, page)
     page_size = min(max(1, page_size), 200)
     dtype = (drilldown_type or "").lower()
+    if dtype in {"missing_upload", "upload_status", "day_info"}:
+        target = focus_date.replace("-", "") if focus_date else (date_keys[-1] if date_keys else _nmts_date_key())
+        if len(target) == 10:
+            target = target.replace("-", "")
+        expected = await _expected_branch_names(scope, current_user)
+        consolidated = not bool(scope.get("branch"))
+        up, meta = await _uploaded_branches_by_date(scope, [target])
+        st = _day_upload_status(target, up, expected, consolidated)
+        branch_rows = []
+        for b in expected:
+            bf = b.casefold()
+            branch_rows.append(
+                {
+                    "branch": b,
+                    "uploaded": bf in up.get(target, set()),
+                    "published_at": (meta.get(target, {}).get(bf) or {}).get("published_at"),
+                    "total_value": (meta.get(target, {}).get(bf) or {}).get("total_value"),
+                }
+            )
+        return {
+            "records": branch_rows,
+            "total": len(branch_rows),
+            "page": 1,
+            "page_size": page_size,
+            "data_status": st["data_status"],
+            "date": _date_key_to_iso(target),
+            "uploaded_branches": st["uploaded_branches"],
+            "missing_branches": st["missing_branches"],
+            "message": "No stock upload was published for the selected scope on this date."
+            if st["data_status"] == "NO_UPLOAD"
+            else None,
+        }
+
     if dtype in {"added", "reduced"}:
         target = focus_date.replace("-", "") if focus_date else (date_keys[-1] if date_keys else _nmts_date_key())
         if len(target) == 10:
             target = target.replace("-", "")
-        prev = _prev_date_key(target)
-        by_date = await _aggregate_latest_parts_for_date_keys([prev, target], scope, category)
-        mv = _compute_day_movement(by_date.get(prev, {}), by_date.get(target, {}), aging_type, metric_type)
+        expected = await _expected_branch_names(scope, current_user)
+        consolidated = not bool(scope.get("branch"))
+        up, _ = await _uploaded_branches_by_date(scope, [target])
+        st = _day_upload_status(target, up, expected, consolidated)
+        if st["data_status"] == "NO_UPLOAD":
+            return {
+                "records": [],
+                "total": 0,
+                "page": page,
+                "page_size": page_size,
+                "data_status": "NO_UPLOAD",
+                "message": "No stock upload was published for the selected scope on this date.",
+            }
+        prior_key = await _find_last_upload_before(target, scope, expected, consolidated)
+        load = [target]
+        if prior_key:
+            load.append(prior_key)
+        by_date = await _aggregate_parts_for_dates(load, scope, category, await _snapshots_enabled())
+        curr_map = _filter_map_branches(by_date.get(target, {}), st["allowed_branch_keys"])
+        prev_map = {}
+        if prior_key:
+            pst = _day_upload_status(prior_key, await _uploaded_branches_by_date(scope, [prior_key])[0], expected, consolidated)
+            prev_map = _filter_map_branches(by_date.get(prior_key, {}), pst["allowed_branch_keys"])
+        mv = _compute_day_movement(prev_map, curr_map, aging_type, metric_type)
         lines = [x for x in mv["lines"] if (dtype == "added" and x["added_qty"] > 0) or (dtype == "reduced" and x["reduced_qty"] > 0)]
         total = len(lines)
         start_i = (page - 1) * page_size

@@ -58,6 +58,49 @@ const displayDate = (iso) => {
   return iso;
 };
 
+const isNullMetric = (v) => v === null || v === undefined;
+
+function comparisonCaption(type) {
+  if (type === 'PREVIOUS_DAY') return 'Change vs Previous Day';
+  if (type === 'LAST_AVAILABLE_UPLOAD') return 'Change Since Last Upload';
+  return 'No Previous Upload';
+}
+
+function StockTrendTooltip({ active, payload, metricType }) {
+  if (!active || !payload?.length) return null;
+  const row = payload[0]?.payload;
+  if (!row) return null;
+  if (row.data_status === 'NO_UPLOAD') {
+    return (
+      <div className="rounded-lg border bg-white p-3 text-sm shadow-lg max-w-xs">
+        <p className="font-semibold">Status: No Stock Upload</p>
+        <p className="text-gray-600 mt-1">
+          No stock upload was published for this scope on {displayDate(row.date)}.
+        </p>
+      </div>
+    );
+  }
+  const money = (v) =>
+    isNullMetric(v) ? 'N/A' : metricType === 'value' ? formatINRCompact(v) : formatINR(v);
+  return (
+    <div className="rounded-lg border bg-white p-3 text-sm shadow-lg max-w-xs">
+      <p className="font-semibold">{displayDate(row.date)}</p>
+      {row.data_status === 'PARTIAL_UPLOAD' && (
+        <p className="text-amber-700 text-xs mt-1">
+          Partial Data: {row.uploaded_branch_count} of {row.expected_branch_count} branches uploaded
+        </p>
+      )}
+      <p>Stock: {money(row.closing ?? row.stock_value)}</p>
+      {row.comparison_date && <p>Compared with: {displayDate(row.comparison_date)}</p>}
+      <p className="text-xs text-gray-500">{comparisonCaption(row.comparison_type)}</p>
+      <p>Added: {money(row.added ?? row.added_value)}</p>
+      <p>Reduced: {money(row.reduced ?? row.reduced_value)}</p>
+      <p>Net Change: {money(row.net_change)}</p>
+      <p>Change %: {isNullMetric(row.change_pct) ? 'N/A' : `${formatINR(row.change_pct)}%`}</p>
+    </div>
+  );
+}
+
 function scopeQuery(scopeBrand, scopeDealer, scopeBranch) {
   const q = {};
   if (scopeBrand && !String(scopeBrand).startsWith('All')) q.brand = scopeBrand;
@@ -135,7 +178,7 @@ function ChartPanel({ title, children, empty }) {
   );
 }
 
-function DrilldownModal({ open, title, onClose, loading, rows, columns, page, total, pageSize, onPage }) {
+function DrilldownModal({ open, title, onClose, loading, rows, columns, page, total, pageSize, onPage, headerNote }) {
   if (!open) return null;
   const pages = Math.max(1, Math.ceil((total || 0) / pageSize));
   return (
@@ -147,6 +190,7 @@ function DrilldownModal({ open, title, onClose, loading, rows, columns, page, to
             <X />
           </button>
         </div>
+        {headerNote && <div className="px-4 py-3 text-sm text-amber-900 bg-amber-50 border-b">{headerNote}</div>}
         <div className="overflow-auto flex-1 p-4">
           {loading ? (
             <div className="flex justify-center py-12 text-gray-500">
@@ -241,6 +285,7 @@ export function Analytics() {
   const [drillTotal, setDrillTotal] = useState(0);
   const [drillPage, setDrillPage] = useState(1);
   const [drillLoading, setDrillLoading] = useState(false);
+  const [drillMeta, setDrillMeta] = useState(null);
 
   const baseParams = useMemo(
     () => ({
@@ -254,7 +299,9 @@ export function Analytics() {
     [fromDate, toDate, agingType, metricType, category, scopeBrand, scopeDealer, scopeBranch]
   );
 
-  const money = (n) => (metricType === 'value' ? formatINRCompact(n) : formatINR(n));
+  const money = (n) => (isNullMetric(n) ? 'N/A' : metricType === 'value' ? formatINRCompact(n) : formatINR(n));
+  const stockMoney = (n) => (isNullMetric(n) ? 'N/A' : metricType === 'value' ? formatINRCompact(n) : formatINR(n));
+  const chartNum = (n) => (isNullMetric(n) ? null : Number(n));
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -312,6 +359,7 @@ export function Analytics() {
       const res = await axios.get(`${API}/analytics/drilldown`, { params });
       setDrillRows(res.data?.records || []);
       setDrillTotal(res.data?.total || 0);
+      setDrillMeta(res.data);
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Drill-down failed');
     } finally {
@@ -322,19 +370,27 @@ export function Analytics() {
   const overallSeries = (overall?.series || []).map((d) => ({
     ...d,
     dateLabel: displayDate(d.date),
+    closing_stock_value: chartNum(d.closing_stock_value),
+    order_value: chartNum(d.order_value),
+    accepted_request_value: chartNum(d.accepted_request_value),
   }));
 
   const stockSeries = (stockTrend?.series || []).map((d) => ({
     ...d,
     dateLabel: displayDate(d.date),
+    closing: chartNum(d.closing),
+    added: chartNum(d.added),
+    reduced: chartNum(d.reduced),
   }));
 
   const movementSeries = (stockMovement?.series || []).map((d) => ({
     ...d,
     dateLabel: displayDate(d.date),
-    reducedNeg: -Math.abs(d.reduced || 0),
+    added: chartNum(d.added),
+    reducedNeg: isNullMetric(d.reduced) ? null : -Math.abs(Number(d.reduced)),
   }));
 
+  const coverage = stockTrend?.data_coverage || overall?.data_coverage || {};
   const os = overall?.summary || {};
   const stSum = stockTrend?.summary || {};
   const ordSum = orderSaving?.summary || {};
@@ -443,32 +499,57 @@ export function Analytics() {
       {!loading && !error && (
         <>
           <Section title="1. Overall View">
+            {os.data_status === 'NO_UPLOAD' && (
+              <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-4 py-2">
+                Status: No Stock Upload on selected end date.
+                {os.last_available_upload_date && (
+                  <span className="ml-2">
+                    Last available upload: {displayDate(os.last_available_upload_date)} (
+                    {isNullMetric(os.last_available_stock_value) ? 'N/A' : formatINRCompact(os.last_available_stock_value)})
+                  </span>
+                )}
+              </p>
+            )}
+            {os.data_status === 'PARTIAL_UPLOAD' && (
+              <button
+                type="button"
+                onClick={() => openDrill('missing_upload', { focusDate: toDate })}
+                className="text-sm text-amber-900 bg-amber-100 border border-amber-300 rounded-xl px-4 py-2 text-left w-full"
+              >
+                Partial Stock Data — {os.uploaded_branch_count} of {os.expected_branch_count} branches uploaded (
+                {formatINR(os.coverage_percentage)}% coverage). Click for branch details.
+              </button>
+            )}
             <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
               <MetricCard
                 label="Current Stock Value"
-                value={formatINRCompact(os.current_stock_value)}
-                compareValue={os.previous_stock_value}
+                value={os.data_status === 'NO_UPLOAD' ? 'N/A' : formatINRCompact(os.current_stock_value)}
+                compareValue={os.data_status === 'NO_UPLOAD' ? undefined : os.previous_stock_value}
+                hint={os.comparison_label || comparisonCaption(os.comparison_type)}
               />
               <MetricCard
-                label="Previous Period Stock"
-                value={formatINRCompact(os.previous_stock_value)}
+                label={`Previous (${os.comparison_label || 'Last Upload'})`}
+                value={isNullMetric(os.previous_stock_value) ? 'N/A' : formatINRCompact(os.previous_stock_value)}
               />
               <MetricCard
                 label="Stock Added"
-                value={formatINRCompact(os.stock_added_value)}
-                onClick={() => openDrill('added', { focusDate: toDate })}
+                value={isNullMetric(os.stock_added_value) ? 'N/A' : formatINRCompact(os.stock_added_value)}
+                onClick={() => (os.data_status === 'NO_UPLOAD' ? openDrill('missing_upload', { focusDate: toDate }) : openDrill('added', { focusDate: toDate }))}
               />
               <MetricCard
                 label="Stock Reduced"
-                value={formatINRCompact(os.stock_reduced_value)}
-                onClick={() => openDrill('reduced', { focusDate: toDate })}
+                value={isNullMetric(os.stock_reduced_value) ? 'N/A' : formatINRCompact(os.stock_reduced_value)}
+                onClick={() => (os.data_status === 'NO_UPLOAD' ? openDrill('missing_upload', { focusDate: toDate }) : openDrill('reduced', { focusDate: toDate }))}
               />
               <MetricCard
                 label="Net Change"
-                value={formatINRCompact(os.net_change_value)}
-                compareValue={os.previous_stock_value}
+                value={isNullMetric(os.net_change_value) ? 'N/A' : formatINRCompact(os.net_change_value)}
+                hint={comparisonCaption(os.comparison_type)}
               />
-              <MetricCard label="Change %" value={`${formatINR(os.change_pct_value)}%`} />
+              <MetricCard
+                label="Change %"
+                value={isNullMetric(os.change_pct_value) ? 'N/A' : `${formatINR(os.change_pct_value)}%`}
+              />
               <MetricCard
                 label="Total Order Value"
                 value={formatINRCompact(os.total_order_value)}
@@ -511,7 +592,26 @@ export function Analytics() {
                   <Tooltip formatter={(v) => formatINRCompact(v)} labelFormatter={displayDate} />
                   <Legend />
                   {seriesVisible.closing_stock_value && (
-                    <Line type="monotone" dataKey="closing_stock_value" name="Closing Stock" stroke="#059669" dot={false} />
+                    <Line
+                      type="monotone"
+                      dataKey="closing_stock_value"
+                      name="Closing Stock"
+                      stroke="#059669"
+                      connectNulls={false}
+                      dot={(props) => {
+                        const { cx, cy, payload } = props;
+                        if (payload?.data_status === 'NO_UPLOAD') {
+                          return (
+                            <text x={cx} y={cy} dy={-6} textAnchor="middle" fontSize={9} fill="#b45309">
+                              No Upload
+                            </text>
+                          );
+                        }
+                        return payload?.closing_stock_value != null ? (
+                          <circle cx={cx} cy={cy} r={3} fill="#059669" />
+                        ) : null;
+                      }}
+                    />
                   )}
                   {seriesVisible.order_value && (
                     <Line type="monotone" dataKey="order_value" name="Order Value" stroke="#2563eb" dot={false} />
@@ -525,26 +625,65 @@ export function Analytics() {
           </Section>
 
           <Section title="2. Stock & Aging Analytics">
+            <div className="rounded-xl border bg-slate-50 px-4 py-3 text-sm text-slate-700 flex flex-wrap gap-4 items-center">
+              <span className="font-semibold">Data coverage</span>
+              <span>Days: {coverage.total_calendar_days ?? '—'}</span>
+              <span>Full: {coverage.full_upload_days ?? 0}</span>
+              <span>Partial: {coverage.partial_upload_days ?? 0}</span>
+              <span>No upload: {coverage.no_upload_days ?? 0}</span>
+              <span>Coverage: {isNullMetric(coverage.coverage_percentage) ? 'N/A' : `${formatINR(coverage.coverage_percentage)}%`}</span>
+            </div>
+            {stSum.data_status === 'PARTIAL_UPLOAD' && (
+              <button
+                type="button"
+                className="w-full text-left text-sm font-semibold text-amber-900 bg-amber-100 border border-amber-300 rounded-xl px-4 py-2"
+                onClick={() => openDrill('missing_upload', { focusDate: toDate })}
+              >
+                Partial Stock Data — {stSum.uploaded_branch_count} of {stSum.expected_branch_count} branches (
+                {formatINR(stSum.coverage_percentage)}%)
+              </button>
+            )}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-              <MetricCard label="Current Total" value={money(stSum.current_total)} />
-              <MetricCard label="Opening" value={money(stSum.opening)} />
-              <MetricCard label="Closing" value={money(stSum.closing)} />
-              <MetricCard label="Added" value={money(stSum.added)} onClick={() => openDrill('added', { focusDate: toDate })} />
-              <MetricCard label="Reduced" value={money(stSum.reduced)} onClick={() => openDrill('reduced', { focusDate: toDate })} />
-              <MetricCard label="Net Change" value={money(stSum.net_change)} />
-              <MetricCard label="Change %" value={`${formatINR(stSum.change_pct)}%`} />
+              <MetricCard label="Current Total" value={stockMoney(stSum.current_total)} hint={stSum.data_status === 'NO_UPLOAD' ? 'No Stock Upload' : stSum.comparison_label} />
+              <MetricCard label="Opening (last upload)" value={stockMoney(stSum.opening)} />
+              <MetricCard label="Closing" value={stockMoney(stSum.closing)} />
+              <MetricCard label="Added" value={stockMoney(stSum.added)} onClick={() => (stSum.data_status === 'NO_UPLOAD' ? openDrill('missing_upload', { focusDate: toDate }) : openDrill('added', { focusDate: toDate }))} />
+              <MetricCard label="Reduced" value={stockMoney(stSum.reduced)} onClick={() => (stSum.data_status === 'NO_UPLOAD' ? openDrill('missing_upload', { focusDate: toDate }) : openDrill('reduced', { focusDate: toDate }))} />
+              <MetricCard label="Net Change" value={stockMoney(stSum.net_change)} hint={comparisonCaption(stSum.comparison_type)} />
+              <MetricCard label="Change %" value={isNullMetric(stSum.change_pct) ? 'N/A' : `${formatINR(stSum.change_pct)}%`} />
             </div>
             <ChartPanel title="Daily stock trend" empty={!stockSeries.length}>
               <ResponsiveContainer width="100%" height={300}>
-                <AreaChart data={stockSeries}>
+                <AreaChart
+                  data={stockSeries}
+                  onClick={(e) => {
+                    const p = e?.activePayload?.[0]?.payload;
+                    if (p?.data_status === 'NO_UPLOAD') openDrill('missing_upload', { focusDate: p.date });
+                  }}
+                >
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis dataKey="dateLabel" />
-                  <YAxis tickFormatter={(v) => money(v)} width={90} />
-                  <Tooltip
-                    formatter={(v, name) => [money(v), name]}
-                    labelFormatter={displayDate}
+                  <YAxis tickFormatter={(v) => stockMoney(v)} width={90} />
+                  <Tooltip content={<StockTrendTooltip metricType={metricType} />} />
+                  <Area
+                    type="monotone"
+                    dataKey="closing"
+                    name="Closing"
+                    stroke="#059669"
+                    fill="#a7f3d0"
+                    connectNulls={false}
+                    dot={(props) => {
+                      const { cx, cy, payload } = props;
+                      if (payload?.data_status === 'NO_UPLOAD') {
+                        return (
+                          <text x={cx} y={cy} dy={-4} textAnchor="middle" fontSize={9} fill="#b45309">
+                            No Upload
+                          </text>
+                        );
+                      }
+                      return payload?.closing != null ? <circle cx={cx} cy={cy} r={3} fill="#059669" /> : null;
+                    }}
                   />
-                  <Area type="monotone" dataKey="closing" name="Closing" stroke="#059669" fill="#a7f3d0" />
                 </AreaChart>
               </ResponsiveContainer>
             </ChartPanel>
@@ -554,7 +693,7 @@ export function Analytics() {
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis dataKey="category" fontSize={10} interval={0} angle={-20} textAnchor="end" height={70} />
                   <YAxis tickFormatter={(v) => money(v)} width={90} />
-                  <Tooltip formatter={(v) => money(v)} />
+                  <Tooltip formatter={(v) => (isNullMetric(v) ? 'N/A' : money(v))} />
                   <Bar
                     dataKey={metricType === 'value' ? 'current_value' : 'current_qty'}
                     fill="#059669"
@@ -570,7 +709,7 @@ export function Analytics() {
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis type="number" tickFormatter={(v) => money(v)} />
                     <YAxis type="category" dataKey="bucket" width={100} />
-                    <Tooltip formatter={(v) => money(v)} />
+                    <Tooltip formatter={(v) => (isNullMetric(v) ? 'N/A' : money(v))} />
                     <Bar dataKey={metricType === 'value' ? 'value' : 'quantity'} fill="#047857" />
                   </BarChart>
                 </ResponsiveContainer>
@@ -581,7 +720,7 @@ export function Analytics() {
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis dataKey="category" fontSize={10} />
                     <YAxis tickFormatter={(v) => money(v)} />
-                    <Tooltip formatter={(v) => money(v)} />
+                    <Tooltip formatter={(v) => (isNullMetric(v) ? 'N/A' : money(v))} />
                     <Legend />
                     {(agingTrend?.stacked || []).length > 0 &&
                       AGING_BUCKETS.map((b, i) => (
@@ -597,10 +736,17 @@ export function Analytics() {
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis dataKey="dateLabel" />
                   <YAxis tickFormatter={(v) => money(v)} width={90} />
-                  <Tooltip formatter={(v) => money(v)} />
+                  <Tooltip formatter={(v) => (isNullMetric(v) ? 'N/A' : money(v))} />
                   <Legend />
                   {AGING_BUCKETS.map((b, i) => (
-                    <Line key={b} type="monotone" dataKey={b} stroke={['#10b981', '#34d399', '#047857', '#f59e0b', '#ef4444'][i]} dot={false} />
+                    <Line
+                      key={b}
+                      type="monotone"
+                      dataKey={b}
+                      stroke={['#10b981', '#34d399', '#047857', '#f59e0b', '#ef4444'][i]}
+                      connectNulls={false}
+                      dot={false}
+                    />
                   ))}
                 </LineChart>
               </ResponsiveContainer>
@@ -663,18 +809,18 @@ export function Analytics() {
 
           <Section title="5. Daily Stock Added vs Reduced">
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-              <MetricCard label="Period Added" value={money(movSum.period_added)} onClick={() => openDrill('added')} />
-              <MetricCard label="Period Reduced" value={money(movSum.period_reduced)} onClick={() => openDrill('reduced')} />
-              <MetricCard label="Net Change" value={money(movSum.net_change)} />
-              <MetricCard label="Closing" value={money(movSum.closing)} />
+              <MetricCard label="Period Added" value={stockMoney(movSum.period_added)} onClick={() => openDrill('added')} />
+              <MetricCard label="Period Reduced" value={stockMoney(movSum.period_reduced)} onClick={() => openDrill('reduced')} />
+              <MetricCard label="Net Change" value={stockMoney(movSum.net_change)} />
+              <MetricCard label="Closing" value={stockMoney(movSum.closing)} />
             </div>
             <ChartPanel title="Added vs reduced (daily)" empty={!movementSeries.length}>
               <ResponsiveContainer width="100%" height={320}>
                 <ComposedChart data={movementSeries}>
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis dataKey="dateLabel" />
-                  <YAxis tickFormatter={(v) => money(Math.abs(v))} width={90} />
-                  <Tooltip formatter={(v, name) => [money(Math.abs(v)), name]} />
+                  <YAxis tickFormatter={(v) => stockMoney(Math.abs(v))} width={90} />
+                  <Tooltip formatter={(v, name) => [isNullMetric(v) ? 'N/A' : stockMoney(Math.abs(v)), name]} />
                   <Legend />
                   <Bar dataKey="added" name="Added" fill="#059669" />
                   <Bar dataKey="reducedNeg" name="Reduced" fill="#ef4444" />
@@ -687,8 +833,19 @@ export function Analytics() {
 
       <DrilldownModal
         open={!!drill}
-        title={drill?.type ? `Details — ${drill.type}` : 'Details'}
-        onClose={() => setDrill(null)}
+        title={
+          drillMeta?.message
+            ? 'Upload status'
+            : drill?.type === 'missing_upload'
+              ? 'Branch upload status'
+              : drill?.type
+                ? `Details — ${drill.type}`
+                : 'Details'
+        }
+        onClose={() => {
+          setDrill(null);
+          setDrillMeta(null);
+        }}
         loading={drillLoading}
         rows={drillRows}
         total={drillTotal}
@@ -698,8 +855,24 @@ export function Analytics() {
           setDrillPage(p);
           fetchDrill(drill.type, p, drill);
         }}
+        headerNote={drillMeta?.message}
         columns={
-          drill?.type === 'order_saving'
+          drill?.type === 'missing_upload'
+            ? [
+                { key: 'branch', label: 'Branch' },
+                {
+                  key: 'uploaded',
+                  label: 'Uploaded',
+                  render: (r) => (r.uploaded ? 'Yes' : 'No'),
+                },
+                { key: 'published_at', label: 'Published at', render: (r) => displayDate(String(r.published_at || '').slice(0, 10)) },
+                {
+                  key: 'total_value',
+                  label: 'Branch stock value',
+                  render: (r) => (isNullMetric(r.total_value) ? '—' : formatINRCompact(r.total_value)),
+                },
+              ]
+            : drill?.type === 'order_saving'
             ? [
                 { key: 'order_number', label: 'Order' },
                 { key: 'part_number', label: 'Part' },
