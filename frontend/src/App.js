@@ -17,6 +17,7 @@ import { Notifications } from './pages/Notifications';
 import Users from './pages/Users';
 import { Profile } from './pages/Profile';
 import { Reports } from './pages/Reports';
+import { Analytics } from './pages/Analytics';
 import { Requests } from './pages/Requests';
 import { QueryDesk } from './pages/QueryDesk';
 import NMTSMobile from './pages/NMTSMobile';
@@ -218,7 +219,7 @@ function App() {
             } />
             <Route path="analytics" element={
               <ProtectedRoute permission="Analytics">
-                <Reports />
+                <Analytics />
               </ProtectedRoute>
             } />
             <Route path="requests" element={
