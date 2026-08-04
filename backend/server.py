@@ -5745,6 +5745,13 @@ except ImportError:
 reports_center.init_reports_center(db, get_current_user, UserResponse)
 api_router.include_router(reports_center.router)
 
+try:
+    from . import analytics_center
+except ImportError:
+    import analytics_center
+analytics_center.init_analytics_center(db, get_current_user, UserResponse, _nmts_date_key, _nmts_now)
+api_router.include_router(analytics_center.router)
+
 # Sleeping Stock Mobile (Mobile User + device-session model)
 try:
     from . import mobile_api
@@ -5837,6 +5844,8 @@ async def seed_master_user_on_startup():
         logger.info("Product Hub indexes verified")
         await reports_center.ensure_indexes()
         logger.info("Reports Center indexes verified")
+        await analytics_center.ensure_analytics_indexes()
+        logger.info("Analytics indexes verified")
         await mobile_api.ensure_mobile_indexes()
     except Exception as e:
         logger.error(f"Product Hub index creation failed: {e}")
