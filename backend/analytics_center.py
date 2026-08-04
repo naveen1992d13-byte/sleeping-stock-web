@@ -601,7 +601,7 @@ async def _find_last_upload_before(before_dk: str, scope: dict, expected_branche
             reverse=True,
         )
     for dk in keys:
-        up, _ = await _uploaded_branches_by_date(scope, [dk])
+        up, _ = await _uploaded_branches_by_date(scope, [dk], {"endpoint": "_find_last_upload_before"})
         st = _day_upload_status(dk, up, expected_branches, consolidated)
         if st["data_status"] in {"AVAILABLE", "PARTIAL_UPLOAD"}:
             return dk
