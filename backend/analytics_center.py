@@ -1,18 +1,23 @@
 """NMTS Analytics APIs — scope-aware dashboards using published Product Hub history."""
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone, date
+from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pymongo.errors import OperationFailure
 
 try:
     from . import reports_center as rc
 except ImportError:
     import reports_center as rc
+
+logger = logging.getLogger("nmts.analytics")
 
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
 _security = HTTPBearer()
@@ -45,6 +50,90 @@ def init_analytics_center(database, get_current_user, user_model, nmts_date_key_
     globals()["UserResponse"] = user_model
     globals()["_nmts_date_key"] = nmts_date_key_fn
     globals()["_nmts_now"] = nmts_now_fn
+
+
+_ANALYTICS_FAIL_DETAIL = "Unable to calculate analytics for the selected range."
+
+
+def _analytics_log_context(
+    endpoint: str,
+    scope: dict,
+    from_date: str = "",
+    to_date: str = "",
+    category: Optional[str] = None,
+    aging_type: str = "",
+    metric_type: str = "",
+) -> dict:
+    return {
+        "endpoint": endpoint,
+        "scope": scope,
+        "from_date": from_date,
+        "to_date": to_date,
+        "category": category,
+        "aging_type": aging_type,
+        "metric_type": metric_type,
+    }
+
+
+def _log_analytics_aggregate_failure(exc: OperationFailure, log_ctx: dict) -> None:
+    logger.error(
+        "Analytics aggregation failed endpoint=%s scope=%s from_date=%s to_date=%s "
+        "category=%s aging_type=%s metric_type=%s mongo_code=%s error=%s",
+        log_ctx.get("endpoint"),
+        log_ctx.get("scope"),
+        log_ctx.get("from_date"),
+        log_ctx.get("to_date"),
+        log_ctx.get("category"),
+        log_ctx.get("aging_type"),
+        log_ctx.get("metric_type"),
+        getattr(exc, "code", None),
+        str(exc)[:500],
+    )
+
+
+async def _products_aggregate_to_list(pipeline: List[dict], log_ctx: Optional[dict] = None) -> List[dict]:
+    log_ctx = log_ctx or {}
+    try:
+        cursor = db.products.aggregate(pipeline, allowDiskUse=True)
+        return await cursor.to_list(length=None)
+    except OperationFailure as exc:
+        _log_analytics_aggregate_failure(exc, log_ctx)
+        raise HTTPException(status_code=500, detail=_ANALYTICS_FAIL_DETAIL)
+
+
+def analytics_safe_endpoint(func):
+    """Log MongoDB aggregation failures and return a safe API error response."""
+
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except HTTPException:
+            raise
+        except OperationFailure as exc:
+            logger.error(
+                "Analytics endpoint failed fn=%s mongo_code=%s error=%s",
+                func.__name__,
+                getattr(exc, "code", None),
+                str(exc)[:500],
+            )
+            raise HTTPException(status_code=500, detail=_ANALYTICS_FAIL_DETAIL)
+
+    return wrapper
+
+
+def _products_analytics_match(scope: dict, date_keys: List[str], category: Optional[str] = None) -> dict:
+    q = _and(
+        _query(scope),
+        {
+            "publish_status": "Published",
+            "active_date_key": {"$in": date_keys},
+        },
+    )
+    cat = _category_clause(category)
+    if cat:
+        q = _and(q, cat)
+    return q
 
 
 def _pct_change(current: float, previous: float) -> float:
@@ -142,17 +231,32 @@ async def _aggregate_latest_parts_for_date_keys(
     date_keys: List[str],
     scope: dict,
     category: Optional[str] = None,
+    log_ctx: Optional[dict] = None,
 ) -> Dict[str, Dict[Tuple[str, str, str, str], dict]]:
     if not date_keys:
         return {}
-    q = _and(_query(scope), {"publish_status": "Published", "active_date_key": {"$in": date_keys}})
-    cat = _category_clause(category)
-    if cat:
-        q = _and(q, cat)
+    q = _products_analytics_match(scope, date_keys, category)
     pipeline = [
         {"$match": q},
         {
-            "$addFields": {
+            "$project": {
+                "_id": 0,
+                "active_date_key": 1,
+                "brand_name": 1,
+                "dealer_name": 1,
+                "branch": 1,
+                "part_number": 1,
+                "item_name": 1,
+                "part_name": 1,
+                "part_category": 1,
+                "category": 1,
+                "purchase_aging_days": 1,
+                "sales_aging_days": 1,
+                "last_receipt_date": 1,
+                "last_sales_date": 1,
+                "published_at": 1,
+                "updated_at": 1,
+                "upload_id": 1,
                 "qty_n": {"$ifNull": ["$available_qty_number", {"$ifNull": ["$quantity", 0]}]},
                 "unit_n": {
                     "$ifNull": [
@@ -162,7 +266,17 @@ async def _aggregate_latest_parts_for_date_keys(
                 },
             }
         },
-        {"$sort": {"active_date_key": 1, "published_at": -1, "updated_at": -1}},
+        {
+            "$sort": {
+                "active_date_key": 1,
+                "brand_name": 1,
+                "dealer_name": 1,
+                "branch": 1,
+                "part_number": 1,
+                "published_at": -1,
+                "updated_at": -1,
+            }
+        },
         {
             "$group": {
                 "_id": {
@@ -187,7 +301,7 @@ async def _aggregate_latest_parts_for_date_keys(
             }
         },
     ]
-    rows = await db.products.aggregate(pipeline, allowDiskUse=True).to_list(500000)
+    rows = await _products_aggregate_to_list(pipeline, log_ctx)
     by_date: Dict[str, Dict[Tuple[str, str, str, str], dict]] = defaultdict(dict)
     for r in rows:
         dk = r["_id"]["date"]
@@ -332,7 +446,9 @@ async def _expected_branch_names(scope: dict, current_user) -> List[str]:
     return []
 
 
-async def _uploaded_branches_by_date(scope: dict, date_keys: List[str]) -> Tuple[Dict[str, set], Dict[str, Dict[str, dict]]]:
+async def _uploaded_branches_by_date(
+    scope: dict, date_keys: List[str], log_ctx: Optional[dict] = None
+) -> Tuple[Dict[str, set], Dict[str, Dict[str, dict]]]:
     """Branch-day upload detection from batch_summaries with published-products fallback."""
     uploaded: Dict[str, set] = defaultdict(set)
     meta: Dict[str, Dict[str, dict]] = defaultdict(dict)
@@ -351,10 +467,16 @@ async def _uploaded_branches_by_date(scope: dict, date_keys: List[str]) -> Tuple
             "total_value": _num(row.get("total_value")),
         }
     pipeline = [
-        {"$match": _and(_query(scope), {"publish_status": "Published", "active_date_key": {"$in": date_keys}})},
-        {"$group": {"_id": {"date": "$active_date_key", "branch": "$branch"}, "rows": {"$sum": 1}}},
+        {
+            "$match": _and(
+                _query(scope),
+                {"publish_status": "Published", "active_date_key": {"$in": date_keys}},
+            )
+        },
+        {"$project": {"_id": 0, "active_date_key": 1, "branch": 1}},
+        {"$group": {"_id": {"date": "$active_date_key", "branch": "$branch"}}},
     ]
-    for row in await db.products.aggregate(pipeline).to_list(50000):
+    for row in await _products_aggregate_to_list(pipeline, log_ctx):
         dk = _text(row.get("_id", {}).get("date"))
         br = _text(row.get("_id", {}).get("branch"))
         if dk and br:
@@ -378,6 +500,7 @@ async def _aggregate_parts_for_dates(
     scope: dict,
     category: Optional[str],
     use_snapshots: bool,
+    log_ctx: Optional[dict] = None,
 ) -> Dict[str, Dict[Tuple[str, str, str, str], dict]]:
     if not date_keys:
         return {}
@@ -419,7 +542,7 @@ async def _aggregate_parts_for_dates(
                     "value": _num(r.get("total_value"), qty * unit),
                 }
             return by_date
-    return await _aggregate_latest_parts_for_date_keys(date_keys, scope, category)
+    return await _aggregate_latest_parts_for_date_keys(date_keys, scope, category, log_ctx)
 
 
 def _day_upload_status(
@@ -463,10 +586,20 @@ async def _find_last_upload_before(before_dk: str, scope: dict, expected_branche
     keys = sorted(set(await db.batch_summaries.distinct("active_date_key", q)), reverse=True)
     if not keys:
         pipeline = [
-            {"$match": _and(_query(scope), {"publish_status": "Published", "active_date_key": {"$lt": before_dk}})},
+            {
+                "$match": _and(
+                    _query(scope),
+                    {"publish_status": "Published", "active_date_key": {"$lt": before_dk}},
+                )
+            },
+            {"$project": {"_id": 0, "active_date_key": 1}},
             {"$group": {"_id": "$active_date_key"}},
+            {"$sort": {"_id": -1}},
         ]
-        keys = sorted([r["_id"] for r in await db.products.aggregate(pipeline).to_list(5000)], reverse=True)
+        keys = sorted(
+            [r["_id"] for r in await _products_aggregate_to_list(pipeline, {"endpoint": "_find_last_upload_before"})],
+            reverse=True,
+        )
     for dk in keys:
         up, _ = await _uploaded_branches_by_date(scope, [dk])
         st = _day_upload_status(dk, up, expected_branches, consolidated)
@@ -520,20 +653,19 @@ async def _build_daily_stock_series(
     aging_type: str,
     metric_type: str,
     current_user,
+    log_ctx: Optional[dict] = None,
 ) -> dict:
     expected_branches = await _expected_branch_names(scope, current_user)
     consolidated = not bool(scope.get("branch"))
-    uploaded_by_date, upload_meta = await _uploaded_branches_by_date(scope, date_keys)
+    uploaded_by_date, upload_meta = await _uploaded_branches_by_date(scope, date_keys, log_ctx)
     use_snap = await _snapshots_enabled()
     prior_key = await _find_last_upload_before(date_keys[0], scope, expected_branches, consolidated)
     load_keys = list(date_keys)
     if prior_key and prior_key not in load_keys:
         load_keys.append(prior_key)
-    if prior_key and prior_key not in load_keys:
-        load_keys.append(prior_key)
-    by_date = await _aggregate_parts_for_dates(load_keys, scope, category, use_snap)
+    by_date = await _aggregate_parts_for_dates(load_keys, scope, category, use_snap, log_ctx)
     if prior_key:
-        up_prior, meta_prior = await _uploaded_branches_by_date(scope, [prior_key])
+        up_prior, meta_prior = await _uploaded_branches_by_date(scope, [prior_key], log_ctx)
         for dk, branches in up_prior.items():
             uploaded_by_date[dk] = uploaded_by_date.get(dk, set()) | branches
         for dk, m in meta_prior.items():
@@ -729,6 +861,7 @@ def _common_params(
 
 
 @router.get("/categories")
+@analytics_safe_endpoint
 async def analytics_categories(
     from_date: str,
     to_date: str,
@@ -744,7 +877,8 @@ async def analytics_categories(
     _, _, date_keys, _, _, _ = _common_params(from_date, to_date)
     if not date_keys:
         return {"categories": []}
-    ctx = await _build_daily_stock_series(scope, date_keys, None, "purchase", "value", current_user)
+    log_ctx = _analytics_log_context("/analytics/categories", scope, from_date, to_date)
+    ctx = await _build_daily_stock_series(scope, date_keys, None, "purchase", "value", current_user, log_ctx)
     last_avail = None
     for row in reversed(ctx["daily"]):
         if row["data_status"] in {"AVAILABLE", "PARTIAL_UPLOAD"}:
@@ -760,6 +894,7 @@ async def analytics_categories(
 
 
 @router.get("/overall")
+@analytics_safe_endpoint
 async def analytics_overall(
     from_date: str,
     to_date: str,
@@ -778,7 +913,12 @@ async def analytics_overall(
     start, end, date_keys, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
-    ctx = await _build_daily_stock_series(scope, date_keys, category, aging_type, metric_type, current_user)
+    log_ctx = _analytics_log_context(
+        "/analytics/overall", scope, from_date, to_date, category, aging_type, metric_type
+    )
+    ctx = await _build_daily_stock_series(
+        scope, date_keys, category, aging_type, metric_type, current_user, log_ctx
+    )
     daily = ctx["daily"]
     stk = ctx["summary"]
 
@@ -842,6 +982,7 @@ async def analytics_overall(
 
 
 @router.get("/stock-trend")
+@analytics_safe_endpoint
 async def analytics_stock_trend(
     from_date: str,
     to_date: str,
@@ -860,11 +1001,15 @@ async def analytics_stock_trend(
     _, _, date_keys, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
-    payload = await _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user)
+    log_ctx = _analytics_log_context(
+        "/analytics/stock-trend", scope, from_date, to_date, category, aging_type, metric_type
+    )
+    payload = await _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user, log_ctx)
     return payload
 
 
 @router.get("/category-trend")
+@analytics_safe_endpoint
 async def analytics_category_trend(
     from_date: str,
     to_date: str,
@@ -883,7 +1028,12 @@ async def analytics_category_trend(
     _, _, date_keys, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
-    ctx = await _build_daily_stock_series(scope, date_keys, category, aging_type, metric_type, current_user)
+    log_ctx = _analytics_log_context(
+        "/analytics/category-trend", scope, from_date, to_date, category, aging_type, metric_type
+    )
+    ctx = await _build_daily_stock_series(
+        scope, date_keys, category, aging_type, metric_type, current_user, log_ctx
+    )
     use_value = metric_type == "value"
     last_avail_key = None
     last_avail_map: Dict = {}
@@ -947,6 +1097,7 @@ async def analytics_category_trend(
 
 
 @router.get("/aging-trend")
+@analytics_safe_endpoint
 async def analytics_aging_trend(
     from_date: str,
     to_date: str,
@@ -967,7 +1118,12 @@ async def analytics_aging_trend(
     )
     if not date_keys:
         return {"buckets": [], "stacked": [], "daily": [], "data_coverage": {}}
-    ctx = await _build_daily_stock_series(scope, date_keys, category, aging_type, metric_type, current_user)
+    log_ctx = _analytics_log_context(
+        "/analytics/aging-trend", scope, from_date, to_date, category, aging_type, metric_type
+    )
+    ctx = await _build_daily_stock_series(
+        scope, date_keys, category, aging_type, metric_type, current_user, log_ctx
+    )
     use_value = metric_type == "value"
     last_row = ctx["daily"][-1]
     bucket_totals = {b: {"value": None, "quantity": None} for b in BUCKETS}
@@ -1163,8 +1319,10 @@ async def analytics_request_acceptance(
     }
 
 
-async def _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user):
-    ctx = await _build_daily_stock_series(scope, date_keys, category, aging_type, metric_type, current_user)
+async def _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user, log_ctx=None):
+    ctx = await _build_daily_stock_series(
+        scope, date_keys, category, aging_type, metric_type, current_user, log_ctx
+    )
     use_value = metric_type == "value"
     series = []
     for pt in ctx["daily"]:
@@ -1216,6 +1374,7 @@ async def _stock_trend_payload(scope, date_keys, aging_type, metric_type, catego
 
 
 @router.get("/stock-movement")
+@analytics_safe_endpoint
 async def analytics_stock_movement(
     from_date: str,
     to_date: str,
@@ -1234,7 +1393,10 @@ async def analytics_stock_movement(
     _, _, date_keys, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
-    data = await _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user)
+    log_ctx = _analytics_log_context(
+        "/analytics/stock-movement", scope, from_date, to_date, category, aging_type, metric_type
+    )
+    data = await _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user, log_ctx)
     series = []
     for p in data.get("series", []):
         series.append(
@@ -1267,6 +1429,7 @@ async def analytics_stock_movement(
 
 
 @router.get("/drilldown")
+@analytics_safe_endpoint
 async def analytics_drilldown(
     from_date: str,
     to_date: str,
@@ -1292,6 +1455,9 @@ async def analytics_drilldown(
     )
     page = max(1, page)
     page_size = min(max(1, page_size), 200)
+    log_ctx = _analytics_log_context(
+        "/analytics/drilldown", scope, from_date, to_date, category, aging_type, metric_type
+    )
     dtype = (drilldown_type or "").lower()
     if dtype in {"missing_upload", "upload_status", "day_info"}:
         target = focus_date.replace("-", "") if focus_date else (date_keys[-1] if date_keys else _nmts_date_key())
@@ -1299,7 +1465,7 @@ async def analytics_drilldown(
             target = target.replace("-", "")
         expected = await _expected_branch_names(scope, current_user)
         consolidated = not bool(scope.get("branch"))
-        up, meta = await _uploaded_branches_by_date(scope, [target])
+        up, meta = await _uploaded_branches_by_date(scope, [target], log_ctx)
         st = _day_upload_status(target, up, expected, consolidated)
         branch_rows = []
         for b in expected:
@@ -1332,7 +1498,7 @@ async def analytics_drilldown(
             target = target.replace("-", "")
         expected = await _expected_branch_names(scope, current_user)
         consolidated = not bool(scope.get("branch"))
-        up, _ = await _uploaded_branches_by_date(scope, [target])
+        up, _ = await _uploaded_branches_by_date(scope, [target], log_ctx)
         st = _day_upload_status(target, up, expected, consolidated)
         if st["data_status"] == "NO_UPLOAD":
             return {
@@ -1347,7 +1513,7 @@ async def analytics_drilldown(
         load = [target]
         if prior_key:
             load.append(prior_key)
-        by_date = await _aggregate_parts_for_dates(load, scope, category, await _snapshots_enabled())
+        by_date = await _aggregate_parts_for_dates(load, scope, category, await _snapshots_enabled(), log_ctx)
         curr_map = _filter_map_branches(by_date.get(target, {}), st["allowed_branch_keys"])
         prev_map = {}
         if prior_key:
@@ -1442,8 +1608,34 @@ async def analytics_drilldown(
 
 
 async def ensure_analytics_indexes():
-    await db.products.create_index([("active_date_key", 1), ("brand_name", 1), ("dealer_name", 1), ("branch", 1)])
-    await db.order_headers.create_index([("created_at", -1), ("brand_name", 1), ("dealer_name", 1), ("branch", 1)])
+    await db.products.create_index(
+        [
+            ("publish_status", 1),
+            ("active_date_key", 1),
+            ("brand_name", 1),
+            ("dealer_name", 1),
+            ("branch", 1),
+            ("part_number", 1),
+            ("published_at", -1),
+        ],
+        name="analytics_products_scope_date_part",
+    )
+    await db.products.create_index(
+        [("active_date_key", 1), ("brand_name", 1), ("dealer_name", 1), ("branch", 1)],
+        name="analytics_products_date_scope",
+    )
+    await db.batch_summaries.create_index(
+        [("active_date_key", 1), ("brand_name", 1), ("dealer_name", 1), ("branch", 1)],
+        name="analytics_batch_date_scope",
+    )
+    await db.order_headers.create_index(
+        [("created_at", -1), ("brand_name", 1), ("dealer_name", 1), ("branch", 1)],
+        name="analytics_orders_scope_date",
+    )
+    await db.analytics_stock_daily_snapshots.create_index(
+        [("snapshot_date_ist", 1), ("brand_name", 1), ("dealer_name", 1), ("branch_name", 1), ("part_number", 1)],
+        name="analytics_snapshot_scope_date",
+    )
     await db.analytics_stock_daily_snapshots.create_index(
         [("snapshot_date_ist", 1), ("brand_id", 1), ("dealer_id", 1), ("branch_id", 1), ("part_number", 1)],
         unique=True,
