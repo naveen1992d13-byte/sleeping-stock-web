@@ -56,7 +56,7 @@ export function NoticeLoginPopup() {
 
   const viewNotice = () => {
     setOpen(false);
-    navigate(`/?notice=${notice.id}`);
+    navigate(`/notice-board?notice=${notice.id}`);
   };
 
   return (

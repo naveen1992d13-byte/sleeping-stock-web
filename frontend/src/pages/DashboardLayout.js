@@ -325,7 +325,7 @@ export function DashboardLayout() {
           </div>
 
           <div className="flex items-center space-x-3">
-            <div className="relative cursor-pointer" onClick={() => openTab('dashboard', 'Notice Board', '/')}>
+            <div className="relative cursor-pointer" onClick={() => openTab('dashboard', 'Notice Board', '/notice-board')}>
               <Bell className="h-5 w-5" style={{ color: '#22C55E' }} />
               {unreadCount > 0 && (
                 <span

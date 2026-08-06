@@ -26,6 +26,7 @@ const AuthContext = createContext(null);
 
 export const MENU_PERMISSIONS = {
   '/': 'Notice Board',
+  '/notice-board': 'Notice Board',
   '/users': 'User Hub',
   '/upload': 'Upload Center',
   '/products': 'Product Hub',
@@ -181,6 +182,11 @@ function App() {
             </ProtectedRoute>
           }>
             <Route index element={
+              <ProtectedRoute permission="Notice Board">
+                <NoticeBoard />
+              </ProtectedRoute>
+            } />
+            <Route path="notice-board" element={
               <ProtectedRoute permission="Notice Board">
                 <NoticeBoard />
               </ProtectedRoute>
