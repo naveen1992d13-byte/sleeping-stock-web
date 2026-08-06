@@ -10,7 +10,7 @@ export const APPLICATION_MENU_ITEMS = [
   { path: '/reports', label: 'Reports', icon: BarChart3, id: 'reports', adminOnly: true },
   { path: '/analytics', label: 'Analytics', icon: Globe, id: 'analytics', adminOnly: true },
   { path: '/', label: 'Notice Board', icon: Megaphone, id: 'dashboard' },
-  { path: '/query', label: 'Query Desk', icon: HelpCircle, id: 'query' },
+  { path: '/query', label: 'Query Desk', icon: HelpCircle, id: 'query', allRoles: true },
   { path: '/sleeping-stock-mobile', label: 'Sleeping Stock Mobile', icon: Smartphone, id: 'sleeping-stock-mobile', allRoles: true },
 ];
 

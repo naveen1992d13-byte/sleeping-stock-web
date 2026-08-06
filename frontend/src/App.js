@@ -34,7 +34,7 @@ export const MENU_PERMISSIONS = {
   '/requests': 'Request Center',
   '/reports': 'Reports',
   '/analytics': 'Analytics',
-  '/query': 'Query Desk',
+  '/query': null, // Available to master, admin, and user (Query Desk).
   '/sleeping-stock-mobile': null, // Available to master, admin and user; API applies scope rules.
 };
 
@@ -234,7 +234,7 @@ function App() {
             } />
             <Route path="nmts-mobile" element={<Navigate to="/sleeping-stock-mobile" replace />} />
             <Route path="query" element={
-              <ProtectedRoute permission="Query Desk">
+              <ProtectedRoute>
                 <QueryDesk />
               </ProtectedRoute>
             } />

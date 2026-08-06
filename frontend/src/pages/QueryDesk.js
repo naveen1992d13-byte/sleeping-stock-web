@@ -482,7 +482,7 @@ export function QueryDesk() {
       </div>
 
       <Sheet open={detailOpen} onOpenChange={setDetailOpen}>
-        <SheetContent side="right" className="w-full sm:max-w-xl overflow-y-auto">
+        <SheetContent side="right" className="w-full max-w-full sm:max-w-xl overflow-y-auto">
           <SheetHeader>
             <SheetTitle>Query Details</SheetTitle>
           </SheetHeader>
