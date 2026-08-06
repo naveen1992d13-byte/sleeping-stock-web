@@ -5753,6 +5753,13 @@ query_desk.init_query_desk(db, get_current_user, UserResponse)
 api_router.include_router(query_desk.router)
 
 try:
+    from . import notice_board
+except ImportError:
+    import notice_board
+notice_board.init_notice_board(db, get_current_user, UserResponse)
+api_router.include_router(notice_board.router)
+
+try:
     from . import analytics_center
 except ImportError:
     import analytics_center
@@ -5853,6 +5860,8 @@ async def seed_master_user_on_startup():
         logger.info("Reports Center indexes verified")
         await query_desk.ensure_indexes()
         logger.info("Query Desk indexes verified")
+        await notice_board.ensure_indexes()
+        logger.info("Notice Board indexes verified")
         await analytics_center.ensure_analytics_indexes()
         logger.info("Analytics indexes verified")
         await mobile_api.ensure_mobile_indexes()

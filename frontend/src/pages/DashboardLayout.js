@@ -32,6 +32,7 @@ import {
   DropdownMenuTrigger,
 } from '../components/ui/dropdown-menu';
 import { toast } from 'sonner';
+import { NoticeLoginPopup } from '../components/NoticeLoginPopup';
 
 export function DashboardLayout() {
   const { user, logout } = useAuth();
@@ -456,6 +457,7 @@ export function DashboardLayout() {
       </div>
 
       <main className="flex-1 p-4">
+        <NoticeLoginPopup />
         <Outlet context={{ scopeBrand, scopeDealer, scopeBranch }} />
       </main>
 

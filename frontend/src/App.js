@@ -8,7 +8,7 @@ import { ProcessingProvider } from './components/GlobalProcessingOverlay';
 // Import pages
 import { LoginPage } from './pages/LoginPage';
 import { DashboardLayout } from './pages/DashboardLayout';
-import Dashboard from './pages/Dashboard';
+import NoticeBoard from './pages/NoticeBoard';
 import { Products } from './pages/Products';
 import { ProductHubHistory } from './pages/ProductHubHistory';
 import { Orders } from './pages/Orders';
@@ -182,7 +182,7 @@ function App() {
           }>
             <Route index element={
               <ProtectedRoute permission="Notice Board">
-                <Dashboard />
+                <NoticeBoard />
               </ProtectedRoute>
             } />
             <Route path="products" element={
