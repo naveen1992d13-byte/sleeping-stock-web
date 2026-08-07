@@ -6,16 +6,6 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { NmtsModal } from '@/components/NmtsModal';
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
-import {
   Search,
   RefreshCw,
   Eye,
@@ -468,10 +458,11 @@ export function QueryDesk() {
     if (!detail?.id || clearSubmitting) return;
     setClearSubmitting(true);
     try {
-      const res = await axios.post(`${API}/queries/${detail.id}/clear`);
-      setDetail(res.data);
+      await axios.post(`${API}/queries/${detail.id}/clear`);
       setClearConfirmOpen(false);
       setShowFollowUpComposer(false);
+      setDetailOpen(false);
+      setDetail(null);
       toast.success('Query closed');
       await loadQueries();
     } catch (e) {
@@ -758,6 +749,39 @@ export function QueryDesk() {
               {!isMaster && isCreator && detail.status !== 'Closed' && (
                 <div className="rounded-lg border border-slate-200 bg-white p-4 space-y-3">
                   {detail.status === 'Answered' && !showFollowUpComposer && (
+                    clearConfirmOpen ? (
+                      <div
+                        className="rounded-lg border-2 border-emerald-200 bg-white p-4 shadow-sm space-y-3"
+                        role="alertdialog"
+                        aria-labelledby="query-clear-confirm-title"
+                        aria-describedby="query-clear-confirm-desc"
+                      >
+                        <h3 id="query-clear-confirm-title" className="text-sm font-semibold text-slate-900">
+                          Confirm resolution
+                        </h3>
+                        <p id="query-clear-confirm-desc" className="text-sm text-slate-600">
+                          Are you sure this query has been resolved?
+                        </p>
+                        <div className="flex flex-wrap gap-2 pt-1">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            disabled={clearSubmitting}
+                            onClick={() => setClearConfirmOpen(false)}
+                          >
+                            Cancel
+                          </Button>
+                          <Button
+                            type="button"
+                            className="nmts-btn-primary"
+                            disabled={clearSubmitting}
+                            onClick={confirmQueryCleared}
+                          >
+                            {clearSubmitting ? 'Closing…' : 'Yes, Close Query'}
+                          </Button>
+                        </div>
+                      </div>
+                    ) : (
                     <>
                       <p className="text-sm font-medium text-slate-800">Has your query been resolved?</p>
                       <div className="flex flex-wrap gap-2">
@@ -779,6 +803,7 @@ export function QueryDesk() {
                         </Button>
                       </div>
                     </>
+                    )
                   )}
                   {(detail.status === 'Open' || detail.status === 'Reopened') && (
                     <p className="text-sm text-slate-600">Waiting for Software Team Reply</p>
@@ -885,29 +910,6 @@ export function QueryDesk() {
             </div>
           )}
       </NmtsModal>
-
-      <AlertDialog open={clearConfirmOpen} onOpenChange={setClearConfirmOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Confirm resolution</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure this query has been resolved?
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={clearSubmitting}>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              disabled={clearSubmitting}
-              onClick={(e) => {
-                e.preventDefault();
-                confirmQueryCleared();
-              }}
-            >
-              {clearSubmitting ? 'Closing…' : 'Yes, Close Query'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </div>
   );
 }
