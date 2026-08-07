@@ -162,19 +162,21 @@ export function Products() {
 
   return <div className="space-y-4" data-testid="product-hub-page">
     <PrintStyles />
-    <div className="flex items-center justify-between gap-3 flex-wrap no-print">
-      <div className="flex items-center gap-3">
-        <Package className="h-8 w-8" style={{ color: COLORS.dark }} />
-        <div>
-          <h1 className="text-2xl font-bold" style={{ color: COLORS.dark }}>Product Hub</h1>
-          <p className="text-sm" style={{ color: COLORS.muted }}>Today's Published Inventory — {isAll(effectiveBranch) ? 'All Branches' : effectiveBranch}</p>
+    <div className="nmts-module-header no-print">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-3">
+          <Package className="h-8 w-8 nmts-module-header-icon" />
+          <div>
+            <h1>Product Hub</h1>
+            <p>Today&apos;s Published Inventory — {isAll(effectiveBranch) ? 'All Branches' : effectiveBranch}</p>
+          </div>
         </div>
+        {isMaster && (
+          <Button onClick={exportMasterZip} disabled={exporting} variant="outline" className="gap-2">
+            <Archive className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Export All (ZIP)'}
+          </Button>
+        )}
       </div>
-      {isMaster && (
-        <Button onClick={exportMasterZip} disabled={exporting} variant="outline" className="gap-2">
-          <Archive className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Export All (ZIP)'}
-        </Button>
-      )}
     </div>
 
     <div className="grid grid-cols-2 md:grid-cols-4 gap-3 no-print">

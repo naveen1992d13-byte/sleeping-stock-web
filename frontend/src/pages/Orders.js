@@ -552,16 +552,18 @@ export function Orders() {
   };
   return (
     <div className="space-y-4" data-testid="orders-page">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-bold text-emerald-700">Order Desk</h1>
-          <p className="text-sm text-slate-500">Upload an order, check Product Hub availability, and store every request in the same order.</p>
-        </div>
-        <div className="flex gap-2">
-          <Button variant={activeTab === 'desk' ? 'default' : 'outline'} onClick={() => setActiveTab('desk')}>Order Desk</Button>
-          <Button variant={activeTab === 'history' ? 'default' : 'outline'} onClick={() => { setActiveTab('history'); loadHistory(); }}>
-            <History className="mr-2 h-4 w-4" />Order History
-          </Button>
+      <div className="nmts-module-header">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h1>Order Desk</h1>
+            <p>Upload an order, check Product Hub availability, and store every request in the same order.</p>
+          </div>
+          <div className="flex gap-2">
+            <Button variant={activeTab === 'desk' ? 'default' : 'outline'} onClick={() => setActiveTab('desk')}>Order Desk</Button>
+            <Button variant={activeTab === 'history' ? 'default' : 'outline'} onClick={() => { setActiveTab('history'); loadHistory(); }}>
+              <History className="mr-2 h-4 w-4" />Order History
+            </Button>
+          </div>
         </div>
       </div>
 

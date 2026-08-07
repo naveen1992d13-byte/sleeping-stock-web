@@ -4,7 +4,6 @@ import { useAuth, API, canAccessPermission } from '../App';
 import axios from 'axios';
 import {
   Bell,
-  Package,
   Users,
   LogOut,
   X,
@@ -13,15 +12,8 @@ import {
   MapPin,
   Building,
   Shield,
-  Upload,
-  ClipboardList,
-  ClipboardCheck,
-  BarChart3,
-  Globe,
-  Megaphone,
-  HelpCircle,
-  FileSpreadsheet,
-  Smartphone
+  Menu,
+  Search,
 } from 'lucide-react';
 import { APPLICATION_MENU_ITEMS } from '../config/menuConfig';
 import { Button } from '../components/ui/button';
@@ -40,7 +32,16 @@ export function DashboardLayout() {
   const navigate = useNavigate();
 
   const [unreadCount, setUnreadCount] = useState(0);
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(() => {
+    try {
+      const stored = localStorage.getItem('nmtsSidebarOpen');
+      if (stored === 'false') return false;
+      if (stored === 'true') return true;
+    } catch {
+      /* ignore */
+    }
+    return typeof window !== 'undefined' ? window.innerWidth >= 1024 : true;
+  });
   const [tabs, setTabs] = useState([]);
   const [activeTabId, setActiveTabId] = useState(null);
 
@@ -179,6 +180,18 @@ export function DashboardLayout() {
   }, [isAdmin, scopeMasters, user?.group, user?.dealer, user?.location, user?.branch]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem('nmtsSidebarOpen', sidebarOpen ? 'true' : 'false');
+    } catch {
+      /* ignore */
+    }
+  }, [sidebarOpen]);
+
+  const toggleSidebar = () => {
+    setSidebarOpen((prev) => !prev);
+  };
+
+  useEffect(() => {
     fetchUnreadCount();
     const interval = setInterval(fetchUnreadCount, 30000);
 
@@ -283,245 +296,230 @@ export function DashboardLayout() {
   };
 
   return (
-    <div className="min-h-screen" style={{ backgroundColor: '#D1FAE5' }}>
-      <header
-        className="sticky top-0 z-50"
-        style={{ backgroundColor: '#A7F3D0', borderBottom: '1px solid #D1D5DB' }}
+    <div className="nmts-app-shell" data-testid="dashboard-layout">
+      {!sidebarOpen ? null : (
+        <button
+          type="button"
+          className="nmts-sidebar-backdrop lg:hidden"
+          aria-label="Close navigation menu"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
+      <aside
+        className={`nmts-sidebar${sidebarOpen ? '' : ' nmts-sidebar--collapsed'}`}
+        aria-hidden={!sidebarOpen}
       >
-        <div className="flex items-center justify-between px-3 py-2">
-          <div className="flex items-center">
-            <img src="/sleeping-stock-logo.png" alt="Sleeping Stock" className="h-12 w-auto mr-2" />
+        <div className="nmts-sidebar-brand">
+          <img src="/sleeping-stock-logo.png" alt="Sleeping Stock" />
+          <div className="nmts-sidebar-brand-title">
+            Sleeping <span>Stock</span>
+          </div>
+          <div className="nmts-sidebar-brand-sub">Non Moving Tracking System</div>
+        </div>
 
-            <div className="hidden md:flex items-center mr-3">
-              <span className="text-xl font-bold" style={{ color: '#242424' }}>Sleeping</span>
-              <span className="text-xl font-bold" style={{ color: '#489232' }}>Stock</span>
-            </div>
+        <nav className="nmts-sidebar-nav" aria-label="Main navigation">
+          {filteredNavItems.map((item) => {
+            const Icon = item.icon;
+            const isActive =
+              location.pathname === item.path ||
+              (item.path === '/notice-board' && location.pathname === '/');
 
-            <Button variant="ghost" size="sm" className="p-1 mr-2" onClick={goHome}>
-              <Home className="h-6 w-6" style={{ color: '#3eb919' }} />
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className={`nmts-sidebar-link${isActive ? ' nmts-sidebar-link--active' : ''}`}
+                onClick={() => {
+                  openTab(item.id, item.label, item.path);
+                  if (typeof window !== 'undefined' && window.innerWidth < 1024) {
+                    setSidebarOpen(false);
+                  }
+                }}
+              >
+                <Icon aria-hidden="true" />
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="nmts-sidebar-footer">© 2026 NMTS. All rights reserved.</div>
+      </aside>
+
+      <div className="nmts-main-column">
+        <header className="nmts-topbar">
+          <div className="nmts-topbar-inner">
+            <button
+              type="button"
+              className="nmts-menu-toggle"
+              data-testid="sidebar-menu-toggle"
+              aria-expanded={sidebarOpen}
+              aria-label={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+              onClick={toggleSidebar}
+            >
+              <Menu className="h-5 w-5" />
+            </button>
+
+            <Button variant="ghost" size="sm" className="p-1 hidden sm:flex" onClick={goHome} title="Home">
+              <Home className="h-5 w-5" style={{ color: '#059669' }} />
             </Button>
 
-            <div className="flex items-center space-x-1 overflow-x-auto max-w-[55vw]">
+            <div className="nmts-tab-strip hidden md:flex">
               {tabs.map((tab) => (
                 <div
                   key={tab.id}
+                  className="nmts-tab-chip"
                   onClick={() => {
                     setActiveTabId(tab.id);
                     navigate(tab.path);
                   }}
-                  className="flex items-center px-3 py-1.5 cursor-pointer rounded"
-                  style={{
-                    backgroundColor: activeTabId === tab.id ? '#059669' : '#059669',
-                    color: 'white'
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      setActiveTabId(tab.id);
+                      navigate(tab.path);
+                    }
                   }}
+                  role="button"
+                  tabIndex={0}
                 >
-                  <span className="text-sm font-medium whitespace-nowrap mr-2">{tab.label}</span>
-                  <button onClick={(e) => closeTab(tab.id, e)} className="hover:bg-white/20 rounded p-0.5">
+                  <span>{tab.label}</span>
+                  <button
+                    type="button"
+                    className="nmts-tab-chip-close"
+                    onClick={(e) => closeTab(tab.id, e)}
+                    aria-label={`Close ${tab.label}`}
+                  >
                     <X className="h-3 w-3" />
                   </button>
                 </div>
               ))}
             </div>
-          </div>
 
-          <div className="flex items-center space-x-3">
-            <div className="relative cursor-pointer" onClick={() => openTab('dashboard', 'Notice Board', '/notice-board')}>
-              <Bell className="h-5 w-5" style={{ color: '#22C55E' }} />
-              {unreadCount > 0 && (
-                <span
-                  className="absolute -top-1 -right-1 h-4 w-4 text-xs flex items-center justify-center rounded-full text-white"
-                  style={{ backgroundColor: '#C55959' }}
-                >
-                  {unreadCount > 9 ? '9+' : unreadCount}
-                </span>
-              )}
+            <div className="nmts-topbar-search" role="search">
+              <Search className="h-4 w-4 shrink-0" aria-hidden="true" />
+              <input
+                type="search"
+                placeholder="Search items, orders, requests..."
+                aria-label="Search"
+                readOnly
+                tabIndex={-1}
+                title="Global search coming soon"
+              />
             </div>
 
-            <Button variant="ghost" onClick={() => setMenuOpen(!menuOpen)} className="flex items-center gap-1 px-2">
-              <span className="text-sm font-medium" style={{ color: '#374151' }}>Menu</span>
-            </Button>
-
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" className="p-1">
-                  <div
-                    className="h-10 w-10 rounded-full flex items-center justify-center border-2"
-                    style={{ backgroundColor: '#E8F5E9', borderColor: '#059669' }}
-                  >
-                    <User className="h-6 w-6" style={{ color: '#047857' }} />
-                  </div>
-                </Button>
-              </DropdownMenuTrigger>
-
-              <DropdownMenuContent
-                align="end"
-                className="w-72 p-0 overflow-hidden"
-                style={{
-                  backgroundColor: '#34D399',
-                  borderRadius: '16px',
-                  boxShadow: '0 8px 24px rgba(0, 0, 0, 0.2)',
-                  border: '2px solid #059669'
-                }}
+            <div className="nmts-topbar-actions">
+              <button
+                type="button"
+                className="nmts-bell-btn"
+                onClick={() => openTab('dashboard', 'Notice Board', '/notice-board')}
+                aria-label="Notifications"
               >
-                <div className="p-4" style={{ borderBottom: '1px solid rgba(255,255,255,0.2)' }}>
-                  <h3 className="text-lg font-bold" style={{ color: '#FFFFFF' }}>
-                    {user?.username || user?.name || 'User'}
-                  </h3>
-                  <p className="text-sm capitalize" style={{ color: '#D1FAE5' }}>
-                    {user?.role || 'User'}
-                  </p>
-                </div>
+                <Bell className="h-5 w-5" />
+                {unreadCount > 0 && (
+                  <span className="nmts-bell-badge">{unreadCount > 9 ? '9+' : unreadCount}</span>
+                )}
+              </button>
 
-                <div className="p-4 space-y-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.2)' }}>
-                  <InfoRow icon={Shield} label="Role" value={user?.role || 'N/A'} />
-                  <InfoRow icon={Building} label="Brand" value={scopeBrand} />
-                  <InfoRow icon={Users} label="Dealer" value={scopeDealer} />
-                  <InfoRow icon={MapPin} label="Branch" value={scopeBranch} />
-                </div>
-
-                <div className="p-3 space-y-1">
-                  <DropdownMenuItem
-                    onClick={() => openTab('profile', 'My Profile', '/profile')}
-                    className="flex items-center gap-3 px-3 py-3 rounded-lg cursor-pointer"
-                    style={{ color: '#FFFFFF' }}
-                  >
-                    <User className="h-5 w-5" style={{ color: '#047857' }} />
-                    <span className="font-medium">My Profile</span>
-                  </DropdownMenuItem>
-
-                  <DropdownMenuItem
-                    onClick={handleLogout}
-                    className="flex items-center gap-3 px-3 py-3 rounded-lg cursor-pointer"
-                    style={{ color: '#C55959' }}
-                  >
-                    <LogOut className="h-5 w-5" style={{ color: '#C55959' }} />
-                    <span className="font-medium">Logout</span>
-                  </DropdownMenuItem>
-                </div>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
-        </div>
-      </header>
-
-      <div
-        className="mx-4 mt-3 mb-2 rounded-xl px-4 py-3 shadow-sm"
-        style={{ backgroundColor: "#F3F7EF", border: "1px solid #C8D5BF" }}
-      >
-        <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 flex-1">
-            <ScopeSelect
-              label="Brand"
-              value={scopeBrand}
-              onChange={(value) => {
-                setScopeBrand(value);
-                if (isMaster) {
-                  setScopeDealer("All Dealers");
-                  setScopeBranch("All Branches");
-                }
-              }}
-              options={isMaster ? brandOptions : [scopeBrand]}
-              disabled={!isMaster}
-            />
-
-            <ScopeSelect
-              label="Dealer"
-              value={scopeDealer}
-              onChange={(value) => {
-                setScopeDealer(value);
-                if (isMaster || isAdmin) {
-                  setScopeBranch("All Branches");
-                }
-              }}
-              options={isMaster ? dealerOptions : [scopeDealer]}
-              disabled={!isMaster}
-            />
-
-            <ScopeSelect
-              label="Branch"
-              value={scopeBranch}
-              onChange={setScopeBranch}
-              options={isMaster || isAdmin ? branchOptions : [scopeBranch]}
-              disabled={!isMaster && !isAdmin}
-            />
-          </div>
-
-          <div
-            className="px-4 py-2 rounded-xl border bg-white text-sm font-bold whitespace-nowrap"
-            style={{ borderColor: "#C8D5BF", color: "#263326" }}
-            title="Current logged-in user"
-          >
-            👤 {getDisplayUserName()} <span style={{ color: "#6B7280" }}>|</span> 🛡 {getDisplayRole()}
-          </div>
-        </div>
-      </div>
-
-      <main className="flex-1 p-4">
-        <NoticeLoginPopup />
-        <Outlet context={{ scopeBrand, scopeDealer, scopeBranch }} />
-      </main>
-
-      {menuOpen && (
-        <div
-          className="fixed inset-0 z-40"
-          onClick={() => setMenuOpen(false)}
-          style={{ backgroundColor: 'rgba(0,0,0,0.3)' }}
-        >
-          <div
-            className="absolute top-16 right-4 rounded-xl shadow-xl p-3 w-56"
-            style={{ backgroundColor: '#FFFFFF', border: '1px solid #D1D5DB' }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <nav className="space-y-1">
-              {filteredNavItems.map((item) => {
-                const Icon = item.icon;
-                const isActive = location.pathname === item.path;
-
-                return (
-                  <button
-                    key={item.id}
-                    onClick={() => {
-                      openTab(item.id, item.label, item.path);
-                      setMenuOpen(false);
-                    }}
-                    className="flex items-center w-full px-3 py-2.5 text-left rounded-lg hover:bg-gray-50"
-                    style={{
-                      color: '#374151',
-                      backgroundColor: isActive ? '#D1FAE5' : 'transparent'
-                    }}
-                  >
-                    <Icon className="h-5 w-5 mr-3" style={{ color: '#22C55E' }} />
-                    <span className="text-sm font-medium">{item.label}</span>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button type="button" className="nmts-user-trigger">
+                    <div className="nmts-user-avatar">
+                      <User className="h-5 w-5" />
+                    </div>
+                    <div className="nmts-user-meta">
+                      <div className="nmts-user-meta-name">{getDisplayUserName()}</div>
+                      <div className="nmts-user-meta-role">{getDisplayRole()}</div>
+                    </div>
                   </button>
-                );
-              })}
+                </DropdownMenuTrigger>
 
-              <div className="border-t pt-2 mt-2" style={{ borderColor: '#E5E7EB' }}>
-                <button
-                  onClick={() => {
-                    openTab('profile', 'My Profile', '/profile');
-                    setMenuOpen(false);
-                  }}
-                  className="flex items-center w-full px-3 py-2.5 text-left rounded-lg hover:bg-gray-50"
-                  style={{ color: '#374151' }}
-                >
-                  <User className="h-5 w-5 mr-3" style={{ color: '#22C55E' }} />
-                  <span className="text-sm font-medium">My Profile</span>
-                </button>
+                <DropdownMenuContent align="end" className="nmts-user-dropdown w-72 p-0">
+                  <div className="nmts-user-dropdown-head">
+                    <h3>{user?.username || user?.name || 'User'}</h3>
+                    <p>{user?.role || 'User'}</p>
+                  </div>
 
-                <button
-                  onClick={handleLogout}
-                  className="flex items-center w-full px-3 py-2.5 text-left rounded-lg hover:bg-red-50"
-                  style={{ color: '#C55959' }}
-                >
-                  <LogOut className="h-5 w-5 mr-3" style={{ color: '#C55959' }} />
-                  <span className="text-sm font-medium">Logout</span>
-                </button>
-              </div>
-            </nav>
+                  <div className="nmts-user-dropdown-body">
+                    <InfoRow icon={Shield} label="Role" value={user?.role || 'N/A'} />
+                    <InfoRow icon={Building} label="Brand" value={scopeBrand} />
+                    <InfoRow icon={Users} label="Dealer" value={scopeDealer} />
+                    <InfoRow icon={MapPin} label="Branch" value={scopeBranch} />
+                  </div>
+
+                  <div className="p-2">
+                    <DropdownMenuItem
+                      onClick={() => openTab('profile', 'My Profile', '/profile')}
+                      className="flex items-center gap-3 px-3 py-2.5 rounded-lg cursor-pointer"
+                    >
+                      <User className="h-5 w-5 text-emerald-700" />
+                      <span className="font-medium">My Profile</span>
+                    </DropdownMenuItem>
+
+                    <DropdownMenuItem
+                      onClick={handleLogout}
+                      className="flex items-center gap-3 px-3 py-2.5 rounded-lg cursor-pointer text-red-600 focus:text-red-600"
+                    >
+                      <LogOut className="h-5 w-5" />
+                      <span className="font-medium">Logout</span>
+                    </DropdownMenuItem>
+                  </div>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          </div>
+        </header>
+
+        <div className="nmts-scope-bar">
+          <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 flex-1">
+              <ScopeSelect
+                label="Brand"
+                value={scopeBrand}
+                onChange={(value) => {
+                  setScopeBrand(value);
+                  if (isMaster) {
+                    setScopeDealer('All Dealers');
+                    setScopeBranch('All Branches');
+                  }
+                }}
+                options={isMaster ? brandOptions : [scopeBrand]}
+                disabled={!isMaster}
+              />
+
+              <ScopeSelect
+                label="Dealer"
+                value={scopeDealer}
+                onChange={(value) => {
+                  setScopeDealer(value);
+                  if (isMaster || isAdmin) {
+                    setScopeBranch('All Branches');
+                  }
+                }}
+                options={isMaster ? dealerOptions : [scopeDealer]}
+                disabled={!isMaster}
+              />
+
+              <ScopeSelect
+                label="Branch"
+                value={scopeBranch}
+                onChange={setScopeBranch}
+                options={isMaster || isAdmin ? branchOptions : [scopeBranch]}
+                disabled={!isMaster && !isAdmin}
+              />
+            </div>
+
+            <div className="nmts-scope-user-pill" title="Current logged-in user">
+              👤 {getDisplayUserName()} <span className="text-gray-400">|</span> 🛡 {getDisplayRole()}
+            </div>
           </div>
         </div>
-      )}
+
+        <main className="nmts-main-content">
+          <NoticeLoginPopup />
+          <Outlet context={{ scopeBrand, scopeDealer, scopeBranch }} />
+        </main>
+      </div>
     </div>
   );
 }
@@ -529,9 +527,7 @@ export function DashboardLayout() {
 function ScopeSelect({ label, value, onChange, options, disabled }) {
   return (
     <div className="flex items-center gap-3">
-      <span className="text-sm font-bold min-w-[70px]" style={{ color: "#263326" }}>
-        {label}:
-      </span>
+      <span className="nmts-scope-label">{label}:</span>
 
       <select
         value={value}
@@ -539,9 +535,9 @@ function ScopeSelect({ label, value, onChange, options, disabled }) {
         onChange={(e) => onChange(e.target.value)}
         className="w-full px-4 py-2 rounded-lg border text-sm font-medium"
         style={{
-          backgroundColor: disabled ? "#EEF2EA" : "#FFFFFF",
-          borderColor: "#C8D5BF",
-          color: "#263326",
+          backgroundColor: disabled ? '#f3f4f6' : '#FFFFFF',
+          borderColor: '#e5e7eb',
+          color: '#111827',
         }}
       >
         {options.map((item) => (
@@ -554,12 +550,10 @@ function ScopeSelect({ label, value, onChange, options, disabled }) {
 
 function InfoRow({ icon: Icon, label, value }) {
   return (
-    <div className="flex items-center gap-3">
-      <Icon className="h-4 w-4" style={{ color: '#D1FAE5' }} />
-      <span style={{ color: '#D1FAE5' }}>{label}:</span>
-      <span className="font-medium capitalize" style={{ color: '#FFFFFF' }}>
-        {value}
-      </span>
+    <div className="nmts-info-row">
+      <Icon aria-hidden="true" />
+      <span>{label}:</span>
+      <span>{value}</span>
     </div>
   );
 }

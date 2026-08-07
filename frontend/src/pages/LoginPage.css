@@ -17,13 +17,18 @@
 .nmts-login-overlay {
   position: absolute;
   inset: 0;
-  z-index: -1;
+  z-index: 0;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
   background:
-    radial-gradient(circle at 50% 44%, rgba(84, 154, 35, 0.08), transparent 30%),
-    linear-gradient(180deg, rgba(0, 0, 0, 0.08), rgba(0, 0, 0, 0.22));
+    radial-gradient(circle at 50% 44%, rgba(84, 154, 35, 0.12), transparent 32%),
+    linear-gradient(180deg, rgba(0, 0, 0, 0.45), rgba(0, 0, 0, 0.62));
+  pointer-events: none;
 }
 
 .nmts-login-shell {
+  position: relative;
+  z-index: 1;
   width: 100%;
   display: flex;
   justify-content: center;
@@ -174,15 +179,44 @@
   height: 100%;
   border: 0;
   outline: 0;
-  background: transparent;
-  color: #1e6444;
+  background: transparent !important;
+  color: #f0f4f0;
   font-size: 16px;
   font-weight: 400;
   padding-left: 12px;
 }
 
 .nmts-login-field input::placeholder {
-  color: rgba(26, 81, 37, 0.539);
+  color: rgba(209, 213, 219, 0.72);
+}
+
+.nmts-login-field--password {
+  padding-right: 8px;
+}
+
+.nmts-password-toggle {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  color: #78c841;
+  transition: background 0.15s ease;
+}
+
+.nmts-password-toggle:hover {
+  background: rgba(120, 200, 65, 0.12);
+}
+
+.nmts-password-toggle-icon {
+  width: 22px;
+  height: 22px;
+  stroke-width: 1.7;
 }
 
 .nmts-login-button {

@@ -589,7 +589,7 @@ const resetPassword = async (item) => {
   };
 
   return (
-    <div className="min-h-screen p-4 md:p-6" style={{ backgroundColor: COLORS.page, color: COLORS.text }}>
+    <div className="space-y-6 p-0 md:p-0" style={{ color: COLORS.text }}>
       <Header />
 
       <div className="grid grid-cols-2 xl:grid-cols-7 gap-4 mb-5">
