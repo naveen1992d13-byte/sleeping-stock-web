@@ -416,19 +416,27 @@ async def login(login_data: LoginRequest):
     user = await db.users.find_one({"user_id": identifier}, {"_id": 0})
 
     if not user:
+        escaped_uid = re.escape(identifier)
+        user = await db.users.find_one(
+            {"user_id": {"$regex": f"^{escaped_uid}$", "$options": "i"}},
+            {"_id": 0},
+        )
+
+    if not user:
         escaped_email = re.escape(normalize_email(identifier))
         user = await db.users.find_one(
             {"email": {"$regex": f"^{escaped_email}$", "$options": "i"}},
             {"_id": 0}
         )
 
-    if not user or not verify_password(login_data.password, user["password"]):
+    stored_hash = user.get("password") if user else None
+    if not user or not stored_hash or not verify_password(login_data.password, stored_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect User ID/Email or password"
         )
 
-    if user.get("status") == "inactive":
+    if str(user.get("status") or "").strip().lower() == "inactive":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is inactive. Please contact administrator."
@@ -5786,7 +5794,7 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(','),
     allow_methods=["*"],
     allow_headers=["*"],
 )
