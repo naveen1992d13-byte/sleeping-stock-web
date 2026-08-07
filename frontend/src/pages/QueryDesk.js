@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
@@ -6,7 +6,16 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { NmtsModal } from '@/components/NmtsModal';
 import {
-  HelpCircle,
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import {
   Search,
   RefreshCw,
   Eye,
@@ -20,7 +29,15 @@ const QUERY_TYPES = ['System', 'General', 'Guidance'];
 const STATUS_STYLES = {
   Open: { bg: '#DBEAFE', fg: '#1E40AF' },
   Answered: { bg: '#D1FAE5', fg: '#065F46' },
+  Reopened: { bg: '#FEF3C7', fg: '#92400E' },
   Closed: { bg: '#E5E7EB', fg: '#374151' },
+};
+
+const STATUS_DETAIL_LABELS = {
+  Open: 'Waiting for Software Team',
+  Answered: 'Waiting for Your Confirmation',
+  Reopened: 'Waiting for Software Team Reply',
+  Closed: 'Closed',
 };
 
 const ALLOWED_EXT = ['.png', '.jpg', '.jpeg', '.pdf', '.xls', '.xlsx'];
@@ -44,15 +61,122 @@ function formatIstDateTime(value) {
   return `${pick('day')} ${pick('month')} ${pick('year')} ${pick('hour')}:${pick('minute')} ${ampm}`;
 }
 
-function StatusBadge({ status }) {
+function StatusBadge({ status, detailLabel = false }) {
   const s = STATUS_STYLES[status] || { bg: '#F3F4F6', fg: '#374151' };
+  const label = detailLabel ? (STATUS_DETAIL_LABELS[status] || status || 'Open') : (status || 'Open');
   return (
     <span
       className="inline-block rounded-full px-2.5 py-1 text-xs font-semibold whitespace-nowrap"
       style={{ backgroundColor: s.bg, color: s.fg }}
     >
-      {status || 'Open'}
+      {label}
     </span>
+  );
+}
+
+function parseTime(value) {
+  const t = new Date(value).getTime();
+  return Number.isNaN(t) ? 0 : t;
+}
+
+function userIdentityIds(user) {
+  const ids = new Set();
+  if (user?.id) ids.add(String(user.id));
+  if (user?.user_id) ids.add(String(user.user_id));
+  return ids;
+}
+
+function isQueryCreator(user, detail) {
+  const creatorId = String(detail?.raised_by?.user_id || '').trim();
+  if (!creatorId) return false;
+  return userIdentityIds(user).has(creatorId);
+}
+
+function buildConversationItems(detail) {
+  if (!detail) return [];
+  const initial = {
+    id: 'initial',
+    kind: 'left',
+    sender_name: detail.raised_by?.user_name || 'User',
+    sender_role: detail.raised_by?.role || 'User',
+    message: detail.description,
+    attachment: detail.attachment,
+    at: detail.raised_at || detail.created_at,
+  };
+  const rest = [];
+  (detail.replies || []).forEach((reply) => {
+    rest.push({
+      id: reply.reply_id,
+      kind: 'right',
+      sender_name: 'Software Team',
+      sender_role: reply.replied_by_role || 'Master Admin',
+      message: reply.message,
+      attachment: reply.attachment,
+      at: reply.replied_at,
+    });
+  });
+  (detail.follow_ups || []).forEach((fu) => {
+    rest.push({
+      id: fu.follow_up_id,
+      kind: 'left',
+      sender_name: fu.sender_name,
+      sender_role: fu.sender_role,
+      message: fu.message,
+      attachment: fu.attachment,
+      at: fu.created_at,
+    });
+  });
+  (detail.events || []).forEach((ev) => {
+    rest.push({
+      id: ev.event_id,
+      kind: 'center',
+      message: ev.message,
+      at: ev.created_at,
+    });
+  });
+  rest.sort((a, b) => parseTime(a.at) - parseTime(b.at));
+  return [initial, ...rest];
+}
+
+function ChatBubble({ item }) {
+  if (item.kind === 'center') {
+    return (
+      <div className="flex justify-center py-1">
+        <p className="max-w-[95%] rounded-md border border-slate-200 bg-slate-50 px-3 py-1.5 text-center text-xs text-slate-600">
+          {item.message}
+          <span className="mt-0.5 block text-[11px] text-slate-400">{formatIstDateTime(item.at)}</span>
+        </p>
+      </div>
+    );
+  }
+  const isRight = item.kind === 'right';
+  return (
+    <div className={`flex ${isRight ? 'justify-end' : 'justify-start'}`}>
+      <div
+        className={`max-w-[75%] min-w-0 rounded-xl border px-3 py-2 shadow-sm ${
+          isRight
+            ? 'border-emerald-200 bg-emerald-50/80'
+            : 'border-slate-200 bg-white'
+        }`}
+      >
+        <p className="text-xs font-semibold text-slate-700">
+          {item.sender_name}
+          <span className="font-normal text-slate-500">
+            {' '}
+            •
+            {' '}
+            {item.sender_role}
+          </span>
+        </p>
+        <p className="mt-1 whitespace-pre-wrap text-sm text-slate-800">{item.message}</p>
+        {item.attachment?.file_url && (
+          <div className="mt-2">
+            <AttachmentLink attachment={item.attachment} />
+          </div>
+        )}
+        <p className="mt-2 text-[11px] text-slate-500">{formatIstDateTime(item.at)}</p>
+      </div>
+    </div>
   );
 }
 
@@ -122,6 +246,27 @@ export function QueryDesk() {
   const [replyMessage, setReplyMessage] = useState('');
   const [replyFile, setReplyFile] = useState(null);
   const [replySending, setReplySending] = useState(false);
+  const [followUpMessage, setFollowUpMessage] = useState('');
+  const [followUpFile, setFollowUpFile] = useState(null);
+  const [followUpSending, setFollowUpSending] = useState(false);
+  const [showFollowUpComposer, setShowFollowUpComposer] = useState(false);
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
+  const [clearSubmitting, setClearSubmitting] = useState(false);
+  const [statusChanging, setStatusChanging] = useState(false);
+  const conversationEndRef = useRef(null);
+  const conversationScrollRef = useRef(null);
+
+  const isCreator = useMemo(
+    () => (detail ? isQueryCreator(user, detail) : false),
+    [user, detail],
+  );
+
+  const conversationItems = useMemo(
+    () => (detail ? buildConversationItems(detail) : []),
+    [detail],
+  );
+
+  const masterCanReply = isMaster && detail && ['Open', 'Reopened'].includes(detail.status);
 
   const scopeParams = useMemo(
     () => ({
@@ -161,6 +306,14 @@ export function QueryDesk() {
   useEffect(() => {
     setPage(1);
   }, [search, filterType, filterStatus, scopeBrand, scopeDealer, scopeBranch]);
+
+  useEffect(() => {
+    if (!detailOpen || !conversationEndRef.current) return undefined;
+    const timer = setTimeout(() => {
+      conversationEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }, 80);
+    return () => clearTimeout(timer);
+  }, [detailOpen, detail?.id, detail?.updated_at, conversationItems.length, showFollowUpComposer]);
 
   useEffect(() => {
     const subject = form.subject.trim();
@@ -241,6 +394,10 @@ export function QueryDesk() {
     setDetailLoading(true);
     setReplyMessage('');
     setReplyFile(null);
+    setFollowUpMessage('');
+    setFollowUpFile(null);
+    setShowFollowUpComposer(false);
+    setClearConfirmOpen(false);
     try {
       const res = await axios.get(`${API}/queries/${queryId}`);
       setDetail(res.data);
@@ -253,7 +410,7 @@ export function QueryDesk() {
   };
 
   const sendReply = async () => {
-    if (!detail?.id) return;
+    if (!detail?.id || replySending) return;
     if (!replyMessage.trim()) {
       toast.error('Reply message is required');
       return;
@@ -279,8 +436,54 @@ export function QueryDesk() {
     }
   };
 
+  const sendFollowUp = async () => {
+    if (!detail?.id || followUpSending) return;
+    if (!followUpMessage.trim()) {
+      toast.error('Description is required');
+      return;
+    }
+    if (!validateFile(followUpFile)) return;
+    setFollowUpSending(true);
+    try {
+      const fd = new FormData();
+      fd.append('message', followUpMessage.trim());
+      if (followUpFile) fd.append('attachment', followUpFile);
+      const res = await axios.post(`${API}/queries/${detail.id}/follow-up`, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      setDetail(res.data);
+      setFollowUpMessage('');
+      setFollowUpFile(null);
+      setShowFollowUpComposer(false);
+      toast.success('Follow-up sent');
+      await loadQueries();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Unable to send follow-up');
+    } finally {
+      setFollowUpSending(false);
+    }
+  };
+
+  const confirmQueryCleared = async () => {
+    if (!detail?.id || clearSubmitting) return;
+    setClearSubmitting(true);
+    try {
+      const res = await axios.post(`${API}/queries/${detail.id}/clear`);
+      setDetail(res.data);
+      setClearConfirmOpen(false);
+      setShowFollowUpComposer(false);
+      toast.success('Query closed');
+      await loadQueries();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Unable to close query');
+    } finally {
+      setClearSubmitting(false);
+    }
+  };
+
   const changeStatus = async (status) => {
-    if (!detail?.id) return;
+    if (!detail?.id || statusChanging) return;
+    setStatusChanging(true);
     try {
       const res = await axios.patch(`${API}/queries/${detail.id}/status`, { status });
       setDetail(res.data);
@@ -288,6 +491,8 @@ export function QueryDesk() {
       await loadQueries();
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Unable to update status');
+    } finally {
+      setStatusChanging(false);
     }
   };
 
@@ -416,6 +621,7 @@ export function QueryDesk() {
               <option value="">All Statuses</option>
               <option value="Open">Open</option>
               <option value="Answered">Answered</option>
+              <option value="Reopened">Reopened</option>
               <option value="Closed">Closed</option>
             </select>
             <Button size="sm" variant="outline" onClick={() => setSearch(searchInput.trim())}>
@@ -483,90 +689,225 @@ export function QueryDesk() {
         open={detailOpen}
         onClose={() => setDetailOpen(false)}
         title="Query Details"
-        maxWidth="max-w-2xl"
+        maxWidth="max-w-3xl"
       >
           {detailLoading && <p className="text-slate-500">Loading…</p>}
           {!detailLoading && detail && (
             <div className="space-y-4 pb-2">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-lg font-bold text-slate-900">{detail.query_no}</span>
-                <StatusBadge status={detail.status} />
-              </div>
-              <div className="grid gap-2 text-sm sm:grid-cols-2">
-                <div><span className="text-slate-500">Type</span><div className="font-medium">{detail.query_type}</div></div>
-                <div><span className="text-slate-500">Raised On</span><div className="font-medium">{formatIstDateTime(detail.raised_at || detail.created_at)}</div></div>
-                <div className="sm:col-span-2"><span className="text-slate-500">Subject</span><div className="font-medium">{detail.subject}</div></div>
-                <div className="sm:col-span-2"><span className="text-slate-500">Description</span><div className="font-medium whitespace-pre-wrap">{detail.description}</div></div>
-                <div><span className="text-slate-500">Raised By</span><div className="font-medium">{detail.raised_by?.user_name}</div></div>
-                <div><span className="text-slate-500">Role</span><div className="font-medium">{detail.raised_by?.role}</div></div>
-                <div><span className="text-slate-500">Brand</span><div className="font-medium">{detail.scope?.brand_name || '—'}</div></div>
-                <div><span className="text-slate-500">Dealer</span><div className="font-medium">{detail.scope?.dealer_name || '—'}</div></div>
-                <div><span className="text-slate-500">Branch</span><div className="font-medium">{detail.scope?.branch_name || '—'}</div></div>
-                <div><span className="text-slate-500">Attachment</span><div><AttachmentLink attachment={detail.attachment} /></div></div>
+                <StatusBadge status={detail.status} detailLabel={isCreator} />
               </div>
 
-              {(detail.replies || []).length > 0 && (
-                <div className="space-y-3">
-                  <h3 className="font-semibold text-slate-800">Software Team Replies</h3>
-                  {detail.replies.map((reply) => (
-                    <div key={reply.reply_id} className="rounded-lg border bg-emerald-50/50 p-3 text-sm">
-                      <div className="flex flex-wrap justify-between gap-2 text-xs text-slate-600">
-                        <span>{reply.replied_by_name} ({reply.replied_by_role})</span>
-                        <span>{formatIstDateTime(reply.replied_at)}</span>
-                      </div>
-                      <p className="mt-2 whitespace-pre-wrap text-slate-800">{reply.message}</p>
-                      {reply.attachment && (
-                        <div className="mt-2"><AttachmentLink attachment={reply.attachment} /></div>
-                      )}
-                    </div>
-                  ))}
+              <div className="grid gap-3 text-sm sm:grid-cols-3">
+                <div>
+                  <span className="text-xs text-slate-500">Type</span>
+                  <div className="font-medium">{detail.query_type}</div>
                 </div>
-              )}
+                <div>
+                  <span className="text-xs text-slate-500">Raised Date</span>
+                  <div className="font-medium">{formatIstDateTime(detail.raised_at || detail.created_at)}</div>
+                </div>
+                <div>
+                  <span className="text-xs text-slate-500">Raised By</span>
+                  <div className="font-medium">{detail.raised_by?.user_name || '—'}</div>
+                </div>
+                <div>
+                  <span className="text-xs text-slate-500">Role</span>
+                  <div className="font-medium">{detail.raised_by?.role || '—'}</div>
+                </div>
+                <div>
+                  <span className="text-xs text-slate-500">Brand</span>
+                  <div className="font-medium">{detail.scope?.brand_name || '—'}</div>
+                </div>
+                <div>
+                  <span className="text-xs text-slate-500">Dealer</span>
+                  <div className="font-medium">{detail.scope?.dealer_name || '—'}</div>
+                </div>
+                <div className="sm:col-span-3">
+                  <span className="text-xs text-slate-500">Branch</span>
+                  <div className="font-medium">{detail.scope?.branch_name || '—'}</div>
+                </div>
+              </div>
 
-              {detail.status === 'Closed' && detail.closed_at && (
+              <div>
+                <p className="text-xs font-medium text-slate-500">Subject</p>
+                <p className="mt-1 text-sm font-semibold text-slate-900">{detail.subject}</p>
+              </div>
+
+              <div>
+                <p className="mb-2 text-sm font-semibold text-slate-800">Conversation</p>
+                <div
+                  ref={conversationScrollRef}
+                  className="max-h-[min(420px,50vh)] space-y-3 overflow-y-auto rounded-lg border border-slate-200 bg-slate-50/50 p-3"
+                >
+                  {conversationItems.map((item) => (
+                    <ChatBubble key={item.id} item={item} />
+                  ))}
+                  <div ref={conversationEndRef} />
+                </div>
+              </div>
+
+              {detail.status === 'Closed' && detail.closed_at && !detail.events?.length && (
                 <p className="text-sm text-slate-600">
                   Closed on {formatIstDateTime(detail.closed_at)}
                   {detail.closed_by?.user_name ? ` by ${detail.closed_by.user_name}` : ''}
                 </p>
               )}
 
-              {isMaster ? (
-                <div className="rounded-lg border p-4 space-y-3">
-                  <h3 className="font-semibold text-slate-800">Reply</h3>
-                  <Textarea
-                    value={replyMessage}
-                    onChange={(e) => setReplyMessage(e.target.value)}
-                    placeholder="Type your reply to the user"
-                    disabled={detail.status === 'Closed'}
-                  />
-                  <input
-                    type="file"
-                    accept={ALLOWED_EXT.join(',')}
-                    className="block w-full text-sm"
-                    disabled={detail.status === 'Closed'}
-                    onChange={(e) => setReplyFile(e.target.files?.[0] || null)}
-                  />
-                  <div className="flex flex-wrap gap-2">
-                    <Button onClick={sendReply} disabled={replySending || detail.status === 'Closed'}>
-                      <Send className="mr-2 h-4 w-4" />
-                      Send Reply
-                    </Button>
-                    {detail.status !== 'Closed' && (
-                      <Button variant="outline" onClick={() => changeStatus('Closed')}>Close Query</Button>
-                    )}
-                    {detail.status === 'Closed' && (
-                      <Button variant="outline" onClick={() => changeStatus('Open')}>Reopen Query</Button>
-                    )}
-                  </div>
+              {!isMaster && isCreator && detail.status !== 'Closed' && (
+                <div className="rounded-lg border border-slate-200 bg-white p-4 space-y-3">
+                  {detail.status === 'Answered' && !showFollowUpComposer && (
+                    <>
+                      <p className="text-sm font-medium text-slate-800">Has your query been resolved?</p>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          type="button"
+                          className="nmts-btn-primary"
+                          disabled={clearSubmitting}
+                          onClick={() => setClearConfirmOpen(true)}
+                        >
+                          Query Cleared
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          disabled={followUpSending}
+                          onClick={() => setShowFollowUpComposer(true)}
+                        >
+                          Not Cleared
+                        </Button>
+                      </div>
+                    </>
+                  )}
+                  {(detail.status === 'Open' || detail.status === 'Reopened') && (
+                    <p className="text-sm text-slate-600">Waiting for Software Team Reply</p>
+                  )}
+                  {detail.status === 'Answered' && showFollowUpComposer && (
+                    <div className="space-y-3">
+                      <div>
+                        <label className="text-xs font-medium text-slate-700">Description / Remark *</label>
+                        <Textarea
+                          className="mt-1 min-h-[88px] text-sm"
+                          value={followUpMessage}
+                          onChange={(e) => setFollowUpMessage(e.target.value)}
+                          placeholder="Describe the remaining issue..."
+                          disabled={followUpSending}
+                        />
+                      </div>
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                        <div className="flex-1">
+                          <input
+                            type="file"
+                            accept={ALLOWED_EXT.join(',')}
+                            className="block w-full text-xs"
+                            disabled={followUpSending}
+                            onChange={(e) => setFollowUpFile(e.target.files?.[0] || null)}
+                          />
+                          {followUpFile && (
+                            <p className="mt-1 truncate text-xs text-slate-600">{followUpFile.name}</p>
+                          )}
+                        </div>
+                        <Button
+                          type="button"
+                          onClick={sendFollowUp}
+                          disabled={followUpSending || !followUpMessage.trim()}
+                          className="nmts-btn-primary shrink-0"
+                        >
+                          <Send className="mr-2 h-4 w-4" />
+                          {followUpSending ? 'Sending…' : 'Send Follow-up'}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
                 </div>
-              ) : (
+              )}
+
+              {!isMaster && !isCreator && detail.status !== 'Closed' && (
                 <p className="rounded-lg border bg-slate-50 p-3 text-sm text-slate-600">
-                  Only the Software Team can reply to this query.
+                  {detail.status === 'Answered'
+                    ? 'Waiting for the query creator to confirm resolution.'
+                    : 'Waiting for Software Team Reply'}
                 </p>
+              )}
+
+              {isMaster && (
+                <div className="space-y-3">
+                  {masterCanReply ? (
+                    <div className="rounded-lg border p-4 space-y-3">
+                      <h3 className="text-sm font-semibold text-slate-800">Software Team Reply</h3>
+                      <Textarea
+                        value={replyMessage}
+                        onChange={(e) => setReplyMessage(e.target.value)}
+                        placeholder="Type your reply"
+                        disabled={replySending}
+                      />
+                      <input
+                        type="file"
+                        accept={ALLOWED_EXT.join(',')}
+                        className="block w-full text-sm"
+                        disabled={replySending}
+                        onChange={(e) => setReplyFile(e.target.files?.[0] || null)}
+                      />
+                      <div className="flex flex-wrap gap-2">
+                        <Button onClick={sendReply} disabled={replySending || !replyMessage.trim()}>
+                          <Send className="mr-2 h-4 w-4" />
+                          {replySending ? 'Sending…' : 'Send Reply'}
+                        </Button>
+                        <Button variant="outline" disabled={statusChanging} onClick={() => changeStatus('Closed')}>
+                          Close Query
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-slate-50 p-3">
+                      <p className="text-sm text-slate-600">
+                        {detail.status === 'Closed'
+                          ? 'This query is closed.'
+                          : detail.status === 'Answered'
+                            ? 'Waiting for the query creator to confirm or send a follow-up.'
+                            : 'No reply required at this time.'}
+                      </p>
+                      {detail.status !== 'Closed' && (
+                        <Button variant="outline" size="sm" disabled={statusChanging} onClick={() => changeStatus('Closed')}>
+                          Close Query
+                        </Button>
+                      )}
+                      {detail.status === 'Closed' && (
+                        <Button variant="outline" size="sm" disabled={statusChanging} onClick={() => changeStatus('Open')}>
+                          Reopen Query
+                        </Button>
+                      )}
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           )}
       </NmtsModal>
+
+      <AlertDialog open={clearConfirmOpen} onOpenChange={setClearConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Confirm resolution</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure this query has been resolved?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={clearSubmitting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={clearSubmitting}
+              onClick={(e) => {
+                e.preventDefault();
+                confirmQueryCleared();
+              }}
+            >
+              {clearSubmitting ? 'Closing…' : 'Yes, Close Query'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

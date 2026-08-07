@@ -24,7 +24,7 @@ _AUTH_DEP = None
 db = None
 
 QUERY_TYPES = {"System", "General", "Guidance"}
-QUERY_STATUSES = {"Open", "Answered", "Closed"}
+QUERY_STATUSES = {"Open", "Answered", "Reopened", "Closed"}
 ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf", ".xls", ".xlsx"}
 MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
 IST = ZoneInfo("Asia/Kolkata")
@@ -92,6 +92,8 @@ def _serialize_query(doc: dict) -> dict:
     out.pop("attachment_storage_path", None)
     for reply in out.get("replies") or []:
         reply.pop("attachment_storage_path", None)
+    for item in out.get("follow_ups") or []:
+        item.pop("attachment_storage_path", None)
     return out
 
 
@@ -236,6 +238,32 @@ def _require_master(current_user):
         raise HTTPException(status_code=403, detail="Only the Software Team can perform this action")
 
 
+def _user_identity_ids(current_user) -> set:
+    ids = set()
+    for value in (getattr(current_user, "id", None), getattr(current_user, "user_id", None)):
+        text = str(value or "").strip()
+        if text:
+            ids.add(text)
+    return ids
+
+
+def _is_query_creator(current_user, doc: dict) -> bool:
+    raised = (doc or {}).get("raised_by") or {}
+    creator_id = str(raised.get("user_id") or "").strip()
+    if not creator_id:
+        return False
+    return creator_id in _user_identity_ids(current_user)
+
+
+def _system_event(message: str, now: datetime) -> dict:
+    return {
+        "event_id": str(uuid.uuid4()),
+        "type": "SYSTEM_STATUS",
+        "message": _sanitize_text(message, 500),
+        "created_at": now,
+    }
+
+
 def _validate_status_transition(current_status: str, new_status: str):
     if new_status not in QUERY_STATUSES:
         raise HTTPException(status_code=400, detail="Invalid status")
@@ -243,7 +271,8 @@ def _validate_status_transition(current_status: str, new_status: str):
         return
     allowed = {
         "Open": {"Answered", "Closed"},
-        "Answered": {"Open", "Closed"},
+        "Answered": {"Reopened", "Closed"},
+        "Reopened": {"Answered", "Closed"},
         "Closed": {"Open"},
     }
     if new_status not in allowed.get(current_status, set()):
@@ -298,6 +327,8 @@ async def create_query(
             "scope": scope,
             "status": "Open",
             "replies": [],
+            "follow_ups": [],
+            "events": [],
             "created_at": now,
             "updated_at": now,
             "raised_at": now,
@@ -423,8 +454,11 @@ async def reply_to_query(
     existing = await db.queries.find_one({"id": query_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Query not found")
-    if existing.get("status") == "Closed":
+    status = existing.get("status") or "Open"
+    if status == "Closed":
         raise HTTPException(status_code=400, detail="Cannot reply to a closed query")
+    if status not in {"Open", "Reopened"}:
+        raise HTTPException(status_code=400, detail="Query is not waiting for a Software Team reply")
 
     now = datetime.now(timezone.utc)
     reply_id = str(uuid.uuid4())
@@ -463,7 +497,121 @@ async def reply_to_query(
         "$push": {"replies": reply_doc},
         "$set": {"status": "Answered", "updated_at": now},
     }
-    doc = await db.queries.find_one_and_update({"id": query_id}, update, return_document=ReturnDocument.AFTER, projection={"_id": 0})
+    doc = await db.queries.find_one_and_update(
+        {"id": query_id, "status": {"$in": ["Open", "Reopened"]}},
+        update,
+        return_document=ReturnDocument.AFTER,
+        projection={"_id": 0},
+    )
+    if not doc:
+        raise HTTPException(status_code=400, detail="Query is not waiting for a Software Team reply")
+    return _serialize_query(doc)
+
+
+@router.post("/{query_id}/follow-up")
+async def add_follow_up(
+    query_id: str,
+    message: str = Form(...),
+    attachment: Optional[UploadFile] = File(None),
+    current_user=Depends(_current_user),
+):
+    clean_message = _sanitize_text(message, 5000)
+    if not clean_message:
+        raise HTTPException(status_code=400, detail="Description is required")
+
+    existing = await db.queries.find_one({"id": query_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Query not found")
+    if existing.get("status") == "Closed":
+        raise HTTPException(status_code=400, detail="Cannot follow up on a closed query")
+    if existing.get("status") != "Answered":
+        raise HTTPException(status_code=400, detail="Follow-up is only allowed after a Software Team reply")
+    if not _is_query_creator(current_user, existing):
+        raise HTTPException(status_code=403, detail="Only the query creator can send a follow-up")
+
+    now = datetime.now(timezone.utc)
+    follow_id = str(uuid.uuid4())
+    follow_doc = {
+        "follow_up_id": follow_id,
+        "message": clean_message,
+        "attachment": None,
+        "sender_user_id": current_user.user_id or current_user.id,
+        "sender_name": current_user.username,
+        "sender_role": _role_label(current_user.role),
+        "created_at": now,
+    }
+    if attachment and attachment.filename:
+        saved = await _save_attachment(attachment, "followup")
+        await db.query_attachments.insert_one(
+            {
+                "file_id": saved["file_id"],
+                "query_id": query_id,
+                "reply_id": follow_id,
+                "file_name": saved["file_name"],
+                "content_type": saved["content_type"],
+                "file_size": saved["file_size"],
+                "storage_path": saved["attachment_storage_path"],
+                "created_at": now,
+            }
+        )
+        follow_doc["attachment"] = {
+            "file_id": saved["file_id"],
+            "file_name": saved["file_name"],
+            "file_url": saved["file_url"],
+            "content_type": saved["content_type"],
+            "file_size": saved["file_size"],
+        }
+
+    doc = await db.queries.find_one_and_update(
+        {"id": query_id, "status": "Answered"},
+        {
+            "$push": {"follow_ups": follow_doc},
+            "$set": {"status": "Reopened", "updated_at": now},
+        },
+        return_document=ReturnDocument.AFTER,
+        projection={"_id": 0},
+    )
+    if not doc:
+        raise HTTPException(status_code=400, detail="Unable to send follow-up for this query state")
+    return _serialize_query(doc)
+
+
+@router.post("/{query_id}/clear")
+async def mark_query_cleared(query_id: str, current_user=Depends(_current_user)):
+    existing = await db.queries.find_one({"id": query_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Query not found")
+    if existing.get("status") == "Closed":
+        raise HTTPException(status_code=400, detail="Query is already closed")
+    if existing.get("status") != "Answered":
+        raise HTTPException(status_code=400, detail="Query is not waiting for your confirmation")
+    if not _is_query_creator(current_user, existing):
+        raise HTTPException(status_code=403, detail="Only the query creator can mark this query as cleared")
+
+    now = datetime.now(timezone.utc)
+    creator_name = _sanitize_text(current_user.username, 200)
+    event = _system_event(f"Query marked as cleared by {creator_name}", now)
+    doc = await db.queries.find_one_and_update(
+        {"id": query_id, "status": "Answered"},
+        {
+            "$push": {"events": event},
+            "$set": {
+                "status": "Closed",
+                "updated_at": now,
+                "closed_at": now,
+                "closed_by": {
+                    "user_id": current_user.user_id or current_user.id,
+                    "user_name": creator_name,
+                    "role": _role_label(current_user.role),
+                },
+                "close_type": "creator_cleared",
+            },
+        },
+        return_document=ReturnDocument.AFTER,
+        projection={"_id": 0},
+    )
+    if not doc:
+        raise HTTPException(status_code=400, detail="Unable to close query in its current state")
     return _serialize_query(doc)
 
 
@@ -483,6 +631,7 @@ async def update_query_status(query_id: str, payload: Dict[str, Any], current_us
 
     now = datetime.now(timezone.utc)
     update_fields = {"status": new_status, "updated_at": now}
+    update_ops: dict = {"$set": update_fields}
     if new_status == "Closed":
         update_fields["closed_at"] = now
         update_fields["closed_by"] = {
@@ -490,13 +639,16 @@ async def update_query_status(query_id: str, payload: Dict[str, Any], current_us
             "user_name": current_user.username,
             "role": "Master Admin",
         }
+        update_fields["close_type"] = "master_manual"
+        update_ops["$push"] = {"events": _system_event("Query closed manually by Master Admin", now)}
     elif new_status == "Open":
         update_fields["closed_at"] = None
         update_fields["closed_by"] = None
+        update_fields["close_type"] = None
 
     doc = await db.queries.find_one_and_update(
         {"id": query_id},
-        {"$set": update_fields},
+        update_ops,
         return_document=ReturnDocument.AFTER,
         projection={"_id": 0},
     )
