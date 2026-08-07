@@ -590,7 +590,6 @@ const resetPassword = async (item) => {
 
   return (
     <div className="space-y-6 p-0 md:p-0" style={{ color: COLORS.text }}>
-      <Header />
 
       <div className="grid grid-cols-2 xl:grid-cols-7 gap-4 mb-5">
         <Stat title="Total Users" value={stats.totalUsers} icon={Users} />
@@ -659,34 +658,44 @@ const resetPassword = async (item) => {
             </div>
           </div>
 
-          <Table headers={["User ID", "Name", "Mobile", "Email", "Role", "State", "Brand", "Dealer", "Branch", "Status", "Action"]}>
+          <div className="nmts-users-table-wrap overflow-x-auto rounded-xl bg-white border">
+            <table className="w-full text-sm nmts-users-table">
+              <thead>
+                <tr style={{ backgroundColor: COLORS.primary, color: "#fff" }}>
+                  {["User ID", "Name", "Mobile", "Email", "Role", "State", "Brand", "Dealer", "Branch", "Status", "Action"].map((h) => (
+                    <th key={h} className="p-3 text-left whitespace-nowrap">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
             {filteredUsers.map((u, i) => {
               const dealer = u.dealer || u.group || "-";
               const branch = u.branch || u.location || "-";
               return (
                 <tr key={i} className="border-b">
-                  <td className="p-3">{u.userId || u.user_id || "-"}</td>
-                  <td className="p-3">{u.name || u.username || "-"}</td>
-                  <td className="p-3">{u.mobile || u.phone || "-"}</td>
-                  <td className="p-3">{u.email || "-"}</td>
-                  <td className="p-3 capitalize">{u.role || "-"}</td>
-                  <td className="p-3">{u.state || "-"}</td>
+                  <td className="p-3 whitespace-nowrap">{u.userId || u.user_id || "-"}</td>
+                  <td className="p-3 min-w-[120px]">{u.name || u.username || "-"}</td>
+                  <td className="p-3 whitespace-nowrap">{u.mobile || u.phone || "-"}</td>
+                  <td className="p-3 min-w-[160px]">{u.email || "-"}</td>
+                  <td className="p-3 capitalize whitespace-nowrap">{u.role || "-"}</td>
+                  <td className="p-3 whitespace-nowrap">{u.state || "-"}</td>
                   <td className="p-3">{u.brand || "-"}</td>
-                  <td className="p-3">{dealer}</td>
-                  <td className="p-3">{branch}</td>
-                  <td className="p-3">
+                  <td className="p-3 min-w-[100px]">{dealer}</td>
+                  <td className="p-3 min-w-[100px]">{branch}</td>
+                  <td className="p-3 status-cell">
                     <span
-                      className="px-3 py-1 rounded-full text-xs font-bold"
+                      className="inline-flex px-2.5 py-1 rounded-full text-xs font-bold whitespace-nowrap"
                       style={{
                         backgroundColor: (u.status || "active") === "active" ? "#DCFCE7" : "#FEE2E2",
                         color: (u.status || "active") === "active" ? "#166534" : "#991B1B",
                         border: `1px solid ${(u.status || "active") === "active" ? "#22C55E" : "#EF4444"}`,
                       }}
                     >
-                      {(u.status || "active") === "active" ? "🟢 Active" : "🔴 Inactive"}
+                      {(u.status || "active") === "active" ? "Active" : "Inactive"}
                     </span>
                   </td>
-                  <td className="p-3 flex gap-3">
+                  <td className="p-3 whitespace-nowrap">
+                    <div className="flex gap-3 items-center">
                     <Eye size={16} title="View" />
 
                     {(isMaster || isAdmin) && (
@@ -718,11 +727,14 @@ const resetPassword = async (item) => {
                         onClick={() => deleteUser(u)}
                       />
                     )}
+                    </div>
                   </td>
                 </tr>
               );
             })}
-          </Table>
+              </tbody>
+            </table>
+          </div>
         </Panel>
       )}
 

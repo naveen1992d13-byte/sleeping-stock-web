@@ -398,19 +398,7 @@ export function Analytics() {
   const movSum = stockMovement?.summary || {};
 
   return (
-    <div className="space-y-8" data-testid="analytics-page">
-      <div className="nmts-module-header">
-        <div className="flex items-center gap-3">
-          <Globe size={32} className="nmts-module-header-icon" />
-          <div>
-            <h1>Analytics</h1>
-            <p>
-              Consolidated insights for {scopeBrand} / {scopeDealer} / {scopeBranch}
-            </p>
-          </div>
-        </div>
-      </div>
-
+    <div className="space-y-6" data-testid="analytics-page">
       <div className="rounded-2xl border bg-white p-5 shadow-sm">
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
           <label className="text-sm font-medium text-gray-700">

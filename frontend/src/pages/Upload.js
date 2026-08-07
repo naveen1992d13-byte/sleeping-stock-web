@@ -218,14 +218,7 @@ export function UploadCenter() {
   const latest = activeUploads[0] || null;
   const summary = latest ? { totalItems: latest.item_count || latest.rows_imported || 0, totalQty: latest.total_available_qty || 0, totalValue: latest.total_value || 0 } : { totalItems: 0, totalQty: 0, totalValue: 0 };
 
-  return <div className="space-y-4" data-testid="upload-center-page">
-    <div className="nmts-module-header">
-      <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="flex items-center gap-3"><Upload className="h-8 w-8 nmts-module-header-icon"/><div><h1>Upload Center</h1><p>Upload, validate, publish and store raw Excel files.</p></div></div>
-        <Button onClick={fetchUploads} variant="outline">Refresh</Button>
-      </div>
-    </div>
-
+  return <div className="space-y-3" data-testid="upload-center-page">
     {(isMaster || isAdmin) && masterSummary && (
       <div className="rounded-2xl bg-white p-4 shadow-sm" style={{border: `1px solid ${COLORS.border}`}}>
         <h2 className="text-sm font-bold mb-3" style={{color: COLORS.muted}}>{isMaster ? 'Master Admin Summary' : 'Admin Summary'} — Today</h2>
@@ -255,17 +248,19 @@ export function UploadCenter() {
       </div>
     )}
 
-    {((isMaster || isAdmin) ? masterSummary : todaySummary) && (() => {
+    {((isMaster || isAdmin) ? masterSummary : todaySummary) && (
+    <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+    {(() => {
       const ps = (isMaster || isAdmin) ? masterSummary : todaySummary;
       const uploadedItems = (isMaster || isAdmin) ? ps.uploadedItems : ps.todayUploadedItems;
       const uploadedQty = (isMaster || isAdmin) ? ps.uploadedQty : ps.todayUploadedAvailableQty;
       const uploadedValue = (isMaster || isAdmin) ? ps.uploadedValue : ps.todayUploadedValue;
       return (
-        <div className="rounded-2xl bg-white p-4 shadow-sm" style={{border: `1px solid ${COLORS.border}`}}>
-          <h2 className="text-sm font-bold mb-3" style={{color: COLORS.muted}}>Publish Summary — Today</h2>
+        <div className="rounded-xl bg-white p-3 shadow-sm" style={{border: `1px solid ${COLORS.border}`}}>
+          <h2 className="text-sm font-bold mb-2" style={{color: COLORS.muted}}>Publish Summary — Today</h2>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
-              <thead><tr style={{backgroundColor: COLORS.primary, color:'#fff'}}><th className="p-3 text-left">Metric</th><th className="p-3 text-right">Uploaded</th><th className="p-3 text-right">Published</th><th className="p-3 text-right">Pending</th></tr></thead>
+              <thead><tr style={{backgroundColor: COLORS.primary, color:'#fff'}}><th className="p-2 text-left">Metric</th><th className="p-2 text-right">Uploaded</th><th className="p-2 text-right">Published</th><th className="p-2 text-right">Pending</th></tr></thead>
               <tbody>
                 <PublishSummaryRow label="Items" uploaded={uploadedItems} published={ps.publishedItems} pending={ps.pendingItems} />
                 <PublishSummaryRow label="Quantity" uploaded={uploadedQty} published={ps.publishedQty} pending={ps.pendingQty} />
@@ -277,38 +272,34 @@ export function UploadCenter() {
       );
     })()}
 
-    <div className="rounded-2xl bg-white p-4 shadow-sm" style={{border: `1px solid ${COLORS.border}`}}>
-      <div className="flex flex-wrap gap-2 border-b pb-3 mb-3">
-        <button
-          type="button"
-          className="inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold text-white"
-          style={{ backgroundColor: COLORS.dark }}
-        >
-          <Package className="h-4 w-4" />
-        Product Hub
-        </button>
+    <div className="rounded-xl bg-white p-3 shadow-sm" style={{border: `1px solid ${COLORS.border}`}}>
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <span className="text-sm font-bold" style={{color: COLORS.text}}>Product Hub Upload</span>
+        <Button onClick={fetchUploads} variant="outline" size="sm">Refresh</Button>
       </div>
-      <div className="grid grid-cols-1 lg:grid-cols-[1fr_260px] gap-3">
-        <div className="border-2 border-dashed rounded-2xl min-h-[130px] flex flex-col items-center justify-center text-center cursor-pointer" style={{backgroundColor: COLORS.soft, borderColor: COLORS.primary}} onClick={() => (activeType==='product'?productFileRef.current?.click():orderFileRef.current?.click())} onDrop={(e)=>handleFilePick(activeType,e)} onDragOver={(e)=>e.preventDefault()}>
-          <TypeIcon className="h-8 w-8 mb-2" style={{color: COLORS.dark}} />
-          <h2 className="text-base font-bold" style={{color: COLORS.text}}>{activeFile ? activeFile.name : `Drag & Drop ${activeTitle} Excel`}</h2>
-          <p className="text-xs" style={{color: COLORS.muted}}>or click to browse (.xlsx / .xls)</p>
+      <div className="grid grid-cols-1 md:grid-cols-[1fr_220px] gap-2">
+        <div className="border-2 border-dashed rounded-xl min-h-[100px] flex flex-col items-center justify-center text-center cursor-pointer py-4" style={{backgroundColor: COLORS.soft, borderColor: COLORS.primary}} onClick={() => (activeType==='product'?productFileRef.current?.click():orderFileRef.current?.click())} onDrop={(e)=>handleFilePick(activeType,e)} onDragOver={(e)=>e.preventDefault()}>
+          <TypeIcon className="h-7 w-7 mb-1" style={{color: COLORS.dark}} />
+          <p className="text-sm font-bold" style={{color: COLORS.text}}>{activeFile ? activeFile.name : `Drag & Drop ${activeTitle} Excel`}</p>
+          <p className="text-xs" style={{color: COLORS.muted}}>or browse (.xlsx / .xls)</p>
           <input type="file" ref={activeType==='product'?productFileRef:orderFileRef} className="hidden" accept=".xlsx,.xls" onChange={(e)=>handleFilePick(activeType,e)} />
         </div>
-        <div className="rounded-2xl p-3 space-y-2" style={{backgroundColor:'#F9FAFB', border:`1px solid ${COLORS.border}`}}>
-          <Button onClick={downloadSampleTemplate} variant="outline" className="w-full gap-2"><Download className="h-4 w-4"/> Sample Template</Button>
-          <Button onClick={handleUpload} disabled={uploading} className="w-full" style={{backgroundColor: COLORS.primary, color:'#fff'}}>{uploading?'Uploading...':'Upload'}</Button>
-          <Button onClick={clearFile} variant="outline" className="w-full">Clear</Button>
+        <div className="rounded-xl p-2 space-y-2" style={{backgroundColor:'#F9FAFB', border:`1px solid ${COLORS.border}`}}>
+          <Button onClick={downloadSampleTemplate} variant="outline" size="sm" className="w-full gap-2"><Download className="h-4 w-4"/> Template</Button>
+          <Button onClick={handleUpload} disabled={uploading} size="sm" className="w-full" style={{backgroundColor: COLORS.primary, color:'#fff'}}>{uploading?'Uploading...':'Upload'}</Button>
+          <Button onClick={clearFile} variant="outline" size="sm" className="w-full">Clear</Button>
         </div>
       </div>
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
-        <Stat title="Last Uploaded Items" value={Number(summary.totalItems).toLocaleString('en-IN')} />
-        <Stat title="Last Uploaded Quantity" value={Number(summary.totalQty).toLocaleString('en-IN')} color={COLORS.blue} />
-        <Stat title="Last Uploaded Value" value={`₹${Number(summary.totalValue).toLocaleString('en-IN')}`} color={COLORS.dark} />
+      <div className="grid grid-cols-3 gap-2 mt-2 text-center text-xs">
+        <Stat title="Last Items" value={Number(summary.totalItems).toLocaleString('en-IN')} />
+        <Stat title="Last Qty" value={Number(summary.totalQty).toLocaleString('en-IN')} color={COLORS.blue} />
+        <Stat title="Last Value" value={`₹${Number(summary.totalValue).toLocaleString('en-IN')}`} color={COLORS.dark} />
       </div>
     </div>
+    </div>
+    )}
 
-    <div className="rounded-2xl bg-white p-4 shadow-sm" style={{border: `1px solid ${COLORS.border}`}}>
+    <div className="rounded-xl bg-white p-3 shadow-sm" style={{border: `1px solid ${COLORS.border}`}}>
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-3">
         <h2 className="text-lg font-bold" style={{color: COLORS.text}}>{activeTitle} Upload History</h2>
         <div className="flex gap-2 w-full md:w-auto">

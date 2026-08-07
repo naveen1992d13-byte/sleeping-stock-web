@@ -4,12 +4,7 @@ import axios from 'axios';
 import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-} from '@/components/ui/sheet';
+import { NmtsModal } from '@/components/NmtsModal';
 import {
   HelpCircle,
   Search,
@@ -203,6 +198,10 @@ export function QueryDesk() {
     setSimilar([]);
   };
 
+  const clearAttachment = () => {
+    setForm((f) => ({ ...f, file: null }));
+  };
+
   const submitQuery = async (e) => {
     e.preventDefault();
     if (!form.subject.trim() || !form.description.trim()) {
@@ -293,98 +292,95 @@ export function QueryDesk() {
   };
 
   return (
-    <div className="space-y-6" data-testid="query-page">
-      <div className="nmts-module-header">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <HelpCircle className="h-8 w-8 nmts-module-header-icon" />
+    <div className="space-y-4" data-testid="query-page">
+      <form onSubmit={submitQuery} className="rounded-xl border bg-white p-4 shadow-sm space-y-3">
+        <h2 className="text-base font-semibold text-slate-800">Raise New Query</h2>
+        <div className="grid gap-4 lg:grid-cols-[1fr_280px]">
+          <div className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <label className="text-xs font-medium text-slate-700">Query Type *</label>
+                <select
+                  className="mt-1 h-9 w-full rounded-md border px-2 text-sm"
+                  value={form.query_type}
+                  onChange={(e) => setForm((f) => ({ ...f, query_type: e.target.value }))}
+                >
+                  {QUERY_TYPES.map((t) => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-slate-700">Subject *</label>
+                <input
+                  className="mt-1 h-9 w-full rounded-md border px-2 text-sm"
+                  maxLength={200}
+                  value={form.subject}
+                  onChange={(e) => setForm((f) => ({ ...f, subject: e.target.value }))}
+                  placeholder="Brief subject"
+                />
+              </div>
+            </div>
+
+            {similar.length > 0 && (
+              <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm">
+                <p className="font-medium text-gray-800 mb-2">Similar existing queries</p>
+                <ul className="space-y-1">
+                  {similar.map((row) => (
+                    <li key={row.id}>
+                      <button
+                        type="button"
+                        className="text-left text-emerald-800 hover:underline w-full"
+                        onClick={() => openDetail(row.id)}
+                      >
+                        <span className="font-semibold">{row.query_no}</span>
+                        {' — '}
+                        {row.subject}
+                        {' '}
+                        <StatusBadge status={row.status} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
             <div>
-              <h1>Query Desk</h1>
-              <p>Raise queries and browse common answers from the Software Team.</p>
+              <label className="text-xs font-medium text-slate-700">Description *</label>
+              <Textarea
+                className="mt-1 min-h-[88px] text-sm"
+                value={form.description}
+                onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
+                placeholder="Describe the screen, steps, and issue"
+              />
             </div>
           </div>
-        </div>
-      </div>
 
-      <form onSubmit={submitQuery} className="rounded-xl border bg-white p-4 md:p-6 space-y-4">
-        <h2 className="text-lg font-semibold text-slate-800">Raise New Query</h2>
-        <div className="grid gap-4 md:grid-cols-2">
-          <div>
-            <label className="text-sm font-medium text-slate-700">Query Type *</label>
-            <select
-              className="mt-1 h-10 w-full rounded-md border px-3 text-sm"
-              value={form.query_type}
-              onChange={(e) => setForm((f) => ({ ...f, query_type: e.target.value }))}
-            >
-              {QUERY_TYPES.map((t) => (
-                <option key={t} value={t}>{t}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Subject *</label>
+          <div className="space-y-3 rounded-lg border border-gray-200 bg-gray-50 p-3">
+            <label className="text-xs font-medium text-slate-700">Attachment (optional)</label>
             <input
-              className="mt-1 h-10 w-full rounded-md border px-3 text-sm"
-              maxLength={200}
-              value={form.subject}
-              onChange={(e) => setForm((f) => ({ ...f, subject: e.target.value }))}
-              placeholder="Brief subject (max 200 characters)"
+              type="file"
+              accept={ALLOWED_EXT.join(',')}
+              className="block w-full text-xs"
+              onChange={(e) => setForm((f) => ({ ...f, file: e.target.files?.[0] || null }))}
             />
+            <p className="text-xs text-slate-500">PNG, JPG, PDF, XLS, XLSX — max 5 MB</p>
+            {form.file && (
+              <div className="nmts-file-chip">
+                <span className="truncate" title={form.file.name}>{form.file.name}</span>
+                <Button type="button" size="sm" variant="outline" onClick={clearAttachment}>Clear File</Button>
+              </div>
+            )}
+            <div className="flex flex-col gap-2 pt-1">
+              <Button type="button" variant="outline" size="sm" onClick={resetForm} disabled={submitting}>
+                <RotateCcw className="mr-2 h-4 w-4" />
+                Reset
+              </Button>
+              <Button type="submit" size="sm" disabled={submitting} className="nmts-btn-primary">
+                {submitting ? 'Submitting…' : 'Submit Query'}
+              </Button>
+            </div>
           </div>
-        </div>
-
-        {similar.length > 0 && (
-          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm">
-            <p className="font-medium text-amber-900 mb-2">Similar existing queries</p>
-            <ul className="space-y-1">
-              {similar.map((row) => (
-                <li key={row.id}>
-                  <button
-                    type="button"
-                    className="text-left text-emerald-800 hover:underline w-full"
-                    onClick={() => openDetail(row.id)}
-                  >
-                    <span className="font-semibold">{row.query_no}</span>
-                    {' — '}
-                    {row.subject}
-                    {' '}
-                    <StatusBadge status={row.status} />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        <div>
-          <label className="text-sm font-medium text-slate-700">Description *</label>
-          <Textarea
-            className="mt-1 min-h-[120px]"
-            value={form.description}
-            onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
-            placeholder="Describe the screen, steps, and issue in detail"
-          />
-        </div>
-
-        <div>
-          <label className="text-sm font-medium text-slate-700">Attachment (optional)</label>
-          <input
-            type="file"
-            accept={ALLOWED_EXT.join(',')}
-            className="mt-1 block w-full text-sm"
-            onChange={(e) => setForm((f) => ({ ...f, file: e.target.files?.[0] || null }))}
-          />
-          <p className="text-xs text-slate-500 mt-1">PNG, JPG, JPEG, PDF, XLS, XLSX — max 5 MB</p>
-        </div>
-
-        <div className="flex flex-wrap gap-2">
-          <Button type="button" variant="outline" onClick={resetForm} disabled={submitting}>
-            <RotateCcw className="mr-2 h-4 w-4" />
-            Reset
-          </Button>
-          <Button type="submit" disabled={submitting}>
-            {submitting ? 'Submitting…' : 'Submit Query'}
-          </Button>
         </div>
       </form>
 
@@ -483,14 +479,15 @@ export function QueryDesk() {
         </div>
       </div>
 
-      <Sheet open={detailOpen} onOpenChange={setDetailOpen}>
-        <SheetContent side="right" className="w-full max-w-full sm:max-w-xl overflow-y-auto">
-          <SheetHeader>
-            <SheetTitle>Query Details</SheetTitle>
-          </SheetHeader>
-          {detailLoading && <p className="mt-4 text-slate-500">Loading…</p>}
+      <NmtsModal
+        open={detailOpen}
+        onClose={() => setDetailOpen(false)}
+        title="Query Details"
+        maxWidth="max-w-2xl"
+      >
+          {detailLoading && <p className="text-slate-500">Loading…</p>}
           {!detailLoading && detail && (
-            <div className="mt-4 space-y-4 pb-8">
+            <div className="space-y-4 pb-2">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-lg font-bold text-slate-900">{detail.query_no}</span>
                 <StatusBadge status={detail.status} />
@@ -569,8 +566,7 @@ export function QueryDesk() {
               )}
             </div>
           )}
-        </SheetContent>
-      </Sheet>
+      </NmtsModal>
     </div>
   );
 }

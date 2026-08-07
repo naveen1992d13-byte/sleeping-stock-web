@@ -10,14 +10,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-} from '@/components/ui/sheet';
-import { Megaphone, Plus, Eye, Paperclip, RefreshCw } from 'lucide-react';
+import { Plus, Eye, Paperclip, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
+import { NmtsModal } from '@/components/NmtsModal';
 
 const BACKEND_ROOT = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8000';
 
@@ -287,40 +282,26 @@ export function NoticeBoard() {
     : null;
 
   return (
-    <div className="space-y-6" data-testid="notice-board-page">
-      <div className="nmts-module-header">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <Megaphone className="h-8 w-8 nmts-module-header-icon" />
-            <div>
-              <h1>Notice Board</h1>
-              <p>
-                {isMaster ? 'Create and manage brand-wise notices' : `Notices for ${user?.brand || 'your brand'}`}
-              </p>
-            </div>
-          </div>
-          {isMaster && (
-            <Button onClick={() => setCreateOpen(true)} className="nmts-btn-primary">
-              <Plus className="h-4 w-4 mr-2" />
-              Create Notice
-            </Button>
-          )}
-        </div>
-      </div>
-
+    <div className="space-y-4" data-testid="notice-board-page">
       {isMaster && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 flex-1">
           {MASTER_STATUSES.filter(Boolean).map((s) => (
             <button
               key={s}
               type="button"
               onClick={() => { setStatusFilter(s); setPage(1); }}
-              className={`rounded-xl border p-3 text-left ${statusFilter === s ? 'border-emerald-600 bg-emerald-50' : 'bg-white'}`}
+              className={`rounded-lg border p-2 text-left text-sm ${statusFilter === s ? 'border-emerald-600 bg-emerald-50' : 'bg-white'}`}
             >
               <div className="text-xs text-slate-500">{s}</div>
-              <div className="font-semibold">{s === statusFilter ? records.length : '—'}</div>
+              <div className="font-semibold text-gray-900">{s === statusFilter ? records.length : '—'}</div>
             </button>
           ))}
+          </div>
+          <Button onClick={() => setCreateOpen(true)} className="nmts-btn-primary shrink-0">
+            <Plus className="h-4 w-4 mr-2" />
+            Create Notice
+          </Button>
         </div>
       )}
 
@@ -428,7 +409,7 @@ export function NoticeBoard() {
       </div>
 
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
+        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto border-t-[3px] border-t-[#85c808]">
           <DialogHeader><DialogTitle>Create Notice</DialogTitle></DialogHeader>
           <form onSubmit={submitCreate} className="space-y-3">
             <input className="w-full border rounded px-3 py-2 text-sm" placeholder="Subject *" maxLength={300} value={createForm.subject} onChange={(e) => setCreateForm({ ...createForm, subject: e.target.value })} required />
@@ -456,11 +437,9 @@ export function NoticeBoard() {
         </DialogContent>
       </Dialog>
 
-      <Sheet open={detailOpen} onOpenChange={setDetailOpen}>
-        <SheetContent className="w-full max-w-full sm:max-w-xl overflow-y-auto">
-          <SheetHeader><SheetTitle>{detail?.subject || 'Notice'}</SheetTitle></SheetHeader>
+      <NmtsModal open={detailOpen} onClose={() => setDetailOpen(false)} title={detail?.subject || 'Notice'} maxWidth="max-w-xl">
           {detail && (
-            <div className="mt-4 space-y-3 text-sm">
+            <div className="space-y-3 text-sm text-gray-900">
               <Badge status={detail.status} />
               <p><span className="text-slate-500">Type:</span> {detail.notice_type}</p>
               <p><span className="text-slate-500">Priority:</span> {detail.priority}</p>
@@ -472,21 +451,18 @@ export function NoticeBoard() {
                 </Button>
               )}
               {!isMaster && detail.acknowledgement_required && (
-                <div className="rounded-lg border p-3 bg-slate-50">
+                <div className="rounded-lg border border-gray-200 p-3 bg-gray-50">
                   <p className="mb-2">I have read and understood this notice.</p>
-                  <Button onClick={acknowledge} disabled={detail.user_ack_status === 'Acknowledged'}>Acknowledge</Button>
+                  <Button onClick={acknowledge} disabled={detail.user_ack_status === 'Acknowledged'} className="nmts-btn-primary">Acknowledge</Button>
                 </div>
               )}
             </div>
           )}
-        </SheetContent>
-      </Sheet>
+      </NmtsModal>
 
-      <Sheet open={trackingOpen} onOpenChange={setTrackingOpen}>
-        <SheetContent className="w-full max-w-full sm:max-w-2xl overflow-y-auto">
-          <SheetHeader><SheetTitle>Notice tracking</SheetTitle></SheetHeader>
+      <NmtsModal open={trackingOpen} onClose={() => setTrackingOpen(false)} title="Notice tracking" maxWidth="max-w-2xl">
           {tracking?.summary && (
-            <div className="mt-4 grid grid-cols-2 gap-2 text-sm">
+            <div className="grid grid-cols-2 gap-2 text-sm">
               <div className="rounded border p-2">Eligible: <b>{tracking.summary.eligible_users}</b></div>
               <div className="rounded border p-2">Read: <b>{tracking.summary.read_users}</b></div>
               <div className="rounded border p-2">Unread: <b>{tracking.summary.unread_users}</b></div>
@@ -495,7 +471,7 @@ export function NoticeBoard() {
           )}
           <div className="mt-4 overflow-x-auto">
             <table className="min-w-full text-xs">
-              <thead><tr className="bg-slate-100"><th className="p-2 text-left">User</th><th className="p-2">Read</th><th className="p-2">Ack</th></tr></thead>
+              <thead><tr className="bg-gray-100"><th className="p-2 text-left">User</th><th className="p-2">Read</th><th className="p-2">Ack</th></tr></thead>
               <tbody>
                 {(tracking?.records || []).map((r) => (
                   <tr key={r.user_id} className="border-t">
@@ -507,8 +483,7 @@ export function NoticeBoard() {
               </tbody>
             </table>
           </div>
-        </SheetContent>
-      </Sheet>
+      </NmtsModal>
     </div>
   );
 }

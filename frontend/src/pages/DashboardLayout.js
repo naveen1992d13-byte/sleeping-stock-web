@@ -13,7 +13,6 @@ import {
   Building,
   Shield,
   Menu,
-  Search,
 } from 'lucide-react';
 import { APPLICATION_MENU_ITEMS } from '../config/menuConfig';
 import { Button } from '../components/ui/button';
@@ -24,7 +23,7 @@ import {
   DropdownMenuTrigger,
 } from '../components/ui/dropdown-menu';
 import { toast } from 'sonner';
-import { NoticeLoginPopup } from '../components/NoticeLoginPopup';
+import { clearAuthStorage } from '../utils/sessionActivity';
 
 export function DashboardLayout() {
   const { user, logout } = useAuth();
@@ -70,7 +69,9 @@ export function DashboardLayout() {
 
   const navItems = APPLICATION_MENU_ITEMS;
 
-  const filteredNavItems = navItems.filter((item) => item.allRoles || canAccessPermission(user, item.label));
+  const filteredNavItems = navItems.filter(
+    (item) => item.allRoles || canAccessPermission(user, item.permissionLabel || item.label)
+  );
 
   useEffect(() => {
     if (!user) return;
@@ -247,14 +248,14 @@ export function DashboardLayout() {
 
   const handleLogout = () => {
     logout();
-    localStorage.removeItem('openTabs');
-    localStorage.removeItem('activeTab');
+    clearAuthStorage();
     navigate('/login');
     toast.success('Logged out successfully');
   };
 
-  const openTab = (id, label, path) => {
-    if (!canAccessPermission(user, label) && label !== 'My Profile') {
+  const openTab = (id, label, path, permissionLabel) => {
+    const perm = permissionLabel || label;
+    if (!canAccessPermission(user, perm) && label !== 'My Profile') {
       toast.error('You do not have permission to open this screen');
       navigate('/');
       return;
@@ -331,10 +332,8 @@ export function DashboardLayout() {
                 type="button"
                 className={`nmts-sidebar-link${isActive ? ' nmts-sidebar-link--active' : ''}`}
                 onClick={() => {
-                  openTab(item.id, item.label, item.path);
-                  if (typeof window !== 'undefined' && window.innerWidth < 1024) {
-                    setSidebarOpen(false);
-                  }
+                  openTab(item.id, item.label, item.path, item.permissionLabel);
+                  setSidebarOpen(false);
                 }}
               >
                 <Icon aria-hidden="true" />
@@ -350,65 +349,91 @@ export function DashboardLayout() {
       <div className="nmts-main-column">
         <header className="nmts-topbar">
           <div className="nmts-topbar-inner">
-            <button
-              type="button"
-              className="nmts-menu-toggle"
-              data-testid="sidebar-menu-toggle"
-              aria-expanded={sidebarOpen}
-              aria-label={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
-              onClick={toggleSidebar}
-            >
-              <Menu className="h-5 w-5" />
-            </button>
+            <div className="nmts-topbar-left">
+              <button
+                type="button"
+                className="nmts-menu-toggle"
+                data-testid="sidebar-menu-toggle"
+                aria-expanded={sidebarOpen}
+                aria-label={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+                onClick={toggleSidebar}
+              >
+                <Menu className="h-5 w-5" />
+              </button>
 
-            <Button variant="ghost" size="sm" className="p-1 hidden sm:flex" onClick={goHome} title="Home">
-              <Home className="h-5 w-5" style={{ color: '#059669' }} />
-            </Button>
+              <Button variant="ghost" size="sm" className="p-1 hidden sm:flex" onClick={goHome} title="Home">
+                <Home className="h-5 w-5" style={{ color: '#059669' }} />
+              </Button>
 
-            <div className="nmts-tab-strip hidden md:flex">
-              {tabs.map((tab) => (
-                <div
-                  key={tab.id}
-                  className="nmts-tab-chip"
-                  onClick={() => {
-                    setActiveTabId(tab.id);
-                    navigate(tab.path);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
+              <div className="nmts-tab-strip">
+                {tabs.map((tab) => (
+                  <div
+                    key={tab.id}
+                    className={`nmts-tab-chip${activeTabId === tab.id ? ' nmts-tab-chip--active' : ''}`}
+                    onClick={() => {
                       setActiveTabId(tab.id);
                       navigate(tab.path);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        setActiveTabId(tab.id);
+                        navigate(tab.path);
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
+                    title={tab.label}
+                  >
+                    <span className="nmts-tab-chip-label">{tab.label}</span>
+                    <button
+                      type="button"
+                      className="nmts-tab-chip-close"
+                      onClick={(e) => closeTab(tab.id, e)}
+                      aria-label={`Close ${tab.label}`}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="nmts-topbar-right">
+              <div className="nmts-header-scope">
+                <HeaderScopeSelect
+                  label="Brand"
+                  value={scopeBrand}
+                  onChange={(value) => {
+                    setScopeBrand(value);
+                    if (isMaster) {
+                      setScopeDealer('All Dealers');
+                      setScopeBranch('All Branches');
                     }
                   }}
-                  role="button"
-                  tabIndex={0}
-                >
-                  <span>{tab.label}</span>
-                  <button
-                    type="button"
-                    className="nmts-tab-chip-close"
-                    onClick={(e) => closeTab(tab.id, e)}
-                    aria-label={`Close ${tab.label}`}
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                </div>
-              ))}
-            </div>
+                  options={isMaster ? brandOptions : [scopeBrand]}
+                  disabled={!isMaster}
+                />
+                <HeaderScopeSelect
+                  label="Dealer"
+                  value={scopeDealer}
+                  onChange={(value) => {
+                    setScopeDealer(value);
+                    if (isMaster || isAdmin) {
+                      setScopeBranch('All Branches');
+                    }
+                  }}
+                  options={isMaster ? dealerOptions : [scopeDealer]}
+                  disabled={!isMaster}
+                />
+                <HeaderScopeSelect
+                  label="Branch"
+                  value={scopeBranch}
+                  onChange={setScopeBranch}
+                  options={isMaster || isAdmin ? branchOptions : [scopeBranch]}
+                  disabled={!isMaster && !isAdmin}
+                />
+              </div>
 
-            <div className="nmts-topbar-search" role="search">
-              <Search className="h-4 w-4 shrink-0" aria-hidden="true" />
-              <input
-                type="search"
-                placeholder="Search items, orders, requests..."
-                aria-label="Search"
-                readOnly
-                tabIndex={-1}
-                title="Global search coming soon"
-              />
-            </div>
-
-            <div className="nmts-topbar-actions">
               <button
                 type="button"
                 className="nmts-bell-btn"
@@ -470,51 +495,6 @@ export function DashboardLayout() {
           </div>
         </header>
 
-        <div className="nmts-scope-bar">
-          <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 flex-1">
-              <ScopeSelect
-                label="Brand"
-                value={scopeBrand}
-                onChange={(value) => {
-                  setScopeBrand(value);
-                  if (isMaster) {
-                    setScopeDealer('All Dealers');
-                    setScopeBranch('All Branches');
-                  }
-                }}
-                options={isMaster ? brandOptions : [scopeBrand]}
-                disabled={!isMaster}
-              />
-
-              <ScopeSelect
-                label="Dealer"
-                value={scopeDealer}
-                onChange={(value) => {
-                  setScopeDealer(value);
-                  if (isMaster || isAdmin) {
-                    setScopeBranch('All Branches');
-                  }
-                }}
-                options={isMaster ? dealerOptions : [scopeDealer]}
-                disabled={!isMaster}
-              />
-
-              <ScopeSelect
-                label="Branch"
-                value={scopeBranch}
-                onChange={setScopeBranch}
-                options={isMaster || isAdmin ? branchOptions : [scopeBranch]}
-                disabled={!isMaster && !isAdmin}
-              />
-            </div>
-
-            <div className="nmts-scope-user-pill" title="Current logged-in user">
-              👤 {getDisplayUserName()} <span className="text-gray-400">|</span> 🛡 {getDisplayRole()}
-            </div>
-          </div>
-        </div>
-
         <main className="nmts-main-content">
           <NoticeLoginPopup />
           <Outlet context={{ scopeBrand, scopeDealer, scopeBranch }} />
@@ -524,27 +504,24 @@ export function DashboardLayout() {
   );
 }
 
-function ScopeSelect({ label, value, onChange, options, disabled }) {
+function HeaderScopeSelect({ label, value, onChange, options, disabled }) {
   return (
-    <div className="flex items-center gap-3">
-      <span className="nmts-scope-label">{label}:</span>
-
+    <label className="nmts-header-scope-field">
+      <span className="nmts-header-scope-label">{label}</span>
       <select
         value={value}
         disabled={disabled}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full px-4 py-2 rounded-lg border text-sm font-medium"
-        style={{
-          backgroundColor: disabled ? '#f3f4f6' : '#FFFFFF',
-          borderColor: '#e5e7eb',
-          color: '#111827',
-        }}
+        className="nmts-header-scope-select"
+        title={label}
       >
         {options.map((item) => (
-          <option key={item} value={item}>{item}</option>
+          <option key={item} value={item}>
+            {item}
+          </option>
         ))}
       </select>
-    </div>
+    </label>
   );
 }
 

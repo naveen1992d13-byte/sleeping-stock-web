@@ -24,14 +24,16 @@ const fmt = (v) => {
 };
 const todayKey = (v=new Date()) => new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(v));
 
-export default function NMTSMobile(){
+export default function NMTSMobile({ variant = 'mobile' }){
+  const showMobileSections = variant !== 'audit';
+  const showAuditSections = variant !== 'mobile';
   const { user } = useAuth();
   const { scopeBrand, scopeDealer, scopeBranch } = useOutletContext();
   const brand=clean(scopeBrand), dealer=clean(scopeDealer), branch=clean(scopeBranch);
   const scopeReady=exact(brand)&&exact(dealer)&&exact(branch);
   const canManage=['master','admin'].includes(user?.role);
   const isMaster = user?.role==='master';
-  const [section,setSection]=useState('mobile');
+  const [section,setSection]=useState(showAuditSections ? 'physical' : 'mobile');
 
   // ==================== Mobile User Management (new model) ====================
   const [mobileUsers,setMobileUsers]=useState([]);
@@ -84,9 +86,10 @@ export default function NMTSMobile(){
 
   useEffect(()=>{
     setPairingResult(null);setPairingFor(null);setPending([]);setSnapshot(null);
-    loadMobileUsers();loadDevices();loadNotificationInterval();loadAppVersions();loadSessions();
+    loadMobileUsers();loadDevices();loadNotificationInterval();loadAppVersions();
+    if (showAuditSections) loadSessions();
     /* eslint-disable-next-line */
-  },[scopeBrand,scopeDealer,scopeBranch,user?.id]);
+  },[scopeBrand,scopeDealer,scopeBranch,user?.id, showAuditSections]);
 
   const generateNewPairing=async()=>{
     if(!scopeReady) return toast.error('Select an exact Brand, Dealer and Branch in the Dashboard filter first');
@@ -166,12 +169,22 @@ export default function NMTSMobile(){
 
   const latestVersion = appVersions[0];
 
-  return <div className="space-y-6">
-    <div><h1 className="text-3xl font-bold">Sleeping Stock Mobile</h1><p className="text-gray-500">Mobile User &amp; device management, notifications, app versioning, and Perpetual Stock verification.</p></div>
-    <div className="grid md:grid-cols-4 gap-3"><Tab active={section==='mobile'} onClick={()=>setSection('mobile')} icon={Smartphone} title="Mobile Users"/><Tab active={section==='settings'} onClick={()=>setSection('settings')} icon={Settings2} title="App &amp; Settings"/><Tab active={section==='perpetual'} onClick={()=>setSection('perpetual')} icon={ClipboardCheck} title="Perpetual Stock"/><Tab active={section==='history'} onClick={()=>setSection('history')} icon={History} title="Verification History"/></div>
-    {!scopeReady && user?.role!=='user' && <div className="border border-amber-300 bg-amber-50 p-3 rounded-lg text-amber-800">Select an exact Brand, Dealer and Branch in the Dashboard filter. Mobile User creation, pairing, and Perpetual Stock all use only that selected scope.</div>}
+  return <div className="space-y-6" data-testid={variant === 'audit' ? 'stock-audit-page' : 'nmts-mobile-page'}>
+    {showMobileSections && (
+      <>
+    <div className="grid md:grid-cols-2 gap-3 max-w-xl"><Tab active={section==='mobile'} onClick={()=>setSection('mobile')} icon={Smartphone} title="Mobile Users"/><Tab active={section==='settings'} onClick={()=>setSection('settings')} icon={Settings2} title="App &amp; Settings"/></div>
+    {!scopeReady && user?.role!=='user' && <div className="border border-amber-300 bg-amber-50 p-3 rounded-lg text-amber-800">Select an exact Brand, Dealer and Branch in the Dashboard filter. Mobile User creation and pairing use only that selected scope.</div>}
+      </>
+    )}
 
-    {section==='mobile'&&<div className="space-y-5">
+    {showAuditSections && (
+      <>
+    <div className="grid md:grid-cols-3 gap-3"><Tab active={section==='physical'} onClick={()=>setSection('physical')} icon={ClipboardCheck} title="Physical Perpetual Stock"/><Tab active={section==='auto'} onClick={()=>setSection('auto')} icon={Camera} title="Auto Perpetual Stock"/><Tab active={section==='history'} onClick={()=>setSection('history')} icon={History} title="Verification History"/></div>
+    {!scopeReady && user?.role!=='user' && <div className="border border-gray-200 bg-gray-50 p-3 rounded-lg text-gray-700 text-sm">Select an exact Brand, Dealer and Branch in the top header filters for perpetual stock verification.</div>}
+      </>
+    )}
+
+    {showMobileSections && section==='mobile'&&<div className="space-y-5">
       {canManage && <Card title="Pair a New Mobile User"><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
         <div><p className="font-medium">Generate one-time QR for the selected Brand / Dealer / Branch.</p><p className="text-xs text-gray-500 mt-1">The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.</p></div>
         <Button onClick={generateNewPairing} disabled={creatingUser||!scopeReady}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button>
@@ -225,7 +238,7 @@ export default function NMTSMobile(){
       </tbody></table></div></Card>
     </div>}
 
-    {section==='settings'&&<div className="space-y-5">
+    {showMobileSections && section==='settings'&&<div className="space-y-5">
       <Card title="Notification Repeat Interval"><div className="flex items-center gap-3">
         <input type="number" min="1" className="border rounded h-10 px-3 w-32" value={notificationInterval} disabled={!isMaster} onChange={e=>setNotificationInterval(e.target.value)}/>
         <span className="text-sm text-gray-500">minutes between repeat alerts for an unaccepted branch request</span>
@@ -251,17 +264,23 @@ export default function NMTSMobile(){
       <Card title="Published Versions"><SimpleTable headers={['Version','Code','Filename','Mandatory','Released']} rows={appVersions.map(v=>[v.version_name,v.version_code,v.apk_filename,v.mandatory?'Yes':'No',fmt(v.release_date)])}/></Card>
     </div>}
 
-    {section==='perpetual'&&<div className="space-y-5">
-      <Card title="Perpetual Stock Lookup"><div className="flex flex-wrap gap-2"><input className="border rounded h-10 px-3 flex-1 min-w-64" value={partNumber} onChange={e=>setPartNumber(e.target.value.toUpperCase())} placeholder="Manual Part Number"/><Button onClick={lookup}><ScanLine className="h-4 w-4 mr-2"/>Lookup</Button><Button variant="outline" onClick={()=>cameraRef.current?.click()}><Camera className="h-4 w-4 mr-2"/>Camera Scan</Button><input ref={cameraRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={scan}/></div>
+    {showAuditSections && section==='physical'&&<div className="space-y-5">
+      <Card title="Physical Perpetual Stock Lookup"><div className="flex flex-wrap gap-2"><input className="border rounded h-10 px-3 flex-1 min-w-64" value={partNumber} onChange={e=>setPartNumber(e.target.value.toUpperCase())} placeholder="Manual Part Number"/><Button onClick={lookup}><ScanLine className="h-4 w-4 mr-2"/>Lookup</Button></div>
       {snapshot&&<div className="mt-4 space-y-4"><div className="grid md:grid-cols-4 gap-3"><Info label="Part Number" value={snapshot.part_number}/><Info label="Part Name" value={snapshot.part_name}/><Info label="System Quantity" value={snapshot.system_quantity}/><Info label="MAV" value={money(snapshot.mav)}/><Info label="PIN Location" value={snapshot.pin_location||'-'}/><Info label="Physical Quantity" value={<input type="number" className="border rounded h-9 px-2 w-full" value={physicalQty} onChange={e=>setPhysicalQty(e.target.value)}/>}/><Info label="Physical Location" value={<input className="border rounded h-9 px-2 w-full" value={physicalLocation} onChange={e=>setPhysicalLocation(e.target.value)}/>}/><Info label="Remarks" value={<input className="border rounded h-9 px-2 w-full" value={remarks} onChange={e=>setRemarks(e.target.value)}/>} /></div>{calc&&<div className="grid md:grid-cols-5 gap-3"><Info label="Difference" value={calc.difference}/><Info label="Shortage Qty" value={calc.shortage_qty}/><Info label="Excess Qty" value={calc.excess_qty}/><Info label="Shortage Value" value={money(calc.shortage_value)}/><Info label="Excess Value" value={money(calc.excess_value)}/></div>}<Button onClick={addItem}><Plus className="h-4 w-4 mr-2"/>Add to Verification List</Button></div>}</Card>
       <Card title={`Temporary Verification List (${pending.length})`}><DetailTable rows={pending} removable onRemove={i=>setPending(p=>p.filter((_,x)=>x!==i))}/><div className="flex justify-end mt-4"><Button onClick={uploadSession} disabled={!pending.length}><Upload className="h-4 w-4 mr-2"/>Finish Upload</Button></div></Card>
       <Card title="Today's Verification"><p className="text-sm text-gray-500 mb-3">All verified line items for today. Total items: {todayItems}</p><DetailTable rows={sessions.filter(s=>todayKey(s.created_at)===todayKey()).flatMap(s=>s.items||[])} empty="Open History and View a session to inspect its items."/></Card>
     </div>}
 
-    {section==='history'&&<div className="space-y-5"><Card title="Verification History Filters"><div className="grid md:grid-cols-4 gap-3"><input type="date" className="border rounded h-10 px-3" value={filters.date_from} onChange={e=>setFilters({...filters,date_from:e.target.value})}/><input type="date" className="border rounded h-10 px-3" value={filters.date_to} onChange={e=>setFilters({...filters,date_to:e.target.value})}/><select className="border rounded h-10 px-3" value={filters.user_filter} onChange={e=>setFilters({...filters,user_filter:e.target.value})}><option value="">All Users</option>{mobileUsers.map(u=><option key={u.mobile_user_id} value={u.mobile_user_id}>{u.name}</option>)}</select><select className="border rounded h-10 px-3" value={filters.status_filter} onChange={e=>setFilters({...filters,status_filter:e.target.value})}><option value="all">All Status</option><option value="submitted">Submitted</option></select></div><Button className="mt-3" onClick={loadSessions}>Apply Filters</Button></Card>
+    {showAuditSections && section==='auto'&&<div className="space-y-5">
+      <Card title="Auto Perpetual Stock (Camera / Scan)"><div className="flex flex-wrap gap-2"><input className="border rounded h-10 px-3 flex-1 min-w-64" value={partNumber} onChange={e=>setPartNumber(e.target.value.toUpperCase())} placeholder="Part Number (from scan or manual)"/><Button variant="outline" onClick={()=>cameraRef.current?.click()}><Camera className="h-4 w-4 mr-2"/>Camera Scan</Button><input ref={cameraRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={scan}/><Button onClick={lookup}><ScanLine className="h-4 w-4 mr-2"/>Lookup</Button></div>
+      {snapshot&&<div className="mt-4 space-y-4"><div className="grid md:grid-cols-4 gap-3"><Info label="Part Number" value={snapshot.part_number}/><Info label="Part Name" value={snapshot.part_name}/><Info label="System Quantity" value={snapshot.system_quantity}/><Info label="MAV" value={money(snapshot.mav)}/><Info label="PIN Location" value={snapshot.pin_location||'-'}/><Info label="Physical Quantity" value={<input type="number" className="border rounded h-9 px-2 w-full" value={physicalQty} onChange={e=>setPhysicalQty(e.target.value)}/>}/><Info label="Physical Location" value={<input className="border rounded h-9 px-2 w-full" value={physicalLocation} onChange={e=>setPhysicalLocation(e.target.value)}/>}/><Info label="Remarks" value={<input className="border rounded h-9 px-2 w-full" value={remarks} onChange={e=>setRemarks(e.target.value)}/>} /></div>{calc&&<div className="grid md:grid-cols-5 gap-3"><Info label="Difference" value={calc.difference}/><Info label="Shortage Qty" value={calc.shortage_qty}/><Info label="Excess Qty" value={calc.excess_qty}/><Info label="Shortage Value" value={money(calc.shortage_value)}/><Info label="Excess Value" value={money(calc.excess_value)}/></div>}<Button onClick={addItem}><Plus className="h-4 w-4 mr-2"/>Add to Verification List</Button></div>}</Card>
+      <Card title={`Temporary Verification List (${pending.length})`}><DetailTable rows={pending} removable onRemove={i=>setPending(p=>p.filter((_,x)=>x!==i))}/><div className="flex justify-end mt-4"><Button onClick={uploadSession} disabled={!pending.length}><Upload className="h-4 w-4 mr-2"/>Finish Upload</Button></div></Card>
+    </div>}
+
+    {showAuditSections && section==='history'&&<div className="space-y-5"><Card title="Verification History Filters"><div className="grid md:grid-cols-4 gap-3"><input type="date" className="border rounded h-10 px-3" value={filters.date_from} onChange={e=>setFilters({...filters,date_from:e.target.value})}/><input type="date" className="border rounded h-10 px-3" value={filters.date_to} onChange={e=>setFilters({...filters,date_to:e.target.value})}/><select className="border rounded h-10 px-3" value={filters.user_filter} onChange={e=>setFilters({...filters,user_filter:e.target.value})}><option value="">All Users</option>{mobileUsers.map(u=><option key={u.mobile_user_id} value={u.mobile_user_id}>{u.name}</option>)}</select><select className="border rounded h-10 px-3" value={filters.status_filter} onChange={e=>setFilters({...filters,status_filter:e.target.value})}><option value="all">All Status</option><option value="submitted">Submitted</option></select></div><Button className="mt-3" onClick={loadSessions}>Apply Filters</Button></Card>
       <Card title="Perpetual Verification History"><div className="flex flex-wrap items-center justify-between gap-3 mb-4"><p className="text-sm text-gray-500">{user?.role==='master'?'Download all permitted brands, dealers and branches.':user?.role==='admin'?'Download all branches under your Brand / Dealer scope.':'Download your branch verification list.'}</p><Button onClick={exportAllExcel}><Download className="h-4 w-4 mr-2"/>Download Complete Excel</Button></div><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1350px]"><thead><tr>{['Session ID','Date','Brand','Dealer','Branch','User','Total Items','Shortage Qty','Shortage Value','Excess Qty','Excess Value','Status','View','Excel'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{sessions.map(s=><tr key={s.session_id} className="border-t"><td className="p-3 font-semibold">{s.session_id}</td><td>{fmt(s.created_at)}</td><td>{s.brand_name}</td><td>{s.dealer_name}</td><td>{s.branch}</td><td>{s.verified_by_name}</td><td>{s.total_items}</td><td>{s.total_shortage_qty}</td><td>{money(s.total_shortage_value)}</td><td>{s.total_excess_qty}</td><td>{money(s.total_excess_value)}</td><td>{s.status}</td><td><Button size="sm" variant="outline" onClick={()=>openSession(s)}><Eye className="h-4 w-4"/></Button></td><td><Button size="sm" variant="outline" onClick={()=>excel(s)}><Download className="h-4 w-4"/></Button></td></tr>)}</tbody></table></div></Card></div>}
 
-    {viewSession&&<div className="fixed inset-0 bg-black/50 z-50 p-4 overflow-auto"><div className="bg-white rounded-xl max-w-7xl mx-auto p-5"><div className="flex justify-between mb-4"><div><h2 className="text-xl font-bold">{viewSession.session_id}</h2><p className="text-gray-500">{fmt(viewSession.created_at)}</p></div><Button variant="outline" onClick={()=>setViewSession(null)}><X className="h-4 w-4"/></Button></div><DetailTable rows={viewSession.items||[]} canManage={canManage} onCorrection={updateCorrection}/></div></div>}
+    {showAuditSections && viewSession&&<div className="fixed inset-0 bg-black/50 z-50 p-4 overflow-auto"><div className="bg-white rounded-xl max-w-7xl mx-auto p-5 border shadow-lg"><div className="flex justify-between mb-4"><div><h2 className="text-xl font-bold">{viewSession.session_id}</h2><p className="text-gray-500">{fmt(viewSession.created_at)}</p></div><Button variant="outline" onClick={()=>setViewSession(null)}><X className="h-4 w-4"/></Button></div><DetailTable rows={viewSession.items||[]} canManage={canManage} onCorrection={updateCorrection}/></div></div>}
   </div>
 }
 

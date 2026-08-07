@@ -190,8 +190,7 @@ export function Requests() {
   };
 
   return <div className="space-y-6" data-testid="requests-page">
-    <div className="nmts-module-header"><div className="flex items-center gap-3"><ClipboardList className="h-8 w-8 nmts-module-header-icon"/><div><h1>Request Center</h1><p>Review and accept each part individually, including partial quantities.</p></div></div></div>
-    <div className="rounded-xl border bg-white overflow-hidden">
+    <div className="rounded-xl border bg-white overflow-hidden shadow-sm">
       <div className="flex flex-wrap gap-2 p-4 border-b">
         <Button variant={view==='incoming'?'default':'outline'} onClick={()=>setView('incoming')}>Requests To Me</Button>
         <Button variant={view==='outgoing'?'default':'outline'} onClick={()=>setView('outgoing')}>My Requests</Button>
