@@ -294,12 +294,14 @@ export function QueryDesk() {
 
   return (
     <div className="space-y-6" data-testid="query-page">
-      <div className="rounded-2xl p-6" style={{ backgroundColor: '#34D399' }}>
-        <div className="flex items-center gap-3">
-          <HelpCircle className="h-8 w-8 text-white" />
-          <div>
-            <h1 className="text-2xl font-bold text-white">Query Desk</h1>
-            <p className="text-emerald-100">Raise queries and browse common answers from the Software Team.</p>
+      <div className="nmts-module-header">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <HelpCircle className="h-8 w-8 nmts-module-header-icon" />
+            <div>
+              <h1>Query Desk</h1>
+              <p>Raise queries and browse common answers from the Software Team.</p>
+            </div>
           </div>
         </div>
       </div>

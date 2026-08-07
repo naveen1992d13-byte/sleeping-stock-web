@@ -3,13 +3,14 @@ import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/App';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
-import { User, Key, ArrowRight } from 'lucide-react';
+import { User, Key, ArrowRight, Eye, EyeOff } from 'lucide-react';
 import './LoginPage.css';
 
 export function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const { login } = useAuth();
   const navigate = useNavigate();
 
@@ -69,10 +70,10 @@ export function LoginPage() {
                 />
               </div>
 
-              <div className="nmts-login-field">
+              <div className="nmts-login-field nmts-login-field--password">
                 <Key className="nmts-field-icon" aria-hidden="true" />
                 <input
-                  type="password"
+                  type={showPassword ? 'text' : 'password'}
                   data-testid="login-password-input"
                   placeholder="Password"
                   value={password}
@@ -81,6 +82,19 @@ export function LoginPage() {
                   autoComplete="current-password"
                   aria-label="Password"
                 />
+                <button
+                  type="button"
+                  className="nmts-password-toggle"
+                  onClick={() => setShowPassword((v) => !v)}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  tabIndex={0}
+                >
+                  {showPassword ? (
+                    <EyeOff className="nmts-password-toggle-icon" aria-hidden="true" />
+                  ) : (
+                    <Eye className="nmts-password-toggle-icon" aria-hidden="true" />
+                  )}
+                </button>
               </div>
 
               <Button

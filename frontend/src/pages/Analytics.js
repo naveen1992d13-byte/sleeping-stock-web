@@ -399,12 +399,12 @@ export function Analytics() {
 
   return (
     <div className="space-y-8" data-testid="analytics-page">
-      <div className="rounded-2xl bg-gradient-to-r from-emerald-600 to-emerald-400 p-6 text-white">
+      <div className="nmts-module-header">
         <div className="flex items-center gap-3">
-          <Globe size={32} />
+          <Globe size={32} className="nmts-module-header-icon" />
           <div>
-            <h1 className="text-2xl font-bold">Analytics</h1>
-            <p className="text-emerald-50 text-sm">
+            <h1>Analytics</h1>
+            <p>
               Consolidated insights for {scopeBrand} / {scopeDealer} / {scopeBranch}
             </p>
           </div>

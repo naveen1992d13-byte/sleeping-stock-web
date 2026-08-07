@@ -288,19 +288,19 @@ export function NoticeBoard() {
 
   return (
     <div className="space-y-6" data-testid="notice-board-page">
-      <div className="rounded-2xl p-6" style={{ backgroundColor: '#34D399' }}>
+      <div className="nmts-module-header">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
-            <Megaphone className="h-8 w-8 text-white" />
+            <Megaphone className="h-8 w-8 nmts-module-header-icon" />
             <div>
-              <h1 className="text-2xl font-bold text-white">Notice Board</h1>
-              <p className="text-emerald-100 text-sm">
+              <h1>Notice Board</h1>
+              <p>
                 {isMaster ? 'Create and manage brand-wise notices' : `Notices for ${user?.brand || 'your brand'}`}
               </p>
             </div>
           </div>
           {isMaster && (
-            <Button onClick={() => setCreateOpen(true)} className="bg-white text-emerald-800 hover:bg-emerald-50">
+            <Button onClick={() => setCreateOpen(true)} className="nmts-btn-primary">
               <Plus className="h-4 w-4 mr-2" />
               Create Notice
             </Button>

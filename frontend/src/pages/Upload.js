@@ -219,9 +219,11 @@ export function UploadCenter() {
   const summary = latest ? { totalItems: latest.item_count || latest.rows_imported || 0, totalQty: latest.total_available_qty || 0, totalValue: latest.total_value || 0 } : { totalItems: 0, totalQty: 0, totalValue: 0 };
 
   return <div className="space-y-4" data-testid="upload-center-page">
-    <div className="flex items-center justify-between gap-3">
-      <div className="flex items-center gap-3"><Upload className="h-8 w-8" style={{color: COLORS.dark}}/><div><h1 className="text-2xl font-bold" style={{color: COLORS.dark}}>Upload Center</h1><p className="text-sm" style={{color: COLORS.muted}}>Upload, validate, publish and store raw Excel files.</p></div></div>
-      <Button onClick={fetchUploads} variant="outline">Refresh</Button>
+    <div className="nmts-module-header">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-3"><Upload className="h-8 w-8 nmts-module-header-icon"/><div><h1>Upload Center</h1><p>Upload, validate, publish and store raw Excel files.</p></div></div>
+        <Button onClick={fetchUploads} variant="outline">Refresh</Button>
+      </div>
     </div>
 
     {(isMaster || isAdmin) && masterSummary && (
