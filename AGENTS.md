@@ -28,7 +28,15 @@ Cursor Cloud update script, so you normally don't need to install them again.
 
 ### Running the frontend
 
-- Start it with `cd frontend && npm start` (CRA/craco dev server on port 3000).
+- Start it with `cd frontend && npm start` (CRA/craco dev server on port **3000**).
+- **GitHub Codespaces:** use the forwarded URL for port **3000** only
+  (`https://<codespace-name>-3000.app.github.dev`). Do not forward random ports
+  (3001/3002/5173) unless you set `PORT` to match; a mismatch returns **404** on
+  the public URL while `curl http://127.0.0.1:<port>` may still work locally.
+  `.devcontainer/devcontainer.json` forwards 3000 and 8000 as public. Run
+  `.devcontainer/setup-codespaces-env.sh` (or reopen the codespace) so
+  `frontend/.env.local` points `REACT_APP_BACKEND_URL` at
+  `https://<codespace-name>-8000.app.github.dev`.
 - **Important gotcha:** the committed `frontend/.env` sets `REACT_APP_BACKEND_URL`
   to a dead GitHub Codespaces URL. For local dev the frontend must point at the
   local backend instead, or login fails with CORS errors. This is handled by a

@@ -57,6 +57,24 @@ let webpackConfig = {
 };
 
 webpackConfig.devServer = (devServerConfig) => {
+  devServerConfig.host = devServerConfig.host || "0.0.0.0";
+  devServerConfig.allowedHosts = "all";
+
+  const codespaceName = process.env.CODESPACE_NAME;
+  const port = process.env.PORT || "3000";
+  if (codespaceName) {
+    const publicHost = `${codespaceName}-${port}.app.github.dev`;
+    devServerConfig.client = {
+      ...(devServerConfig.client || {}),
+      webSocketURL: {
+        protocol: "wss",
+        hostname: publicHost,
+        port: 443,
+        pathname: "/ws",
+      },
+    };
+  }
+
   // Add health check endpoints if enabled
   if (config.enableHealthCheck && setupHealthEndpoints && healthPluginInstance) {
     const originalSetupMiddlewares = devServerConfig.setupMiddlewares;

@@ -1,0 +1,24 @@
+{
+  "name": "NMTS Sleeping Stock",
+  "forwardPorts": [3000, 8000],
+  "portsAttributes": {
+    "3000": {
+      "label": "Frontend (React)",
+      "onAutoForward": "notify",
+      "visibility": "public"
+    },
+    "8000": {
+      "label": "Backend (FastAPI)",
+      "onAutoForward": "notify",
+      "visibility": "public"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "remote.autoForwardPorts": true
+      }
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/setup-codespaces-env.sh"
+}
