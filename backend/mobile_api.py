@@ -967,10 +967,11 @@ async def generate_auto_perpetual(
         raise HTTPException(403, "Dealer outside scope")
     if q.get("branch") and q["branch"] != branch:
         raise HTTPException(403, "Branch outside scope")
-    from auto_perpetual import generate_auto_perpetual_for_branch, ist_date_key
+    from auto_perpetual import generate_auto_perpetual_for_branch, ist_date_key, resolve_branch_inventory_date_key
 
-    india = _now().astimezone(ZoneInfo("Asia/Kolkata"))
-    active_date_key = india.strftime("%Y-%m-%d")
+    active_date_key = await resolve_branch_inventory_date_key(
+        db, brand_name=brand_name, dealer_name=dealer_name, branch=branch
+    )
     result = await generate_auto_perpetual_for_branch(
         db,
         brand_name=brand_name,
@@ -1693,6 +1694,7 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
         "physical_location": physical_location, "scanned_location": physical_location,
         "location": physical_location, "location_status": location_status, "overall_status": overall_status,
         "remarks": payload.remark or "", "remark": payload.remark or "", "entry_method": entry_method,
+        "verification_method": entry_method,
         "verified_user": session["mobile_user"]["name"], "verified_by": mobile_user_id,
         "verified_by_name": session["mobile_user"]["name"], "mobile_user_id": mobile_user_id,
         "device_id": device_id, "brand_name": session["brand_name"], "dealer_name": session["dealer_name"],

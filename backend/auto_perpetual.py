@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
-from pymongo import ReturnDocument
+from pymongo import ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError
 from zoneinfo import ZoneInfo
 
@@ -35,6 +35,30 @@ def month_key(dt: Optional[datetime] = None) -> str:
 
 def ist_date_key(dt: Optional[datetime] = None) -> str:
     return (dt or _ist_now()).strftime("%Y-%m-%d")
+
+
+def inventory_date_key(dt: Optional[datetime] = None) -> str:
+    """Published inventory snapshot key (matches product active_date_key / upload date)."""
+    return (dt or _ist_now()).strftime("%Y%m%d")
+
+
+async def resolve_branch_inventory_date_key(
+    db, *, brand_name: str, dealer_name: str, branch: str
+) -> str:
+    """Latest published inventory snapshot for the branch (falls back to IST today)."""
+    row = await db.products.find_one(
+        {
+            "brand_name": brand_name,
+            "dealer_name": dealer_name,
+            "branch": branch,
+            "publish_status": "Published",
+            "is_active_today": True,
+            "active_date_key": {"$exists": True, "$ne": ""},
+        },
+        {"_id": 0, "active_date_key": 1},
+        sort=[("active_date_key", -1)],
+    )
+    return (row or {}).get("active_date_key") or inventory_date_key()
 
 
 def yymmdd_key(dt: Optional[datetime] = None) -> str:
@@ -220,7 +244,7 @@ async def apply_stock_movement_priority(
 ) -> int:
     """Flag movement-driven recheck candidates (separate from monthly unique coverage)."""
     prev_key = await _previous_inventory_date_key(
-        db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, current_date_key=current_date_key
+        db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, current_key=current_date_key
     )
     if not prev_key:
         return 0
@@ -311,46 +335,76 @@ async def sync_monthly_pool(
     verified = await _verified_parts_this_month(db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, month=month)
     upserts = 0
     now = _now()
+    batch: List[UpdateOne] = []
+    batch_parts: List[str] = []
+
+    async def flush_batch():
+        nonlocal upserts, batch, batch_parts
+        if not batch_parts:
+            return
+        pri_rows = await db.auto_perpetual_pool.find(
+            {
+                "month_key": month,
+                "branch": branch,
+                "coverage_kind": "monthly",
+                "part_number": {"$in": batch_parts},
+            },
+            {"_id": 0, "part_number": 1, "priority_score": 1},
+        ).to_list(len(batch_parts))
+        pri_map = {str(r["part_number"]).upper(): int(r.get("priority_score") or 0) for r in pri_rows}
+        for part in batch_parts:
+            pri = pri_map.get(part, 0)
+            p = part_docs[part]
+            loc = p["loc"]
+            qty = p["qty"]
+            status = "verified" if part in verified else "pending"
+            if qty <= 0:
+                status = "na"
+            batch.append(
+                UpdateOne(
+                    {
+                        "month_key": month,
+                        "branch": branch,
+                        "part_number": part,
+                        "coverage_kind": "monthly",
+                    },
+                    {
+                        "$setOnInsert": {
+                            "id": str(uuid.uuid4()),
+                            "brand_name": brand_name,
+                            "dealer_name": dealer_name,
+                            "loc": loc,
+                            "created_at": now,
+                        },
+                        "$set": {
+                            "system_qty": qty,
+                            "inventory_date_key": active_date_key,
+                            "status": status,
+                            "priority_score": pri,
+                            "updated_at": now,
+                        },
+                    },
+                    upsert=True,
+                )
+            )
+        if batch:
+            await db.auto_perpetual_pool.bulk_write(batch, ordered=False)
+            upserts += len(batch)
+        batch = []
+        batch_parts = []
+
+    part_docs: Dict[str, Dict[str, Any]] = {}
     for p in products:
         part = str(p.get("part_number") or "").strip().upper()
         if not part:
             continue
         loc = str(p.get("loc") or p.get("location") or "").strip()
         qty = float(p.get("available_qty_number") or p.get("quantity") or 0)
-        status = "verified" if part in verified else "pending"
-        if qty <= 0:
-            status = "na"
-        existing = await db.auto_perpetual_pool.find_one(
-            {"month_key": month, "branch": branch, "part_number": part, "coverage_kind": "monthly"},
-            {"priority_score": 1},
-        )
-        pri = int((existing or {}).get("priority_score") or 0)
-        await db.auto_perpetual_pool.update_one(
-            {
-                "month_key": month,
-                "branch": branch,
-                "part_number": part,
-                "coverage_kind": "monthly",
-            },
-            {
-                "$setOnInsert": {
-                    "id": str(uuid.uuid4()),
-                    "brand_name": brand_name,
-                    "dealer_name": dealer_name,
-                    "loc": loc,
-                    "created_at": now,
-                },
-                "$set": {
-                    "system_qty": qty,
-                    "inventory_date_key": active_date_key,
-                    "status": status,
-                    "priority_score": pri,
-                    "updated_at": now,
-                },
-            },
-            upsert=True,
-        )
-        upserts += 1
+        part_docs[part] = {"loc": loc, "qty": qty}
+        batch_parts.append(part)
+        if len(batch_parts) >= 500:
+            await flush_batch()
+    await flush_batch()
     return upserts
 
 
@@ -408,7 +462,13 @@ async def generate_auto_perpetual_for_branch(
     if existing_run and existing_run.get("status") == "completed" and not recalc_pending:
         return {"duplicate": True, "run": existing_run}
     if existing_run and existing_run.get("status") == "generating":
-        raise HTTPException(status_code=409, detail="Auto Perpetual generation already in progress for this branch")
+        started = existing_run.get("started_at")
+        stale = False
+        if isinstance(started, datetime):
+            st = started if started.tzinfo else started.replace(tzinfo=timezone.utc)
+            stale = (_now() - st.astimezone(timezone.utc)).total_seconds() > 900
+        if not stale:
+            raise HTTPException(status_code=409, detail="Auto Perpetual generation already in progress for this branch")
 
     await db.auto_perpetual_daily_runs.update_one(
         run_key,
@@ -420,14 +480,19 @@ async def generate_auto_perpetual_for_branch(
     )
 
     try:
-        await sync_monthly_pool(
-            db,
-            brand_name=brand_name,
-            dealer_name=dealer_name,
-            branch=branch,
-            active_date_key=active_date_key,
-            month=month,
+        sample_pool = await db.auto_perpetual_pool.find_one(
+            {"month_key": month, "branch": branch, "brand_name": brand_name, "coverage_kind": "monthly"},
+            {"_id": 0, "inventory_date_key": 1},
         )
+        if not sample_pool or sample_pool.get("inventory_date_key") != active_date_key:
+            await sync_monthly_pool(
+                db,
+                brand_name=brand_name,
+                dealer_name=dealer_name,
+                branch=branch,
+                active_date_key=active_date_key,
+                month=month,
+            )
         await apply_stock_movement_priority(
             db,
             brand_name=brand_name,

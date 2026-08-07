@@ -2,7 +2,7 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from auto_perpetual import _loc_group, _working_days_left_in_month, month_key, branch_code
+from auto_perpetual import _loc_group, _working_days_left_in_month, month_key, branch_code, inventory_date_key
 
 
 def test_loc_group():
@@ -18,6 +18,10 @@ def test_working_days_left():
 
 def test_month_key():
     assert month_key(datetime(2026, 3, 15, tzinfo=ZoneInfo("Asia/Kolkata"))) == "2026-03"
+
+
+def test_inventory_date_key():
+    assert inventory_date_key(datetime(2026, 8, 7, tzinfo=ZoneInfo("Asia/Kolkata"))) == "20260807"
 
 
 def test_branch_code():
