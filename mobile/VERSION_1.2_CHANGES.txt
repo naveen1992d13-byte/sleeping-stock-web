@@ -1,0 +1,26 @@
+SLEEPING STOCK MOBILE 1.2.0
+
+Changes included
+1. Correct Sleeping Stock logo used on pairing screen, app icon, adaptive icon and splash.
+2. Android keyboard uses resize mode. Pairing, verification and search inputs remain visible while typing.
+3. OCR captures only the scan-box area and detects printed text / reasonable handwriting.
+4. Part numbers are normalized to uppercase A-Z and 0-9 only. Spaces, hyphens and all special characters are removed.
+5. OCR also proposes a part description. The user can edit it before adding.
+6. Missing part flow: Part Not Found -> Add New Part -> quantity/location -> add to list -> submit as excess new part.
+7. Daily verification session: one device receives one verification_session_id per local calendar day.
+   Multiple uploads and any number of line items on the same device/day use the same session ID.
+8. Existing Notifications and Request processing logic was not changed.
+
+Mobile API payload additions
+- verification_session_id
+- part_name
+- is_new_part
+
+The backend stock-verification request model should accept and store these three optional fields.
+Existing client_id idempotency remains unchanged.
+
+
+Version 1.2.1 final correction
+- Android hardware Back now navigates to the previous app screen.
+- Scanner -> originating screen; Request -> Notifications; module screens -> Home.
+- Back is consumed on Home and Pairing so Android does not close the app unexpectedly.

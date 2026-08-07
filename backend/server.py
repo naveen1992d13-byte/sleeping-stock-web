@@ -2893,8 +2893,8 @@ async def get_upload_balance_details(
         "expected_uploads": len(expected_pairs),
         "completed_uploads": len(completed_pairs),
         "balance_uploads": max(len(expected_pairs) - len(completed_pairs), 0),
-        "completed",
-        "pending",
+        "completed": completed,
+        "pending": pending,
     }
 
 
@@ -5666,6 +5666,64 @@ async def list_mobile_stock_verification_sessions(
             created["$lt"] = (datetime.fromisoformat(date_to).replace(tzinfo=ZoneInfo("Asia/Kolkata")) + timedelta(days=1)).astimezone(timezone.utc)
         query["created_at"] = created
     return await db.stock_verification_sessions.find(query, {"_id": 0}).sort("created_at", -1).to_list(length=10000)
+
+
+@api_router.get("/mobile/perpetual-stock/verification-history")
+async def list_verification_history_records(
+    brand: str,
+    dealer: str,
+    branch: str,
+    date_from: str = None,
+    date_to: str = None,
+    month: str = None,
+    mobile_user_id: str = None,
+    verification_type: str = None,
+    result_filter: str = None,
+    part_number: str = None,
+    loc: str = None,
+    limit: int = 500,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Line-level audit history (Physical / Auto / Recheck) with filters."""
+    query = _mobile_dashboard_scope_query(current_user, brand, dealer, branch)
+    if month and len(month) == 7:
+        y, m = int(month[:4]), int(month[5:7])
+        start = datetime(y, m, 1, tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(timezone.utc)
+        end_month = m + 1 if m < 12 else 1
+        end_year = y if m < 12 else y + 1
+        end = datetime(end_year, end_month, 1, tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(timezone.utc)
+        query["verified_at"] = {"$gte": start, "$lt": end}
+    elif date_from or date_to:
+        created = {}
+        if date_from:
+            created["$gte"] = datetime.fromisoformat(date_from).replace(tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(timezone.utc)
+        if date_to:
+            created["$lt"] = (datetime.fromisoformat(date_to).replace(tzinfo=ZoneInfo("Asia/Kolkata")) + timedelta(days=1)).astimezone(timezone.utc)
+        query["verified_at"] = created
+    if mobile_user_id:
+        query["mobile_user_id"] = mobile_user_id
+    if part_number:
+        query["part_number"] = {"$regex": f"^{re.escape(part_number.strip())}$", "$options": "i"}
+    if loc:
+        query["$or"] = [{"pin_location": loc}, {"system_location": loc}, {"location": loc}]
+    if verification_type and verification_type.lower() != "all":
+        vt = verification_type.lower()
+        if vt == "recheck":
+            query["coverage_kind"] = "recheck"
+        else:
+            query["verification_type"] = vt
+    if result_filter and result_filter.lower() != "all":
+        rf = result_filter.lower()
+        if rf == "match":
+            query["quantity_status"] = "matched"
+        elif rf == "shortage":
+            query["quantity_status"] = "shortage"
+        elif rf == "excess":
+            query["quantity_status"] = "excess"
+        elif rf == "damage":
+            query["has_damage"] = True
+    rows = await db.stock_verification_history.find(query, {"_id": 0}).sort("verified_at", -1).limit(min(limit, 2000)).to_list(2000)
+    return rows
 
 
 @api_router.get("/mobile/perpetual-stock/export-all/excel")

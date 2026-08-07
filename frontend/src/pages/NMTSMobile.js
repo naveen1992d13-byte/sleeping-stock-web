@@ -46,6 +46,8 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const apkFileRef=useRef(null);
   const [autoSummary,setAutoSummary]=useState(null);
   const [autoAssignments,setAutoAssignments]=useState([]);
+  const [userPerformance,setUserPerformance]=useState([]);
+  const [historyRecords,setHistoryRecords]=useState([]);
   const [autoGenerating,setAutoGenerating]=useState(false);
   const [autoRecalcBusy,setAutoRecalcBusy]=useState(false);
   const [creatingUser,setCreatingUser]=useState(false);
@@ -68,7 +70,7 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const [pending,setPending]=useState([]);
   const [sessions,setSessions]=useState([]);
   const [viewSession,setViewSession]=useState(null);
-  const [filters,setFilters]=useState({date_from:'',date_to:'',user_filter:'',status_filter:'all'});
+  const [filters,setFilters]=useState({date_from:'',date_to:'',month:'',user_filter:'',verification_type:'all',result_filter:'all',part_number:'',loc:''});
   const cameraRef=useRef(null);
 
   const loadMobileUsers=async()=>{
@@ -87,13 +89,24 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const loadAutoPerpetual=async()=>{
     if(!scopeReady){ setAutoSummary(null); setAutoAssignments([]); return; }
     try{
-      const [s,a]=await Promise.all([
+      const [s,a,p]=await Promise.all([
         axios.get(`${API}/mobile/auto-perpetual/summary`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
         axios.get(`${API}/mobile/auto-perpetual/assignments/today`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
+        axios.get(`${API}/mobile/auto-perpetual/user-performance`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
       ]);
       setAutoSummary(s.data||null);
       setAutoAssignments(a.data||[]);
-    }catch(e){ setAutoSummary(null); setAutoAssignments([]); }
+      setUserPerformance(p.data||[]);
+    }catch(e){ setAutoSummary(null); setAutoAssignments([]); setUserPerformance([]); }
+  };
+  const loadHistoryRecords=async()=>{
+    if(!scopeReady){ setHistoryRecords([]); return; }
+    try{
+      const params={brand,dealer,branch,...filters, limit:500};
+      Object.keys(params).forEach(k=>{ if(params[k]===''||params[k]==='all') delete params[k]; });
+      const r=await axios.get(`${API}/mobile/perpetual-stock/verification-history`,{params});
+      setHistoryRecords(r.data||[]);
+    }catch(e){ toast.error(e.response?.data?.detail||'History load failed'); setHistoryRecords([]); }
   };
   const loadApkLink=async()=>{
     try{
@@ -109,12 +122,12 @@ export default function NMTSMobile({ variant = 'mobile' }){
     loadApkLink();
   };
 
-  const loadSessions=async()=>{if(!scopeReady){setSessions([]);return;}try{const r=await axios.get(`${API}/mobile/perpetual-stock/sessions`,{params:{brand,dealer,branch,...filters}});const base=r.data||[];const today=base.filter(s=>todayKey(s.created_at)===todayKey());const detailed=await Promise.all(today.map(async s=>{try{const d=await axios.get(`${API}/mobile/perpetual-stock/sessions/${s.session_id}`);return d.data}catch{return s}}));const byId=new Map(detailed.map(s=>[s.session_id,s]));setSessions(base.map(s=>byId.get(s.session_id)||s));}catch(e){toast.error(e.response?.data?.detail||'Verification history load failed')}};
+  const loadSessions=async()=>{if(!scopeReady){setSessions([]);return;}try{const r=await axios.get(`${API}/mobile/perpetual-stock/sessions`,{params:{brand,dealer,branch,date_from:filters.date_from||undefined,date_to:filters.date_to||undefined}});setSessions(r.data||[]);}catch(e){toast.error(e.response?.data?.detail||'Verification history load failed')}};
 
   useEffect(()=>{
     setPairingResult(null);setPairingFor(null);setPending([]);setSnapshot(null);
     loadMobileUsers();loadNotificationInterval();loadAppVersions();loadTodayAttendance();
-    if (showAuditSections) { loadSessions(); loadAutoPerpetual(); }
+    if (showAuditSections) { loadSessions(); loadAutoPerpetual(); loadHistoryRecords(); }
     /* eslint-disable-next-line */
   },[scopeBrand,scopeDealer,scopeBranch,user?.id, showAuditSections]);
 
@@ -258,7 +271,7 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const openSession=async(s)=>{try{const r=await axios.get(`${API}/mobile/perpetual-stock/sessions/${s.session_id}`);setViewSession(r.data)}catch(e){toast.error(e.response?.data?.detail||'Session load failed')}};
   const updateCorrection=async(row,method)=>{try{const status=method==='no_action'?'pending':'corrected';const r=await axios.put(`${API}/mobile/perpetual-stock/${row.id}/correction`,{correction_status:status,correction_method:method,correction_remarks:''});setViewSession(v=>({...v,items:(v.items||[]).map(x=>x.id===row.id?r.data:x)}));toast.success('Correction updated')}catch(e){toast.error(e.response?.data?.detail||'Correction update failed')}};
   const excel=async(s)=>{try{const r=await axios.get(`${API}/mobile/perpetual-stock/sessions/${s.session_id}/excel`,{responseType:'blob'});const url=URL.createObjectURL(r.data);const a=document.createElement('a');a.href=url;a.download=`${s.session_id}.xlsx`;a.click();URL.revokeObjectURL(url)}catch(e){toast.error('Excel download failed')}};
-  const exportAllExcel=async()=>{try{const params={...filters};if(exact(brand))params.brand=brand;if(exact(dealer))params.dealer=dealer;if(exact(branch))params.branch=branch;delete params.user_filter;delete params.status_filter;const r=await axios.get(`${API}/mobile/perpetual-stock/export-all/excel`,{params,responseType:'blob'});const url=URL.createObjectURL(r.data);const a=document.createElement('a');a.href=url;a.download=user?.role==='master'?'perpetual_stock_master.xlsx':user?.role==='admin'?'perpetual_stock_admin.xlsx':'perpetual_stock_branch.xlsx';a.click();URL.revokeObjectURL(url);toast.success('Complete Perpetual Stock Excel downloaded')}catch(e){toast.error(e.response?.data?.detail||'Complete Excel download failed')}};
+  const exportAllExcel=async()=>{try{const params={date_from:filters.date_from||undefined,date_to:filters.date_to||undefined};if(exact(brand))params.brand=brand;if(exact(dealer))params.dealer=dealer;if(exact(branch))params.branch=branch;const r=await axios.get(`${API}/mobile/perpetual-stock/export-all/excel`,{params,responseType:'blob'});const url=URL.createObjectURL(r.data);const a=document.createElement('a');a.href=url;a.download=user?.role==='master'?'perpetual_stock_master.xlsx':user?.role==='admin'?'perpetual_stock_admin.xlsx':'perpetual_stock_branch.xlsx';a.click();URL.revokeObjectURL(url);toast.success('Complete Perpetual Stock Excel downloaded')}catch(e){toast.error(e.response?.data?.detail||'Complete Excel download failed')}};
   const todayItems=useMemo(()=>sessions.filter(s=>todayKey(s.created_at)===todayKey()).reduce((n,s)=>n+Number(s.total_items||0),0),[sessions]);
 
   const latestVersion = appVersions[0];
@@ -369,6 +382,11 @@ export default function NMTSMobile({ variant = 'mobile' }){
           <Info label="Coverage %" value={`${autoSummary.monthly_coverage_pct}%`}/>
           <Info label="Pending" value={autoSummary.pending_lines}/>
           <Info label="Days left" value={autoSummary.days_remaining}/>
+          <Info label="Match lines" value={autoSummary.match_lines}/>
+          <Info label="Shortage lines" value={autoSummary.shortage_lines}/>
+          <Info label="Damage lines" value={autoSummary.damage_lines}/>
+          <Info label="Physical count" value={autoSummary.physical_verification_count}/>
+          <Info label="Auto count" value={autoSummary.auto_verification_count}/>
         </div>}
         <div className="flex flex-wrap gap-2">
           <Button onClick={()=>generateAutoPerpetual(false)} disabled={!scopeReady||autoGenerating}><ClipboardCheck className="h-4 w-4 mr-2"/>{autoGenerating?'Generating...':'Generate Auto Perpetual'}</Button>
@@ -382,10 +400,17 @@ export default function NMTSMobile({ variant = 'mobile' }){
           {!autoAssignments.length && <tr><td colSpan={4} className="text-center py-6 text-gray-500">No assignments yet. Generate Auto Perpetual after marking attendance.</td></tr>}
         </tbody></table></div>
       </Card>
+      <Card title="User performance (this month)">
+        <div className="overflow-x-auto"><table className="w-full text-sm min-w-[1100px]"><thead><tr>{['Rank','User','Monthly Target','Normal','Catch-up','Assigned','Completed','Pending','Completion %'].map(h=><th key={h} className="text-left p-2">{h}</th>)}</tr></thead><tbody>
+          {userPerformance.map(u=><tr key={u.mobile_user_id} className="border-t"><td className="p-2">{u.rank}</td><td className="p-2">{u.name}<div className="text-xs text-gray-500 font-mono">{u.mobile_user_id}</div></td><td className="p-2">{u.monthly_target}</td><td className="p-2">{u.normal_target}</td><td className="p-2">{u.catch_up_target}</td><td className="p-2">{u.assigned}</td><td className="p-2">{u.completed}</td><td className="p-2">{u.pending}</td><td className="p-2 font-semibold">{u.completion_pct}%</td></tr>)}
+          {!userPerformance.length && <tr><td colSpan={9} className="text-center py-6 text-gray-500">No performance data yet.</td></tr>}
+        </tbody></table></div>
+      </Card>
     </div>}
 
-    {showAuditSections && section==='history'&&<div className="space-y-5"><Card title="Verification History Filters"><div className="grid md:grid-cols-4 gap-3"><input type="date" className="border rounded h-10 px-3" value={filters.date_from} onChange={e=>setFilters({...filters,date_from:e.target.value})}/><input type="date" className="border rounded h-10 px-3" value={filters.date_to} onChange={e=>setFilters({...filters,date_to:e.target.value})}/><select className="border rounded h-10 px-3" value={filters.user_filter} onChange={e=>setFilters({...filters,user_filter:e.target.value})}><option value="">All Users</option>{mobileUsers.map(u=><option key={u.mobile_user_id} value={u.mobile_user_id}>{u.name}</option>)}</select><select className="border rounded h-10 px-3" value={filters.status_filter} onChange={e=>setFilters({...filters,status_filter:e.target.value})}><option value="all">All Status</option><option value="submitted">Submitted</option></select></div><Button className="mt-3" onClick={loadSessions}>Apply Filters</Button></Card>
-      <Card title="Perpetual Verification History"><div className="flex flex-wrap items-center justify-between gap-3 mb-4"><p className="text-sm text-gray-500">{user?.role==='master'?'Download all permitted brands, dealers and branches.':user?.role==='admin'?'Download all branches under your Brand / Dealer scope.':'Download your branch verification list.'}</p><Button onClick={exportAllExcel}><Download className="h-4 w-4 mr-2"/>Download Complete Excel</Button></div><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1350px]"><thead><tr>{['Session ID','Date','Brand','Dealer','Branch','User','Total Items','Shortage Qty','Shortage Value','Excess Qty','Excess Value','Status','View','Excel'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{sessions.map(s=><tr key={s.session_id} className="border-t"><td className="p-3 font-semibold">{s.session_id}</td><td>{fmt(s.created_at)}</td><td>{s.brand_name}</td><td>{s.dealer_name}</td><td>{s.branch}</td><td>{s.verified_by_name}</td><td>{s.total_items}</td><td>{s.total_shortage_qty}</td><td>{money(s.total_shortage_value)}</td><td>{s.total_excess_qty}</td><td>{money(s.total_excess_value)}</td><td>{s.status}</td><td><Button size="sm" variant="outline" onClick={()=>openSession(s)}><Eye className="h-4 w-4"/></Button></td><td><Button size="sm" variant="outline" onClick={()=>excel(s)}><Download className="h-4 w-4"/></Button></td></tr>)}</tbody></table></div></Card></div>}
+    {showAuditSections && section==='history'&&<div className="space-y-5"><Card title="Verification History Filters"><div className="grid md:grid-cols-4 gap-3"><input type="date" className="border rounded h-10 px-3" value={filters.date_from} onChange={e=>setFilters({...filters,date_from:e.target.value})}/><input type="date" className="border rounded h-10 px-3" value={filters.date_to} onChange={e=>setFilters({...filters,date_to:e.target.value})}/><input type="month" className="border rounded h-10 px-3" value={filters.month} onChange={e=>setFilters({...filters,month:e.target.value})}/><select className="border rounded h-10 px-3" value={filters.user_filter} onChange={e=>setFilters({...filters,user_filter:e.target.value})}><option value="">All Users</option>{mobileUsers.map(u=><option key={u.mobile_user_id} value={u.mobile_user_id}>{u.name}</option>)}</select><select className="border rounded h-10 px-3" value={filters.verification_type} onChange={e=>setFilters({...filters,verification_type:e.target.value})}><option value="all">All Types</option><option value="physical">Physical</option><option value="auto">Auto</option><option value="recheck">Recheck</option></select><select className="border rounded h-10 px-3" value={filters.result_filter} onChange={e=>setFilters({...filters,result_filter:e.target.value})}><option value="all">All Results</option><option value="match">Match</option><option value="shortage">Shortage</option><option value="excess">Excess</option><option value="damage">Damage</option></select><input className="border rounded h-10 px-3" placeholder="Part Number" value={filters.part_number} onChange={e=>setFilters({...filters,part_number:e.target.value})}/><input className="border rounded h-10 px-3" placeholder="LOC" value={filters.loc} onChange={e=>setFilters({...filters,loc:e.target.value})}/></div><Button className="mt-3" onClick={()=>{loadHistoryRecords(); loadSessions();}}>Apply Filters</Button></Card>
+      <Card title={`Audit records (${historyRecords.length})`}><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1600px]"><thead><tr>{['Session','Type','Date','User','Part','LOC','System','Physical','Short','Excess','Damage','Result','Remark'].map(h=><th key={h} className="text-left p-2">{h}</th>)}</tr></thead><tbody>{historyRecords.map(r=><tr key={r.id||`${r.session_id}-${r.part_number}`} className="border-t"><td className="p-2 font-mono text-xs">{r.session_id}</td><td className="p-2">{r.coverage_kind==='recheck'?'Recheck':r.verification_type||'-'}</td><td className="p-2">{fmt(r.verified_at||r.created_at)}</td><td className="p-2">{r.verified_by_name||r.verified_user}</td><td className="p-2">{r.part_number}</td><td className="p-2">{r.pin_location||r.system_location||'-'}</td><td className="p-2">{r.system_quantity}</td><td className="p-2">{r.physical_quantity}</td><td className="p-2">{r.shortage_qty}</td><td className="p-2">{r.excess_qty}</td><td className="p-2">{r.damage_qty||0}</td><td className="p-2">{r.quantity_status||r.overall_status}</td><td className="p-2">{r.remark||r.remarks||'-'}</td></tr>)}</tbody></table></div></Card>
+      <Card title="Session summary"><div className="flex flex-wrap items-center justify-between gap-3 mb-4"><Button onClick={exportAllExcel}><Download className="h-4 w-4 mr-2"/>Download Complete Excel</Button></div><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1350px]"><thead><tr>{['Session ID','Date','Brand','Dealer','Branch','User','Total Items','Shortage Qty','Excess Qty','Status','View'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{sessions.map(s=><tr key={s.session_id} className="border-t"><td className="p-3 font-semibold">{s.session_id}</td><td>{fmt(s.created_at)}</td><td>{s.brand_name}</td><td>{s.dealer_name}</td><td>{s.branch}</td><td>{s.verified_by_name}</td><td>{s.total_items}</td><td>{s.total_shortage_qty}</td><td>{s.total_excess_qty}</td><td>{s.status}</td><td><Button size="sm" variant="outline" onClick={()=>openSession(s)}><Eye className="h-4 w-4"/></Button></td></tr>)}</tbody></table></div></Card></div>}
 
     {showAuditSections && viewSession&&<div className="fixed inset-0 bg-black/50 z-50 p-4 overflow-auto"><div className="bg-white rounded-xl max-w-7xl mx-auto p-5 border shadow-lg"><div className="flex justify-between mb-4"><div><h2 className="text-xl font-bold">{viewSession.session_id}</h2><p className="text-gray-500">{fmt(viewSession.created_at)}</p></div><Button variant="outline" onClick={()=>setViewSession(null)}><X className="h-4 w-4"/></Button></div><DetailTable rows={viewSession.items||[]} canManage={canManage} onCorrection={updateCorrection}/></div></div>}
 

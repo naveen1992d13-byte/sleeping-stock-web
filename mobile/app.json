@@ -1,0 +1,52 @@
+{
+  "expo": {
+    "name": "Sleeping Stock Mobile",
+    "slug": "sleeping-stock-mobile",
+    "version": "1.2.1",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/splash-logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#050706"
+    },
+    "android": {
+      "package": "in.sleepingstock.mobile",
+      "versionCode": 5,
+      "permissions": [
+        "CAMERA",
+        "POST_NOTIFICATIONS"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#050706"
+      },
+      "softwareKeyboardLayoutMode": "resize"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Sleeping Stock Mobile to scan pairing codes and part numbers.",
+          "recordAudioAndroid": false
+        }
+      ],
+      "expo-sqlite",
+      "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "color": "#2458c6"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "545530df-24b8-4e30-a35d-0fb66b3c3f81"
+      }
+    },
+    "owner": "naveensleep"
+  }
+}

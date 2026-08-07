@@ -980,7 +980,32 @@ async def generate_auto_perpetual(
         recalc_pending=recalc_pending,
         active_date_key=active_date_key,
     )
+    if not result.get("duplicate"):
+        from mobile_push import notify_auto_perpetual_assignments
+
+        await notify_auto_perpetual_assignments(
+            db,
+            assignments_by_user=result.get("assignments_by_user") or {},
+            branch=branch,
+            allocation_date=ist_date_key(),
+        )
     return result
+
+
+@router.get("/auto-perpetual/user-performance")
+async def auto_perpetual_user_performance(
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    month: Optional[str] = None,
+    current_user: UserResponse = Depends(_web_current_user),
+):
+    q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
+    if q.get("brand_name") and q["brand_name"] != brand_name:
+        raise HTTPException(403, "Brand outside scope")
+    from auto_perpetual import user_performance_summary
+
+    return await user_performance_summary(db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, month=month)
 
 
 @router.get("/auto-perpetual/summary")
@@ -1021,18 +1046,54 @@ async def auto_perpetual_assignments_today(
 
 @router.get("/auto-perpetual/tasks")
 async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
-    from auto_perpetual import ist_date_key
+    from auto_perpetual import ist_date_key, get_or_create_auto_daily_session
 
     mu = session["mobile_user"]["mobile_user_id"]
+    allocation_date = ist_date_key()
     rows = await db.auto_perpetual_assignments.find(
         {
-            "allocation_date": ist_date_key(),
+            "allocation_date": allocation_date,
             "mobile_user_id": mu,
             "status": "pending",
         },
         {"_id": 0},
     ).to_list(500)
-    return {"tasks": rows, "count": len(rows)}
+    session_id = await get_or_create_auto_daily_session(
+        db,
+        mobile_user_id=mu,
+        brand_name=session["brand_name"],
+        dealer_name=session["dealer_name"],
+        branch=session["branch"],
+        device_id=session["device"]["device_id"],
+    )
+    enriched = []
+    for row in rows:
+        product, _ = await find_scoped_product(row.get("part_number", ""), session["brand_name"], session["dealer_name"], session["branch"])
+        enriched.append(
+            {
+                **row,
+                "part_name": resolve_product_part_name(product or {}),
+                "system_qty": _mobile_stock_qty(product),
+                "loc": row.get("loc") or _product_pin_location(product or {}),
+            }
+        )
+    return {"tasks": enriched, "count": len(enriched), "session_id": session_id, "allocation_date": allocation_date}
+
+
+@router.get("/auto-perpetual/session/today")
+async def auto_perpetual_session_today(session=Depends(get_device_session)):
+    from auto_perpetual import get_or_create_auto_daily_session, ist_date_key
+
+    mu = session["mobile_user"]["mobile_user_id"]
+    session_id = await get_or_create_auto_daily_session(
+        db,
+        mobile_user_id=mu,
+        brand_name=session["brand_name"],
+        dealer_name=session["dealer_name"],
+        branch=session["branch"],
+        device_id=session["device"]["device_id"],
+    )
+    return {"session_id": session_id, "allocation_date": ist_date_key()}
 
 
 # ==================== NOTIFICATIONS (BRANCH-SCOPED, MOBILE SIDE) ====================
@@ -1538,6 +1599,7 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
                     session["brand_name"],
                     session["dealer_name"],
                     session["branch"],
+                    verification_type=payload.verification_type or "physical",
                 )
             existing.setdefault("source", "MOBILE")
             existing.setdefault("information_only", True)
@@ -1568,11 +1630,31 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
     except (TypeError, ValueError):
         damage_qty = 0.0
     vtype = (payload.verification_type or "physical").lower()
+    if vtype not in ("physical", "auto", "recheck"):
+        vtype = "physical"
+
     system_record, clean_part = await find_scoped_product(
         payload.part_number, session["brand_name"], session["dealer_name"], session["branch"]
     )
     if not clean_part:
         raise HTTPException(400, "Part number is required")
+
+    assignment = None
+    coverage_kind = "monthly"
+    if vtype == "auto":
+        from auto_perpetual import ist_date_key
+
+        assignment = await db.auto_perpetual_assignments.find_one(
+            {
+                "allocation_date": ist_date_key(),
+                "mobile_user_id": mobile_user_id,
+                "part_number": str(clean_part).strip().upper(),
+                "status": "pending",
+            },
+            {"_id": 0},
+        )
+        if assignment:
+            coverage_kind = assignment.get("coverage_kind") or "monthly"
     system_qty = _mobile_stock_qty(system_record)
     difference = physical_qty - system_qty
     part_found = bool(system_record)
@@ -1618,8 +1700,10 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
         "status": "submitted", "correction_status": correction_status, "correction_method": "",
         "correction_remarks": "", "information_only": True, "affects_stock": False, "source": "MOBILE",
         "damage_qty": damage_qty,
-        "verification_type": vtype,
+        "verification_type": vtype if coverage_kind != "recheck" else "recheck",
+        "coverage_kind": coverage_kind,
         "has_damage": damage_qty > 0,
+        "assignment_id": (assignment or {}).get("id"),
     }
     try:
         await db.stock_verification_history.insert_one(dict(doc))
@@ -1642,14 +1726,15 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
         raise
 
     await _mirror_mobile_verification_to_web(doc)
-    if vtype in ("auto", "physical"):
-        from auto_perpetual import month_key, ist_date_key
+    from auto_perpetual import month_key, ist_date_key
 
+    part_key = str(doc["part_number"]).strip().upper()
+    if coverage_kind == "monthly" and vtype in ("auto", "physical"):
         await db.auto_perpetual_pool.update_one(
             {
                 "month_key": month_key(),
                 "branch": session["branch"],
-                "part_number": str(doc["part_number"]).strip().upper(),
+                "part_number": part_key,
                 "coverage_kind": "monthly",
             },
             {
@@ -1662,13 +1747,32 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
                 }
             },
         )
+    elif coverage_kind == "recheck":
+        await db.auto_perpetual_pool.update_one(
+            {
+                "month_key": month_key(),
+                "branch": session["branch"],
+                "part_number": part_key,
+                "coverage_kind": "recheck",
+            },
+            {
+                "$set": {
+                    "status": "verified",
+                    "verified_at": now,
+                    "verified_by_mobile_user_id": mobile_user_id,
+                    "verified_by_name": session["mobile_user"]["name"],
+                    "updated_at": now,
+                }
+            },
+        )
+    if vtype == "auto":
         await db.auto_perpetual_assignments.update_many(
             {
                 "allocation_date": ist_date_key(),
                 "mobile_user_id": mobile_user_id,
-                "part_number": str(doc["part_number"]).strip().upper(),
+                "part_number": part_key,
             },
-            {"$set": {"status": "completed", "completed_at": now}},
+            {"$set": {"status": "completed", "completed_at": now, "verified_by_mobile_user_id": mobile_user_id}},
         )
     return {
         "success": True, "message": "Verification recorded", "id": doc["id"], "verification_id": doc["id"],

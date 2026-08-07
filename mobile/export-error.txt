@@ -1,0 +1,32 @@
+env: load .env
+env: export EXPO_PUBLIC_API_URL
+Starting Metro Bundler
+Android node_modules/expo/AppEntry.js ▓▓░░░░░░░░░░░░░░ 14.8% ( 16/107)
+Android node_modules/expo/AppEntry.js ▓▓▓▓░░░░░░░░░░░░ 26.6% (162/314)
+Android node_modules/expo/AppEntry.js ▓▓▓▓▓▓▓▓▓▓▓░░░░░ 69.3% (362/440)
+Android node_modules/expo/AppEntry.js ▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░ 91.1% (459/481)
+Android Bundling failed 14634ms node_modules/expo/AppEntry.js (568 modules)
+Error: Unable to resolve module ./src/api from /workspaces/NMTS-Mobile-/App.js: 
+
+None of these files exist:
+  * src/api(.android.ts|.native.ts|.ts|.android.tsx|.native.tsx|.tsx|.android.mjs|.native.mjs|.mjs|.android.js|.native.js|.js|.android.jsx|.native.jsx|.jsx|.android.json|.native.json|.json|.android.cjs|.native.cjs|.cjs|.android.scss|.native.scss|.scss|.android.sass|.native.sass|.sass|.android.css|.native.css|.css)
+  * src/api
+[0m [90m 3 |[39m [36mimport[39m[33m*[39m[36mas[39m [33mSecureStore[39m [36mfrom[39m[32m'expo-secure-store'[39m[33m;[39m[36mimport[39m[33m*[39m[36mas[39m [33mDevice[39m [36mfrom[39m[32m'expo-device'[39m[33m;[39m[36mimport[39m[33m*[39m[36mas[39m [33mApplication[39m [36mfrom[39m[32m'expo-application'[39m[33m;[39m[36mimport[39m [33mNetInfo[39m [36mfrom[39m[32m'@react-native-community/netinfo'[39m[33m;[39m
+ [90m 4 |[39m [36mimport[39m{[33mCamera[39m[33m,[39museCameraDevice[33m,[39museCameraPermission[33m,[39museFrameProcessor}[36mfrom[39m[32m'react-native-vision-camera'[39m[33m;[39m[36mimport[39m{scanOCR}[36mfrom[39m[32m'react-native-vision-camera-ocr-plus'[39m[33m;[39m[36mimport[39m{[33mWorklets[39m}[36mfrom[39m[32m'react-native-worklets-core'[39m[33m;[39m
+[31m[1m>[22m[39m[90m 5 |[39m [36mimport[39m{api[33m,[39mmessage}[36mfrom[39m[32m'./src/api'[39m[33m;[39m
+ [90m   |[39m                         [31m[1m^[22m[39m
+ [90m 6 |[39m [36mconst[39m [33mG[39m[33m=[39m[32m'#176b43'[39m[33m,[39m[33mBG[39m[33m=[39m[32m'#eef1ef'[39m[33m;[39m
+ [90m 7 |[39m [36mconst[39m clean[33m=[39mv[33m=>[39m[33mString[39m(v[33m||[39m[32m''[39m)[33m.[39mtrim()[33m.[39mreplace([35m/[^A-Za-z0-9-]/g[39m[33m,[39m[32m''[39m)[33m;[39m
+ [90m 8 |[39m [36mconst[39m [33mButton[39m[33m=[39m({title[33m,[39monPress[33m,[39mdisabled[33m,[39moutline})[33m=>[39m[33m<[39m[33mPressable[39m disabled[33m=[39m{disabled} onPress[33m=[39m{onPress} style[33m=[39m{[s[33m.[39mbtn[33m,[39moutline[33m&&[39ms[33m.[39moutline[33m,[39mdisabled[33m&&[39m{opacity[33m:[39m[35m.5[39m}]}[33m>[39m[33m<[39m[33mText[39m style[33m=[39m{[s[33m.[39mbtnText[33m,[39moutline[33m&&[39m{color[33m:[39m[33mG[39m}]}[33m>[39m{title}[33m<[39m[33m/[39m[33mText[39m[33m>[39m[33m<[39m[33m/[39m[33mPressable[39m[33m>[39m[33m;[39m[0m
+
+Import stack:
+
+ App.js
+ | import "./src/api"
+
+ node_modules/expo/AppEntry.js
+ | import "../../App"
+
+ 
+ | import "./node_modules/expo/AppEntry.js"
+
