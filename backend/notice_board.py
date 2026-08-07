@@ -293,6 +293,8 @@ async def create_notice(body: NoticeCreateBody, current_user=Depends(_current_us
         if not _sanitize_text(body.brand_name or ""):
             raise HTTPException(status_code=400, detail="Brand is required for selected brand audience")
         brand = await _lookup_brand(body.brand_name)
+        if not brand.get("brand_id"):
+            raise HTTPException(status_code=400, detail="Brand not found in system")
         brand_id, brand_name = brand["brand_id"], brand["brand_name"]
     now = _utcnow()
     notice_id = str(uuid.uuid4())

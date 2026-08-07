@@ -1,15 +1,9 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
 import { Plus, Eye, Paperclip, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
 import { NmtsModal } from '@/components/NmtsModal';
@@ -91,6 +85,46 @@ export function NoticeBoard() {
   const [createOpen, setCreateOpen] = useState(false);
   const [createForm, setCreateForm] = useState(emptyCreateForm());
   const [creating, setCreating] = useState(false);
+  const [brandOptions, setBrandOptions] = useState([]);
+  const [brandsLoading, setBrandsLoading] = useState(false);
+
+  const activeBrandNames = useMemo(() => {
+    const seen = new Set();
+    const names = [];
+    (brandOptions || []).forEach((b) => {
+      const status = String(b?.status || 'active').toLowerCase();
+      if (status && status !== 'active') return;
+      const name = String(b?.name || '').trim();
+      if (!name) return;
+      const key = name.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      names.push(name);
+    });
+    return names.sort((a, b) => a.localeCompare(b));
+  }, [brandOptions]);
+
+  useEffect(() => {
+    if (!createOpen || !isMaster) return undefined;
+    let cancelled = false;
+    (async () => {
+      setBrandsLoading(true);
+      try {
+        const res = await axios.get(`${API}/masters/brands`);
+        if (!cancelled) setBrandOptions(Array.isArray(res.data) ? res.data : []);
+      } catch {
+        if (!cancelled) {
+          setBrandOptions([]);
+          toast.error('Unable to load brands');
+        }
+      } finally {
+        if (!cancelled) setBrandsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [createOpen, isMaster]);
 
   const [detail, setDetail] = useState(null);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -298,7 +332,7 @@ export function NoticeBoard() {
             </button>
           ))}
           </div>
-          <Button onClick={() => setCreateOpen(true)} className="nmts-btn-primary shrink-0">
+          <Button onClick={() => { setCreateForm(emptyCreateForm()); setCreateOpen(true); }} className="nmts-btn-primary shrink-0">
             <Plus className="h-4 w-4 mr-2" />
             Create Notice
           </Button>
@@ -408,34 +442,126 @@ export function NoticeBoard() {
         </div>
       </div>
 
-      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto border-t-[3px] border-t-[#85c808]">
-          <DialogHeader><DialogTitle>Create Notice</DialogTitle></DialogHeader>
-          <form onSubmit={submitCreate} className="space-y-3">
-            <input className="w-full border rounded px-3 py-2 text-sm" placeholder="Subject *" maxLength={300} value={createForm.subject} onChange={(e) => setCreateForm({ ...createForm, subject: e.target.value })} required />
-            <Textarea placeholder="Short content / description *" value={createForm.content} onChange={(e) => setCreateForm({ ...createForm, content: e.target.value })} required />
-            <select className="w-full border rounded px-3 py-2 text-sm" value={createForm.notice_type} onChange={(e) => setCreateForm({ ...createForm, notice_type: e.target.value })}>
-              {NOTICE_TYPES.map((t) => <option key={t}>{t}</option>)}
+      <NmtsModal
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+        title="Create Notice"
+        maxWidth="max-w-lg"
+      >
+        <form onSubmit={submitCreate} className="space-y-3 text-sm text-slate-800">
+          <div>
+            <label className="text-xs font-medium text-slate-700">Subject *</label>
+            <input
+              className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm shadow-sm"
+              placeholder="Subject"
+              maxLength={300}
+              value={createForm.subject}
+              onChange={(e) => setCreateForm({ ...createForm, subject: e.target.value })}
+              required
+            />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-slate-700">Short content / description *</label>
+            <Textarea
+              className="mt-1 min-h-[88px] text-sm"
+              placeholder="Short content / description"
+              value={createForm.content}
+              onChange={(e) => setCreateForm({ ...createForm, content: e.target.value })}
+              required
+            />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-slate-700">Notice Type</label>
+            <select
+              className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm"
+              value={createForm.notice_type}
+              onChange={(e) => setCreateForm({ ...createForm, notice_type: e.target.value })}
+            >
+              {NOTICE_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
             </select>
-            <select className="w-full border rounded px-3 py-2 text-sm" value={createForm.priority} onChange={(e) => setCreateForm({ ...createForm, priority: e.target.value })}>
-              {PRIORITIES.map((p) => <option key={p}>{p}</option>)}
+          </div>
+          <div>
+            <label className="text-xs font-medium text-slate-700">Priority</label>
+            <select
+              className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm"
+              value={createForm.priority}
+              onChange={(e) => setCreateForm({ ...createForm, priority: e.target.value })}
+            >
+              {PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
             </select>
-            <select className="w-full border rounded px-3 py-2 text-sm" value={createForm.audience_type} onChange={(e) => setCreateForm({ ...createForm, audience_type: e.target.value })}>
+          </div>
+          <div>
+            <label className="text-xs font-medium text-slate-700">Audience</label>
+            <select
+              className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm"
+              value={createForm.audience_type}
+              onChange={(e) => setCreateForm({
+                ...createForm,
+                audience_type: e.target.value,
+                brand_name: e.target.value === 'all_brands' ? '' : createForm.brand_name,
+              })}
+            >
               <option value="all_brands">All Brands</option>
               <option value="selected_brand">Selected Brand</option>
             </select>
-            {createForm.audience_type === 'selected_brand' && (
-              <input className="w-full border rounded px-3 py-2 text-sm" placeholder="Brand name (e.g. Hyundai)" value={createForm.brand_name} onChange={(e) => setCreateForm({ ...createForm, brand_name: e.target.value })} />
-            )}
-            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={createForm.popup_required} onChange={(e) => setCreateForm({ ...createForm, popup_required: e.target.checked })} /> Popup required</label>
-            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={createForm.acknowledgement_required} onChange={(e) => setCreateForm({ ...createForm, acknowledgement_required: e.target.checked })} /> Acknowledgement required</label>
-            <input type="datetime-local" className="w-full border rounded px-3 py-2 text-sm" value={createForm.publish_date} onChange={(e) => setCreateForm({ ...createForm, publish_date: e.target.value })} />
-            <input type="datetime-local" className="w-full border rounded px-3 py-2 text-sm" value={createForm.expiry_date} onChange={(e) => setCreateForm({ ...createForm, expiry_date: e.target.value })} />
-            <input type="file" accept="application/pdf,.pdf" className="text-sm" onChange={(e) => setCreateForm({ ...createForm, pdf: e.target.files?.[0] || null })} />
-            <Button type="submit" disabled={creating}>{creating ? 'Saving…' : 'Save as Draft'}</Button>
-          </form>
-        </DialogContent>
-      </Dialog>
+          </div>
+          {createForm.audience_type === 'selected_brand' && (
+            <div>
+              <label className="text-xs font-medium text-slate-700">Brand *</label>
+              <select
+                className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm"
+                value={createForm.brand_name}
+                onChange={(e) => setCreateForm({ ...createForm, brand_name: e.target.value })}
+                required
+                disabled={brandsLoading}
+              >
+                <option value="">{brandsLoading ? 'Loading brands…' : 'Select brand'}</option>
+                {activeBrandNames.map((name) => (
+                  <option key={name} value={name}>{name}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={createForm.popup_required} onChange={(e) => setCreateForm({ ...createForm, popup_required: e.target.checked })} />
+            Popup required
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={createForm.acknowledgement_required} onChange={(e) => setCreateForm({ ...createForm, acknowledgement_required: e.target.checked })} />
+            Acknowledgement required
+          </label>
+          <div>
+            <label className="text-xs font-medium text-slate-700">From Date</label>
+            <input
+              type="datetime-local"
+              className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm"
+              value={createForm.publish_date}
+              onChange={(e) => setCreateForm({ ...createForm, publish_date: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-slate-700">To Date</label>
+            <input
+              type="datetime-local"
+              className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm"
+              value={createForm.expiry_date}
+              onChange={(e) => setCreateForm({ ...createForm, expiry_date: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-slate-700">Attachment (PDF)</label>
+            <input
+              type="file"
+              accept="application/pdf,.pdf"
+              className="mt-1 block w-full text-xs"
+              onChange={(e) => setCreateForm({ ...createForm, pdf: e.target.files?.[0] || null })}
+            />
+          </div>
+          <Button type="submit" disabled={creating} className="nmts-btn-primary w-full sm:w-auto">
+            {creating ? 'Saving…' : 'Save as Draft'}
+          </Button>
+        </form>
+      </NmtsModal>
 
       <NmtsModal open={detailOpen} onClose={() => setDetailOpen(false)} title={detail?.subject || 'Notice'} maxWidth="max-w-xl">
           {detail && (
