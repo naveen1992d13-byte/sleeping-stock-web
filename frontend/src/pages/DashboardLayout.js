@@ -24,6 +24,7 @@ import {
 } from '../components/ui/dropdown-menu';
 import { toast } from 'sonner';
 import { clearAuthStorage } from '../utils/sessionActivity';
+import { NoticeLoginPopup } from '../components/NoticeLoginPopup';
 
 export function DashboardLayout() {
   const { user, logout } = useAuth();
