@@ -5,6 +5,7 @@ import { API, useAuth } from '../App';
 import { Smartphone, Download, Ban, Trash2, ScanLine, Copy, ClipboardCheck, Camera, History, Eye, Plus, Upload, X, RefreshCw, Settings2, QrCode, CheckCircle2, ArrowRightLeft } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { toast } from 'sonner';
+import { NmtsConfirmDialog } from '../components/NmtsConfirmDialog';
 
 const clean = (v) => String(v || '').trim();
 const exact = (v) => clean(v) && clean(v) !== 'N/A' && !clean(v).startsWith('All ');
@@ -41,6 +42,11 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const [creatingUser,setCreatingUser]=useState(false);
   const [pairingFor,setPairingFor]=useState(null); // mobile_user_id currently generating a code for
   const [pairingResult,setPairingResult]=useState(null); // { mobile_user_id, pairing_code, qr_payload, expires_at }
+
+  const [branchMoveTarget, setBranchMoveTarget] = useState(null);
+  const [branchMoveBusy, setBranchMoveBusy] = useState(false);
+  const [deviceRemoveTarget, setDeviceRemoveTarget] = useState(null);
+  const [deviceRemoveBusy, setDeviceRemoveBusy] = useState(false);
 
   // ==================== App & Settings (new model) ====================
   const [notificationInterval,setNotificationInterval]=useState(30);
@@ -121,15 +127,43 @@ export default function NMTSMobile({ variant = 'mobile' }){
     finally{setPairingFor(null)}
   };
 
-  const changeBranch=async(mu)=>{
-    if(!scopeReady) return toast.error('Select the new Brand / Dealer / Branch in the Dashboard filter first');
-    if(!window.confirm(`Move ${mu.mobile_user_id} from ${mu.branch} to ${branch}? Existing mobile session will be logged out.`)) return;
-    try{
-      const r=await axios.put(`${API}/mobile/users/${mu.mobile_user_id}/branch`,{brand_name:brand,dealer_name:dealer,branch});
-      toast.success(r.data?.message||'Branch updated');
-      loadMobileUsers();loadDevices();
-    }catch(e){const d=e.response?.data?.detail;toast.error(typeof d==='string'?d:(d?.message||'Branch change failed'))}
+  const performChangeBranch = async () => {
+    const mu = branchMoveTarget;
+    if (!mu || branchMoveBusy) return;
+    if (!scopeReady) return toast.error('Select the new Brand / Dealer / Branch in the Dashboard filter first');
+    setBranchMoveBusy(true);
+    try {
+      const r = await axios.put(`${API}/mobile/users/${mu.mobile_user_id}/branch`, { brand_name: brand, dealer_name: dealer, branch });
+      toast.success(r.data?.message || 'Branch updated');
+      setBranchMoveTarget(null);
+      loadMobileUsers();
+      loadDevices();
+    } catch (e) {
+      const d = e.response?.data?.detail;
+      toast.error(typeof d === 'string' ? d : (d?.message || 'Branch change failed'));
+    } finally {
+      setBranchMoveBusy(false);
+    }
   };
+
+  const changeBranch = (mu) => {
+    if (!scopeReady) return toast.error('Select the new Brand / Dealer / Branch in the Dashboard filter first');
+    setBranchMoveTarget(mu);
+  };
+
+  const performRemoveDevice = async () => {
+    const d = deviceRemoveTarget;
+    if (!d || deviceRemoveBusy) return;
+    setDeviceRemoveBusy(true);
+    try {
+      await setDeviceStatus(d, 'removed');
+      setDeviceRemoveTarget(null);
+    } finally {
+      setDeviceRemoveBusy(false);
+    }
+  };
+
+  const requestRemoveDevice = (d) => setDeviceRemoveTarget(d);
 
   const setDeviceStatus=async(d,status)=>{
     try{await axios.put(`${API}/mobile/devices/${d.device_id}/status`,{status});toast.success(`Device set to ${status}`);loadDevices();loadMobileUsers();}
@@ -231,7 +265,7 @@ export default function NMTSMobile({ variant = 'mobile' }){
           <td><span className={`px-2 py-1 rounded text-xs ${d.status==='active'?'bg-green-100 text-green-700':d.status==='removed'?'bg-red-100 text-red-700':'bg-gray-200 text-gray-600'}`}>{d.status}</span></td>
           <td><div className="flex gap-2">
             {d.status==='active'?<Button size="sm" variant="outline" onClick={()=>setDeviceStatus(d,'inactive')}><Ban className="h-4 w-4"/></Button>:d.status==='inactive'?<Button size="sm" onClick={()=>setDeviceStatus(d,'active')}>Activate</Button>:null}
-            {d.status!=='removed' && <Button size="sm" variant="outline" onClick={()=>{if(window.confirm('Remove this device permanently? The mobile user will need a new pairing code to reconnect.'))setDeviceStatus(d,'removed')}}><Trash2 className="h-4 w-4"/></Button>}
+            {d.status!=='removed' && <Button size="sm" variant="outline" onClick={()=>requestRemoveDevice(d)}><Trash2 className="h-4 w-4"/></Button>}
           </div></td>
         </tr>)}
         {!devices.length && <tr><td colSpan="13" className="text-center py-8 text-gray-500">No paired devices yet.</td></tr>}
@@ -281,6 +315,36 @@ export default function NMTSMobile({ variant = 'mobile' }){
       <Card title="Perpetual Verification History"><div className="flex flex-wrap items-center justify-between gap-3 mb-4"><p className="text-sm text-gray-500">{user?.role==='master'?'Download all permitted brands, dealers and branches.':user?.role==='admin'?'Download all branches under your Brand / Dealer scope.':'Download your branch verification list.'}</p><Button onClick={exportAllExcel}><Download className="h-4 w-4 mr-2"/>Download Complete Excel</Button></div><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1350px]"><thead><tr>{['Session ID','Date','Brand','Dealer','Branch','User','Total Items','Shortage Qty','Shortage Value','Excess Qty','Excess Value','Status','View','Excel'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{sessions.map(s=><tr key={s.session_id} className="border-t"><td className="p-3 font-semibold">{s.session_id}</td><td>{fmt(s.created_at)}</td><td>{s.brand_name}</td><td>{s.dealer_name}</td><td>{s.branch}</td><td>{s.verified_by_name}</td><td>{s.total_items}</td><td>{s.total_shortage_qty}</td><td>{money(s.total_shortage_value)}</td><td>{s.total_excess_qty}</td><td>{money(s.total_excess_value)}</td><td>{s.status}</td><td><Button size="sm" variant="outline" onClick={()=>openSession(s)}><Eye className="h-4 w-4"/></Button></td><td><Button size="sm" variant="outline" onClick={()=>excel(s)}><Download className="h-4 w-4"/></Button></td></tr>)}</tbody></table></div></Card></div>}
 
     {showAuditSections && viewSession&&<div className="fixed inset-0 bg-black/50 z-50 p-4 overflow-auto"><div className="bg-white rounded-xl max-w-7xl mx-auto p-5 border shadow-lg"><div className="flex justify-between mb-4"><div><h2 className="text-xl font-bold">{viewSession.session_id}</h2><p className="text-gray-500">{fmt(viewSession.created_at)}</p></div><Button variant="outline" onClick={()=>setViewSession(null)}><X className="h-4 w-4"/></Button></div><DetailTable rows={viewSession.items||[]} canManage={canManage} onCorrection={updateCorrection}/></div></div>}
+
+    <NmtsConfirmDialog
+      open={!!branchMoveTarget}
+      title="Move Mobile User Branch"
+      message={
+        branchMoveTarget
+          ? `Move ${branchMoveTarget.mobile_user_id} from ${branchMoveTarget.branch} to ${branch}? Existing mobile session will be logged out.`
+          : ''
+      }
+      confirmLabel="Move Branch"
+      variant="danger"
+      loading={branchMoveBusy}
+      onCancel={() => {
+        if (!branchMoveBusy) setBranchMoveTarget(null);
+      }}
+      onConfirm={performChangeBranch}
+    />
+
+    <NmtsConfirmDialog
+      open={!!deviceRemoveTarget}
+      title="Remove Device"
+      message="Remove this device permanently? The mobile user will need a new pairing code to reconnect."
+      confirmLabel="Remove Device"
+      variant="danger"
+      loading={deviceRemoveBusy}
+      onCancel={() => {
+        if (!deviceRemoveBusy) setDeviceRemoveTarget(null);
+      }}
+      onConfirm={performRemoveDevice}
+    />
   </div>
 }
 

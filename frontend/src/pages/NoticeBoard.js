@@ -7,6 +7,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Plus, Eye, Paperclip, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
 import { NmtsModal } from '@/components/NmtsModal';
+import { NmtsConfirmDialog } from '@/components/NmtsConfirmDialog';
 
 const BACKEND_ROOT = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8000';
 
@@ -131,6 +132,14 @@ export function NoticeBoard() {
   const [tracking, setTracking] = useState(null);
   const [trackingOpen, setTrackingOpen] = useState(false);
 
+  const [publishConfirmId, setPublishConfirmId] = useState(null);
+  const [publishBusy, setPublishBusy] = useState(false);
+  const [expireConfirmId, setExpireConfirmId] = useState(null);
+  const [expireBusy, setExpireBusy] = useState(false);
+  const [cancelNoticeId, setCancelNoticeId] = useState(null);
+  const [cancelReason, setCancelReason] = useState('');
+  const [cancelBusy, setCancelBusy] = useState(false);
+
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -251,39 +260,62 @@ export function NoticeBoard() {
     }
   };
 
-  const publishNotice = async (id) => {
-    if (!window.confirm('Publish this notice to eligible users?')) return;
+  const performPublishNotice = async () => {
+    const id = publishConfirmId;
+    if (!id || publishBusy) return;
+    setPublishBusy(true);
     try {
       await axios.post(`${API}/notice-board/notices/${id}/publish`);
       toast.success('Notice published');
+      setPublishConfirmId(null);
       load();
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Publish failed');
+    } finally {
+      setPublishBusy(false);
     }
   };
 
-  const cancelNotice = async (id) => {
-    const reason = window.prompt('Cancellation reason (optional):') ?? '';
-    if (!window.confirm('Cancel this notice?')) return;
+  const openPublishConfirm = (id) => setPublishConfirmId(id);
+
+  const openCancelNoticeModal = (id) => {
+    setCancelReason('');
+    setCancelNoticeId(id);
+  };
+
+  const performCancelNotice = async () => {
+    const id = cancelNoticeId;
+    if (!id || cancelBusy) return;
+    setCancelBusy(true);
     try {
-      await axios.post(`${API}/notice-board/notices/${id}/cancel`, { reason });
+      await axios.post(`${API}/notice-board/notices/${id}/cancel`, { reason: cancelReason ?? '' });
       toast.success('Notice cancelled');
+      setCancelNoticeId(null);
       load();
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Cancel failed');
+    } finally {
+      setCancelBusy(false);
     }
   };
 
-  const expireNotice = async (id) => {
-    if (!window.confirm('Mark this notice as expired?')) return;
+  const performExpireNotice = async () => {
+    const id = expireConfirmId;
+    if (!id || expireBusy) return;
+    setExpireBusy(true);
     try {
       await axios.post(`${API}/notice-board/notices/${id}/expire`);
       toast.success('Notice expired');
+      setExpireConfirmId(null);
       load();
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Expire failed');
+    } finally {
+      setExpireBusy(false);
     }
   };
+
+  const openExpireConfirm = (id) => setExpireConfirmId(id);
 
   const openTracking = async (id) => {
     try {
@@ -420,13 +452,13 @@ export function NoticeBoard() {
                       <Eye className="h-4 w-4" />
                     </Button>
                     {isMaster && row.status === 'Draft' && (
-                      <Button size="sm" onClick={() => publishNotice(row.id)}>Publish</Button>
+                      <Button size="sm" onClick={() => openPublishConfirm(row.id)}>Publish</Button>
                     )}
                     {isMaster && row.status === 'Published' && (
                       <>
                         <Button size="sm" variant="outline" onClick={() => openTracking(row.id)}>Track</Button>
-                        <Button size="sm" variant="outline" onClick={() => cancelNotice(row.id)}>Cancel</Button>
-                        <Button size="sm" variant="outline" onClick={() => expireNotice(row.id)}>Expire</Button>
+                        <Button size="sm" variant="outline" onClick={() => openCancelNoticeModal(row.id)}>Cancel</Button>
+                        <Button size="sm" variant="outline" onClick={() => openExpireConfirm(row.id)}>Expire</Button>
                       </>
                     )}
                   </td>
@@ -609,6 +641,64 @@ export function NoticeBoard() {
               </tbody>
             </table>
           </div>
+      </NmtsModal>
+
+      <NmtsConfirmDialog
+        open={!!publishConfirmId}
+        title="Publish Notice"
+        message="Publish this notice to eligible users?"
+        confirmLabel="Publish"
+        loading={publishBusy}
+        onCancel={() => {
+          if (!publishBusy) setPublishConfirmId(null);
+        }}
+        onConfirm={performPublishNotice}
+      />
+
+      <NmtsConfirmDialog
+        open={!!expireConfirmId}
+        title="Expire Notice"
+        message="Mark this notice as expired?"
+        confirmLabel="Mark Expired"
+        loading={expireBusy}
+        onCancel={() => {
+          if (!expireBusy) setExpireConfirmId(null);
+        }}
+        onConfirm={performExpireNotice}
+      />
+
+      <NmtsModal
+        open={!!cancelNoticeId}
+        onClose={() => {
+          if (!cancelBusy) setCancelNoticeId(null);
+        }}
+        title="Cancel Notice"
+        maxWidth="max-w-md"
+      >
+        <p className="text-sm text-slate-600 mb-3">
+          Optional reason will be stored with the cancellation.
+        </p>
+        <label className="text-xs font-medium text-slate-700">Cancellation Reason (optional)</label>
+        <Textarea
+          className="mt-1 min-h-[88px] text-sm"
+          value={cancelReason}
+          disabled={cancelBusy}
+          onChange={(e) => setCancelReason(e.target.value)}
+          placeholder="Reason for cancellation"
+        />
+        <div className="flex flex-wrap justify-end gap-2 mt-4">
+          <Button type="button" variant="outline" disabled={cancelBusy} onClick={() => setCancelNoticeId(null)}>
+            Back
+          </Button>
+          <Button
+            type="button"
+            className="bg-red-600 hover:bg-red-700 text-white"
+            disabled={cancelBusy}
+            onClick={performCancelNotice}
+          >
+            {cancelBusy ? 'Cancelling…' : 'Confirm Cancellation'}
+          </Button>
+        </div>
       </NmtsModal>
     </div>
   );
