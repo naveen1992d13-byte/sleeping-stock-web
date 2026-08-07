@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import * as XLSX from 'xlsx';
 import { API, useAuth } from '@/App';
-import { useOutletContext } from 'react-router-dom';
+import { useLocation, useOutletContext } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { FileSpreadsheet, ClipboardPaste, Search, Send, History, RefreshCw, ChevronDown, ChevronUp, Printer, Eraser } from 'lucide-react';
@@ -191,7 +191,7 @@ export function Orders() {
   const scopeReady = !isAllScope(scopeBrand) && !isAllScope(scopeDealer) && !isAllScope(scopeBranch);
   const fileRef = useRef(null);
   const uploadInFlightRef = useRef(false);
-  const [activeTab, setActiveTab] = useState('desk');
+  const location = useLocation();
   const [orders, setOrders] = useState([]);
   const [currentOrder, setCurrentOrder] = useState(null);
   const [items, setItems] = useState(emptyRows);
@@ -227,7 +227,7 @@ export function Orders() {
 
   const loadOrder = async (orderId, switchToDesk = true) => {
     setLoading(true);
-    if (switchToDesk) setSendRequestResult(null); // opening a different order — clear the previous order's banner
+    if (switchToDesk) setSendRequestResult(null);
     try {
       const res = await axios.get(`${API}/order-desk/orders/${orderId}`);
       setCurrentOrder(res.data.order);
@@ -235,13 +235,21 @@ export function Orders() {
       const next = {};
       (res.data.items || []).forEach(item => { next[item.id] = item.allocations || []; });
       setAllocations(next);
-      if (switchToDesk) setActiveTab('desk');
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Unable to open order');
     } finally {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    const openOrderId = location.state?.openOrderId;
+    if (openOrderId) {
+      loadOrder(openOrderId, true);
+      window.history.replaceState({}, document.title);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.state?.openOrderId]);
 
   const handleUpload = async (event) => {
     const file = event.target.files?.[0];
@@ -259,7 +267,6 @@ export function Orders() {
       setCurrentOrder(res.data.order);
       setItems(res.data.items || []);
       setAllocations({});
-      setActiveTab('desk');
       await loadHistory();
       toast.success(res.data?.duplicate
         ? `Order already created: ${res.data.order.order_number}`
@@ -551,55 +558,9 @@ export function Orders() {
     setItems(prev => prev.map(item => item.id === itemId ? { ...item, retry_selected: !item.retry_selected } : item));
   };
   return (
-    <div className="space-y-4" data-testid="orders-page">
-      <div className="nmts-module-header">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1>Order Desk</h1>
-            <p>Upload an order, check Product Hub availability, and store every request in the same order.</p>
-          </div>
-          <div className="flex gap-2">
-            <Button variant={activeTab === 'desk' ? 'default' : 'outline'} onClick={() => setActiveTab('desk')}>Order Desk</Button>
-            <Button variant={activeTab === 'history' ? 'default' : 'outline'} onClick={() => { setActiveTab('history'); loadHistory(); }}>
-              <History className="mr-2 h-4 w-4" />Order History
-            </Button>
-          </div>
-        </div>
-      </div>
-
-      {activeTab === 'history' ? (
-        <div className="rounded-xl border bg-white overflow-hidden">
-          <div className="flex items-center justify-between p-4 border-b">
-            <h2 className="font-semibold">Saved Orders</h2>
-            <Button variant="outline" size="sm" onClick={loadHistory}><RefreshCw className="mr-2 h-4 w-4" />Refresh</Button>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="bg-emerald-50"><tr>{['Order No','Created Date','Dealer','Branch','Items','Required Qty','Value','Status','Fulfillment','Action'].map(h => <th key={h} className="p-3 text-left">{h}</th>)}</tr></thead>
-              <tbody>
-                {orders.map(order => (
-                  <tr key={order.id} className="border-t">
-                    <td className="p-3 font-semibold text-emerald-700">{order.order_number}</td>
-                    <td className="p-3">{String(order.created_at || '').slice(0, 10)}</td>
-                    <td className="p-3">{order.dealer_name}</td>
-                    <td className="p-3">{order.branch}</td>
-                    <td className="p-3">{order.item_count}</td>
-                    <td className="p-3">{formatNumber(order.total_required_qty)}</td>
-                    <td className="p-3">{formatNumber(order.total_order_value)}</td>
-                    <td className="p-3">{order.status}</td>
-                    <td className="p-3">{order.overall_status || (order.status === 'Requested' ? 'Requested' : '-')}</td>
-                    <td className="p-3"><Button size="sm" variant="outline" onClick={() => loadOrder(order.id)}>Open</Button></td>
-                  </tr>
-                ))}
-                {!orders.length && <tr><td colSpan={10} className="p-8 text-center text-slate-500">No saved orders</td></tr>}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      ) : (
-        <>
-          <div className="rounded-xl border bg-white p-4">
-            <div className="flex flex-wrap items-center gap-3">
+    <div className="space-y-3" data-testid="orders-page">
+      <div className="rounded-xl border bg-white p-3 shadow-sm">
+        <div className="flex flex-wrap items-center gap-2">
               <input ref={fileRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={handleUpload} />
               <Button onClick={() => fileRef.current?.click()} disabled={loading}><FileSpreadsheet className="mr-2 h-4 w-4" />Upload Excel</Button>
               <Button variant="outline" onClick={() => setPasteOpen(true)} disabled={loading}><ClipboardPaste className="mr-2 h-4 w-4" />Copy From Excel</Button>
@@ -609,10 +570,9 @@ export function Orders() {
                 <span className="font-bold text-emerald-700">{currentOrder?.order_number || 'Created automatically after upload'}</span>
               </div>
             </div>
-            <p className="mt-2 text-xs text-slate-500">Excel columns: Part Number, Quantity, Description, Value. Description is stored exactly from the uploaded Excel or pasted rows.</p>
           </div>
 
-          {currentOrder && (
+      {currentOrder && (
             <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
               {[['Items', currentOrder.item_count], ['Required Qty', totals.required], ['Allocated Qty', totals.allocated], ['Balance Qty', totals.balance], ['Status', currentOrder.status]].map(([label, value]) => (
                 <div key={label} className="rounded-xl border bg-white p-3"><div className="text-xs text-slate-500">{label}</div><div className="text-lg font-bold">{typeof value === 'number' ? formatNumber(value) : value}</div></div>
@@ -799,8 +759,6 @@ export function Orders() {
               </table>
             </div>
           </div>
-        </>
-      )}
 
       <Dialog open={pasteOpen} onOpenChange={setPasteOpen}>
         <DialogContent className="max-w-3xl">

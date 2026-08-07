@@ -21,6 +21,15 @@ import { Analytics } from './pages/Analytics';
 import { Requests } from './pages/Requests';
 import { QueryDesk } from './pages/QueryDesk';
 import NMTSMobile from './pages/NMTSMobile';
+import { OrderHistory } from './pages/OrderHistory';
+import StockAudit from './pages/StockAudit';
+import { SessionInactivityGuard } from './components/SessionInactivityGuard';
+import {
+  touchSessionActivity,
+  clearSessionActivity,
+  isSessionExpiredByInactivity,
+  clearAuthStorage,
+} from './utils/sessionActivity';
 
 const AuthContext = createContext(null);
 
@@ -32,11 +41,13 @@ export const MENU_PERMISSIONS = {
   '/products': 'Product Hub',
   '/product-history': 'Product Hub History',
   '/orders': 'Order Desk',
+  '/order-history': 'Order History',
   '/requests': 'Request Center',
   '/reports': 'Reports',
   '/analytics': 'Analytics',
   '/query': null, // Available to master, admin, and user (Query Desk).
   '/sleeping-stock-mobile': null, // Available to master, admin and user; API applies scope rules.
+  '/stock-audit': null,
 };
 
 export const normalizePermissions = (permissions) => {
@@ -92,11 +103,19 @@ function AuthProvider({ children }) {
     localStorage.setItem('token', token);
     localStorage.setItem('user', JSON.stringify(cleanUser));
     localStorage.setItem('permissions', JSON.stringify(cleanUser.permissions));
+    touchSessionActivity();
     setUser(cleanUser);
     return cleanUser;
   };
 
   useEffect(() => {
+    if (isSessionExpiredByInactivity()) {
+      clearAuthStorage();
+      setUser(null);
+      setLoading(false);
+      return;
+    }
+
     const token = localStorage.getItem('token');
     const storedUser = localStorage.getItem('user');
 
@@ -113,12 +132,11 @@ function AuthProvider({ children }) {
     if (token) {
       axios.get(`${API}/auth/me`)
         .then((res) => {
+          touchSessionActivity();
           saveUserSession(token, res.data);
         })
         .catch(() => {
-          localStorage.removeItem('token');
-          localStorage.removeItem('user');
-          localStorage.removeItem('permissions');
+          clearAuthStorage();
           setUser(null);
         })
         .finally(() => setLoading(false));
@@ -138,9 +156,7 @@ function AuthProvider({ children }) {
   };
 
   const logout = () => {
-    localStorage.removeItem('token');
-    localStorage.removeItem('user');
-    localStorage.removeItem('permissions');
+    clearAuthStorage();
     setUser(null);
   };
 
@@ -173,6 +189,7 @@ function App() {
     <ProcessingProvider>
     <AuthProvider>
       <BrowserRouter>
+        <SessionInactivityGuard />
         <Toaster position="top-right" richColors />
         <Routes>
           <Route path="/login" element={<LoginPage />} />
@@ -206,6 +223,11 @@ function App() {
                 <Orders />
               </ProtectedRoute>
             } />
+            <Route path="order-history" element={
+              <ProtectedRoute permission="Order Desk">
+                <OrderHistory />
+              </ProtectedRoute>
+            } />
             <Route path="upload" element={
               <ProtectedRoute permission="Upload Center">
                 <UploadCenter />
@@ -236,6 +258,11 @@ function App() {
             <Route path="sleeping-stock-mobile" element={
               <ProtectedRoute>
                 <NMTSMobile />
+              </ProtectedRoute>
+            } />
+            <Route path="stock-audit" element={
+              <ProtectedRoute>
+                <StockAudit />
               </ProtectedRoute>
             } />
             <Route path="nmts-mobile" element={<Navigate to="/sleeping-stock-mobile" replace />} />

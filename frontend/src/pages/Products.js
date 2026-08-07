@@ -160,30 +160,20 @@ export function Products() {
     finally { setExporting(false); }
   };
 
-  return <div className="space-y-4" data-testid="product-hub-page">
+  return <div className="space-y-3" data-testid="product-hub-page">
     <PrintStyles />
-    <div className="nmts-module-header no-print">
-      <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="flex items-center gap-3">
-          <Package className="h-8 w-8 nmts-module-header-icon" />
-          <div>
-            <h1>Product Hub</h1>
-            <p>Today&apos;s Published Inventory — {isAll(effectiveBranch) ? 'All Branches' : effectiveBranch}</p>
-          </div>
-        </div>
-        {isMaster && (
-          <Button onClick={exportMasterZip} disabled={exporting} variant="outline" className="gap-2">
-            <Archive className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Export All (ZIP)'}
-          </Button>
-        )}
-      </div>
-    </div>
-
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 no-print">
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-2 no-print items-stretch">
       <SummaryCard title="Total Item" value={summary.totalItem} icon={Boxes} />
       <SummaryCard title="Total Available Item" value={summary.totalAvailableItem} color={COLORS.blue} icon={Boxes} />
       <SummaryCard title="Total Available Quantity" value={summary.totalAvailableQty} color={COLORS.dark} icon={Boxes} />
       <SummaryCard title="Total Value" value={summary.totalValue} prefix="₹" color={COLORS.dark} icon={Boxes} />
+      {isMaster && (
+        <div className="flex items-center justify-end">
+          <Button onClick={exportMasterZip} disabled={exporting} variant="outline" className="gap-2 h-10">
+            <Archive className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Export All (ZIP)'}
+          </Button>
+        </div>
+      )}
     </div>
 
     <div className="rounded-2xl bg-white p-4 shadow-sm" style={{ border: `1px solid ${COLORS.border}` }}>
