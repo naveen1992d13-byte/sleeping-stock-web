@@ -2848,6 +2848,56 @@ async def get_master_upload_summary(
     }
 
 
+@api_router.get("/uploads/master-summary/balance-details")
+async def get_upload_balance_details(
+    brand: Optional[str] = None,
+    dealer: Optional[str] = None,
+    branch: Optional[str] = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Dealer/branch pairs that have not uploaded today (scoped)."""
+    await _ensure_master_or_admin(current_user)
+    date_key = _nmts_date_key()
+    upload_query = {"date_key": date_key}
+    _apply_role_scope_v2(upload_query, current_user, brand, dealer, branch)
+    uploads_today = await db.uploads.find(upload_query, {"_id": 0, "raw_file_bytes": 0}).to_list(200000)
+    active_uploads = [u for u in uploads_today if u.get("status") != "Cancelled"]
+    completed_pairs = {
+        (u.get("dealer_name"), u.get("branch"))
+        for u in active_uploads if u.get("dealer_name") and u.get("branch")
+    }
+    branch_query = {}
+    if not _is_all_scope(dealer):
+        branch_query["dealer"] = dealer
+    elif current_user.role != "master":
+        branch_query["dealer"] = current_user.group
+    branch_docs = await db.branches.find(branch_query, {"_id": 0}).to_list(10000)
+    expected_pairs = {(b.get("dealer"), b.get("name")) for b in branch_docs if b.get("dealer") and b.get("name")}
+    if not _is_all_scope(branch):
+        expected_pairs = {p for p in expected_pairs if p[1] == branch}
+    pending = []
+    completed = []
+    for dealer_name, branch_name in sorted(expected_pairs):
+        row = {
+            "dealer": dealer_name,
+            "branch": branch_name,
+            "brand": brand if brand and not str(brand).startswith("All") else (current_user.brand if current_user.role != "master" else ""),
+            "upload_status": "Completed" if (dealer_name, branch_name) in completed_pairs else "Pending",
+        }
+        if row["upload_status"] == "Completed":
+            completed.append(row)
+        else:
+            pending.append(row)
+    return {
+        "date_key": date_key,
+        "expected_uploads": len(expected_pairs),
+        "completed_uploads": len(completed_pairs),
+        "balance_uploads": max(len(expected_pairs) - len(completed_pairs), 0),
+        "completed",
+        "pending",
+    }
+
+
 @api_router.get("/uploads/today-summary")
 async def get_today_upload_summary(
     brand: Optional[str] = None,
@@ -4300,6 +4350,61 @@ async def order_desk_order_detail(order_id: str, current_user: UserResponse = De
     return {'order': order, 'items': items}
 
 
+@api_router.get('/order-desk/orders/{order_id}/export')
+async def order_desk_order_export(order_id: str, current_user: UserResponse = Depends(get_current_user)):
+    from fastapi.responses import StreamingResponse
+    from io import BytesIO
+
+    detail = await order_desk_order_detail(order_id, current_user)
+    order = detail['order']
+    items = detail['items']
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Order Desk'
+    headers = [
+        'Part Number', 'Part Name', 'Requested Qty', 'Available Qty', 'Allocated Qty', 'Balance Qty',
+        'Value', 'LOC', 'Purchase Aging', 'Sales Aging', 'Availability Status', 'Source Branch', 'Source Dealer',
+    ]
+    ws.append(headers)
+    for item in items:
+        alloc_qty = sum(float(s.get('allocated_qty') or 0) for s in (item.get('selected_sources') or []))
+        req = float(item.get('required_qty') or item.get('quantity') or 0)
+        avail = float(item.get('available_qty') or 0)
+        sources = item.get('selected_sources') or item.get('same_dealer_sources') or []
+        src_branch = sources[0].get('branch') if sources else ''
+        src_dealer = sources[0].get('dealer_name') if sources else ''
+        ws.append([
+            item.get('part_number'),
+            item.get('description') or item.get('part_name'),
+            req,
+            avail,
+            alloc_qty,
+            max(req - alloc_qty, 0),
+            item.get('value') or item.get('line_value'),
+            item.get('loc') or item.get('location'),
+            item.get('purchase_aging_days'),
+            item.get('sales_aging_days'),
+            item.get('availability_status'),
+            src_branch,
+            src_dealer,
+        ])
+    meta = wb.create_sheet('Summary')
+    meta.append(['Order Number', order.get('order_number')])
+    meta.append(['Brand', order.get('brand_name')])
+    meta.append(['Dealer', order.get('dealer_name')])
+    meta.append(['Branch', order.get('branch')])
+    meta.append(['Status', order.get('status')])
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f"Order_Desk_{order.get('order_number') or order_id}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={'Content-Disposition': f'attachment; filename={fname}'},
+    )
+
+
 @api_router.post('/order-desk/orders/{order_id}/check-availability')
 async def order_desk_check_availability(order_id: str, brand: Optional[str] = None, dealer: Optional[str] = None, branch: Optional[str] = None, current_user: UserResponse = Depends(get_current_user)):
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
@@ -5445,6 +5550,58 @@ async def _build_verification_record(item, scope_query, current_user, session_id
     }
 
 
+async def _get_or_create_web_physical_session(
+    current_user: UserResponse,
+    brand: str,
+    dealer: str,
+    branch: str,
+) -> str:
+    """One Physical Perpetual web session per NMTS user + branch + IST day."""
+    india_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    verification_date = india_now.strftime("%Y-%m-%d")
+    scope = {
+        "session_kind": "physical_web",
+        "verification_date": verification_date,
+        "verified_by": current_user.id,
+        "brand_name": brand.strip(),
+        "dealer_name": dealer.strip(),
+        "branch": branch.strip(),
+        "status": "ACTIVE",
+    }
+    existing = await db.stock_verification_sessions.find_one(scope, {"_id": 0, "session_id": 1})
+    if existing and existing.get("session_id"):
+        return existing["session_id"]
+    session_id = await _next_mops_verification_session_id()
+    now = datetime.now(timezone.utc)
+    session_doc = {
+        "id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "session_kind": "physical_web",
+        "verification_type": "physical",
+        "verification_date": verification_date,
+        "brand_name": brand.strip(),
+        "dealer_name": dealer.strip(),
+        "branch": branch.strip(),
+        "verified_by": current_user.id,
+        "verified_by_name": current_user.username,
+        "status": "ACTIVE",
+        "total_items": 0,
+        "source": "WEB_PHYSICAL",
+        "information_only": True,
+        "affects_stock": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        await db.stock_verification_sessions.insert_one(session_doc)
+    except Exception:
+        existing = await db.stock_verification_sessions.find_one(scope, {"_id": 0, "session_id": 1})
+        if existing and existing.get("session_id"):
+            return existing["session_id"]
+        raise
+    return session_id
+
+
 @api_router.post("/mobile/perpetual-stock/sessions")
 async def create_mobile_stock_verification_session(payload: StockVerificationSessionCreate, current_user: UserResponse = Depends(get_current_user)):
     if not payload.items:
@@ -5452,7 +5609,9 @@ async def create_mobile_stock_verification_session(payload: StockVerificationSes
     if len(payload.items) > 5000:
         raise HTTPException(status_code=400, detail="A verification session cannot exceed 5000 items")
     scope_query = _mobile_dashboard_scope_query(current_user, payload.brand, payload.dealer, payload.branch)
-    session_id = await _next_perpetual_session_id(payload.brand)
+    session_id = await _get_or_create_web_physical_session(
+        current_user, payload.brand, payload.dealer, payload.branch
+    )
     now = datetime.now(timezone.utc)
     records = []
     seen = set()
@@ -5469,17 +5628,23 @@ async def create_mobile_stock_verification_session(payload: StockVerificationSes
         "total_excess_qty": sum(r["excess_qty"] for r in records),
         "total_excess_value": sum(r["excess_value"] for r in records),
     }
-    session = {
-        "id": str(uuid.uuid4()), "session_id": session_id, "created_at": now, "date": now,
-        "brand_name": payload.brand.strip(), "dealer_name": payload.dealer.strip(), "branch": payload.branch.strip(),
-        "verified_by": current_user.id, "verified_by_name": current_user.username,
-        "status": "submitted", **totals, "information_only": True, "affects_stock": False,
-    }
-    await db.stock_verification_sessions.insert_one(session.copy())
     if records:
         await db.stock_verifications.insert_many([r.copy() for r in records])
-    session.pop("_id", None)
-    return {**session, "items": records}
+    await db.stock_verification_sessions.update_one(
+        {"session_id": session_id},
+        {
+            "$inc": {
+                "total_items": totals["total_items"],
+                "total_shortage_qty": totals["total_shortage_qty"],
+                "total_shortage_value": totals["total_shortage_value"],
+                "total_excess_qty": totals["total_excess_qty"],
+                "total_excess_value": totals["total_excess_value"],
+            },
+            "$set": {"updated_at": now, "status": "submitted"},
+        },
+    )
+    session = await db.stock_verification_sessions.find_one({"session_id": session_id}, {"_id": 0})
+    return {**(session or {}), "items": records}
 
 
 @api_router.get("/mobile/perpetual-stock/sessions")

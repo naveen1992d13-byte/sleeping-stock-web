@@ -5,7 +5,8 @@ import { API, useAuth } from '@/App';
 import { useLocation, useOutletContext } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { FileSpreadsheet, ClipboardPaste, Search, Send, History, RefreshCw, ChevronDown, ChevronUp, Printer, Eraser } from 'lucide-react';
+import { openOrderDeskPrint } from '@/utils/orderDeskPrint';
+import { FileSpreadsheet, ClipboardPaste, Search, Send, History, RefreshCw, ChevronDown, ChevronUp, Printer, Eraser, Download } from 'lucide-react';
 import { toast } from 'sonner';
 
 const emptyRows = [];
@@ -546,6 +547,33 @@ export function Orders() {
     }
   };
 
+  const exportOrderExcel = async () => {
+    if (!currentOrder?.id) return toast.error('Upload or open an order first');
+    try {
+      const res = await axios.get(`${API}/order-desk/orders/${currentOrder.id}/export`, { responseType: 'blob' });
+      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `Order_Desk_${currentOrder.order_number || currentOrder.id}.xlsx`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+      toast.success('Order exported to Excel');
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Order export failed');
+    }
+  };
+
+  const printOrderDesk = () => {
+    if (!currentOrder) return toast.error('Upload or open an order first');
+    const enriched = items.map((item) => ({
+      ...item,
+      selected_sources: allocations[item.id] || item.selected_sources || [],
+    }));
+    openOrderDeskPrint({ order: currentOrder, items: enriched });
+  };
+
   const clearCurrentWorkspace = () => {
     setCurrentOrder(null); setItems([]); setAllocations({}); setExpandedItem(''); setSourceMode({});
     setAvailabilityFilter('all'); setAgingFilter('0'); setSuggestedQtyByItem({}); setSendRequestResult(null);
@@ -680,7 +708,11 @@ export function Orders() {
 
               <Button variant="outline" onClick={clearCurrentWorkspace} className="h-9 self-end"><Eraser className="mr-2 h-4 w-4" />Clear</Button>
 
-              <Button variant="outline" onClick={() => window.print()} className="h-9 self-end" title="Print current Order Desk results">
+              <Button variant="outline" onClick={exportOrderExcel} className="h-9 self-end" title="Download order details as Excel">
+                <Download className="mr-2 h-4 w-4" />Excel
+              </Button>
+
+              <Button variant="outline" onClick={printOrderDesk} className="h-9 self-end" title="Print dedicated Order Desk document">
                 <Printer className="mr-2 h-4 w-4" />Print
               </Button>
             </div>

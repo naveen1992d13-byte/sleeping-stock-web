@@ -6,10 +6,21 @@ import { Button } from '@/components/ui/button';
 import { Upload, Package, ClipboardCheck, Download, Send, FileSpreadsheet, Search, Eye, XCircle, CheckCircle2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { NmtsConfirmDialog } from '@/components/NmtsConfirmDialog';
+import { NmtsModal } from '@/components/NmtsModal';
 import * as XLSX from 'xlsx';
 
 const COLORS = { primary: '#059669', dark: '#047857', soft: '#ECFDF5', border: '#D1D5DB', text: '#1F2937', muted: '#6B7280', danger: '#DC2626', warning: '#D97706', blue: '#2563EB' };
 const CANCEL_REASONS = ['Wrong File', 'Duplicate Upload', 'Wrong Brand', 'Wrong Dealer', 'Wrong Branch', 'Incorrect Data', 'Other'];
+const formatDisplayNumber = (value, { currency = false } = {}) => {
+  const n = Number(value || 0);
+  const rounded = currency ? Math.round(n) : n;
+  return rounded.toLocaleString('en-IN', {
+    maximumFractionDigits: currency ? 0 : 0,
+    minimumFractionDigits: 0,
+  });
+};
+
+const formatDisplayCurrency = (value) => `₹${formatDisplayNumber(value, { currency: true })}`;
 const isAll = (v) => !v || String(v).startsWith('All ') || v === 'N/A';
 
 // Authenticated file download helper. Uses axios (which already attaches the
@@ -54,6 +65,9 @@ export function UploadCenter() {
   const [cancelReason, setCancelReason] = useState(CANCEL_REASONS[0]);
   const [publishConfirmTarget, setPublishConfirmTarget] = useState(null);
   const [publishBusy, setPublishBusy] = useState(false);
+  const [balanceOpen, setBalanceOpen] = useState(false);
+  const [balanceDetails, setBalanceDetails] = useState(null);
+  const [balanceLoading, setBalanceLoading] = useState(false);
   const [masterSummary, setMasterSummary] = useState(null);
   const [todaySummary, setTodaySummary] = useState(null);
   const productFileRef = useRef(null);
@@ -181,6 +195,23 @@ export function UploadCenter() {
     }
   };
 
+  const openBalanceDetails = async () => {
+    setBalanceLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (scopeBrand) params.append('brand', scopeBrand);
+      if (scopeDealer) params.append('dealer', scopeDealer);
+      if (scopeBranch) params.append('branch', scopeBranch);
+      const res = await axios.get(`${API}/uploads/master-summary/balance-details?${params.toString()}`);
+      setBalanceDetails(res.data);
+      setBalanceOpen(true);
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Unable to load balance uploader details');
+    } finally {
+      setBalanceLoading(false);
+    }
+  };
+
   const publishUpload = (u) => setPublishConfirmTarget(u);
 
   const openCancelModal = (u) => { setCancelTarget(u); setCancelReason(CANCEL_REASONS[0]); };
@@ -240,7 +271,7 @@ export function UploadCenter() {
           <SummaryCard title="Total Uploaded Branch" value={masterSummary.branchesUploaded} />
           <SummaryCard title="Expected Uploaders" value={masterSummary.expectedUploads} />
           <SummaryCard title="Completed Uploaders" value={masterSummary.completedUploads} color={COLORS.dark} />
-          <SummaryCard title="Balance Uploaders" value={masterSummary.balanceUploads} color={COLORS.warning} />
+          <SummaryCard title="Balance Uploaders" value={masterSummary.balanceUploads} color={COLORS.warning} onClick={masterSummary.balanceUploads > 0 ? openBalanceDetails : undefined} loading={balanceLoading} clickable={masterSummary.balanceUploads > 0} />
           <SummaryCard title="Published Uploads" value={masterSummary.published} color={COLORS.dark} />
           <SummaryCard title="Pending Uploads" value={masterSummary.pending} color={COLORS.warning} />
           <SummaryCard title="Cancelled Uploads" value={masterSummary.cancelled} color={COLORS.danger} />
@@ -255,7 +286,7 @@ export function UploadCenter() {
           <SummaryCard title="Today Uploaded Items" value={todaySummary.todayUploadedItems} />
           <SummaryCard title="Today Uploaded Available Items" value={todaySummary.todayUploadedAvailableItems} color={COLORS.blue} />
           <SummaryCard title="Today Uploaded Available Quantity" value={todaySummary.todayUploadedAvailableQty} color={COLORS.dark} />
-          <SummaryCard title="Today Uploaded Value" value={todaySummary.todayUploadedValue} prefix="₹" color={COLORS.dark} />
+          <SummaryCard title="Today Uploaded Value" value={todaySummary.todayUploadedValue} prefix="₹" color={COLORS.dark} currency />
         </div>
       </div>
     )}
@@ -305,7 +336,7 @@ export function UploadCenter() {
       <div className="grid grid-cols-3 gap-2 mt-2 text-center text-xs">
         <Stat title="Last Items" value={Number(summary.totalItems).toLocaleString('en-IN')} />
         <Stat title="Last Qty" value={Number(summary.totalQty).toLocaleString('en-IN')} color={COLORS.blue} />
-        <Stat title="Last Value" value={`₹${Number(summary.totalValue).toLocaleString('en-IN')}`} color={COLORS.dark} />
+        <Stat title="Last Value" value={formatDisplayCurrency(summary.totalValue)} color={COLORS.dark} />
       </div>
     </div>
     </div>
@@ -343,6 +374,42 @@ export function UploadCenter() {
       onConfirm={performPublishUpload}
     />
 
+    <NmtsModal open={balanceOpen} onClose={() => setBalanceOpen(false)} title="Upload status — today" maxWidth="max-w-2xl">
+      {balanceDetails && (
+        <div className="space-y-4 text-sm">
+          <p className="text-slate-600">
+            Expected {balanceDetails.expected_uploads} branch uploaders · Completed {balanceDetails.completed_uploads} · Pending {balanceDetails.balance_uploads}
+          </p>
+          <div>
+            <h3 className="font-semibold text-amber-800 mb-2">Pending ({balanceDetails.pending?.length || 0})</h3>
+            <div className="max-h-48 overflow-auto border rounded-lg">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50"><tr><th className="p-2 text-left">Dealer</th><th className="p-2 text-left">Branch</th><th className="p-2 text-left">Status</th></tr></thead>
+                <tbody>
+                  {(balanceDetails.pending || []).map((r) => (
+                    <tr key={`${r.dealer}-${r.branch}`} className="border-t"><td className="p-2">{r.dealer}</td><td className="p-2">{r.branch}</td><td className="p-2 text-amber-700">{r.upload_status}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3 className="font-semibold text-emerald-800 mb-2">Completed ({balanceDetails.completed?.length || 0})</h3>
+            <div className="max-h-40 overflow-auto border rounded-lg">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50"><tr><th className="p-2 text-left">Dealer</th><th className="p-2 text-left">Branch</th></tr></thead>
+                <tbody>
+                  {(balanceDetails.completed || []).map((r) => (
+                    <tr key={`c-${r.dealer}-${r.branch}`} className="border-t"><td className="p-2">{r.dealer}</td><td className="p-2">{r.branch}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+    </NmtsModal>
+
     {cancelTarget && (
       <div className="fixed inset-0 z-50 flex items-center justify-center" style={{backgroundColor: 'rgba(0,0,0,0.4)'}} onClick={closeCancelModal}>
         <div className="bg-white rounded-2xl p-5 w-full max-w-sm shadow-xl" onClick={(e) => e.stopPropagation()}>
@@ -367,7 +434,7 @@ export function UploadCenter() {
 }
 
 function PublishSummaryRow({label, uploaded, published, pending, currency=false}){
-  const fmt=(v)=>`${currency?'₹':''}${Number(v||0).toLocaleString('en-IN')}`;
+  const fmt=(v)=> currency ? formatDisplayCurrency(v) : formatDisplayNumber(v);
   return <tr className="border-b"><td className="p-3 font-bold" style={{color:COLORS.text}}>{label}</td><td className="p-3 text-right">{fmt(uploaded)}</td><td className="p-3 text-right font-bold" style={{color:COLORS.dark}}>{fmt(published)}</td><td className="p-3 text-right font-bold" style={{color:COLORS.warning}}>{fmt(pending)}</td></tr>;
 }
 function Stat({ title, value, color = COLORS.primary }) {
@@ -385,13 +452,13 @@ function Stat({ title, value, color = COLORS.primary }) {
       >
         {title}
       </p>
-      <p className="mt-2 text-2xl font-bold" style={{ color }}>
+      <p className="mt-2 text-xl font-bold tabular-nums truncate" style={{ color }}>
         {value ?? 0}
       </p>
     </div>
   );
 }
 
-function SummaryCard({title,value,color=COLORS.primary,prefix=''}){return <div className="rounded-xl p-2 text-center" style={{backgroundColor:'#F9FAFB', border:`1px solid ${COLORS.border}`}}><p className="text-[10px] font-bold leading-tight" style={{color:COLORS.muted}}>{title}</p><h3 className="text-lg font-bold" style={{color}}>{prefix}{Number(value||0).toLocaleString('en-IN')}</h3></div>}
+function SummaryCard({title,value,color=COLORS.primary,prefix='',onClick,loading=false,clickable=false,currency=false}){return <button type="button" disabled={!clickable||loading} onClick={onClick} className="rounded-xl p-2 text-center w-full min-w-0" style={{backgroundColor:'#F9FAFB', border:`1px solid ${COLORS.border}`, cursor: clickable?'pointer':'default'}}><p className="text-[10px] font-bold leading-tight" style={{color:COLORS.muted}}>{title}</p><h3 className="text-sm sm:text-base md:text-lg font-bold truncate tabular-nums max-w-full" style={{color, fontSize: 'clamp(0.75rem, 2.5vw, 1.125rem)'}}>{prefix}{currency ? formatDisplayNumber(value, { currency: true }) : formatDisplayNumber(value)}</h3></button>}
 function StatusBadge({u}){const s=u.status||'Uploaded'; const cancelled=s==='Cancelled'; const published=u.publish_status==='Published'; const color=cancelled?COLORS.danger:published?COLORS.dark:COLORS.warning; return <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full font-bold" style={{color, backgroundColor:cancelled?'#FEE2E2':published?'#DCFCE7':'#FEF3C7'}}>{published?<CheckCircle2 className="h-3 w-3"/>:<Eye className="h-3 w-3"/>}{cancelled?'Cancelled':published?'Published':s}</span>}
 export default UploadCenter;
