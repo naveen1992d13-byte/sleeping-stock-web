@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { useOutletContext } from "react-router-dom";
 import { Button } from "../components/ui/button";
-import { useAuth } from "../App";
+import { useAuth, API as NMTS_API } from "../App";
 import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
 
 const API = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8000";
@@ -134,7 +134,7 @@ export default function UsersPage() {
     try {
       const [st, b, d, br, u] = await Promise.all([
         fetch(`${API}/api/masters/states`, { headers }).then((r) => r.json()),
-        fetch(`${API}/api/masters/brands`, { headers }).then((r) => r.json()),
+        fetch(`${NMTS_API}/masters/brands`, { headers }).then((r) => r.json()),
         fetch(`${API}/api/masters/dealers`, { headers }).then((r) => r.json()),
         fetch(`${API}/api/masters/branches`, { headers }).then((r) => r.json()),
         fetch(`${API}/api/users/list`, { headers }).then((r) => r.json()),
@@ -370,8 +370,8 @@ export default function UsersPage() {
 
     const method = editingBrand ? "PUT" : "POST";
     const url = editingBrand
-      ? `${API}/api/masters/brands/${editingBrand.code}`
-      : `${API}/api/masters/brands`;
+      ? `${NMTS_API}/masters/brands/${editingBrand.code}`
+      : `${NMTS_API}/masters/brands`;
 
     const res = await fetch(url, { method, headers, body: JSON.stringify(brandForm) });
     if (!res.ok) return alert((await res.json()).detail || "Brand save failed");
@@ -383,7 +383,7 @@ export default function UsersPage() {
 
   const deleteBrand = async (code) => {
     if (!window.confirm("Delete this Brand?")) return;
-    const res = await fetch(`${API}/api/masters/brands/${code}`, { method: "DELETE", headers });
+    const res = await fetch(`${NMTS_API}/masters/brands/${code}`, { method: "DELETE", headers });
     if (!res.ok) return alert((await res.json()).detail || "Brand delete failed");
     loadData();
   };
