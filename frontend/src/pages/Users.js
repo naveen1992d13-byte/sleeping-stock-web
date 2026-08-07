@@ -11,6 +11,7 @@ import {
   KeyRound,
   Power,
   Eye,
+  EyeOff,
   Building2,
   MapPin,
   ShieldCheck,
@@ -21,6 +22,9 @@ import { useOutletContext } from "react-router-dom";
 import { Button } from "../components/ui/button";
 import { useAuth, API as NMTS_API } from "../App";
 import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
+import { toast } from "sonner";
+import { NmtsConfirmDialog } from "../components/NmtsConfirmDialog";
+import { NmtsModal } from "../components/NmtsModal";
 
 const API = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8000";
 
@@ -96,6 +100,15 @@ export default function UsersPage() {
   };
 
   const [newUser, setNewUser] = useState(blankUser);
+
+  const [confirmDlg, setConfirmDlg] = useState(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const [resetTarget, setResetTarget] = useState(null);
+  const [resetPasswordValue, setResetPasswordValue] = useState("");
+  const [resetPasswordConfirm, setResetPasswordConfirm] = useState("");
+  const [showResetPassword, setShowResetPassword] = useState(false);
+  const [showResetPasswordConfirm, setShowResetPasswordConfirm] = useState(false);
+  const [resetSubmitting, setResetSubmitting] = useState(false);
 
  const token =
   localStorage.getItem("token") ||
@@ -342,8 +355,22 @@ export default function UsersPage() {
     setNewUser(blankUser);
   };
 
+  const openConfirm = (cfg) => setConfirmDlg(cfg);
+
+  const handleConfirmDialog = async () => {
+    if (!confirmDlg?.onConfirm || confirmBusy) return;
+    const action = confirmDlg.onConfirm;
+    setConfirmDlg(null);
+    setConfirmBusy(true);
+    try {
+      await action();
+    } finally {
+      setConfirmBusy(false);
+    }
+  };
+
   const addOrUpdateState = async () => {
-    if (!stateForm.code || !stateForm.name) return alert("State Code and Name required");
+    if (!stateForm.code || !stateForm.name) return toast.warning("State Code and Name required");
 
     const method = editingState ? "PUT" : "POST";
     const url = editingState
@@ -351,22 +378,31 @@ export default function UsersPage() {
       : `${API}/api/masters/states`;
 
     const res = await fetch(url, { method, headers, body: JSON.stringify(stateForm) });
-    if (!res.ok) return alert((await res.json()).detail || "State save failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "State save failed");
 
     setStateForm({ code: "", name: "" });
     setEditingState(null);
     loadData();
   };
 
-  const deleteState = async (code) => {
-    if (!window.confirm("Delete this State?")) return;
+  const performDeleteState = async (code) => {
     const res = await fetch(`${API}/api/masters/states/${code}`, { method: "DELETE", headers });
-    if (!res.ok) return alert((await res.json()).detail || "State delete failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "State delete failed");
     loadData();
   };
 
+  const deleteState = (code) => {
+    openConfirm({
+      title: "Delete State",
+      message: "Delete this State?",
+      confirmLabel: "Delete",
+      variant: "danger",
+      onConfirm: () => performDeleteState(code),
+    });
+  };
+
   const addOrUpdateBrand = async () => {
-    if (!brandForm.code || !brandForm.name) return alert("Brand Code and Name required");
+    if (!brandForm.code || !brandForm.name) return toast.warning("Brand Code and Name required");
 
     const method = editingBrand ? "PUT" : "POST";
     const url = editingBrand
@@ -374,22 +410,31 @@ export default function UsersPage() {
       : `${NMTS_API}/masters/brands`;
 
     const res = await fetch(url, { method, headers, body: JSON.stringify(brandForm) });
-    if (!res.ok) return alert((await res.json()).detail || "Brand save failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "Brand save failed");
 
     setBrandForm({ code: "", name: "" });
     setEditingBrand(null);
     loadData();
   };
 
-  const deleteBrand = async (code) => {
-    if (!window.confirm("Delete this Brand?")) return;
+  const performDeleteBrand = async (code) => {
     const res = await fetch(`${NMTS_API}/masters/brands/${code}`, { method: "DELETE", headers });
-    if (!res.ok) return alert((await res.json()).detail || "Brand delete failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "Brand delete failed");
     loadData();
   };
 
+  const deleteBrand = (code) => {
+    openConfirm({
+      title: "Delete Brand",
+      message: "Delete this Brand?",
+      confirmLabel: "Delete",
+      variant: "danger",
+      onConfirm: () => performDeleteBrand(code),
+    });
+  };
+
   const addOrUpdateDealer = async () => {
-    if (!dealerForm.name) return alert("Dealer Name required");
+    if (!dealerForm.name) return toast.warning("Dealer Name required");
 
     const method = editingDealer ? "PUT" : "POST";
     const url = editingDealer
@@ -397,22 +442,31 @@ export default function UsersPage() {
       : `${API}/api/masters/dealers`;
 
     const res = await fetch(url, { method, headers, body: JSON.stringify(dealerForm) });
-    if (!res.ok) return alert((await res.json()).detail || "Dealer save failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "Dealer save failed");
 
     setDealerForm({ name: "" });
     setEditingDealer(null);
     loadData();
   };
 
-  const deleteDealer = async (name) => {
-    if (!window.confirm("Delete this Dealer?")) return;
+  const performDeleteDealer = async (name) => {
     const res = await fetch(`${API}/api/masters/dealers/${encodeURIComponent(name)}`, { method: "DELETE", headers });
-    if (!res.ok) return alert((await res.json()).detail || "Dealer delete failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "Dealer delete failed");
     loadData();
   };
 
+  const deleteDealer = (name) => {
+    openConfirm({
+      title: "Delete Dealer",
+      message: "Delete this Dealer?",
+      confirmLabel: "Delete",
+      variant: "danger",
+      onConfirm: () => performDeleteDealer(name),
+    });
+  };
+
   const addOrUpdateBranch = async () => {
-    if (!branchForm.dealer || !branchForm.name) return alert("Dealer and Branch required");
+    if (!branchForm.dealer || !branchForm.name) return toast.warning("Dealer and Branch required");
 
     const method = editingBranch ? "PUT" : "POST";
     const url = editingBranch
@@ -420,24 +474,33 @@ export default function UsersPage() {
       : `${API}/api/masters/branches`;
 
     const res = await fetch(url, { method, headers, body: JSON.stringify(branchForm) });
-    if (!res.ok) return alert((await res.json()).detail || "Branch save failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "Branch save failed");
 
     setBranchForm({ dealer: "", name: "" });
     setEditingBranch(null);
     loadData();
   };
 
-  const deleteBranch = async (name) => {
-    if (!window.confirm("Delete this Branch?")) return;
+  const performDeleteBranch = async (name) => {
     const res = await fetch(`${API}/api/masters/branches/${encodeURIComponent(name)}`, { method: "DELETE", headers });
-    if (!res.ok) return alert((await res.json()).detail || "Branch delete failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "Branch delete failed");
     loadData();
   };
 
+  const deleteBranch = (name) => {
+    openConfirm({
+      title: "Delete Branch",
+      message: "Delete this Branch?",
+      confirmLabel: "Delete",
+      variant: "danger",
+      onConfirm: () => performDeleteBranch(name),
+    });
+  };
+
   const saveUser = async () => {
-    if (isNormalUser) return alert("You are not allowed to create users");
-    if (isAdmin && newUser.role !== "user") return alert("Admin can create only User role");
-    if (newUser.password !== newUser.confirmPassword) return alert("Password not matching");
+    if (isNormalUser) return toast.warning("You are not allowed to create users");
+    if (isAdmin && newUser.role !== "user") return toast.warning("Admin can create only User role");
+    if (newUser.password !== newUser.confirmPassword) return toast.warning("Password not matching");
 
     const payload = isAdmin
       ? {
@@ -450,10 +513,10 @@ export default function UsersPage() {
         }
       : newUser;
 
-    if (!payload.state) return alert("Please select State");
-    if (!payload.brand) return alert("Please select Brand");
-    if (!payload.dealer) return alert("Please select Dealer");
-    if (!payload.branch) return alert("Please select Branch");
+    if (!payload.state) return toast.warning("Please select State");
+    if (!payload.brand) return toast.warning("Please select Brand");
+    if (!payload.dealer) return toast.warning("Please select Dealer");
+    if (!payload.branch) return toast.warning("Please select Branch");
 
     const res = await fetch(`${API}/api/users/create`, {
       method: "POST",
@@ -461,9 +524,9 @@ export default function UsersPage() {
       body: JSON.stringify(payload),
     });
 
-    if (!res.ok) return alert((await res.json()).detail || "User save failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "User save failed");
 
-    alert("User created successfully");
+    toast.success("User created successfully");
     resetUserForm();
     setActiveTab("list");
     loadData();
@@ -471,61 +534,88 @@ export default function UsersPage() {
 
   const toggleUserStatus = async (item) => {
     const id = item.id;
-    if (!id) return alert("User ID not found");
+    if (!id) return toast.error("User ID not found");
 
     const res = await fetch(`${API}/api/profile/${id}/status`, {
       method: "PUT",
       headers,
     });
 
-    if (!res.ok) return alert((await res.json()).detail || "Status update failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "Status update failed");
     loadData();
   };
 
-  const deleteUser = async (item) => {
-    if (!isMaster) return alert("Only Master can delete users");
-    if (!window.confirm("Delete this user?")) return;
-
+  const performDeleteUser = async (item) => {
     const res = await fetch(`${API}/api/users/${item.id}`, {
       method: "DELETE",
       headers,
     });
 
-    if (!res.ok) return alert((await res.json()).detail || "User delete failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "User delete failed");
     loadData();
   };
-  
-const resetPassword = async (item) => {
-    if (!isMaster && !isAdmin) {
-      return alert("Not allowed");
-    }
 
-    const newPassword = window.prompt("Enter New Password");
-    if (!newPassword) return;
-
-    const confirmPassword = window.prompt("Confirm Password");
-    if (newPassword !== confirmPassword) {
-      return alert("Password not matching");
-    }
-
-    const res = await fetch(`${API}/api/users/${item.id}/reset-password`, {
-      method: "PUT",
-      headers,
-      body: JSON.stringify({
-        password: newPassword,
-      }),
+  const deleteUser = (item) => {
+    if (!isMaster) return toast.warning("Only Master can delete users");
+    openConfirm({
+      title: "Delete User",
+      message: "Delete this user?",
+      confirmLabel: "Delete",
+      variant: "danger",
+      onConfirm: () => performDeleteUser(item),
     });
+  };
 
-    if (!res.ok) {
-      return alert((await res.json()).detail || "Password reset failed");
+  const openResetPasswordModal = (item) => {
+    if (!isMaster && !isAdmin) {
+      return toast.warning("Not allowed");
     }
+    setResetTarget(item);
+    setResetPasswordValue("");
+    setResetPasswordConfirm("");
+    setShowResetPassword(false);
+    setShowResetPasswordConfirm(false);
+  };
 
-    alert("Password reset successfully");
+  const closeResetPasswordModal = () => {
+    if (resetSubmitting) return;
+    setResetTarget(null);
+    setResetPasswordValue("");
+    setResetPasswordConfirm("");
+  };
+
+  const submitResetPassword = async () => {
+    if (!resetTarget?.id || resetSubmitting) return;
+    if (resetPasswordValue !== resetPasswordConfirm) {
+      return toast.warning("Password not matching");
+    }
+    if (!resetPasswordValue) return;
+
+    setResetSubmitting(true);
+    try {
+      const res = await fetch(`${API}/api/users/${resetTarget.id}/reset-password`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({
+          password: resetPasswordValue,
+        }),
+      });
+
+      if (!res.ok) {
+        toast.error((await res.json()).detail || "Password reset failed");
+        return;
+      }
+
+      toast.success("Password reset successfully");
+      closeResetPasswordModal();
+    } finally {
+      setResetSubmitting(false);
+    }
   };
 
   const uploadTemplate = async () => {
     if (!templateForm.brand || !templateForm.templateType || !templateForm.file) {
-      return alert("Brand, Template Type and File required");
+      return toast.warning("Brand, Template Type and File required");
     }
 
     const form = new FormData();
@@ -540,22 +630,22 @@ const resetPassword = async (item) => {
       body: form,
     });
 
-    if (!res.ok) return alert((await res.json()).detail || "Template upload failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "Template upload failed");
 
-    alert("Template uploaded successfully");
+    toast.success("Template uploaded successfully");
     setTemplateForm({ brand: "", templateType: "Product Hub", file: null });
     loadTemplates();
   };
 
   const downloadTemplate = async (item) => {
     const id = item.id || item.templateId || item.template_id;
-    if (!id) return alert("Template ID not found");
+    if (!id) return toast.error("Template ID not found");
     try {
       const res = await fetch(`${API}/api/templates/download/${id}`, { headers: authHeaders });
       if (!res.ok) {
         let detail = "Template download failed";
         try { detail = (await res.json()).detail || detail; } catch {}
-        return alert(detail);
+        return toast.error(detail);
       }
       const blob = await res.blob();
       const disposition = res.headers.get("content-disposition") || "";
@@ -570,22 +660,33 @@ const resetPassword = async (item) => {
       link.remove();
       window.URL.revokeObjectURL(blobUrl);
     } catch {
-      alert("Template download failed");
+      toast.error("Template download failed");
     }
   };
 
-  const deleteTemplate = async (item) => {
+  const performDeleteTemplate = async (item) => {
     const id = item.id || item.templateId || item.template_id;
-    if (!id) return alert("Template ID not found");
-    if (!window.confirm("Delete this template?")) return;
+    if (!id) return toast.error("Template ID not found");
 
     const res = await fetch(`${API}/api/templates/${id}`, {
       method: "DELETE",
       headers,
     });
 
-    if (!res.ok) return alert((await res.json()).detail || "Template delete failed");
+    if (!res.ok) return toast.error((await res.json()).detail || "Template delete failed");
     loadTemplates();
+  };
+
+  const deleteTemplate = (item) => {
+    const id = item.id || item.templateId || item.template_id;
+    if (!id) return toast.error("Template ID not found");
+    openConfirm({
+      title: "Delete Template",
+      message: "Delete this template?",
+      confirmLabel: "Delete",
+      variant: "danger",
+      onConfirm: () => performDeleteTemplate(item),
+    });
   };
 
   return (
@@ -704,7 +805,7 @@ const resetPassword = async (item) => {
                           size={16}
                           title="Reset Password"
                           style={{ cursor: "pointer", color: "#2563EB" }}
-                          onClick={() => resetPassword(u)}
+                          onClick={() => openResetPasswordModal(u)}
                         />
 
                         <Power
@@ -906,6 +1007,88 @@ const resetPassword = async (item) => {
           )}
         </Panel>
       )}
+
+      <NmtsConfirmDialog
+        open={!!confirmDlg}
+        title={confirmDlg?.title || ""}
+        message={confirmDlg?.message}
+        confirmLabel={confirmDlg?.confirmLabel || "Confirm"}
+        cancelLabel="Cancel"
+        variant={confirmDlg?.variant || "default"}
+        loading={confirmBusy}
+        onCancel={() => {
+          if (!confirmBusy) setConfirmDlg(null);
+        }}
+        onConfirm={handleConfirmDialog}
+      />
+
+      <NmtsModal
+        open={!!resetTarget}
+        onClose={closeResetPasswordModal}
+        title="Reset Password"
+        maxWidth="max-w-md"
+      >
+        <p className="text-sm mb-4" style={{ color: COLORS.muted }}>
+          Reset password for {resetTarget?.name || resetTarget?.userId || resetTarget?.user_id || "user"}.
+        </p>
+        <div className="space-y-4">
+          <div>
+            <label className="font-bold block mb-1">New Password</label>
+            <div className="relative">
+              <input
+                type={showResetPassword ? "text" : "password"}
+                value={resetPasswordValue}
+                disabled={resetSubmitting}
+                onChange={(e) => setResetPasswordValue(e.target.value)}
+                className="w-full px-4 py-3 pr-10 rounded-xl border bg-white"
+                style={{ color: COLORS.text }}
+              />
+              <button
+                type="button"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500"
+                onClick={() => setShowResetPassword((v) => !v)}
+                tabIndex={-1}
+              >
+                {showResetPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="font-bold block mb-1">Confirm Password</label>
+            <div className="relative">
+              <input
+                type={showResetPasswordConfirm ? "text" : "password"}
+                value={resetPasswordConfirm}
+                disabled={resetSubmitting}
+                onChange={(e) => setResetPasswordConfirm(e.target.value)}
+                className="w-full px-4 py-3 pr-10 rounded-xl border bg-white"
+                style={{ color: COLORS.text }}
+              />
+              <button
+                type="button"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500"
+                onClick={() => setShowResetPasswordConfirm((v) => !v)}
+                tabIndex={-1}
+              >
+                {showResetPasswordConfirm ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </button>
+            </div>
+          </div>
+          <div className="flex justify-end gap-2 pt-2">
+            <Button type="button" variant="outline" disabled={resetSubmitting} onClick={closeResetPasswordModal}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={resetSubmitting || !resetPasswordValue}
+              onClick={submitResetPassword}
+              style={{ backgroundColor: COLORS.button, color: "#fff" }}
+            >
+              {resetSubmitting ? "Resetting…" : "Reset Password"}
+            </Button>
+          </div>
+        </div>
+      </NmtsModal>
     </div>
   );
 }

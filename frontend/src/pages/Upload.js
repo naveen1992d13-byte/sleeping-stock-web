@@ -5,6 +5,7 @@ import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
 import { Upload, Package, ClipboardCheck, Download, Send, FileSpreadsheet, Search, Eye, XCircle, CheckCircle2 } from 'lucide-react';
 import { toast } from 'sonner';
+import { NmtsConfirmDialog } from '@/components/NmtsConfirmDialog';
 import * as XLSX from 'xlsx';
 
 const COLORS = { primary: '#059669', dark: '#047857', soft: '#ECFDF5', border: '#D1D5DB', text: '#1F2937', muted: '#6B7280', danger: '#DC2626', warning: '#D97706', blue: '#2563EB' };
@@ -51,6 +52,8 @@ export function UploadCenter() {
   const [downloadingKey, setDownloadingKey] = useState(null);
   const [cancelTarget, setCancelTarget] = useState(null);
   const [cancelReason, setCancelReason] = useState(CANCEL_REASONS[0]);
+  const [publishConfirmTarget, setPublishConfirmTarget] = useState(null);
+  const [publishBusy, setPublishBusy] = useState(false);
   const [masterSummary, setMasterSummary] = useState(null);
   const [todaySummary, setTodaySummary] = useState(null);
   const productFileRef = useRef(null);
@@ -160,16 +163,25 @@ export function UploadCenter() {
     } catch (e) { toast.error(e.response?.data?.detail || 'Template download failed'); setDownloadingKey(null); }
   };
 
-  const publishUpload = async (u) => {
-    if (!window.confirm(`Publish ${u.upload_no} to ${activeTitle}?`)) return;
+  const performPublishUpload = async () => {
+    const u = publishConfirmTarget;
+    if (!u?.id || publishBusy) return;
+    setPublishBusy(true);
     try {
       await axios.put(`${API}/uploads/${u.id}/publish-v2`);
       toast.success('Published');
+      setPublishConfirmTarget(null);
       fetchUploads();
       if (isMaster || isAdmin) fetchMasterSummary();
       if (isUser) fetchTodaySummary();
-    } catch (e) { toast.error(e.response?.data?.detail || 'Publish failed'); }
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Publish failed');
+    } finally {
+      setPublishBusy(false);
+    }
   };
+
+  const publishUpload = (u) => setPublishConfirmTarget(u);
 
   const openCancelModal = (u) => { setCancelTarget(u); setCancelReason(CANCEL_REASONS[0]); };
   const closeCancelModal = () => setCancelTarget(null);
@@ -315,6 +327,21 @@ export function UploadCenter() {
       </div>
     </div>
 
+    <NmtsConfirmDialog
+      open={!!publishConfirmTarget}
+      title="Publish Upload"
+      message={
+        publishConfirmTarget
+          ? `Publish ${publishConfirmTarget.upload_no} to ${activeTitle}?`
+          : ''
+      }
+      confirmLabel="Publish"
+      loading={publishBusy}
+      onCancel={() => {
+        if (!publishBusy) setPublishConfirmTarget(null);
+      }}
+      onConfirm={performPublishUpload}
+    />
 
     {cancelTarget && (
       <div className="fixed inset-0 z-50 flex items-center justify-center" style={{backgroundColor: 'rgba(0,0,0,0.4)'}} onClick={closeCancelModal}>

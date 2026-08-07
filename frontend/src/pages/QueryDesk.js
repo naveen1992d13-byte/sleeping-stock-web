@@ -5,16 +5,7 @@ import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { NmtsModal } from '@/components/NmtsModal';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { NmtsConfirmDialog } from '@/components/NmtsConfirmDialog';
 import {
   Search,
   RefreshCw,
@@ -886,28 +877,20 @@ export function QueryDesk() {
           )}
       </NmtsModal>
 
-      <AlertDialog open={clearConfirmOpen} onOpenChange={setClearConfirmOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Confirm resolution</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure this query has been resolved?
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={clearSubmitting}>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              disabled={clearSubmitting}
-              onClick={(e) => {
-                e.preventDefault();
-                confirmQueryCleared();
-              }}
-            >
-              {clearSubmitting ? 'Closing…' : 'Yes, Close Query'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <NmtsConfirmDialog
+        open={clearConfirmOpen}
+        title="Confirm Query Resolution"
+        message="Has your query been fully resolved?"
+        cancelLabel="Cancel"
+        confirmLabel="Yes, Close Query"
+        loading={clearSubmitting}
+        onCancel={() => {
+          if (!clearSubmitting) setClearConfirmOpen(false);
+        }}
+        onConfirm={() => {
+          if (!clearSubmitting) confirmQueryCleared();
+        }}
+      />
     </div>
   );
 }

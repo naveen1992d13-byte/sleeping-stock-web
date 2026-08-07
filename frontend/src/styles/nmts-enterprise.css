@@ -356,6 +356,80 @@
   overflow-y: auto;
 }
 
+/* Nested confirm / form dialogs above standard NmtsModal (100) */
+.nmts-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 110;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(15, 20, 25, 0.5);
+  backdrop-filter: blur(3px);
+}
+
+.nmts-confirm-panel {
+  width: 100%;
+  max-width: 420px;
+  background: #fff;
+  border: 1px solid var(--nmts-border);
+  border-radius: 14px;
+  box-shadow: var(--nmts-shadow-md);
+  border-top: 3px solid var(--nmts-green);
+  padding: 18px 20px 16px;
+}
+
+.nmts-confirm-title {
+  margin: 0 0 8px;
+  font-size: 1.125rem;
+  font-weight: 700;
+  color: var(--nmts-text);
+}
+
+.nmts-confirm-message {
+  margin: 0 0 16px;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  color: var(--nmts-text-muted);
+}
+
+.nmts-confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.nmts-notice-login-panel {
+  border-top: 3px solid var(--nmts-green);
+}
+
+.nmts-priority-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 9999px;
+  padding: 2px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.nmts-priority-normal {
+  background: #f3f4f6;
+  color: #374151;
+}
+
+.nmts-priority-important {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.nmts-priority-urgent {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
 .nmts-users-table-wrap {
   overflow-x: auto;
 }

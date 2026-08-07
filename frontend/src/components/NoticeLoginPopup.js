@@ -3,12 +3,14 @@ import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import { NmtsModal } from '@/components/NmtsModal';
+
+function priorityBadgeClass(priority) {
+  const p = String(priority || 'Normal');
+  if (p === 'Urgent') return 'nmts-priority-badge nmts-priority-urgent';
+  if (p === 'Important') return 'nmts-priority-badge nmts-priority-important';
+  return 'nmts-priority-badge nmts-priority-normal';
+}
 
 /**
  * Login popup for Admin/User — fetched once per layout mount (IST daily rules on backend).
@@ -60,27 +62,56 @@ export function NoticeLoginPopup() {
   };
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="max-w-md">
-        <DialogHeader>
-          <DialogTitle>{notice.subject}</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-2 text-sm">
-          <p className="text-slate-600 line-clamp-4">{notice.content}</p>
-          <p><span className="font-medium">Type:</span> {notice.notice_type}</p>
-          <p><span className="font-medium">Priority:</span> {notice.priority}</p>
-          {extras > 1 && (
-            <p className="text-xs text-amber-700">{extras - 1} more active notice(s) available on Notice Board.</p>
-          )}
+    <NmtsModal
+      open={open}
+      onClose={() => setOpen(false)}
+      title={notice.subject}
+      maxWidth="max-w-lg"
+    >
+      <div className="nmts-notice-login-panel -mx-4 -mt-2 px-1 pb-1">
+        <div className="flex items-start gap-4 mb-4">
+          <img
+            src="/sleeping-stock-logo.png"
+            alt="Sleeping Stock"
+            className="h-14 w-14 object-contain shrink-0"
+            onError={(e) => {
+              e.currentTarget.style.display = 'none';
+            }}
+          />
+          <div className="min-w-0 flex-1">
+            <p className="text-xs font-semibold uppercase tracking-wide text-emerald-700 mb-1">
+              Notice from NMTS
+            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+              <span className="rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-slate-700">
+                {notice.notice_type}
+              </span>
+              <span className={priorityBadgeClass(notice.priority)}>{notice.priority}</span>
+            </div>
+          </div>
         </div>
-        <div className="flex flex-wrap gap-2 pt-2">
-          <Button onClick={viewNotice}>View Notice</Button>
+        <p className="text-sm text-slate-600 leading-relaxed line-clamp-5 whitespace-pre-wrap">
+          {notice.content}
+        </p>
+        {extras > 1 && (
+          <p className="mt-3 text-xs text-amber-800 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2">
+            {extras - 1} more active notice(s) available on Notice Board.
+          </p>
+        )}
+        <div className="flex flex-wrap gap-2 pt-5 border-t border-slate-100 mt-5">
+          <Button type="button" className="nmts-btn-primary" onClick={viewNotice}>
+            View Notice
+          </Button>
           {notice.priority !== 'Urgent' || !notice.acknowledgement_required ? (
-            <Button variant="outline" onClick={remindLater}>Remind Me Later</Button>
+            <Button type="button" variant="outline" onClick={remindLater}>
+              Remind Me Later
+            </Button>
           ) : null}
-          <Button variant="ghost" onClick={() => setOpen(false)}>Close</Button>
+          <Button type="button" variant="ghost" onClick={() => setOpen(false)}>
+            Close
+          </Button>
         </div>
-      </DialogContent>
-    </Dialog>
+      </div>
+    </NmtsModal>
   );
 }
