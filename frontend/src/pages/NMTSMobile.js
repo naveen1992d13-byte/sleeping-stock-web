@@ -48,7 +48,9 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const [autoAssignments,setAutoAssignments]=useState([]);
   const [userPerformance,setUserPerformance]=useState([]);
   const [historyRecords,setHistoryRecords]=useState([]);
-  const [autoGenerating,setAutoGenerating]=useState(false);
+  const [autoSuggestions,setAutoSuggestions]=useState([]);
+  const [suggestionDetail,setSuggestionDetail]=useState(null);
+  const [sendBusy,setSendBusy]=useState(false);
   const [autoRecalcBusy,setAutoRecalcBusy]=useState(false);
   const [creatingUser,setCreatingUser]=useState(false);
   const [pairingFor,setPairingFor]=useState(null);
@@ -89,14 +91,16 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const loadAutoPerpetual=async()=>{
     if(!scopeReady){ setAutoSummary(null); setAutoAssignments([]); return; }
     try{
-      const [s,a,p]=await Promise.all([
+      const [s,a,p,sg]=await Promise.all([
         axios.get(`${API}/mobile/auto-perpetual/summary`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
         axios.get(`${API}/mobile/auto-perpetual/assignments/today`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
         axios.get(`${API}/mobile/auto-perpetual/user-performance`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
+        axios.get(`${API}/mobile/auto-perpetual/suggestions`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
       ]);
       setAutoSummary(s.data||null);
       setAutoAssignments(a.data||[]);
       setUserPerformance(p.data||[]);
+      setAutoSuggestions(sg.data||[]);
     }catch(e){ setAutoSummary(null); setAutoAssignments([]); setUserPerformance([]); }
   };
   const loadHistoryRecords=async()=>{
@@ -219,11 +223,29 @@ export default function NMTSMobile({ variant = 'mobile' }){
     if(recalc) setAutoRecalcBusy(true); else setAutoGenerating(true);
     try{
       const r=await axios.post(`${API}/mobile/auto-perpetual/generate`,null,{params:{brand_name:brand,dealer_name:dealer,branch,recalc_pending:recalc}});
-      if(r.data?.duplicate) toast.info('Auto Perpetual already generated for today');
-      else toast.success(`Assigned ${r.data?.assignments_created||0} line items to ${r.data?.active_users||0} active users`);
+      if(r.data?.duplicate) toast.info('Draft suggestion already exists for today');
+      else toast.success(`Draft ${r.data?.suggestion_number||''} created with ${r.data?.total_items||r.data?.suggestion?.total_items||0} items — review and Send to Mobile`);
       loadAutoPerpetual();
     }catch(e){toast.error(e.response?.data?.detail||'Generate failed')}
     finally{ setAutoGenerating(false); setAutoRecalcBusy(false); }
+  };
+
+  const openSuggestion=async(id)=>{
+    try{
+      const r=await axios.get(`${API}/mobile/auto-perpetual/suggestions/${id}`);
+      setSuggestionDetail(r.data);
+    }catch(e){toast.error('Could not load suggestion details')}
+  };
+
+  const sendSuggestion=async(id)=>{
+    setSendBusy(true);
+    try{
+      const r=await axios.post(`${API}/mobile/auto-perpetual/suggestions/${id}/send`);
+      toast.success(`Sent ${r.data?.assignments_created||0} assignments to mobile users`);
+      setSuggestionDetail(null);
+      loadAutoPerpetual();
+    }catch(e){toast.error(e.response?.data?.detail||'Send failed')}
+    finally{setSendBusy(false)}
   };
 
   const generatePairing=async(mu)=>{
@@ -374,24 +396,45 @@ export default function NMTSMobile({ variant = 'mobile' }){
 
     {showAuditSections && section==='auto'&&<div className="space-y-5">
       <Card title="Auto Perpetual — monthly coverage">
-        <p className="text-sm text-gray-600 mb-4">Mark mobile users Present/Absent under Mobile Users, then generate today&apos;s allocations. One AOPS session per user per day.</p>
+        <p className="text-sm text-gray-600 mb-4">Mark attendance, then <b>Generate</b> to create a DRAFT suggestion (APS). Review the summary and use <b>Send to Mobile Users</b> to activate assignments.</p>
+        {autoSummary?.month_end_recovery_warning && <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3">Month-end recovery adjustment may be required — check carry-forward backlog and days remaining.</p>}
         {autoSummary && <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
           <Info label="Month" value={autoSummary.month_key}/>
-          <Info label="Total lines" value={autoSummary.total_stock_lines}/>
+          <Info label="Eligible lines" value={autoSummary.eligible_lines ?? autoSummary.total_stock_lines}/>
           <Info label="Verified (unique)" value={autoSummary.verified_unique_lines}/>
           <Info label="Coverage %" value={`${autoSummary.monthly_coverage_pct}%`}/>
           <Info label="Pending" value={autoSummary.pending_lines}/>
           <Info label="Days left" value={autoSummary.days_remaining}/>
+          <Info label="Carry-forward backlog" value={autoSummary.carry_forward_backlog ?? 0}/>
+          <Info label="Recovery extra / user" value={autoSummary.recovery_extra_per_user ?? 0}/>
           <Info label="Match lines" value={autoSummary.match_lines}/>
-          <Info label="Shortage lines" value={autoSummary.shortage_lines}/>
-          <Info label="Damage lines" value={autoSummary.damage_lines}/>
+          <Info label="Loc mismatch" value={autoSummary.location_mismatch_lines ?? 0}/>
           <Info label="Physical count" value={autoSummary.physical_verification_count}/>
           <Info label="Auto count" value={autoSummary.auto_verification_count}/>
         </div>}
         <div className="flex flex-wrap gap-2">
-          <Button onClick={()=>generateAutoPerpetual(false)} disabled={!scopeReady||autoGenerating}><ClipboardCheck className="h-4 w-4 mr-2"/>{autoGenerating?'Generating...':'Generate Auto Perpetual'}</Button>
-          <Button variant="outline" onClick={()=>generateAutoPerpetual(true)} disabled={!scopeReady||autoRecalcBusy}><RefreshCw className="h-4 w-4 mr-2"/>{autoRecalcBusy?'Working...':'Recalculate pending'}</Button>
+          <Button onClick={()=>generateAutoPerpetual(false)} disabled={!scopeReady||autoGenerating}><ClipboardCheck className="h-4 w-4 mr-2"/>{autoGenerating?'Generating...':'Generate Auto Perpetual (Draft)'}</Button>
+          <Button variant="outline" onClick={()=>generateAutoPerpetual(true)} disabled={!scopeReady||autoRecalcBusy}><RefreshCw className="h-4 w-4 mr-2"/>{autoRecalcBusy?'Working...':'Regenerate draft'}</Button>
           <Button variant="outline" onClick={loadAutoPerpetual} disabled={!scopeReady}><RefreshCw className="h-4 w-4 mr-2"/>Refresh</Button>
+        </div>
+      </Card>
+      <Card title="Auto suggestions (summary)">
+        <div className="space-y-3">
+          {autoSuggestions.map(s=>(
+            <div key={s.id} className="border rounded-lg p-4 bg-gray-50 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="font-semibold">{s.suggestion_number}</div>
+                <div className="text-xs text-gray-500">{s.allocation_date} · {s.status}</div>
+                <div className="text-sm mt-1">Items: {s.total_items} · Qty: {s.total_qty} · Value: ₹{money(s.total_value)}</div>
+                <div className="text-xs text-gray-600">Loc {s.location_count} · ↑ {s.increased_count} · ↓ {s.decreased_count}</div>
+              </div>
+              <div className="flex gap-2">
+                <Button size="sm" variant="outline" onClick={()=>openSuggestion(s.id)}><Eye className="h-4 w-4 mr-1"/>View</Button>
+                {s.status==='DRAFT' && <Button size="sm" onClick={()=>sendSuggestion(s.id)} disabled={sendBusy}><ArrowRightLeft className="h-4 w-4 mr-1"/>Send to Mobile</Button>}
+              </div>
+            </div>
+          ))}
+          {!autoSuggestions.length && <p className="text-center text-gray-500 py-6">No Auto suggestions yet. Generate a draft after marking attendance.</p>}
         </div>
       </Card>
       <Card title={`Today&apos;s assignments (${autoAssignments.length})`}>
@@ -411,6 +454,8 @@ export default function NMTSMobile({ variant = 'mobile' }){
     {showAuditSections && section==='history'&&<div className="space-y-5"><Card title="Verification History Filters"><div className="grid md:grid-cols-4 gap-3"><input type="date" className="border rounded h-10 px-3" value={filters.date_from} onChange={e=>setFilters({...filters,date_from:e.target.value})}/><input type="date" className="border rounded h-10 px-3" value={filters.date_to} onChange={e=>setFilters({...filters,date_to:e.target.value})}/><input type="month" className="border rounded h-10 px-3" value={filters.month} onChange={e=>setFilters({...filters,month:e.target.value})}/><select className="border rounded h-10 px-3" value={filters.user_filter} onChange={e=>setFilters({...filters,user_filter:e.target.value})}><option value="">All Users</option>{mobileUsers.map(u=><option key={u.mobile_user_id} value={u.mobile_user_id}>{u.name}</option>)}</select><select className="border rounded h-10 px-3" value={filters.verification_type} onChange={e=>setFilters({...filters,verification_type:e.target.value})}><option value="all">All Types</option><option value="physical">Physical</option><option value="auto">Auto</option><option value="recheck">Recheck</option></select><select className="border rounded h-10 px-3" value={filters.result_filter} onChange={e=>setFilters({...filters,result_filter:e.target.value})}><option value="all">All Results</option><option value="match">Match</option><option value="shortage">Shortage</option><option value="excess">Excess</option><option value="damage">Damage</option></select><input className="border rounded h-10 px-3" placeholder="Part Number" value={filters.part_number} onChange={e=>setFilters({...filters,part_number:e.target.value})}/><input className="border rounded h-10 px-3" placeholder="LOC" value={filters.loc} onChange={e=>setFilters({...filters,loc:e.target.value})}/></div><Button className="mt-3" onClick={()=>{loadHistoryRecords(); loadSessions();}}>Apply Filters</Button></Card>
       <Card title={`Audit records (${historyRecords.length})`}><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1600px]"><thead><tr>{['Session','Type','Date','User','Part','LOC','System','Physical','Short','Excess','Damage','Result','Remark'].map(h=><th key={h} className="text-left p-2">{h}</th>)}</tr></thead><tbody>{historyRecords.map(r=><tr key={r.id||`${r.session_id}-${r.part_number}`} className="border-t"><td className="p-2 font-mono text-xs">{r.session_id}</td><td className="p-2">{r.coverage_kind==='recheck'?'Recheck':r.verification_type||'-'}</td><td className="p-2">{fmt(r.verified_at||r.created_at)}</td><td className="p-2">{r.verified_by_name||r.verified_user}</td><td className="p-2">{r.part_number}</td><td className="p-2">{r.pin_location||r.system_location||'-'}</td><td className="p-2">{r.system_quantity}</td><td className="p-2">{r.physical_quantity}</td><td className="p-2">{r.shortage_qty}</td><td className="p-2">{r.excess_qty}</td><td className="p-2">{r.damage_qty||0}</td><td className="p-2">{r.quantity_status||r.overall_status}</td><td className="p-2">{r.remark||r.remarks||'-'}</td></tr>)}</tbody></table></div></Card>
       <Card title="Session summary"><div className="flex flex-wrap items-center justify-between gap-3 mb-4"><Button onClick={exportAllExcel}><Download className="h-4 w-4 mr-2"/>Download Complete Excel</Button></div><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1350px]"><thead><tr>{['Session ID','Date','Brand','Dealer','Branch','User','Total Items','Shortage Qty','Excess Qty','Status','View'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{sessions.map(s=><tr key={s.session_id} className="border-t"><td className="p-3 font-semibold">{s.session_id}</td><td>{fmt(s.created_at)}</td><td>{s.brand_name}</td><td>{s.dealer_name}</td><td>{s.branch}</td><td>{s.verified_by_name}</td><td>{s.total_items}</td><td>{s.total_shortage_qty}</td><td>{s.total_excess_qty}</td><td>{s.status}</td><td><Button size="sm" variant="outline" onClick={()=>openSession(s)}><Eye className="h-4 w-4"/></Button></td></tr>)}</tbody></table></div></Card></div>}
+
+    {showAuditSections && suggestionDetail&&<div className="fixed inset-0 bg-black/50 z-50 p-4 overflow-auto"><div className="bg-white rounded-xl max-w-6xl mx-auto p-5 border shadow-lg"><div className="flex justify-between mb-4"><div><h2 className="text-xl font-bold">{suggestionDetail.suggestion_number}</h2><p className="text-gray-500">{suggestionDetail.status} · {suggestionDetail.total_items} items · ₹{money(suggestionDetail.total_value)}</p></div><div className="flex gap-2"><Button variant="outline" onClick={()=>setSuggestionDetail(null)}><X className="h-4 w-4"/></Button>{suggestionDetail.status==='DRAFT'&&<Button onClick={()=>sendSuggestion(suggestionDetail.id)} disabled={sendBusy}>Send to Mobile Users</Button>}</div></div><div className="overflow-x-auto max-h-[70vh]"><table className="w-full text-sm min-w-[900px]"><thead><tr>{['Part','Description','Sys Qty','Location','Type','User','Batch','Status'].map(h=><th key={h} className="text-left p-2">{h}</th>)}</tr></thead><tbody>{(suggestionDetail.items||[]).map((it,i)=><tr key={i} className="border-t"><td className="p-2">{it.part_number}</td><td className="p-2">{it.part_name}</td><td className="p-2">{it.system_qty}</td><td className="p-2">{it.system_location}</td><td className="p-2">{it.suggestion_type}</td><td className="p-2 font-mono text-xs">{it.mobile_user_id||'-'}</td><td className="p-2">{it.batch_no||'-'}</td><td className="p-2">{it.verification_status||'-'}</td></tr>)}</tbody></table></div></div></div>}
 
     {showAuditSections && viewSession&&<div className="fixed inset-0 bg-black/50 z-50 p-4 overflow-auto"><div className="bg-white rounded-xl max-w-7xl mx-auto p-5 border shadow-lg"><div className="flex justify-between mb-4"><div><h2 className="text-xl font-bold">{viewSession.session_id}</h2><p className="text-gray-500">{fmt(viewSession.created_at)}</p></div><Button variant="outline" onClick={()=>setViewSession(null)}><X className="h-4 w-4"/></Button></div><DetailTable rows={viewSession.items||[]} canManage={canManage} onCorrection={updateCorrection}/></div></div>}
 
