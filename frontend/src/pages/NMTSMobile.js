@@ -34,26 +34,32 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const scopeReady=exact(brand)&&exact(dealer)&&exact(branch);
   const canManage=['master','admin'].includes(user?.role);
   const isMaster = user?.role==='master';
+  const canManageMobileAccount = ['master','admin','user'].includes(user?.role);
   const [section,setSection]=useState(showAuditSections ? 'physical' : 'mobile');
 
   // ==================== Mobile User Management (new model) ====================
   const [mobileUsers,setMobileUsers]=useState([]);
-  const [devices,setDevices]=useState([]);
+  const [todayAttendance,setTodayAttendance]=useState({});
+  const [deleteTarget,setDeleteTarget]=useState(null);
+  const [deleteBusy,setDeleteBusy]=useState(false);
+  const [apkUploading,setApkUploading]=useState(false);
+  const apkFileRef=useRef(null);
+  const [autoSummary,setAutoSummary]=useState(null);
+  const [autoAssignments,setAutoAssignments]=useState([]);
+  const [userPerformance,setUserPerformance]=useState([]);
+  const [historyRecords,setHistoryRecords]=useState([]);
+  const [autoGenerating,setAutoGenerating]=useState(false);
+  const [autoRecalcBusy,setAutoRecalcBusy]=useState(false);
   const [creatingUser,setCreatingUser]=useState(false);
-  const [pairingFor,setPairingFor]=useState(null); // mobile_user_id currently generating a code for
-  const [pairingResult,setPairingResult]=useState(null); // { mobile_user_id, pairing_code, qr_payload, expires_at }
+  const [pairingFor,setPairingFor]=useState(null);
+  const [pairingResult,setPairingResult]=useState(null);
 
   const [branchMoveTarget, setBranchMoveTarget] = useState(null);
   const [branchMoveBusy, setBranchMoveBusy] = useState(false);
-  const [deviceRemoveTarget, setDeviceRemoveTarget] = useState(null);
-  const [deviceRemoveBusy, setDeviceRemoveBusy] = useState(false);
-
-  // ==================== App & Settings (new model) ====================
   const [notificationInterval,setNotificationInterval]=useState(30);
   const [savingInterval,setSavingInterval]=useState(false);
   const [appVersions,setAppVersions]=useState([]);
-  const [newVersion,setNewVersion]=useState({version_name:'',version_code:'',apk_filename:'',apk_path:'',release_notes:'',min_supported_version_code:1,mandatory:false});
-  const [publishingVersion,setPublishingVersion]=useState(false);
+  const [apkDownloadUrl,setApkDownloadUrl]=useState('');
 
   // ==================== Perpetual Stock + History (unchanged existing feature) ====================
   const [partNumber,setPartNumber]=useState('');
@@ -64,7 +70,7 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const [pending,setPending]=useState([]);
   const [sessions,setSessions]=useState([]);
   const [viewSession,setViewSession]=useState(null);
-  const [filters,setFilters]=useState({date_from:'',date_to:'',user_filter:'',status_filter:'all'});
+  const [filters,setFilters]=useState({date_from:'',date_to:'',month:'',user_filter:'',verification_type:'all',result_filter:'all',part_number:'',loc:''});
   const cameraRef=useRef(null);
 
   const loadMobileUsers=async()=>{
@@ -73,27 +79,55 @@ export default function NMTSMobile({ variant = 'mobile' }){
       const r=await axios.get(`${API}/mobile/users`,{params});
       setMobileUsers(r.data||[]);
     }catch(e){toast.error(e.response?.data?.detail||'Mobile user list load failed')}
-  };
-  const loadDevices=async()=>{
+  };  const loadTodayAttendance=async()=>{
+    if(!scopeReady) { setTodayAttendance({}); return; }
     try{
-      const params = isMaster ? {brand_name:brand,dealer_name:dealer,branch} : (user?.role==='admin' ? {branch} : {});
-      const r=await axios.get(`${API}/mobile/devices`,{params});
-      setDevices(r.data||[]);
-    }catch(e){toast.error(e.response?.data?.detail||'Device list load failed')}
+      const r=await axios.get(`${API}/mobile/users/attendance/today`,{params:{brand_name:brand,dealer_name:dealer,branch}});
+      setTodayAttendance(r.data?.records||{});
+    }catch{ setTodayAttendance({}); }
+  };
+  const loadAutoPerpetual=async()=>{
+    if(!scopeReady){ setAutoSummary(null); setAutoAssignments([]); return; }
+    try{
+      const [s,a,p]=await Promise.all([
+        axios.get(`${API}/mobile/auto-perpetual/summary`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
+        axios.get(`${API}/mobile/auto-perpetual/assignments/today`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
+        axios.get(`${API}/mobile/auto-perpetual/user-performance`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
+      ]);
+      setAutoSummary(s.data||null);
+      setAutoAssignments(a.data||[]);
+      setUserPerformance(p.data||[]);
+    }catch(e){ setAutoSummary(null); setAutoAssignments([]); setUserPerformance([]); }
+  };
+  const loadHistoryRecords=async()=>{
+    if(!scopeReady){ setHistoryRecords([]); return; }
+    try{
+      const params={brand,dealer,branch,...filters, limit:500};
+      Object.keys(params).forEach(k=>{ if(params[k]===''||params[k]==='all') delete params[k]; });
+      const r=await axios.get(`${API}/mobile/perpetual-stock/verification-history`,{params});
+      setHistoryRecords(r.data||[]);
+    }catch(e){ toast.error(e.response?.data?.detail||'History load failed'); setHistoryRecords([]); }
+  };
+  const loadApkLink=async()=>{
+    try{
+      const r=await axios.get(`${API}/mobile/app-versions/download-link/latest`);
+      setApkDownloadUrl(r.data?.download_url||'');
+    }catch{ setApkDownloadUrl(''); }
   };
   const loadNotificationInterval=async()=>{
     try{const r=await axios.get(`${API}/mobile/settings/notification-interval`);setNotificationInterval(r.data?.interval_minutes||30);}catch(e){/* non-blocking */}
   };
   const loadAppVersions=async()=>{
-    try{const r=await axios.get(`${API}/mobile/app-versions`);setAppVersions(r.data||[]);}catch(e){/* non-blocking */}
+    try{const r=await axios.get(`${API}/mobile/app-versions`);setAppVersions(r.data||[]);}catch{/* non-blocking */}
+    loadApkLink();
   };
 
-  const loadSessions=async()=>{if(!scopeReady){setSessions([]);return;}try{const r=await axios.get(`${API}/mobile/perpetual-stock/sessions`,{params:{brand,dealer,branch,...filters}});const base=r.data||[];const today=base.filter(s=>todayKey(s.created_at)===todayKey());const detailed=await Promise.all(today.map(async s=>{try{const d=await axios.get(`${API}/mobile/perpetual-stock/sessions/${s.session_id}`);return d.data}catch{return s}}));const byId=new Map(detailed.map(s=>[s.session_id,s]));setSessions(base.map(s=>byId.get(s.session_id)||s));}catch(e){toast.error(e.response?.data?.detail||'Verification history load failed')}};
+  const loadSessions=async()=>{if(!scopeReady){setSessions([]);return;}try{const r=await axios.get(`${API}/mobile/perpetual-stock/sessions`,{params:{brand,dealer,branch,date_from:filters.date_from||undefined,date_to:filters.date_to||undefined}});setSessions(r.data||[]);}catch(e){toast.error(e.response?.data?.detail||'Verification history load failed')}};
 
   useEffect(()=>{
     setPairingResult(null);setPairingFor(null);setPending([]);setSnapshot(null);
-    loadMobileUsers();loadDevices();loadNotificationInterval();loadAppVersions();
-    if (showAuditSections) loadSessions();
+    loadMobileUsers();loadNotificationInterval();loadAppVersions();loadTodayAttendance();
+    if (showAuditSections) { loadSessions(); loadAutoPerpetual(); loadHistoryRecords(); }
     /* eslint-disable-next-line */
   },[scopeBrand,scopeDealer,scopeBranch,user?.id, showAuditSections]);
 
@@ -113,8 +147,83 @@ export default function NMTSMobile({ variant = 'mobile' }){
     try{
       await axios.put(`${API}/mobile/users/${mu.mobile_user_id}/status`,{status: mu.status==='active'?'inactive':'active'});
       toast.success(`${mu.mobile_user_id} set to ${mu.status==='active'?'inactive':'active'}`);
-      loadMobileUsers();loadDevices();
+      loadMobileUsers();loadTodayAttendance();
     }catch(e){toast.error(e.response?.data?.detail||'Status update failed')}
+  };
+
+  const setDailyAttendance=async(mu,status)=>{
+    try{
+      await axios.put(`${API}/mobile/users/${mu.mobile_user_id}/attendance`,{status});
+      toast.success(`${mu.mobile_user_id} marked ${status} for today (Auto Perpetual)`);
+      loadTodayAttendance();
+    }catch(e){toast.error(e.response?.data?.detail||'Attendance update failed')}
+  };
+
+  const deleteMobileUser=async()=>{
+    const mu=deleteTarget;
+    if(!mu||deleteBusy) return;
+    setDeleteBusy(true);
+    try{
+      await axios.delete(`${API}/mobile/users/${mu.mobile_user_id}`);
+      toast.success('Mobile user archived');
+      setDeleteTarget(null);
+      loadMobileUsers();loadTodayAttendance();
+    }catch(e){toast.error(e.response?.data?.detail||'Delete failed')}
+    finally{setDeleteBusy(false)}
+  };
+
+  const uploadApk=async(e)=>{
+    const file=e.target.files?.[0];
+    e.target.value='';
+    if(!file) return;
+    if(!file.name.toLowerCase().endsWith('.apk')) return toast.error('Only .apk files are allowed');
+    setApkUploading(true);
+    try{
+      const form=new FormData();
+      form.append('file',file);
+      await axios.post(`${API}/mobile/app-versions/upload`,form,{headers:{'Content-Type':'multipart/form-data'}});
+      toast.success('APK uploaded');
+      loadAppVersions();
+    }catch(err){toast.error(err.response?.data?.detail||'APK upload failed')}
+    finally{setApkUploading(false)}
+  };
+
+  const downloadApk=async()=>{
+    try{
+      const r=await axios.get(`${API}/mobile/app-versions/download/latest`,{responseType:'blob'});
+      const url=URL.createObjectURL(r.data);
+      const a=document.createElement('a');
+      a.href=url;
+      a.download=(appVersions[0]?.apk_filename)||'sleeping-stock.apk';
+      a.click();
+      URL.revokeObjectURL(url);
+    }catch(e){toast.error(e.response?.data?.detail||'Download failed')}
+  };
+
+  const copyApkLink=async()=>{
+    try{
+      let link=apkDownloadUrl;
+      if(!link){
+        const r=await axios.get(`${API}/mobile/app-versions/download-link/latest`);
+        link=r.data?.download_url||'';
+        setApkDownloadUrl(link);
+      }
+      if(!link) return toast.error('No download link available');
+      await navigator.clipboard.writeText(link);
+      toast.success('Download link copied');
+    }catch(e){toast.error('Could not copy link')}
+  };
+
+  const generateAutoPerpetual=async(recalc=false)=>{
+    if(!scopeReady) return toast.error('Select exact Brand, Dealer and Branch');
+    if(recalc) setAutoRecalcBusy(true); else setAutoGenerating(true);
+    try{
+      const r=await axios.post(`${API}/mobile/auto-perpetual/generate`,null,{params:{brand_name:brand,dealer_name:dealer,branch,recalc_pending:recalc}});
+      if(r.data?.duplicate) toast.info('Auto Perpetual already generated for today');
+      else toast.success(`Assigned ${r.data?.assignments_created||0} line items to ${r.data?.active_users||0} active users`);
+      loadAutoPerpetual();
+    }catch(e){toast.error(e.response?.data?.detail||'Generate failed')}
+    finally{ setAutoGenerating(false); setAutoRecalcBusy(false); }
   };
 
   const generatePairing=async(mu)=>{
@@ -137,13 +246,9 @@ export default function NMTSMobile({ variant = 'mobile' }){
       toast.success(r.data?.message || 'Branch updated');
       setBranchMoveTarget(null);
       loadMobileUsers();
-      loadDevices();
-    } catch (e) {
-      const d = e.response?.data?.detail;
-      toast.error(typeof d === 'string' ? d : (d?.message || 'Branch change failed'));
-    } finally {
-      setBranchMoveBusy(false);
-    }
+      loadTodayAttendance();
+    }catch(e){const d=e.response?.data?.detail;toast.error(typeof d==='string'?d:(d?.message||'Branch change failed'))}
+    finally { setBranchMoveBusy(false); }
   };
 
   const changeBranch = (mu) => {
@@ -151,43 +256,11 @@ export default function NMTSMobile({ variant = 'mobile' }){
     setBranchMoveTarget(mu);
   };
 
-  const performRemoveDevice = async () => {
-    const d = deviceRemoveTarget;
-    if (!d || deviceRemoveBusy) return;
-    setDeviceRemoveBusy(true);
-    try {
-      await setDeviceStatus(d, 'removed');
-      setDeviceRemoveTarget(null);
-    } finally {
-      setDeviceRemoveBusy(false);
-    }
-  };
-
-  const requestRemoveDevice = (d) => setDeviceRemoveTarget(d);
-
-  const setDeviceStatus=async(d,status)=>{
-    try{await axios.put(`${API}/mobile/devices/${d.device_id}/status`,{status});toast.success(`Device set to ${status}`);loadDevices();loadMobileUsers();}
-    catch(e){toast.error(e.response?.data?.detail||'Device update failed')}
-  };
-
   const saveNotificationInterval=async()=>{
     setSavingInterval(true);
     try{await axios.put(`${API}/mobile/settings/notification-interval`,{interval_minutes:Number(notificationInterval)});toast.success('Notification interval updated')}
     catch(e){toast.error(e.response?.data?.detail||'Update failed')}
     finally{setSavingInterval(false)}
-  };
-
-  const publishVersion=async()=>{
-    if(!clean(newVersion.version_name)||!newVersion.version_code||!clean(newVersion.apk_filename)||!clean(newVersion.apk_path))
-      return toast.error('Version Name, Version Code, APK Filename and APK Path are required');
-    setPublishingVersion(true);
-    try{
-      await axios.post(`${API}/mobile/app-versions`,{...newVersion,version_code:Number(newVersion.version_code),min_supported_version_code:Number(newVersion.min_supported_version_code)||1});
-      toast.success('App version published');
-      setNewVersion({version_name:'',version_code:'',apk_filename:'',apk_path:'',release_notes:'',min_supported_version_code:1,mandatory:false});
-      loadAppVersions();
-    }catch(e){toast.error(e.response?.data?.detail||'Publish failed')}
-    finally{setPublishingVersion(false)}
   };
 
   const lookup=async()=>{if(!scopeReady)return toast.error('Select exact Dashboard Brand, Dealer and Branch');if(!clean(partNumber))return toast.error('Enter Part Number');try{const r=await axios.get(`${API}/mobile/perpetual-stock/lookup`,{params:{part_number:clean(partNumber),brand,dealer,branch}});setSnapshot(r.data);setPhysicalLocation(r.data.pin_location||'');setPhysicalQty('');setRemarks('')}catch(e){setSnapshot(null);toast.error(e.response?.data?.detail||'Part not found')}};
@@ -198,7 +271,7 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const openSession=async(s)=>{try{const r=await axios.get(`${API}/mobile/perpetual-stock/sessions/${s.session_id}`);setViewSession(r.data)}catch(e){toast.error(e.response?.data?.detail||'Session load failed')}};
   const updateCorrection=async(row,method)=>{try{const status=method==='no_action'?'pending':'corrected';const r=await axios.put(`${API}/mobile/perpetual-stock/${row.id}/correction`,{correction_status:status,correction_method:method,correction_remarks:''});setViewSession(v=>({...v,items:(v.items||[]).map(x=>x.id===row.id?r.data:x)}));toast.success('Correction updated')}catch(e){toast.error(e.response?.data?.detail||'Correction update failed')}};
   const excel=async(s)=>{try{const r=await axios.get(`${API}/mobile/perpetual-stock/sessions/${s.session_id}/excel`,{responseType:'blob'});const url=URL.createObjectURL(r.data);const a=document.createElement('a');a.href=url;a.download=`${s.session_id}.xlsx`;a.click();URL.revokeObjectURL(url)}catch(e){toast.error('Excel download failed')}};
-  const exportAllExcel=async()=>{try{const params={...filters};if(exact(brand))params.brand=brand;if(exact(dealer))params.dealer=dealer;if(exact(branch))params.branch=branch;delete params.user_filter;delete params.status_filter;const r=await axios.get(`${API}/mobile/perpetual-stock/export-all/excel`,{params,responseType:'blob'});const url=URL.createObjectURL(r.data);const a=document.createElement('a');a.href=url;a.download=user?.role==='master'?'perpetual_stock_master.xlsx':user?.role==='admin'?'perpetual_stock_admin.xlsx':'perpetual_stock_branch.xlsx';a.click();URL.revokeObjectURL(url);toast.success('Complete Perpetual Stock Excel downloaded')}catch(e){toast.error(e.response?.data?.detail||'Complete Excel download failed')}};
+  const exportAllExcel=async()=>{try{const params={date_from:filters.date_from||undefined,date_to:filters.date_to||undefined};if(exact(brand))params.brand=brand;if(exact(dealer))params.dealer=dealer;if(exact(branch))params.branch=branch;const r=await axios.get(`${API}/mobile/perpetual-stock/export-all/excel`,{params,responseType:'blob'});const url=URL.createObjectURL(r.data);const a=document.createElement('a');a.href=url;a.download=user?.role==='master'?'perpetual_stock_master.xlsx':user?.role==='admin'?'perpetual_stock_admin.xlsx':'perpetual_stock_branch.xlsx';a.click();URL.revokeObjectURL(url);toast.success('Complete Perpetual Stock Excel downloaded')}catch(e){toast.error(e.response?.data?.detail||'Complete Excel download failed')}};
   const todayItems=useMemo(()=>sessions.filter(s=>todayKey(s.created_at)===todayKey()).reduce((n,s)=>n+Number(s.total_items||0),0),[sessions]);
 
   const latestVersion = appVersions[0];
@@ -213,7 +286,7 @@ export default function NMTSMobile({ variant = 'mobile' }){
 
     {showAuditSections && (
       <>
-    <div className="grid md:grid-cols-3 gap-3"><Tab active={section==='physical'} onClick={()=>setSection('physical')} icon={ClipboardCheck} title="Physical Perpetual Stock"/><Tab active={section==='auto'} onClick={()=>setSection('auto')} icon={Camera} title="Auto Perpetual Stock"/><Tab active={section==='history'} onClick={()=>setSection('history')} icon={History} title="Verification History"/></div>
+    <div className="grid md:grid-cols-3 gap-3"><Tab active={section==='physical'} onClick={()=>setSection('physical')} icon={ClipboardCheck} title="Physical Perpetual"/><Tab active={section==='auto'} onClick={()=>setSection('auto')} icon={Camera} title="Auto Perpetual"/><Tab active={section==='history'} onClick={()=>setSection('history')} icon={History} title="Verification History"/></div>
     {!scopeReady && user?.role!=='user' && <div className="border border-gray-200 bg-gray-50 p-3 rounded-lg text-gray-700 text-sm">Select an exact Brand, Dealer and Branch in the top header filters for perpetual stock verification.</div>}
       </>
     )}
@@ -243,76 +316,101 @@ export default function NMTSMobile({ variant = 'mobile' }){
         </div>
       </div>}
 
-      <Card title="Mobile Users"><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1400px]"><thead><tr>{['Mobile User ID','Name','Mobile','Brand','Dealer','Branch','Created By','Creator Role','Created Date','Devices','Active','Last Active','Status','Actions'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>
-        {mobileUsers.map(mu=><tr className="border-t" key={mu.mobile_user_id}>
+      <Card title="Mobile Users">
+        <p className="text-xs text-gray-500 mb-3">Mark <b>Today (Auto)</b> Active/Inactive before Generate Auto Perpetual. Account Active/Inactive controls login access.</p>
+        <div className="overflow-x-auto"><table className="w-full text-sm min-w-[1200px]"><thead><tr>{['Mobile User ID','Name','Mobile','Brand','Dealer','Branch','Account','Today (Auto)','Last Active','Actions'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>
+        {mobileUsers.map(mu=>{
+          const att=todayAttendance[mu.mobile_user_id];
+          const attLabel=att==='active'?'Active':att==='inactive'?'Inactive':'Not set';
+          return <tr className="border-t" key={mu.mobile_user_id}>
           <td className="p-3 font-mono">{mu.mobile_user_id}</td><td>{mu.name}</td><td>{mu.mobile_number}</td><td>{mu.brand_name}</td><td>{mu.dealer_name}</td><td>{mu.branch}</td>
-          <td>{mu.created_by_name}</td><td className="capitalize">{mu.created_by_role}</td><td>{fmt(mu.created_at)}</td>
-          <td>{mu.paired_device_count||0}</td><td>{mu.active_device_count||0}</td><td>{mu.last_active_at?fmt(mu.last_active_at):'-'}</td>
           <td><span className={`px-2 py-1 rounded text-xs ${mu.status==='active'?'bg-green-100 text-green-700':'bg-gray-200 text-gray-600'}`}>{mu.status}</span></td>
+          <td><span className={`px-2 py-1 rounded text-xs ${att==='active'?'bg-emerald-100 text-emerald-800':att==='inactive'?'bg-amber-100 text-amber-800':'bg-gray-100 text-gray-600'}`}>{attLabel}</span></td>
+          <td>{mu.last_active_at?fmt(mu.last_active_at):'-'}</td>
           <td><div className="flex gap-2 flex-wrap">
-            <Button size="sm" variant="outline" title="Generate Re-pair QR" onClick={()=>generatePairing(mu)} disabled={pairingFor===mu.mobile_user_id || mu.status!=='active'}><RefreshCw className="h-4 w-4"/></Button>
-            <Button size="sm" variant="outline" title="Move to currently selected branch" onClick={()=>changeBranch(mu)} disabled={!scopeReady}><ArrowRightLeft className="h-4 w-4"/></Button>
-            <Button size="sm" variant="outline" onClick={()=>toggleUserStatus(mu)}>{mu.status==='active'?<Ban className="h-4 w-4"/>:<CheckCircle2 className="h-4 w-4"/>}</Button>
+            {canManage && <Button size="sm" variant="outline" title="Re-pair QR" onClick={()=>generatePairing(mu)} disabled={pairingFor===mu.mobile_user_id || mu.status!=='active'}><RefreshCw className="h-4 w-4"/></Button>}
+            {canManage && <Button size="sm" variant="outline" title="Change branch" onClick={()=>changeBranch(mu)} disabled={!scopeReady}><ArrowRightLeft className="h-4 w-4"/></Button>}
+            {canManageMobileAccount && mu.status!=='deleted' && <>
+              <Button size="sm" variant="outline" title="Account active/inactive" onClick={()=>toggleUserStatus(mu)}>{mu.status==='active'?<Ban className="h-4 w-4"/>:<CheckCircle2 className="h-4 w-4"/>}</Button>
+              <Button size="sm" variant={att==='active'?'default':'outline'} title="Present for Auto today" onClick={()=>setDailyAttendance(mu,'active')}>Present</Button>
+              <Button size="sm" variant={att==='inactive'?'secondary':'outline'} title="Absent for Auto today" onClick={()=>setDailyAttendance(mu,'inactive')}>Absent</Button>
+            </>}
+            {isMaster && mu.status!=='deleted' && <Button size="sm" variant="outline" title="Delete (archive)" onClick={()=>setDeleteTarget(mu)}><Trash2 className="h-4 w-4 text-red-600"/></Button>}
           </div></td>
-        </tr>)}
-        {!mobileUsers.length && <tr><td colSpan={17} className="text-center py-8 text-gray-500">No mobile users yet for this scope.</td></tr>}
-      </tbody></table></div></Card>
-
-      <Card title="Linked Mobile Devices"><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1200px]"><thead><tr>{['Mobile User','Device User Name','Device User Mobile','Device Name','Device Info','Brand','Dealer','Branch','App Version','Paired','Last Active','Status','Actions'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>
-        {devices.map(d=><tr className="border-t" key={d.device_id}>
-          <td className="p-3 font-mono">{d.mobile_user_id}</td><td>{d.device_user_name||'-'}</td><td>{d.device_user_mobile||'-'}</td><td>{d.device_name}</td><td>{d.device_info}</td><td>{d.brand_name}</td><td>{d.dealer_name}</td><td>{d.branch}</td>
-          <td>{d.app_version||'-'}</td><td>{fmt(d.paired_at)}</td><td>{d.last_active_at?fmt(d.last_active_at):'-'}</td>
-          <td><span className={`px-2 py-1 rounded text-xs ${d.status==='active'?'bg-green-100 text-green-700':d.status==='removed'?'bg-red-100 text-red-700':'bg-gray-200 text-gray-600'}`}>{d.status}</span></td>
-          <td><div className="flex gap-2">
-            {d.status==='active'?<Button size="sm" variant="outline" onClick={()=>setDeviceStatus(d,'inactive')}><Ban className="h-4 w-4"/></Button>:d.status==='inactive'?<Button size="sm" onClick={()=>setDeviceStatus(d,'active')}>Activate</Button>:null}
-            {d.status!=='removed' && <Button size="sm" variant="outline" onClick={()=>requestRemoveDevice(d)}><Trash2 className="h-4 w-4"/></Button>}
-          </div></td>
-        </tr>)}
-        {!devices.length && <tr><td colSpan="13" className="text-center py-8 text-gray-500">No paired devices yet.</td></tr>}
+        </tr>})}
+        {!mobileUsers.length && <tr><td colSpan={10} className="text-center py-8 text-gray-500">No mobile users yet for this scope.</td></tr>}
       </tbody></table></div></Card>
     </div>}
 
     {showMobileSections && section==='settings'&&<div className="space-y-5">
-      <Card title="Notification Repeat Interval"><div className="flex items-center gap-3">
+      <Card title="Notification Repeat Interval"><div className="flex items-center gap-3 flex-wrap">
         <input type="number" min="1" className="border rounded h-10 px-3 w-32" value={notificationInterval} disabled={!isMaster} onChange={e=>setNotificationInterval(e.target.value)}/>
         <span className="text-sm text-gray-500">minutes between repeat alerts for an unaccepted branch request</span>
         {isMaster && <Button onClick={saveNotificationInterval} disabled={savingInterval}><RefreshCw className="h-4 w-4 mr-2"/>{savingInterval?'Saving...':'Save'}</Button>}
       </div></Card>
 
-      {isMaster && <Card title="Publish App Version"><div className="grid md:grid-cols-3 gap-3">
-        <input className="border rounded h-10 px-3" placeholder="Version Name (1.0.1)" value={newVersion.version_name} onChange={e=>setNewVersion({...newVersion,version_name:e.target.value})}/>
-        <input type="number" className="border rounded h-10 px-3" placeholder="Android Version Code" value={newVersion.version_code} onChange={e=>setNewVersion({...newVersion,version_code:e.target.value})}/>
-        <input className="border rounded h-10 px-3" placeholder="APK Filename" value={newVersion.apk_filename} onChange={e=>setNewVersion({...newVersion,apk_filename:e.target.value})}/>
-        <input className="border rounded h-10 px-3 md:col-span-2" placeholder="APK Download Path / URL" value={newVersion.apk_path} onChange={e=>setNewVersion({...newVersion,apk_path:e.target.value})}/>
-        <input type="number" className="border rounded h-10 px-3" placeholder="Min Supported Version Code" value={newVersion.min_supported_version_code} onChange={e=>setNewVersion({...newVersion,min_supported_version_code:e.target.value})}/>
-        <input className="border rounded h-10 px-3 md:col-span-2" placeholder="Release Notes" value={newVersion.release_notes} onChange={e=>setNewVersion({...newVersion,release_notes:e.target.value})}/>
-        <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={newVersion.mandatory} onChange={e=>setNewVersion({...newVersion,mandatory:e.target.checked})}/>Mandatory update</label>
-        <Button onClick={publishVersion} disabled={publishingVersion} className="md:col-span-3"><Upload className="h-4 w-4 mr-2"/>{publishingVersion?'Publishing...':'Publish Version'}</Button>
-      </div></Card>}
-
-      <Card title="APK Download"><div className="flex items-center justify-between">
-        <div>{latestVersion ? <>Current version: <b>{latestVersion.version_name}</b> (code {latestVersion.version_code}){latestVersion.mandatory && <span className="ml-2 text-xs bg-red-100 text-red-700 px-2 py-1 rounded">Mandatory</span>}<div className="text-xs text-gray-500 mt-1">{latestVersion.release_notes}</div></> : 'No app version published yet.'}</div>
-        {latestVersion && <a href={latestVersion.apk_path} target="_blank" rel="noreferrer"><Button><Download className="h-4 w-4 mr-2"/>Download APK</Button></a>}
-      </div></Card>
-
-      <Card title="Published Versions"><SimpleTable headers={['Version','Code','Filename','Mandatory','Released']} rows={appVersions.map(v=>[v.version_name,v.version_code,v.apk_filename,v.mandatory?'Yes':'No',fmt(v.release_date)])}/></Card>
+      <Card title="Mobile APK">
+        {isMaster && <div className="mb-4 flex flex-wrap items-center gap-3">
+          <input ref={apkFileRef} type="file" accept=".apk,application/vnd.android.package-archive" className="hidden" onChange={uploadApk}/>
+          <Button onClick={()=>apkFileRef.current?.click()} disabled={apkUploading}><Upload className="h-4 w-4 mr-2"/>{apkUploading?'Uploading...':'Upload APK'}</Button>
+          <span className="text-xs text-gray-500">.apk only · Master Admin</span>
+        </div>}
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+          <div>{latestVersion ? <>Latest: <b>{latestVersion.version_name||latestVersion.apk_filename}</b><div className="text-xs text-gray-500 mt-1">Released {fmt(latestVersion.release_date)}</div></> : 'No APK published yet.'}</div>
+          <div className="flex flex-wrap gap-2">
+            {latestVersion && <Button onClick={downloadApk}><Download className="h-4 w-4 mr-2"/>Download APK</Button>}
+            {latestVersion && <Button variant="outline" onClick={copyApkLink}><Copy className="h-4 w-4 mr-2"/>Copy Download Link</Button>}
+          </div>
+        </div>
+      </Card>
     </div>}
 
     {showAuditSections && section==='physical'&&<div className="space-y-5">
-      <Card title="Physical Perpetual Stock Lookup"><div className="flex flex-wrap gap-2"><input className="border rounded h-10 px-3 flex-1 min-w-64" value={partNumber} onChange={e=>setPartNumber(e.target.value.toUpperCase())} placeholder="Manual Part Number"/><Button onClick={lookup}><ScanLine className="h-4 w-4 mr-2"/>Lookup</Button></div>
+      <Card title="Physical Perpetual"><div className="flex flex-wrap gap-2"><input className="border rounded h-10 px-3 flex-1 min-w-64" value={partNumber} onChange={e=>setPartNumber(e.target.value.toUpperCase())} placeholder="Manual Part Number"/><Button onClick={lookup}><ScanLine className="h-4 w-4 mr-2"/>Lookup</Button></div>
       {snapshot&&<div className="mt-4 space-y-4"><div className="grid md:grid-cols-4 gap-3"><Info label="Part Number" value={snapshot.part_number}/><Info label="Part Name" value={snapshot.part_name}/><Info label="System Quantity" value={snapshot.system_quantity}/><Info label="MAV" value={money(snapshot.mav)}/><Info label="PIN Location" value={snapshot.pin_location||'-'}/><Info label="Physical Quantity" value={<input type="number" className="border rounded h-9 px-2 w-full" value={physicalQty} onChange={e=>setPhysicalQty(e.target.value)}/>}/><Info label="Physical Location" value={<input className="border rounded h-9 px-2 w-full" value={physicalLocation} onChange={e=>setPhysicalLocation(e.target.value)}/>}/><Info label="Remarks" value={<input className="border rounded h-9 px-2 w-full" value={remarks} onChange={e=>setRemarks(e.target.value)}/>} /></div>{calc&&<div className="grid md:grid-cols-5 gap-3"><Info label="Difference" value={calc.difference}/><Info label="Shortage Qty" value={calc.shortage_qty}/><Info label="Excess Qty" value={calc.excess_qty}/><Info label="Shortage Value" value={money(calc.shortage_value)}/><Info label="Excess Value" value={money(calc.excess_value)}/></div>}<Button onClick={addItem}><Plus className="h-4 w-4 mr-2"/>Add to Verification List</Button></div>}</Card>
       <Card title={`Temporary Verification List (${pending.length})`}><DetailTable rows={pending} removable onRemove={i=>setPending(p=>p.filter((_,x)=>x!==i))}/><div className="flex justify-end mt-4"><Button onClick={uploadSession} disabled={!pending.length}><Upload className="h-4 w-4 mr-2"/>Finish Upload</Button></div></Card>
       <Card title="Today's Verification"><p className="text-sm text-gray-500 mb-3">All verified line items for today. Total items: {todayItems}</p><DetailTable rows={sessions.filter(s=>todayKey(s.created_at)===todayKey()).flatMap(s=>s.items||[])} empty="Open History and View a session to inspect its items."/></Card>
     </div>}
 
     {showAuditSections && section==='auto'&&<div className="space-y-5">
-      <Card title="Auto Perpetual Stock (Camera / Scan)"><div className="flex flex-wrap gap-2"><input className="border rounded h-10 px-3 flex-1 min-w-64" value={partNumber} onChange={e=>setPartNumber(e.target.value.toUpperCase())} placeholder="Part Number (from scan or manual)"/><Button variant="outline" onClick={()=>cameraRef.current?.click()}><Camera className="h-4 w-4 mr-2"/>Camera Scan</Button><input ref={cameraRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={scan}/><Button onClick={lookup}><ScanLine className="h-4 w-4 mr-2"/>Lookup</Button></div>
-      {snapshot&&<div className="mt-4 space-y-4"><div className="grid md:grid-cols-4 gap-3"><Info label="Part Number" value={snapshot.part_number}/><Info label="Part Name" value={snapshot.part_name}/><Info label="System Quantity" value={snapshot.system_quantity}/><Info label="MAV" value={money(snapshot.mav)}/><Info label="PIN Location" value={snapshot.pin_location||'-'}/><Info label="Physical Quantity" value={<input type="number" className="border rounded h-9 px-2 w-full" value={physicalQty} onChange={e=>setPhysicalQty(e.target.value)}/>}/><Info label="Physical Location" value={<input className="border rounded h-9 px-2 w-full" value={physicalLocation} onChange={e=>setPhysicalLocation(e.target.value)}/>}/><Info label="Remarks" value={<input className="border rounded h-9 px-2 w-full" value={remarks} onChange={e=>setRemarks(e.target.value)}/>} /></div>{calc&&<div className="grid md:grid-cols-5 gap-3"><Info label="Difference" value={calc.difference}/><Info label="Shortage Qty" value={calc.shortage_qty}/><Info label="Excess Qty" value={calc.excess_qty}/><Info label="Shortage Value" value={money(calc.shortage_value)}/><Info label="Excess Value" value={money(calc.excess_value)}/></div>}<Button onClick={addItem}><Plus className="h-4 w-4 mr-2"/>Add to Verification List</Button></div>}</Card>
-      <Card title={`Temporary Verification List (${pending.length})`}><DetailTable rows={pending} removable onRemove={i=>setPending(p=>p.filter((_,x)=>x!==i))}/><div className="flex justify-end mt-4"><Button onClick={uploadSession} disabled={!pending.length}><Upload className="h-4 w-4 mr-2"/>Finish Upload</Button></div></Card>
+      <Card title="Auto Perpetual — monthly coverage">
+        <p className="text-sm text-gray-600 mb-4">Mark mobile users Present/Absent under Mobile Users, then generate today&apos;s allocations. One AOPS session per user per day.</p>
+        {autoSummary && <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+          <Info label="Month" value={autoSummary.month_key}/>
+          <Info label="Total lines" value={autoSummary.total_stock_lines}/>
+          <Info label="Verified (unique)" value={autoSummary.verified_unique_lines}/>
+          <Info label="Coverage %" value={`${autoSummary.monthly_coverage_pct}%`}/>
+          <Info label="Pending" value={autoSummary.pending_lines}/>
+          <Info label="Days left" value={autoSummary.days_remaining}/>
+          <Info label="Match lines" value={autoSummary.match_lines}/>
+          <Info label="Shortage lines" value={autoSummary.shortage_lines}/>
+          <Info label="Damage lines" value={autoSummary.damage_lines}/>
+          <Info label="Physical count" value={autoSummary.physical_verification_count}/>
+          <Info label="Auto count" value={autoSummary.auto_verification_count}/>
+        </div>}
+        <div className="flex flex-wrap gap-2">
+          <Button onClick={()=>generateAutoPerpetual(false)} disabled={!scopeReady||autoGenerating}><ClipboardCheck className="h-4 w-4 mr-2"/>{autoGenerating?'Generating...':'Generate Auto Perpetual'}</Button>
+          <Button variant="outline" onClick={()=>generateAutoPerpetual(true)} disabled={!scopeReady||autoRecalcBusy}><RefreshCw className="h-4 w-4 mr-2"/>{autoRecalcBusy?'Working...':'Recalculate pending'}</Button>
+          <Button variant="outline" onClick={loadAutoPerpetual} disabled={!scopeReady}><RefreshCw className="h-4 w-4 mr-2"/>Refresh</Button>
+        </div>
+      </Card>
+      <Card title={`Today&apos;s assignments (${autoAssignments.length})`}>
+        <div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr>{['User','Part','LOC','Status'].map(h=><th key={h} className="text-left p-2">{h}</th>)}</tr></thead><tbody>
+          {autoAssignments.map(a=><tr key={a.id||`${a.mobile_user_id}-${a.part_number}`} className="border-t"><td className="p-2 font-mono">{a.mobile_user_id}</td><td className="p-2">{a.part_number}</td><td className="p-2">{a.loc||'-'}</td><td className="p-2">{a.status}</td></tr>)}
+          {!autoAssignments.length && <tr><td colSpan={4} className="text-center py-6 text-gray-500">No assignments yet. Generate Auto Perpetual after marking attendance.</td></tr>}
+        </tbody></table></div>
+      </Card>
+      <Card title="User performance (this month)">
+        <div className="overflow-x-auto"><table className="w-full text-sm min-w-[1100px]"><thead><tr>{['Rank','User','Monthly Target','Normal','Catch-up','Assigned','Completed','Pending','Completion %'].map(h=><th key={h} className="text-left p-2">{h}</th>)}</tr></thead><tbody>
+          {userPerformance.map(u=><tr key={u.mobile_user_id} className="border-t"><td className="p-2">{u.rank}</td><td className="p-2">{u.name}<div className="text-xs text-gray-500 font-mono">{u.mobile_user_id}</div></td><td className="p-2">{u.monthly_target}</td><td className="p-2">{u.normal_target}</td><td className="p-2">{u.catch_up_target}</td><td className="p-2">{u.assigned}</td><td className="p-2">{u.completed}</td><td className="p-2">{u.pending}</td><td className="p-2 font-semibold">{u.completion_pct}%</td></tr>)}
+          {!userPerformance.length && <tr><td colSpan={9} className="text-center py-6 text-gray-500">No performance data yet.</td></tr>}
+        </tbody></table></div>
+      </Card>
     </div>}
 
-    {showAuditSections && section==='history'&&<div className="space-y-5"><Card title="Verification History Filters"><div className="grid md:grid-cols-4 gap-3"><input type="date" className="border rounded h-10 px-3" value={filters.date_from} onChange={e=>setFilters({...filters,date_from:e.target.value})}/><input type="date" className="border rounded h-10 px-3" value={filters.date_to} onChange={e=>setFilters({...filters,date_to:e.target.value})}/><select className="border rounded h-10 px-3" value={filters.user_filter} onChange={e=>setFilters({...filters,user_filter:e.target.value})}><option value="">All Users</option>{mobileUsers.map(u=><option key={u.mobile_user_id} value={u.mobile_user_id}>{u.name}</option>)}</select><select className="border rounded h-10 px-3" value={filters.status_filter} onChange={e=>setFilters({...filters,status_filter:e.target.value})}><option value="all">All Status</option><option value="submitted">Submitted</option></select></div><Button className="mt-3" onClick={loadSessions}>Apply Filters</Button></Card>
-      <Card title="Perpetual Verification History"><div className="flex flex-wrap items-center justify-between gap-3 mb-4"><p className="text-sm text-gray-500">{user?.role==='master'?'Download all permitted brands, dealers and branches.':user?.role==='admin'?'Download all branches under your Brand / Dealer scope.':'Download your branch verification list.'}</p><Button onClick={exportAllExcel}><Download className="h-4 w-4 mr-2"/>Download Complete Excel</Button></div><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1350px]"><thead><tr>{['Session ID','Date','Brand','Dealer','Branch','User','Total Items','Shortage Qty','Shortage Value','Excess Qty','Excess Value','Status','View','Excel'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{sessions.map(s=><tr key={s.session_id} className="border-t"><td className="p-3 font-semibold">{s.session_id}</td><td>{fmt(s.created_at)}</td><td>{s.brand_name}</td><td>{s.dealer_name}</td><td>{s.branch}</td><td>{s.verified_by_name}</td><td>{s.total_items}</td><td>{s.total_shortage_qty}</td><td>{money(s.total_shortage_value)}</td><td>{s.total_excess_qty}</td><td>{money(s.total_excess_value)}</td><td>{s.status}</td><td><Button size="sm" variant="outline" onClick={()=>openSession(s)}><Eye className="h-4 w-4"/></Button></td><td><Button size="sm" variant="outline" onClick={()=>excel(s)}><Download className="h-4 w-4"/></Button></td></tr>)}</tbody></table></div></Card></div>}
+    {showAuditSections && section==='history'&&<div className="space-y-5"><Card title="Verification History Filters"><div className="grid md:grid-cols-4 gap-3"><input type="date" className="border rounded h-10 px-3" value={filters.date_from} onChange={e=>setFilters({...filters,date_from:e.target.value})}/><input type="date" className="border rounded h-10 px-3" value={filters.date_to} onChange={e=>setFilters({...filters,date_to:e.target.value})}/><input type="month" className="border rounded h-10 px-3" value={filters.month} onChange={e=>setFilters({...filters,month:e.target.value})}/><select className="border rounded h-10 px-3" value={filters.user_filter} onChange={e=>setFilters({...filters,user_filter:e.target.value})}><option value="">All Users</option>{mobileUsers.map(u=><option key={u.mobile_user_id} value={u.mobile_user_id}>{u.name}</option>)}</select><select className="border rounded h-10 px-3" value={filters.verification_type} onChange={e=>setFilters({...filters,verification_type:e.target.value})}><option value="all">All Types</option><option value="physical">Physical</option><option value="auto">Auto</option><option value="recheck">Recheck</option></select><select className="border rounded h-10 px-3" value={filters.result_filter} onChange={e=>setFilters({...filters,result_filter:e.target.value})}><option value="all">All Results</option><option value="match">Match</option><option value="shortage">Shortage</option><option value="excess">Excess</option><option value="damage">Damage</option></select><input className="border rounded h-10 px-3" placeholder="Part Number" value={filters.part_number} onChange={e=>setFilters({...filters,part_number:e.target.value})}/><input className="border rounded h-10 px-3" placeholder="LOC" value={filters.loc} onChange={e=>setFilters({...filters,loc:e.target.value})}/></div><Button className="mt-3" onClick={()=>{loadHistoryRecords(); loadSessions();}}>Apply Filters</Button></Card>
+      <Card title={`Audit records (${historyRecords.length})`}><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1600px]"><thead><tr>{['Session','Type','Date','User','Part','LOC','System','Physical','Short','Excess','Damage','Result','Remark'].map(h=><th key={h} className="text-left p-2">{h}</th>)}</tr></thead><tbody>{historyRecords.map(r=><tr key={r.id||`${r.session_id}-${r.part_number}`} className="border-t"><td className="p-2 font-mono text-xs">{r.session_id}</td><td className="p-2">{r.coverage_kind==='recheck'?'Recheck':r.verification_type||'-'}</td><td className="p-2">{fmt(r.verified_at||r.created_at)}</td><td className="p-2">{r.verified_by_name||r.verified_user}</td><td className="p-2">{r.part_number}</td><td className="p-2">{r.pin_location||r.system_location||'-'}</td><td className="p-2">{r.system_quantity}</td><td className="p-2">{r.physical_quantity}</td><td className="p-2">{r.shortage_qty}</td><td className="p-2">{r.excess_qty}</td><td className="p-2">{r.damage_qty||0}</td><td className="p-2">{r.quantity_status||r.overall_status}</td><td className="p-2">{r.remark||r.remarks||'-'}</td></tr>)}</tbody></table></div></Card>
+      <Card title="Session summary"><div className="flex flex-wrap items-center justify-between gap-3 mb-4"><Button onClick={exportAllExcel}><Download className="h-4 w-4 mr-2"/>Download Complete Excel</Button></div><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1350px]"><thead><tr>{['Session ID','Date','Brand','Dealer','Branch','User','Total Items','Shortage Qty','Excess Qty','Status','View'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{sessions.map(s=><tr key={s.session_id} className="border-t"><td className="p-3 font-semibold">{s.session_id}</td><td>{fmt(s.created_at)}</td><td>{s.brand_name}</td><td>{s.dealer_name}</td><td>{s.branch}</td><td>{s.verified_by_name}</td><td>{s.total_items}</td><td>{s.total_shortage_qty}</td><td>{s.total_excess_qty}</td><td>{s.status}</td><td><Button size="sm" variant="outline" onClick={()=>openSession(s)}><Eye className="h-4 w-4"/></Button></td></tr>)}</tbody></table></div></Card></div>}
 
     {showAuditSections && viewSession&&<div className="fixed inset-0 bg-black/50 z-50 p-4 overflow-auto"><div className="bg-white rounded-xl max-w-7xl mx-auto p-5 border shadow-lg"><div className="flex justify-between mb-4"><div><h2 className="text-xl font-bold">{viewSession.session_id}</h2><p className="text-gray-500">{fmt(viewSession.created_at)}</p></div><Button variant="outline" onClick={()=>setViewSession(null)}><X className="h-4 w-4"/></Button></div><DetailTable rows={viewSession.items||[]} canManage={canManage} onCorrection={updateCorrection}/></div></div>}
 
@@ -334,16 +432,14 @@ export default function NMTSMobile({ variant = 'mobile' }){
     />
 
     <NmtsConfirmDialog
-      open={!!deviceRemoveTarget}
-      title="Remove Device"
-      message="Remove this device permanently? The mobile user will need a new pairing code to reconnect."
-      confirmLabel="Remove Device"
+      open={!!deleteTarget}
+      title="Delete Mobile User"
+      message={deleteTarget ? `Archive ${deleteTarget.mobile_user_id}? Verification history is preserved; they will not receive new allocations.` : ''}
+      confirmLabel="Delete"
       variant="danger"
-      loading={deviceRemoveBusy}
-      onCancel={() => {
-        if (!deviceRemoveBusy) setDeviceRemoveTarget(null);
-      }}
-      onConfirm={performRemoveDevice}
+      loading={deleteBusy}
+      onCancel={() => { if (!deleteBusy) setDeleteTarget(null); }}
+      onConfirm={deleteMobileUser}
     />
   </div>
 }

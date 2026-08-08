@@ -33,7 +33,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Header, Request, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict
 from pymongo import ReturnDocument
@@ -300,6 +300,24 @@ class StockVerificationSubmit(BaseModel):
     remark: Optional[str] = None
     entry_method: str  # MANUAL or CAMERA_OCR
     client_id: Optional[str] = None  # offline-queue idempotency key (Part 22)
+    damage_qty: Optional[float] = 0
+    verification_type: Optional[str] = "physical"  # physical | auto
+
+
+class MobileUserAttendanceUpdate(BaseModel):
+    attendance_date: Optional[str] = None  # YYYY-MM-DD IST; default today
+    status: str  # active | inactive for daily Auto Perpetual attendance
+
+
+async def _assert_mobile_user_access(current_user, mobile_user_id: str) -> dict:
+    row = await db.mobile_users.find_one({"mobile_user_id": mobile_user_id}, {"_id": 0})
+    if not row or row.get("deleted_at"):
+        raise HTTPException(404, "Mobile user not found")
+    q = _scoped_query_for_user(current_user)
+    for key in ("brand_name", "dealer_name", "branch"):
+        if key in q and row.get(key) != q[key]:
+            raise HTTPException(403, "Mobile user is outside your permitted scope")
+    return row
 
 
 class AppVersionUpsert(BaseModel):
@@ -416,6 +434,7 @@ async def list_mobile_users(
     current_user: UserResponse = Depends(_web_current_user),
 ):
     q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
+    q["deleted_at"] = {"$exists": False}
     rows = await db.mobile_users.find(q, {"_id": 0, "password_hash": 0}).sort("created_at", -1).to_list(5000)
     return rows
 
@@ -432,6 +451,9 @@ async def get_mobile_user(mobile_user_id: str, current_user: UserResponse = Depe
 async def set_mobile_user_status(mobile_user_id: str, payload: DeviceStatusUpdate, current_user: UserResponse = Depends(_web_current_user)):
     if payload.status not in ("active", "inactive"):
         raise HTTPException(400, "status must be active or inactive")
+    await _assert_mobile_user_access(current_user, mobile_user_id)
+    if current_user.role not in ("master", "admin", "user"):
+        raise HTTPException(403, "Not allowed")
     result = await db.mobile_users.update_one(
         {"mobile_user_id": mobile_user_id}, {"$set": {"status": payload.status, "updated_at": _now_iso()}}
     )
@@ -446,6 +468,79 @@ async def set_mobile_user_status(mobile_user_id: str, payload: DeviceStatusUpdat
         )
     await _audit(current_user, f"mobile_user_{payload.status}", mobile_user_id, {})
     return {"message": f"Mobile user set to {payload.status}"}
+
+
+@router.delete("/users/{mobile_user_id}")
+async def delete_mobile_user(mobile_user_id: str, current_user: UserResponse = Depends(_web_current_user)):
+    if current_user.role != "master":
+        raise HTTPException(403, "Only Master Admin can delete mobile users")
+    row = await _assert_mobile_user_access(current_user, mobile_user_id)
+    now = _now_iso()
+    await db.mobile_users.update_one(
+        {"mobile_user_id": mobile_user_id},
+        {"$set": {"status": "deleted", "deleted_at": now, "updated_at": now, "active_device_count": 0}},
+    )
+    await db.mobile_sessions.delete_many({"mobile_user_id": mobile_user_id})
+    await db.mobile_devices.update_many(
+        {"mobile_user_id": mobile_user_id},
+        {"$set": {"status": "removed", "updated_at": now}},
+    )
+    await _audit(current_user, "mobile_user_deleted", mobile_user_id, {"name": row.get("name")})
+    return {"message": "Mobile user archived. Verification history is preserved."}
+
+
+@router.put("/users/{mobile_user_id}/attendance")
+async def set_mobile_user_attendance(
+    mobile_user_id: str,
+    payload: MobileUserAttendanceUpdate,
+    current_user: UserResponse = Depends(_web_current_user),
+):
+    if current_user.role not in ("master", "admin", "user"):
+        raise HTTPException(403, "Not allowed")
+    if payload.status not in ("active", "inactive"):
+        raise HTTPException(400, "status must be active or inactive")
+    row = await _assert_mobile_user_access(current_user, mobile_user_id)
+    india = _now().astimezone(ZoneInfo("Asia/Kolkata"))
+    attendance_date = payload.attendance_date or india.strftime("%Y-%m-%d")
+    await db.mobile_user_attendance.update_one(
+        {"attendance_date": attendance_date, "mobile_user_id": mobile_user_id},
+        {
+            "$set": {
+                "status": payload.status,
+                "brand_name": row["brand_name"],
+                "dealer_name": row["dealer_name"],
+                "branch": row["branch"],
+                "updated_at": _now_iso(),
+                "updated_by": current_user.id,
+            },
+            "$setOnInsert": {"created_at": _now_iso()},
+        },
+        upsert=True,
+    )
+    return {"message": f"Attendance for {attendance_date} set to {payload.status}"}
+
+
+@router.get("/users/attendance/today")
+async def list_today_attendance(
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    current_user: UserResponse = Depends(_web_current_user),
+):
+    q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
+    if q.get("brand_name") and q["brand_name"] != brand_name:
+        raise HTTPException(403, "Brand outside scope")
+    if q.get("dealer_name") and q["dealer_name"] != dealer_name:
+        raise HTTPException(403, "Dealer outside scope")
+    if q.get("branch") and q["branch"] != branch:
+        raise HTTPException(403, "Branch outside scope")
+    india = _now().astimezone(ZoneInfo("Asia/Kolkata"))
+    attendance_date = india.strftime("%Y-%m-%d")
+    rows = await db.mobile_user_attendance.find(
+        {"attendance_date": attendance_date, "branch": branch},
+        {"_id": 0, "mobile_user_id": 1, "status": 1},
+    ).to_list(500)
+    return {"attendance_date": attendance_date, "records": {r["mobile_user_id"]: r["status"] for r in rows}}
 
 
 @router.put("/users/{mobile_user_id}/branch")
@@ -771,6 +866,235 @@ async def latest_app_version():
 async def list_app_versions(current_user: UserResponse = Depends(_web_current_user)):
     rows = await db.mobile_app_versions.find({}, {"_id": 0}).sort("version_code", -1).to_list(200)
     return rows
+
+
+_APK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mobile_apk_storage")
+
+
+@router.post("/app-versions/upload")
+async def upload_apk_file(
+    file: UploadFile = File(...),
+    current_user: UserResponse = Depends(_web_current_user),
+):
+    if current_user.role != "master":
+        raise HTTPException(403, "Only Master Admin can upload APK files")
+    if not file.filename or not file.filename.lower().endswith(".apk"):
+        raise HTTPException(400, "Only .apk files are allowed")
+    os.makedirs(_APK_DIR, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file.filename)
+    dest = os.path.join(_APK_DIR, safe_name)
+    content = await file.read()
+    if len(content) < 1024:
+        raise HTTPException(400, "APK file is too small")
+    with open(dest, "wb") as fh:
+        fh.write(content)
+    version_code = int(_now().timestamp())
+    public_token = str(uuid.uuid4()).replace("-", "")
+    doc = {
+        "version_name": safe_name.replace(".apk", ""),
+        "version_code": version_code,
+        "apk_filename": safe_name,
+        "apk_path": dest,
+        "public_download_token": public_token,
+        "release_notes": "",
+        "min_supported_version_code": 1,
+        "mandatory": False,
+        "release_date": _now_iso(),
+        "published_by": current_user.username,
+    }
+    await db.mobile_app_versions.update_one({"version_code": version_code}, {"$set": doc}, upsert=True)
+    await _audit(current_user, "upload_apk", safe_name, {"version_code": version_code})
+    return {"message": "APK uploaded", "version": doc}
+
+
+@router.get("/app-versions/download/latest")
+async def download_latest_apk(current_user: UserResponse = Depends(_web_current_user)):
+    row = await db.mobile_app_versions.find({}, {"_id": 0}).sort("version_code", -1).limit(1).to_list(1)
+    if not row:
+        raise HTTPException(404, "No APK published")
+    meta = row[0]
+    path = meta.get("apk_path")
+    if not path or not os.path.isfile(path):
+        raise HTTPException(404, "APK file missing on server")
+    from fastapi.responses import FileResponse
+
+    return FileResponse(path, filename=meta.get("apk_filename") or "sleeping-stock.apk", media_type="application/vnd.android.package-archive")
+
+
+@router.get("/app-versions/download-link/latest")
+async def latest_apk_download_link(request: Request, current_user: UserResponse = Depends(_web_current_user)):
+    row = await db.mobile_app_versions.find({}, {"_id": 0, "public_download_token": 1}).sort("version_code", -1).limit(1).to_list(1)
+    base = _public_api_base_url(request)
+    if row and row[0].get("public_download_token"):
+        return {"download_url": f"{base}/mobile/app-versions/public/{row[0]['public_download_token']}"}
+    return {"download_url": f"{base}/mobile/app-versions/download/latest"}
+
+
+@router.get("/app-versions/public/{token}")
+async def download_apk_public(token: str):
+    """Shareable APK URL (no auth). Token is issued when Master uploads an APK."""
+    meta = await db.mobile_app_versions.find_one({"public_download_token": token}, {"_id": 0})
+    if not meta:
+        raise HTTPException(404, "Download link invalid or expired")
+    path = meta.get("apk_path")
+    if not path or not os.path.isfile(path):
+        raise HTTPException(404, "APK file missing on server")
+    from fastapi.responses import FileResponse
+
+    return FileResponse(
+        path,
+        filename=meta.get("apk_filename") or "sleeping-stock.apk",
+        media_type="application/vnd.android.package-archive",
+    )
+
+
+# ==================== AUTO PERPETUAL (WEB) ====================
+
+@router.post("/auto-perpetual/generate")
+async def generate_auto_perpetual(
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    recalc_pending: bool = False,
+    current_user: UserResponse = Depends(_web_current_user),
+):
+    if current_user.role not in ("master", "admin", "user"):
+        raise HTTPException(403, "Not allowed")
+    q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
+    if q.get("brand_name") and q["brand_name"] != brand_name:
+        raise HTTPException(403, "Brand outside scope")
+    if q.get("dealer_name") and q["dealer_name"] != dealer_name:
+        raise HTTPException(403, "Dealer outside scope")
+    if q.get("branch") and q["branch"] != branch:
+        raise HTTPException(403, "Branch outside scope")
+    from auto_perpetual import generate_auto_perpetual_for_branch, ist_date_key, resolve_branch_inventory_date_key
+
+    active_date_key = await resolve_branch_inventory_date_key(
+        db, brand_name=brand_name, dealer_name=dealer_name, branch=branch
+    )
+    result = await generate_auto_perpetual_for_branch(
+        db,
+        brand_name=brand_name,
+        dealer_name=dealer_name,
+        branch=branch,
+        actor_user_id=current_user.id,
+        recalc_pending=recalc_pending,
+        active_date_key=active_date_key,
+    )
+    if not result.get("duplicate"):
+        from mobile_push import notify_auto_perpetual_assignments
+
+        await notify_auto_perpetual_assignments(
+            db,
+            assignments_by_user=result.get("assignments_by_user") or {},
+            branch=branch,
+            allocation_date=ist_date_key(),
+        )
+    return result
+
+
+@router.get("/auto-perpetual/user-performance")
+async def auto_perpetual_user_performance(
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    month: Optional[str] = None,
+    current_user: UserResponse = Depends(_web_current_user),
+):
+    q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
+    if q.get("brand_name") and q["brand_name"] != brand_name:
+        raise HTTPException(403, "Brand outside scope")
+    from auto_perpetual import user_performance_summary
+
+    return await user_performance_summary(db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, month=month)
+
+
+@router.get("/auto-perpetual/summary")
+async def auto_perpetual_summary(
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    current_user: UserResponse = Depends(_web_current_user),
+):
+    q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
+    if q.get("brand_name") and q["brand_name"] != brand_name:
+        raise HTTPException(403, "Brand outside scope")
+    from auto_perpetual import branch_monthly_summary
+
+    return await branch_monthly_summary(db, brand_name=brand_name, dealer_name=dealer_name, branch=branch)
+
+
+@router.get("/auto-perpetual/assignments/today")
+async def auto_perpetual_assignments_today(
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    current_user: UserResponse = Depends(_web_current_user),
+):
+    from auto_perpetual import ist_date_key
+
+    rows = await db.auto_perpetual_assignments.find(
+        {
+            "allocation_date": ist_date_key(),
+            "brand_name": brand_name,
+            "dealer_name": dealer_name,
+            "branch": branch,
+        },
+        {"_id": 0},
+    ).sort("mobile_user_id", 1).to_list(5000)
+    return rows
+
+
+@router.get("/auto-perpetual/tasks")
+async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
+    from auto_perpetual import ist_date_key, get_or_create_auto_daily_session
+
+    mu = session["mobile_user"]["mobile_user_id"]
+    allocation_date = ist_date_key()
+    rows = await db.auto_perpetual_assignments.find(
+        {
+            "allocation_date": allocation_date,
+            "mobile_user_id": mu,
+            "status": "pending",
+        },
+        {"_id": 0},
+    ).to_list(500)
+    session_id = await get_or_create_auto_daily_session(
+        db,
+        mobile_user_id=mu,
+        brand_name=session["brand_name"],
+        dealer_name=session["dealer_name"],
+        branch=session["branch"],
+        device_id=session["device"]["device_id"],
+    )
+    enriched = []
+    for row in rows:
+        product, _ = await find_scoped_product(row.get("part_number", ""), session["brand_name"], session["dealer_name"], session["branch"])
+        enriched.append(
+            {
+                **row,
+                "part_name": resolve_product_part_name(product or {}),
+                "system_qty": _mobile_stock_qty(product),
+                "loc": row.get("loc") or _product_pin_location(product or {}),
+            }
+        )
+    return {"tasks": enriched, "count": len(enriched), "session_id": session_id, "allocation_date": allocation_date}
+
+
+@router.get("/auto-perpetual/session/today")
+async def auto_perpetual_session_today(session=Depends(get_device_session)):
+    from auto_perpetual import get_or_create_auto_daily_session, ist_date_key
+
+    mu = session["mobile_user"]["mobile_user_id"]
+    session_id = await get_or_create_auto_daily_session(
+        db,
+        mobile_user_id=mu,
+        brand_name=session["brand_name"],
+        dealer_name=session["dealer_name"],
+        branch=session["branch"],
+        device_id=session["device"]["device_id"],
+    )
+    return {"session_id": session_id, "allocation_date": ist_date_key()}
 
 
 # ==================== NOTIFICATIONS (BRANCH-SCOPED, MOBILE SIDE) ====================
@@ -1117,13 +1441,27 @@ async def _get_or_create_mobile_daily_verification_session(
     brand_name: str,
     dealer_name: str,
     branch: str,
+    verification_type: str = "physical",
 ) -> str:
     """One ACTIVE session per mobile user + brand + dealer + branch + IST calendar day."""
     india_now = _now().astimezone(ZoneInfo("Asia/Kolkata"))
     verification_date = india_now.strftime("%Y-%m-%d")
-    date_key = india_now.strftime("%Y%m%d")
+    date_key = india_now.strftime("%y%m%d")
+    if (verification_type or "physical").lower() == "auto":
+        from auto_perpetual import get_or_create_auto_daily_session
+
+        return await get_or_create_auto_daily_session(
+            db,
+            mobile_user_id=mobile_user_id,
+            brand_name=brand_name,
+            dealer_name=dealer_name,
+            branch=branch,
+            device_id=device_id,
+        )
+
+    session_kind = "physical_perpetual"
     scope = {
-        "session_kind": "mobile_daily",
+        "session_kind": session_kind,
         "verification_date": verification_date,
         "mobile_user_id": mobile_user_id,
         "brand_id": brand_name,
@@ -1132,28 +1470,32 @@ async def _get_or_create_mobile_daily_verification_session(
         "status": "ACTIVE",
     }
     existing = await db.stock_verification_sessions.find_one(scope, {"_id": 0, "session_id": 1})
+    if not existing:
+        legacy_scope = {**scope, "session_kind": "mobile_daily"}
+        existing = await db.stock_verification_sessions.find_one(legacy_scope, {"_id": 0, "session_id": 1})
     if existing and existing.get("session_id"):
         await db.stock_verification_sessions.update_one(
             {"session_id": existing["session_id"]},
-            {"$set": {"updated_at": _now(), "device_id": device_id}},
+            {"$set": {"updated_at": _now(), "device_id": device_id, "session_kind": session_kind}},
         )
         return existing["session_id"]
 
     counter = await db.counters.find_one_and_update(
-        {"_id": f"ses_verification_session_{date_key}"},
+        {"_id": f"mops_verification_session_{date_key}"},
         {"$inc": {"seq": 1}, "$setOnInsert": {"date_key": date_key}},
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
     seq = int(counter.get("seq", 1))
     if seq > 9999:
-        raise HTTPException(status_code=500, detail="Daily SES verification session serial exhausted")
-    session_id = f"SES{date_key}{seq:04d}"
+        raise HTTPException(status_code=500, detail="Daily MOPS verification session serial exhausted")
+    session_id = f"MOPS{date_key}{seq:04d}"
     now = _now()
     session_doc = {
         "id": str(uuid.uuid4()),
         "session_id": session_id,
-        "session_kind": "mobile_daily",
+        "session_kind": session_kind,
+        "verification_type": "physical",
         "verification_date": verification_date,
         "mobile_user_id": mobile_user_id,
         "brand_id": brand_name,
@@ -1175,6 +1517,10 @@ async def _get_or_create_mobile_daily_verification_session(
         await db.stock_verification_sessions.insert_one(session_doc)
     except DuplicateKeyError:
         raced = await db.stock_verification_sessions.find_one(scope, {"_id": 0, "session_id": 1})
+        if not raced:
+            raced = await db.stock_verification_sessions.find_one(
+                {**scope, "session_kind": "mobile_daily"}, {"_id": 0, "session_id": 1}
+            )
         if raced and raced.get("session_id"):
             return raced["session_id"]
         raise
@@ -1254,6 +1600,7 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
                     session["brand_name"],
                     session["dealer_name"],
                     session["branch"],
+                    verification_type=payload.verification_type or "physical",
                 )
             existing.setdefault("source", "MOBILE")
             existing.setdefault("information_only", True)
@@ -1276,13 +1623,39 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
         session["brand_name"],
         session["dealer_name"],
         session["branch"],
+        verification_type=payload.verification_type or "physical",
     )
+
+    try:
+        damage_qty = max(0.0, float(payload.damage_qty or 0))
+    except (TypeError, ValueError):
+        damage_qty = 0.0
+    vtype = (payload.verification_type or "physical").lower()
+    if vtype not in ("physical", "auto", "recheck"):
+        vtype = "physical"
 
     system_record, clean_part = await find_scoped_product(
         payload.part_number, session["brand_name"], session["dealer_name"], session["branch"]
     )
     if not clean_part:
         raise HTTPException(400, "Part number is required")
+
+    assignment = None
+    coverage_kind = "monthly"
+    if vtype == "auto":
+        from auto_perpetual import ist_date_key
+
+        assignment = await db.auto_perpetual_assignments.find_one(
+            {
+                "allocation_date": ist_date_key(),
+                "mobile_user_id": mobile_user_id,
+                "part_number": str(clean_part).strip().upper(),
+                "status": "pending",
+            },
+            {"_id": 0},
+        )
+        if assignment:
+            coverage_kind = assignment.get("coverage_kind") or "monthly"
     system_qty = _mobile_stock_qty(system_record)
     difference = physical_qty - system_qty
     part_found = bool(system_record)
@@ -1321,12 +1694,18 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
         "physical_location": physical_location, "scanned_location": physical_location,
         "location": physical_location, "location_status": location_status, "overall_status": overall_status,
         "remarks": payload.remark or "", "remark": payload.remark or "", "entry_method": entry_method,
+        "verification_method": entry_method,
         "verified_user": session["mobile_user"]["name"], "verified_by": mobile_user_id,
         "verified_by_name": session["mobile_user"]["name"], "mobile_user_id": mobile_user_id,
         "device_id": device_id, "brand_name": session["brand_name"], "dealer_name": session["dealer_name"],
         "branch": session["branch"], "snapshot_at": now, "created_at": now, "verified_at": now,
         "status": "submitted", "correction_status": correction_status, "correction_method": "",
         "correction_remarks": "", "information_only": True, "affects_stock": False, "source": "MOBILE",
+        "damage_qty": damage_qty,
+        "verification_type": vtype if coverage_kind != "recheck" else "recheck",
+        "coverage_kind": coverage_kind,
+        "has_damage": damage_qty > 0,
+        "assignment_id": (assignment or {}).get("id"),
     }
     try:
         await db.stock_verification_history.insert_one(dict(doc))
@@ -1349,6 +1728,54 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
         raise
 
     await _mirror_mobile_verification_to_web(doc)
+    from auto_perpetual import month_key, ist_date_key
+
+    part_key = str(doc["part_number"]).strip().upper()
+    if coverage_kind == "monthly" and vtype in ("auto", "physical"):
+        await db.auto_perpetual_pool.update_one(
+            {
+                "month_key": month_key(),
+                "branch": session["branch"],
+                "part_number": part_key,
+                "coverage_kind": "monthly",
+            },
+            {
+                "$set": {
+                    "status": "verified",
+                    "verified_at": now,
+                    "verified_by_mobile_user_id": mobile_user_id,
+                    "verified_by_name": session["mobile_user"]["name"],
+                    "updated_at": now,
+                }
+            },
+        )
+    elif coverage_kind == "recheck":
+        await db.auto_perpetual_pool.update_one(
+            {
+                "month_key": month_key(),
+                "branch": session["branch"],
+                "part_number": part_key,
+                "coverage_kind": "recheck",
+            },
+            {
+                "$set": {
+                    "status": "verified",
+                    "verified_at": now,
+                    "verified_by_mobile_user_id": mobile_user_id,
+                    "verified_by_name": session["mobile_user"]["name"],
+                    "updated_at": now,
+                }
+            },
+        )
+    if vtype == "auto":
+        await db.auto_perpetual_assignments.update_many(
+            {
+                "allocation_date": ist_date_key(),
+                "mobile_user_id": mobile_user_id,
+                "part_number": part_key,
+            },
+            {"$set": {"status": "completed", "completed_at": now, "verified_by_mobile_user_id": mobile_user_id}},
+        )
     return {
         "success": True, "message": "Verification recorded", "id": doc["id"], "verification_id": doc["id"],
         "session_id": session_id,
@@ -1432,6 +1859,9 @@ async def _audit(current_user, action: str, target: str, details: dict, actor_ov
 # ==================== INDEXES ====================
 
 async def ensure_mobile_indexes():
+    from auto_perpetual import ensure_auto_perpetual_indexes
+
+    await ensure_auto_perpetual_indexes(db)
     await db.mobile_users.create_index([("mobile_user_id", 1)], unique=True)
     await db.mobile_users.create_index([("mobile_number", 1)])
     # Backfill normalized numbers for older records before enforcing uniqueness.
@@ -1506,10 +1936,26 @@ async def ensure_mobile_indexes():
             ],
             unique=True,
             name="uq_mobile_daily_verification_session",
-            partialFilterExpression={"session_kind": "mobile_daily", "status": "ACTIVE"},
+            partialFilterExpression={"session_kind": {"$in": ["mobile_daily", "physical_perpetual"]}, "status": "ACTIVE"},
         )
     except (DuplicateKeyError, OperationFailure) as exc:
         logger.error("Cannot create mobile daily verification session index: %s", exc)
+
+    try:
+        await db.stock_verification_sessions.create_index(
+            [
+                ("verification_date", 1),
+                ("mobile_user_id", 1),
+                ("brand_id", 1),
+                ("dealer_id", 1),
+                ("branch_id", 1),
+            ],
+            unique=True,
+            name="uq_auto_perpetual_daily_session",
+            partialFilterExpression={"session_kind": "auto_perpetual", "status": "ACTIVE"},
+        )
+    except (DuplicateKeyError, OperationFailure) as exc:
+        logger.error("Cannot create auto perpetual session index: %s", exc)
 
     await db.mobile_audit_logs.create_index([("created_at", -1)])
     await db.mobile_audit_logs.create_index([("target", 1)])

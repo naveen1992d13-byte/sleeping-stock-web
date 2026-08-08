@@ -3,9 +3,8 @@ import { useOutletContext } from 'react-router-dom';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
-import { Package, Search, Download, Archive, Boxes, Printer } from 'lucide-react';
+import { Package, Search, Download, Archive, Boxes } from 'lucide-react';
 import { toast } from 'sonner';
-import { PrintStyles, PrintHeader } from '@/utils/printLayout';
 
 const COLORS = { primary: '#059669', dark: '#047857', soft: '#ECFDF5', border: '#D1D5DB', text: '#1F2937', muted: '#6B7280', danger: '#DC2626', warning: '#D97706', blue: '#2563EB' };
 const isAll = (v) => !v || String(v).startsWith('All ') || v === 'N/A';
@@ -161,8 +160,7 @@ export function Products() {
   };
 
   return <div className="space-y-3" data-testid="product-hub-page">
-    <PrintStyles />
-    <div className="grid grid-cols-2 md:grid-cols-5 gap-2 no-print items-stretch">
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-2 items-stretch">
       <SummaryCard title="Total Item" value={summary.totalItem} icon={Boxes} />
       <SummaryCard title="Total Available Item" value={summary.totalAvailableItem} color={COLORS.blue} icon={Boxes} />
       <SummaryCard title="Total Available Quantity" value={summary.totalAvailableQty} color={COLORS.dark} icon={Boxes} />
@@ -177,7 +175,7 @@ export function Products() {
     </div>
 
     <div className="rounded-2xl bg-white p-4 shadow-sm" style={{ border: `1px solid ${COLORS.border}` }}>
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-3 no-print">
+      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-3">
         <h2 className="text-lg font-bold" style={{ color: COLORS.text }}>{isAll(effectiveBranch) ? 'Product Records' : `${effectiveBranch} — Product Records`}</h2>
         <div className="flex gap-2 w-full md:w-auto flex-wrap">
           <div className="relative flex-1 md:w-64">
@@ -198,17 +196,8 @@ export function Products() {
           <Button onClick={() => exportBranch({ brand_name: scopeBrand, dealer_name: scopeDealer, branch: effectiveBranch })} disabled={exporting} variant="outline" className="gap-2">
             <Download className="h-4 w-4" /> Export
           </Button>
-          <Button onClick={() => window.print()} variant="outline" className="gap-2">
-            <Printer className="h-4 w-4" /> Print
-          </Button>
         </div>
       </div>
-
-      <PrintHeader
-        title="Product Hub — Product Records"
-        subtitle={`Scope: ${scopeBrand} / ${scopeDealer} / ${effectiveBranch}`}
-        meta={[['Category', category], ['Stock Status', stockStatus === 'all' ? 'All Items' : stockStatus], ['Records', totalRecords]]}
-      />
 
       <div className="overflow-x-auto rounded-xl max-h-[58vh]" style={{ border: `1px solid ${COLORS.border}` }}>
         <table className="w-full text-xs">

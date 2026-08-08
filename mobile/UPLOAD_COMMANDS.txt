@@ -1,0 +1,8 @@
+git status
+git add App.js package.json app.json eas.json src/api.js src/config/env.js src/services/session.js
+git commit -m "Final mobile UI with QR supplied server URL"
+git push origin main
+
+npm install
+npx expo-doctor
+npx eas build --platform android --profile preview --clear-cache
