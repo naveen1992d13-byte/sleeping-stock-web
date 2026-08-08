@@ -51,6 +51,7 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const [autoSuggestions,setAutoSuggestions]=useState([]);
   const [suggestionDetail,setSuggestionDetail]=useState(null);
   const [sendBusy,setSendBusy]=useState(false);
+  const [autoGenerating,setAutoGenerating]=useState(false);
   const [autoRecalcBusy,setAutoRecalcBusy]=useState(false);
   const [creatingUser,setCreatingUser]=useState(false);
   const [pairingFor,setPairingFor]=useState(null);
@@ -89,7 +90,13 @@ export default function NMTSMobile({ variant = 'mobile' }){
     }catch{ setTodayAttendance({}); }
   };
   const loadAutoPerpetual=async()=>{
-    if(!scopeReady){ setAutoSummary(null); setAutoAssignments([]); return; }
+    if(!scopeReady){
+      setAutoSummary(null);
+      setAutoAssignments([]);
+      setUserPerformance([]);
+      setAutoSuggestions([]);
+      return;
+    }
     try{
       const [s,a,p,sg]=await Promise.all([
         axios.get(`${API}/mobile/auto-perpetual/summary`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
@@ -98,10 +105,15 @@ export default function NMTSMobile({ variant = 'mobile' }){
         axios.get(`${API}/mobile/auto-perpetual/suggestions`,{params:{brand_name:brand,dealer_name:dealer,branch}}),
       ]);
       setAutoSummary(s.data||null);
-      setAutoAssignments(a.data||[]);
-      setUserPerformance(p.data||[]);
-      setAutoSuggestions(sg.data||[]);
-    }catch(e){ setAutoSummary(null); setAutoAssignments([]); setUserPerformance([]); }
+      setAutoAssignments(Array.isArray(a.data)?a.data:[]);
+      setUserPerformance(Array.isArray(p.data)?p.data:[]);
+      setAutoSuggestions(Array.isArray(sg.data)?sg.data:[]);
+    }catch(e){
+      setAutoSummary(null);
+      setAutoAssignments([]);
+      setUserPerformance([]);
+      setAutoSuggestions([]);
+    }
   };
   const loadHistoryRecords=async()=>{
     if(!scopeReady){ setHistoryRecords([]); return; }
@@ -224,7 +236,7 @@ export default function NMTSMobile({ variant = 'mobile' }){
     try{
       const r=await axios.post(`${API}/mobile/auto-perpetual/generate`,null,{params:{brand_name:brand,dealer_name:dealer,branch,recalc_pending:recalc}});
       if(r.data?.duplicate) toast.info('Draft suggestion already exists for today');
-      else toast.success(`Draft ${r.data?.suggestion_number||''} created with ${r.data?.total_items||r.data?.suggestion?.total_items||0} items — review and Send to Mobile`);
+      else toast.success(`Draft ${r.data?.suggestion_number||r.data?.suggestion?.suggestion_number||''} created with ${r.data?.total_items??r.data?.suggestion?.total_items??0} items — review and Send to Mobile`);
       loadAutoPerpetual();
     }catch(e){toast.error(e.response?.data?.detail||'Generate failed')}
     finally{ setAutoGenerating(false); setAutoRecalcBusy(false); }
@@ -413,8 +425,8 @@ export default function NMTSMobile({ variant = 'mobile' }){
           <Info label="Auto count" value={autoSummary.auto_verification_count}/>
         </div>}
         <div className="flex flex-wrap gap-2">
-          <Button onClick={()=>generateAutoPerpetual(false)} disabled={!scopeReady||autoGenerating}><ClipboardCheck className="h-4 w-4 mr-2"/>{autoGenerating?'Generating...':'Generate Auto Perpetual (Draft)'}</Button>
-          <Button variant="outline" onClick={()=>generateAutoPerpetual(true)} disabled={!scopeReady||autoRecalcBusy}><RefreshCw className="h-4 w-4 mr-2"/>{autoRecalcBusy?'Working...':'Regenerate draft'}</Button>
+          <Button onClick={()=>generateAutoPerpetual(false)} disabled={!scopeReady||autoGenerating||autoRecalcBusy||sendBusy}><ClipboardCheck className="h-4 w-4 mr-2"/>{autoGenerating?'Generating...':'Generate Auto Perpetual (Draft)'}</Button>
+          <Button variant="outline" onClick={()=>generateAutoPerpetual(true)} disabled={!scopeReady||autoRecalcBusy||autoGenerating||sendBusy}><RefreshCw className="h-4 w-4 mr-2"/>{autoRecalcBusy?'Working...':'Regenerate draft'}</Button>
           <Button variant="outline" onClick={loadAutoPerpetual} disabled={!scopeReady}><RefreshCw className="h-4 w-4 mr-2"/>Refresh</Button>
         </div>
       </Card>
