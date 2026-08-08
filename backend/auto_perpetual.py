@@ -84,6 +84,7 @@ async def ensure_auto_perpetual_indexes(db) -> None:
         unique=True,
         name="uq_auto_assign_day_user_part",
     )
+    await db.auto_perpetual_assignments.create_index([("suggestion_id", 1), ("status", 1)])
     await db.auto_perpetual_daily_runs.create_index(
         [("allocation_date", 1), ("branch", 1), ("brand_name", 1), ("dealer_name", 1)],
         unique=True,
@@ -95,6 +96,9 @@ async def ensure_auto_perpetual_indexes(db) -> None:
         name="uq_mobile_attendance_day_user",
     )
     await db.mobile_push_delivery_logs.create_index([("mobile_user_id", 1), ("created_at", -1)])
+    from auto_perpetual_suggestions import ensure_suggestion_indexes
+
+    await ensure_suggestion_indexes(db)
 
 
 async def _next_aops_session_id(db, branch_name: str) -> str:
@@ -242,72 +246,18 @@ async def apply_stock_movement_priority(
     month: str,
     current_date_key: str,
 ) -> int:
-    """Flag movement-driven recheck candidates (separate from monthly unique coverage)."""
-    prev_key = await _previous_inventory_date_key(
-        db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, current_key=current_date_key
+    """Deprecated: use tag_movement_on_pool in auto_perpetual_suggestions (no recheck)."""
+    from auto_perpetual_suggestions import tag_movement_on_pool
+
+    await tag_movement_on_pool(
+        db,
+        brand_name=brand_name,
+        dealer_name=dealer_name,
+        branch=branch,
+        month=month,
+        current_date_key=current_date_key,
     )
-    if not prev_key:
-        return 0
-    current = await _inventory_qty_map(db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, active_date_key=current_date_key)
-    previous = await _inventory_qty_map(db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, active_date_key=prev_key)
-    verified_monthly = await _verified_parts_this_month(db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, month=month)
-    updates = 0
-    now = _now()
-    all_parts = set(current) | set(previous)
-    for part in all_parts:
-        cur_q = current.get(part, 0.0)
-        prev_q = previous.get(part, 0.0)
-        movement = None
-        score = 0
-        if part not in previous and cur_q > 0:
-            movement, score = "new_line", 100
-        elif part not in current or cur_q <= 0:
-            await db.auto_perpetual_pool.update_one(
-                {"month_key": month, "branch": branch, "part_number": part, "coverage_kind": "monthly"},
-                {"$set": {"status": "na", "movement_note": "line_removed_or_zero", "updated_at": now}},
-            )
-            continue
-        elif cur_q > prev_q:
-            movement, score = "qty_increased", 80
-        elif cur_q < prev_q:
-            movement, score = "qty_decreased", 70
-        if not movement:
-            continue
-        if part in verified_monthly:
-            await db.auto_perpetual_pool.update_one(
-                {
-                    "month_key": month,
-                    "branch": branch,
-                    "part_number": part,
-                    "coverage_kind": "recheck",
-                },
-                {
-                    "$setOnInsert": {
-                        "id": str(uuid.uuid4()),
-                        "brand_name": brand_name,
-                        "dealer_name": dealer_name,
-                        "loc": "",
-                        "created_at": now,
-                    },
-                    "$set": {
-                        "system_qty": cur_q,
-                        "inventory_date_key": current_date_key,
-                        "status": "pending",
-                        "movement_reason": movement,
-                        "priority_score": score,
-                        "updated_at": now,
-                    },
-                },
-                upsert=True,
-            )
-            updates += 1
-        else:
-            await db.auto_perpetual_pool.update_one(
-                {"month_key": month, "branch": branch, "part_number": part, "coverage_kind": "monthly"},
-                {"$set": {"movement_reason": movement, "priority_score": score, "updated_at": now}},
-            )
-            updates += 1
-    return updates
+    return 0
 
 
 async def sync_monthly_pool(
@@ -448,250 +398,59 @@ async def generate_auto_perpetual_for_branch(
     recalc_pending: bool = False,
     active_date_key: str,
 ) -> Dict[str, Any]:
-    """Idempotent daily allocation for one branch (IST day)."""
-    allocation_date = ist_date_key()
-    month = month_key()
-    run_key = {
-        "allocation_date": allocation_date,
-        "branch": branch,
-        "brand_name": brand_name,
-        "dealer_name": dealer_name,
-    }
+    """Create DRAFT Auto Perpetual suggestion (APS). Does not assign mobile work."""
+    from auto_perpetual_suggestions import create_draft_suggestion
 
-    existing_run = await db.auto_perpetual_daily_runs.find_one(run_key, {"_id": 0})
-    if existing_run and existing_run.get("status") == "completed" and not recalc_pending:
-        return {"duplicate": True, "run": existing_run}
-    if existing_run and existing_run.get("status") == "generating":
-        started = existing_run.get("started_at")
-        stale = False
-        if isinstance(started, datetime):
-            st = started if started.tzinfo else started.replace(tzinfo=timezone.utc)
-            stale = (_now() - st.astimezone(timezone.utc)).total_seconds() > 900
-        if not stale:
-            raise HTTPException(status_code=409, detail="Auto Perpetual generation already in progress for this branch")
-
-    await db.auto_perpetual_daily_runs.update_one(
-        run_key,
-        {
-            "$setOnInsert": {"id": str(uuid.uuid4()), "month_key": month, "created_at": _now()},
-            "$set": {"status": "generating", "started_at": _now()},
-        },
-        upsert=True,
+    if recalc_pending:
+        allocation_date = ist_date_key()
+        await db.auto_perpetual_suggestions.delete_many(
+            {
+                "allocation_date": allocation_date,
+                "branch": branch,
+                "brand_name": brand_name,
+                "dealer_name": dealer_name,
+                "status": "DRAFT",
+            }
+        )
+    result = await create_draft_suggestion(
+        db,
+        brand_name=brand_name,
+        dealer_name=dealer_name,
+        branch=branch,
+        actor_user_id=actor_user_id,
+        active_date_key=active_date_key,
+        force=recalc_pending,
     )
-
-    try:
-        sample_pool = await db.auto_perpetual_pool.find_one(
-            {"month_key": month, "branch": branch, "brand_name": brand_name, "coverage_kind": "monthly"},
-            {"_id": 0, "inventory_date_key": 1},
-        )
-        if not sample_pool or sample_pool.get("inventory_date_key") != active_date_key:
-            await sync_monthly_pool(
-                db,
-                brand_name=brand_name,
-                dealer_name=dealer_name,
-                branch=branch,
-                active_date_key=active_date_key,
-                month=month,
-            )
-        await apply_stock_movement_priority(
-            db,
-            brand_name=brand_name,
-            dealer_name=dealer_name,
-            branch=branch,
-            month=month,
-            current_date_key=active_date_key,
-        )
-
-        active_users = await _attendance_active_users(
-            db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, attendance_date=allocation_date
-        )
-        if not active_users:
-            raise HTTPException(status_code=400, detail="Mark at least one mobile user Active for today before generating Auto Perpetual")
-
-        pending_rows = await db.auto_perpetual_pool.find(
-            {
-                "month_key": month,
-                "branch": branch,
-                "brand_name": brand_name,
-                "dealer_name": dealer_name,
-                "coverage_kind": {"$in": ["monthly", "recheck"]},
-                "status": "pending",
-            },
-            {"_id": 0},
-        ).to_list(50000)
-
-        pending_rows.sort(
-            key=lambda r: (
-                -int(r.get("priority_score") or 0),
-                _loc_group(r.get("loc", "")),
-                r.get("coverage_kind") != "recheck",
-                r.get("part_number", ""),
-            )
-        )
-
-        total_lines = await db.auto_perpetual_pool.count_documents(
-            {"month_key": month, "branch": branch, "coverage_kind": "monthly", "status": {"$ne": "na"}}
-        )
-        verified_count = await db.auto_perpetual_pool.count_documents(
-            {"month_key": month, "branch": branch, "coverage_kind": "monthly", "status": "verified"}
-        )
-        pending_count = len(pending_rows)
-        days_left = _working_days_left_in_month(_ist_now())
-        n_users = len(active_users)
-        baseline = max(1, -(-pending_count // max(1, n_users * days_left)))  # ceil division
-
-        active_ids = {u["mobile_user_id"] for u in active_users}
-        all_branch_users = await db.mobile_users.find(
-            {
-                "brand_name": brand_name,
-                "dealer_name": dealer_name,
-                "branch": branch,
-                "status": "active",
-                "deleted_at": {"$exists": False},
-            },
-            {"_id": 0, "mobile_user_id": 1},
-        ).to_list(500)
-        inactive_today = await db.mobile_user_attendance.find(
-            {"attendance_date": allocation_date, "branch": branch, "status": "inactive"},
-            {"_id": 0, "mobile_user_id": 1},
-        ).to_list(500)
-        inactive_ids = {r["mobile_user_id"] for r in inactive_today}
-        catch_up_applied = (existing_run or {}).get("inactive_catch_up_applied") or []
-        for u in all_branch_users:
-            mu_id = u["mobile_user_id"]
-            if mu_id in active_ids or mu_id not in inactive_ids:
-                continue
-            if mu_id in catch_up_applied:
-                continue
-            await db.mobile_users.update_one(
-                {"mobile_user_id": mu_id},
-                {"$inc": {"auto_catch_up_pending": baseline}},
-            )
-            catch_up_applied.append(mu_id)
-
-        catch_up: Dict[str, int] = {}
-        for u in active_users:
-            missed = int(u.get("auto_catch_up_pending") or 0)
-            catch_up[u["mobile_user_id"]] = min(missed, baseline * 2)
-
-        if recalc_pending:
-            await db.auto_perpetual_assignments.delete_many(
-                {
-                    "allocation_date": allocation_date,
-                    "branch": branch,
-                    "status": "pending",
-                }
-            )
-            await db.auto_perpetual_pool.update_many(
-                {"month_key": month, "branch": branch, "status": "allocated", "allocated_date": allocation_date},
-                {"$set": {"status": "pending", "allocated_mobile_user_id": None, "allocated_date": None}},
-            )
-
-        assignments_created = 0
-        assignments_by_user: Dict[str, int] = {}
-        idx = 0
-        for u in active_users:
-            mu_id = u["mobile_user_id"]
-            assignments_by_user[mu_id] = 0
-            target = baseline + catch_up.get(mu_id, 0)
-            session_id = await get_or_create_auto_daily_session(
-                db,
-                mobile_user_id=mu_id,
-                brand_name=brand_name,
-                dealer_name=dealer_name,
-                branch=branch,
-            )
-            assigned_parts: List[str] = []
-            while target > 0 and idx < len(pending_rows):
-                row = pending_rows[idx]
-                idx += 1
-                part = row["part_number"]
-                cov = row.get("coverage_kind") or "monthly"
-                try:
-                    await db.auto_perpetual_assignments.insert_one(
-                        {
-                            "id": str(uuid.uuid4()),
-                            "allocation_date": allocation_date,
-                            "month_key": month,
-                            "brand_name": brand_name,
-                            "dealer_name": dealer_name,
-                            "branch": branch,
-                            "mobile_user_id": mu_id,
-                            "part_number": part,
-                            "loc": row.get("loc"),
-                            "coverage_kind": cov,
-                            "session_id": session_id,
-                            "status": "pending",
-                            "assigned_at": _now(),
-                            "assigned_by": actor_user_id,
-                        }
-                    )
-                except DuplicateKeyError:
-                    continue
-                await db.auto_perpetual_pool.update_one(
-                    {
-                        "month_key": month,
-                        "branch": branch,
-                        "part_number": part,
-                        "coverage_kind": cov,
-                    },
-                    {
-                        "$set": {
-                            "status": "allocated",
-                            "allocated_mobile_user_id": mu_id,
-                            "allocated_date": allocation_date,
-                            "updated_at": _now(),
-                        }
-                    },
-                )
-                assigned_parts.append(part)
-                assignments_created += 1
-                assignments_by_user[mu_id] = assignments_by_user.get(mu_id, 0) + 1
-                target -= 1
-
-            if catch_up.get(mu_id, 0) > 0 and assigned_parts:
-                await db.mobile_users.update_one(
-                    {"mobile_user_id": mu_id},
-                    {"$inc": {"auto_catch_up_pending": -min(catch_up[mu_id], len(assigned_parts))}},
-                )
-
-        run_doc = {
-            **run_key,
-            "id": str(uuid.uuid4()),
-            "month_key": month,
-            "status": "completed",
-            "active_users": [u["mobile_user_id"] for u in active_users],
-            "assignments_created": assignments_created,
-            "baseline_per_user": baseline,
-            "pending_at_generation": pending_count,
-            "total_lines": total_lines,
-            "verified_lines": verified_count,
-            "generated_at": _now(),
-            "generated_by": actor_user_id,
-            "inactive_catch_up_applied": catch_up_applied,
-            "assignments_by_user": assignments_by_user,
-        }
-        await db.auto_perpetual_daily_runs.update_one(run_key, {"$set": run_doc}, upsert=True)
-
-        return {
-            "duplicate": False,
-            "assignments_created": assignments_created,
-            "assignments_by_user": assignments_by_user,
-            "baseline_per_user": baseline,
-            "active_users": len(active_users),
-            "pending_pool": pending_count,
-            "coverage_pct": round((verified_count / total_lines) * 100, 2) if total_lines else 0,
-            "run": run_doc,
-        }
-    except Exception:
-        await db.auto_perpetual_daily_runs.update_one(run_key, {"$set": {"status": "failed", "failed_at": _now()}}, upsert=True)
-        raise
+    if result.get("duplicate"):
+        return {"duplicate": True, "suggestion": result.get("suggestion"), "run": result.get("suggestion")}
+    sug = result.get("suggestion") or {}
+    return {
+        "duplicate": False,
+        "draft": True,
+        "suggestion_number": sug.get("suggestion_number"),
+        "total_items": sug.get("total_items"),
+        "assignments_created": 0,
+        "assignments_by_user": {},
+        "suggestion": sug,
+    }
 
 
 async def branch_monthly_summary(db, *, brand_name: str, dealer_name: str, branch: str) -> Dict[str, Any]:
     month = month_key()
     month_start = datetime(int(month[:4]), int(month[5:7]), 1, tzinfo=IST)
-    total = await db.auto_perpetual_pool.count_documents({"month_key": month, "branch": branch, "coverage_kind": "monthly"})
+    total = await db.auto_perpetual_pool.count_documents({"month_key": month, "branch": branch, "coverage_kind": "monthly", "status": {"$ne": "na"}})
+    eligible = await db.auto_perpetual_pool.count_documents(
+        {"month_key": month, "branch": branch, "coverage_kind": "monthly", "status": "pending"}
+    )
+    planner = await db.auto_perpetual_branch_planner.find_one(
+        {"month_key": month, "branch": branch, "brand_name": brand_name, "dealer_name": dealer_name},
+        {"_id": 0, "missed_generation_backlog": 1},
+    )
+    backlog = int((planner or {}).get("missed_generation_backlog") or 0)
+    days_left = _working_days_left_in_month(_ist_now())
+    from auto_perpetual_suggestions import recovery_extra_from_backlog
+
+    recovery_extra, _, month_end_warning = recovery_extra_from_backlog(backlog, days_left)
     verified = await db.auto_perpetual_pool.count_documents({"month_key": month, "branch": branch, "coverage_kind": "monthly", "status": "verified"})
     pending = await db.auto_perpetual_pool.count_documents(
         {"month_key": month, "branch": branch, "coverage_kind": "monthly", "status": {"$in": ["pending", "allocated"]}}
@@ -735,6 +494,13 @@ async def branch_monthly_summary(db, *, brand_name: str, dealer_name: str, branc
         "damage_qty": round(float(sums.get("damage_qty") or 0), 2),
         "physical_verification_count": physical_count,
         "auto_verification_count": auto_count,
+        "eligible_lines": eligible,
+        "carry_forward_backlog": backlog,
+        "recovery_extra_per_user": recovery_extra,
+        "month_end_recovery_warning": month_end_warning,
+        "location_mismatch_lines": await db.stock_verification_history.count_documents(
+            {**hist_q, "verification_type": "auto", "location_status": "mismatch"}
+        ),
     }
 
 

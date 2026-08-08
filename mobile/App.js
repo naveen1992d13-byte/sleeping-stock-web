@@ -39,6 +39,7 @@ import {
   getLatestAppVersion,
   getAutoPerpetualTasks,
   getAutoPerpetualSessionToday,
+  finishAutoPerpetualSession,
 } from './src/api';
 import {
   initOfflineQueue,
@@ -176,7 +177,7 @@ export default function App() {
   const [verificationBusy, setVerificationBusy] = useState(false);
 
   const [autoTasks, setAutoTasks] = useState([]);
-  const [autoSessionId, setAutoSessionId] = useState('');
+  const [autoProgress, setAutoProgress] = useState({ assigned: 0, completed: 0 });
   const [autoBusy, setAutoBusy] = useState(false);
   const [autoSelected, setAutoSelected] = useState(null);
   const [autoDamageQty, setAutoDamageQty] = useState('');
@@ -539,6 +540,7 @@ Server: ${apiBaseUrl}`, [
       const data = await getAutoPerpetualTasks();
       setAutoTasks(data?.tasks || []);
       setAutoSessionId(data?.session_id || '');
+      setAutoProgress({ assigned: data?.assigned_count || 0, completed: data?.completed_count || 0 });
     } catch (error) {
       Alert.alert('Auto Perpetual', friendlyError(error));
       setAutoTasks([]);
@@ -592,8 +594,24 @@ Server: ${apiBaseUrl}`, [
       setAutoDamageQty('');
       setVerificationRemark('');
       await loadAutoTasks();
+      const refreshed = await getAutoPerpetualTasks().catch(() => ({ tasks: [] }));
+      if (refreshed.tasks?.length) selectAutoTask(refreshed.tasks[0]);
+      else setAutoSelected(null);
     } catch (error) {
       Alert.alert('Submit Failed', friendlyError(error));
+    } finally {
+      setAutoBusy(false);
+    }
+  };
+
+  const finishAutoWork = async () => {
+    setAutoBusy(true);
+    try {
+      const r = await finishAutoPerpetualSession();
+      Alert.alert('Auto Perpetual', `Session ${r.session_id}: ${r.status}\nCompleted ${r.completed_count}/${r.assigned_count}`);
+      await loadAutoTasks();
+    } catch (error) {
+      Alert.alert('Finish', friendlyError(error));
     } finally {
       setAutoBusy(false);
     }
@@ -775,6 +793,7 @@ Server: ${apiBaseUrl}`, [
           onBack={goBack}
           sessionId={autoSessionId}
           tasks={autoTasks}
+          progress={autoProgress}
           busy={autoBusy}
           selected={autoSelected}
           onSelect={selectAutoTask}
@@ -788,6 +807,7 @@ Server: ${apiBaseUrl}`, [
           setDamageQty={setAutoDamageQty}
           onRefresh={loadAutoTasks}
           onSubmit={submitAutoVerification}
+          onFinish={finishAutoWork}
         />
       )}
       {screen === 'verification' && (
@@ -899,35 +919,47 @@ function HomeScreen({ session, pendingCount, navigate, logout }) {
   );
 }
 
-function AutoPerpetualScreen({ onBack, sessionId, tasks, busy, selected, onSelect, physicalQty, setPhysicalQty, physicalLocation, setPhysicalLocation, remark, setRemark, damageQty, setDamageQty, onRefresh, onSubmit }) {
-  const diff = selected ? differenceFor(selected.systemQty, physicalQty, selected.unitValue) : null;
+function AutoPerpetualScreen({ onBack, sessionId, tasks, progress, busy, selected, onSelect, physicalQty, setPhysicalQty, physicalLocation, setPhysicalLocation, remark, setRemark, damageQty, setDamageQty, onRefresh, onSubmit, onFinish }) {
+  const diff = selected ? differenceFor(selected.system_qty ?? selected.systemQty, physicalQty, 0) : null;
+  const locMatch = selected && physicalLocation
+    ? (String(selected.loc || selected.system_location || '').trim().toUpperCase() === String(physicalLocation).trim().toUpperCase())
+    : null;
   return (
     <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 18}>
       <Header title="Auto Perpetual" onBack={onBack} action="Refresh" onAction={onRefresh} />
       <ScrollView style={styles.flex} contentContainerStyle={[styles.topContent, { paddingBottom: 220 }]} keyboardShouldPersistTaps="handled">
-        <Text style={styles.sectionLabel}>TODAY&apos;S SESSION</Text>
-        <View style={styles.detailCard}><Text style={styles.partBig}>{sessionId || 'Loading session…'}</Text><Text style={styles.partName}>Pending tasks: {tasks.length}</Text></View>
-        <Text style={styles.sectionLabel}>ASSIGNED PARTS ({tasks.length})</Text>
-        {tasks.length === 0 ? <Empty text="No Auto Perpetual tasks for today." /> : tasks.map((t) => (
-          <TouchableOpacity key={`${t.part_number}-${t.id || ''}`} style={[styles.verificationRow, selected?.part_number === t.part_number && { borderColor: BLUE, borderWidth: 2 }]} onPress={() => onSelect(t)}>
-            <View style={{ flex: 1 }}><Text style={styles.rowPartNo}>{t.part_number}</Text><Text style={styles.rowPartName}>{t.part_name || '-'}</Text><Text style={styles.rowMeta}>LOC: {t.loc || '-'} · Sys: {t.system_qty ?? '-'}{t.coverage_kind === 'recheck' ? ' · RECHECK' : ''}</Text></View>
-          </TouchableOpacity>
-        ))}
+        <Text style={styles.sectionLabel}>TODAY&apos;S AUTO PERPETUAL</Text>
+        <View style={styles.detailCard}>
+          <Text style={styles.partBig}>{sessionId || 'No session yet'}</Text>
+          <Text style={styles.partName}>Progress: {progress.completed} / {progress.assigned} completed · Pending tasks: {tasks.length}</Text>
+        </View>
+        {tasks.length > 0 && !selected && (
+          <PrimaryButton title="Start next assigned part" onPress={() => onSelect(tasks[0])} busy={busy} />
+        )}
         {selected && (
           <View style={styles.detailCard}>
-            <Text style={styles.partBig}>{selected.partNumber}</Text>
-            <Text style={styles.partName}>{selected.partName}</Text>
-            <InfoGrid rows={[['System Qty', selected.systemQty], ['LOC', selected.systemLocation], ['Shortage', diff?.shortageQty ?? 0], ['Excess', diff?.excessQty ?? 0]]} />
+            <Text style={styles.sectionLabel}>SYSTEM (read-only)</Text>
+            <InfoGrid rows={[['Part No', selected.part_number], ['Description', selected.part_name || '-'], ['System Qty', selected.system_qty ?? '-'], ['System LOC', selected.loc || selected.system_location || '-']]} />
+            <Text style={styles.sectionLabel}>PHYSICAL VERIFICATION</Text>
             <View style={styles.twoInputs}>
               <TextInput style={[styles.bottomInput, styles.halfInput]} value={physicalQty} onChangeText={(v) => setPhysicalQty(v.replace(/[^0-9.]/g, ''))} placeholder="Physical Qty" keyboardType="decimal-pad" placeholderTextColor="#8793a6" />
               <TextInput style={[styles.bottomInput, styles.halfInput]} value={damageQty} onChangeText={(v) => setDamageQty(v.replace(/[^0-9.]/g, ''))} placeholder="Damage Qty" keyboardType="decimal-pad" placeholderTextColor="#8793a6" />
             </View>
-            <TextInput style={styles.bottomInput} value={physicalLocation} onChangeText={setPhysicalLocation} placeholder="Physical LOC" autoCapitalize="characters" placeholderTextColor="#8793a6" />
+            <TextInput style={styles.bottomInput} value={physicalLocation} onChangeText={setPhysicalLocation} placeholder="Physical Location" autoCapitalize="characters" placeholderTextColor="#8793a6" />
             <TextInput style={styles.bottomInput} value={remark} onChangeText={setRemark} placeholder="Remark (optional)" placeholderTextColor="#8793a6" />
             {diff && <StatusPill value={diff.status} />}
-            <PrimaryButton title="Submit Verification" onPress={onSubmit} busy={busy} />
+            {locMatch === false && <Text style={{ color: '#b45309', marginTop: 6 }}>Location mismatch vs system</Text>}
+            {locMatch === true && diff?.status === 'MATCHED' && <Text style={{ color: '#15803d', marginTop: 6 }}>Qty & location matched</Text>}
+            <PrimaryButton title="Submit & Next" onPress={onSubmit} busy={busy} />
           </View>
         )}
+        <SecondaryButton title="Finish Auto Perpetual Session" onPress={onFinish} disabled={!sessionId} />
+        <Text style={styles.sectionLabel}>REMAINING ({tasks.length})</Text>
+        {tasks.length === 0 ? <Empty text="No pending Auto Perpetual tasks." /> : tasks.slice(0, 8).map((t) => (
+          <TouchableOpacity key={`${t.part_number}-${t.id || ''}`} style={styles.verificationRow} onPress={() => onSelect(t)}>
+            <View style={{ flex: 1 }}><Text style={styles.rowPartNo}>{t.part_number}</Text><Text style={styles.rowMeta}>LOC: {t.loc || '-'} · Batch {t.batch_no || '-'}</Text></View>
+          </TouchableOpacity>
+        ))}
       </ScrollView>
     </KeyboardAvoidingView>
   );

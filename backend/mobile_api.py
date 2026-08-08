@@ -981,16 +981,57 @@ async def generate_auto_perpetual(
         recalc_pending=recalc_pending,
         active_date_key=active_date_key,
     )
-    if not result.get("duplicate"):
-        from mobile_push import notify_auto_perpetual_assignments
-
-        await notify_auto_perpetual_assignments(
-            db,
-            assignments_by_user=result.get("assignments_by_user") or {},
-            branch=branch,
-            allocation_date=ist_date_key(),
-        )
     return result
+
+
+@router.get("/auto-perpetual/suggestions")
+async def list_auto_suggestions(
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    limit: int = 20,
+    current_user: UserResponse = Depends(_web_current_user),
+):
+    rows = await db.auto_perpetual_suggestions.find(
+        {"brand_name": brand_name, "dealer_name": dealer_name, "branch": branch},
+        {"_id": 0, "items": 0},
+    ).sort("created_at", -1).limit(min(limit, 50)).to_list(50)
+    return rows
+
+
+@router.get("/auto-perpetual/suggestions/{suggestion_id}")
+async def get_auto_suggestion_detail(
+    suggestion_id: str,
+    current_user: UserResponse = Depends(_web_current_user),
+):
+    row = await db.auto_perpetual_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
+    if not row:
+        raise HTTPException(404, "Suggestion not found")
+    items = sorted(
+        row.get("items") or [],
+        key=lambda r: (r.get("system_location") or "").upper(),
+    )
+    row["items"] = items
+    return row
+
+
+@router.post("/auto-perpetual/suggestions/{suggestion_id}/send")
+async def send_auto_suggestion(
+    suggestion_id: str,
+    current_user: UserResponse = Depends(_web_current_user),
+):
+    from auto_perpetual_suggestions import send_suggestion_to_mobile
+    from mobile_push import notify_auto_perpetual_assignments
+
+    async def _notify(**kwargs):
+        await notify_auto_perpetual_assignments(db, **kwargs)
+
+    return await send_suggestion_to_mobile(
+        db,
+        suggestion_id=suggestion_id,
+        actor_user_id=current_user.id,
+        notify_fn=_notify,
+    )
 
 
 @router.get("/auto-perpetual/user-performance")
@@ -1047,7 +1088,7 @@ async def auto_perpetual_assignments_today(
 
 @router.get("/auto-perpetual/tasks")
 async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
-    from auto_perpetual import ist_date_key, get_or_create_auto_daily_session
+    from auto_perpetual import ist_date_key
 
     mu = session["mobile_user"]["mobile_user_id"]
     allocation_date = ist_date_key()
@@ -1059,13 +1100,38 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
         },
         {"_id": 0},
     ).to_list(500)
-    session_id = await get_or_create_auto_daily_session(
-        db,
-        mobile_user_id=mu,
-        brand_name=session["brand_name"],
-        dealer_name=session["dealer_name"],
-        branch=session["branch"],
-        device_id=session["device"]["device_id"],
+    rows.sort(key=lambda r: (r.get("loc") or r.get("part_number") or "").upper())
+    session_id = ""
+    if rows:
+        session_id = rows[0].get("session_id") or ""
+        if not session_id:
+            from auto_perpetual import get_or_create_auto_daily_session
+
+            session_id = await get_or_create_auto_daily_session(
+                db,
+                mobile_user_id=mu,
+                brand_name=session["brand_name"],
+                dealer_name=session["dealer_name"],
+                branch=session["branch"],
+                device_id=session["device"]["device_id"],
+            )
+    else:
+        existing = await db.stock_verification_sessions.find_one(
+            {
+                "session_kind": "auto_perpetual",
+                "verification_date": allocation_date,
+                "mobile_user_id": mu,
+                "branch_id": session["branch"],
+                "status": {"$in": ["ACTIVE", "PENDING", "COMPLETED"]},
+            },
+            {"_id": 0, "session_id": 1},
+        )
+        session_id = (existing or {}).get("session_id") or ""
+    assigned = await db.auto_perpetual_assignments.count_documents(
+        {"allocation_date": allocation_date, "mobile_user_id": mu}
+    )
+    completed = await db.auto_perpetual_assignments.count_documents(
+        {"allocation_date": allocation_date, "mobile_user_id": mu, "status": "completed"}
     )
     enriched = []
     for row in rows:
@@ -1075,10 +1141,31 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
                 **row,
                 "part_name": resolve_product_part_name(product or {}),
                 "system_qty": _mobile_stock_qty(product),
+                "system_location": row.get("loc") or _product_pin_location(product or {}),
                 "loc": row.get("loc") or _product_pin_location(product or {}),
             }
         )
-    return {"tasks": enriched, "count": len(enriched), "session_id": session_id, "allocation_date": allocation_date}
+    return {
+        "tasks": enriched,
+        "count": len(enriched),
+        "session_id": session_id,
+        "allocation_date": allocation_date,
+        "assigned_count": assigned,
+        "completed_count": completed,
+    }
+
+
+@router.post("/auto-perpetual/session/finish")
+async def finish_auto_perpetual_session(session=Depends(get_device_session)):
+    from auto_perpetual_suggestions import finish_auto_session_for_user
+
+    return await finish_auto_session_for_user(
+        db,
+        mobile_user_id=session["mobile_user"]["mobile_user_id"],
+        brand_name=session["brand_name"],
+        dealer_name=session["dealer_name"],
+        branch=session["branch"],
+    )
 
 
 @router.get("/auto-perpetual/session/today")
@@ -1706,6 +1793,12 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
         "coverage_kind": coverage_kind,
         "has_damage": damage_qty > 0,
         "assignment_id": (assignment or {}).get("id"),
+        "suggestion_number": (assignment or {}).get("suggestion_number"),
+        "batch_no": (assignment or {}).get("batch_no"),
+        "suggestion_type": (assignment or {}).get("suggestion_type"),
+        "qty_result": quantity_status.upper(),
+        "location_result": "LOCATION MATCHED" if location_status == "matched" else "LOCATION MISMATCH",
+        "final_result": overall_status.upper().replace("_", " "),
     }
     try:
         await db.stock_verification_history.insert_one(dict(doc))
@@ -1775,6 +1868,19 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
                 "part_number": part_key,
             },
             {"$set": {"status": "completed", "completed_at": now, "verified_by_mobile_user_id": mobile_user_id}},
+        )
+        sid = (assignment or {}).get("suggestion_id")
+        if sid:
+            from auto_perpetual_suggestions import refresh_suggestion_status
+
+            await refresh_suggestion_status(db, sid)
+        await db.stock_verification_sessions.update_one(
+            {"session_id": session_id},
+            {"$set": {"status": "IN_PROGRESS", "updated_at": now}},
+        )
+        await db.stock_verification_history.update_one(
+            {"id": doc["id"]},
+            {"$set": {"month_key": month_key()}},
         )
     return {
         "success": True, "message": "Verification recorded", "id": doc["id"], "verification_id": doc["id"],
