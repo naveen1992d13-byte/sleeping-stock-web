@@ -23,6 +23,14 @@ _nmts_date_key = None
 _nmts_now = None
 
 BUCKETS = rc.BUCKETS
+# Analytics Stock Aging Analysis uses the final product buckets (distinct from Reports).
+ANALYTICS_AGING_BUCKETS = [
+    "0–90 Days",
+    "91–180 Days",
+    "181–270 Days",
+    "271–361 Days",
+    ">361 Days",
+]
 _num = rc._num
 _text = rc._text
 _dt = rc._dt
@@ -31,6 +39,25 @@ _aging_days = rc._aging_days
 _scope = rc._scope
 _query = rc._query
 _and = rc._and
+
+
+def _analytics_bucket(days) -> str:
+    """Map aging days into the Analytics stacked-column buckets."""
+    if days is None or days == "":
+        return ANALYTICS_AGING_BUCKETS[0]
+    try:
+        d = float(days)
+    except (TypeError, ValueError):
+        return ANALYTICS_AGING_BUCKETS[0]
+    if d <= 90:
+        return ANALYTICS_AGING_BUCKETS[0]
+    if d <= 180:
+        return ANALYTICS_AGING_BUCKETS[1]
+    if d <= 270:
+        return ANALYTICS_AGING_BUCKETS[2]
+    if d <= 361:
+        return ANALYTICS_AGING_BUCKETS[3]
+    return ANALYTICS_AGING_BUCKETS[4]
 
 
 async def _current_user(credentials: HTTPAuthorizationCredentials = Depends(_security)):
@@ -143,68 +170,128 @@ async def _aggregate_latest_parts_for_date_keys(
     scope: dict,
     category: Optional[str] = None,
 ) -> Dict[str, Dict[Tuple[str, str, str, str], dict]]:
+    """Latest published part rows per date/branch, scoped and de-duplicated.
+
+    Uses `$top` (no separate `$sort`) so Atlas shared-tier 32MB sort limits are
+    avoided, and still processes one `active_date_key` at a time for safety.
+    """
     if not date_keys:
         return {}
-    q = _and(_query(scope), {"publish_status": "Published", "active_date_key": {"$in": date_keys}})
     cat = _category_clause(category)
-    if cat:
-        q = _and(q, cat)
-    pipeline = [
-        {"$match": q},
-        {
-            "$addFields": {
-                "qty_n": {"$ifNull": ["$available_qty_number", {"$ifNull": ["$quantity", 0]}]},
-                "unit_n": {
-                    "$ifNull": [
-                        "$unit_value_number",
-                        {"$ifNull": ["$mav_value", {"$ifNull": ["$unit_value", 0]}]},
-                    ]
-                },
-            }
-        },
-        {"$sort": {"active_date_key": 1, "published_at": -1, "updated_at": -1}},
-        {
-            "$group": {
-                "_id": {
-                    "date": "$active_date_key",
-                    "brand": "$brand_name",
-                    "dealer": "$dealer_name",
-                    "branch": "$branch",
-                    "part": "$part_number",
-                },
-                "brand_name": {"$first": "$brand_name"},
-                "dealer_name": {"$first": "$dealer_name"},
-                "branch": {"$first": "$branch"},
-                "part_number": {"$first": "$part_number"},
-                "part_name": {"$first": {"$ifNull": ["$item_name", {"$ifNull": ["$part_name", ""]}]}},
-                "part_category": {"$first": {"$ifNull": ["$part_category", {"$ifNull": ["$category", "Uncategorized"]}]}},
-                "qty": {"$first": "$qty_n"},
-                "unit": {"$first": "$unit_n"},
-                "purchase_aging_days": {"$first": "$purchase_aging_days"},
-                "sales_aging_days": {"$first": "$sales_aging_days"},
-                "last_receipt_date": {"$first": "$last_receipt_date"},
-                "last_sales_date": {"$first": "$last_sales_date"},
-            }
-        },
-    ]
-    rows = await db.products.aggregate(pipeline, allowDiskUse=True).to_list(500000)
     by_date: Dict[str, Dict[Tuple[str, str, str, str], dict]] = defaultdict(dict)
-    for r in rows:
-        dk = r["_id"]["date"]
-        pk = (
-            _text(r.get("brand_name")).casefold(),
-            _text(r.get("dealer_name")).casefold(),
-            _text(r.get("branch")).casefold(),
-            _text(r.get("part_number")).casefold(),
-        )
-        qty = _num(r.get("qty"))
-        unit = _num(r.get("unit"))
-        by_date[dk][pk] = {
-            **r,
-            "qty": qty,
-            "unit": unit,
-            "value": qty * unit,
-        }
+    seen = set()
+    ordered_keys = []
+    for dk in date_keys:
+        if dk and dk not in seen:
+            seen.add(dk)
+            ordered_keys.append(dk)
+
+    for dk in ordered_keys:
+        q = _and(_query(scope), {"publish_status": "Published", "active_date_key": dk})
+        if cat:
+            q = _and(q, cat)
+        pipeline = [
+            {"$match": q},
+            {
+                "$project": {
+                    "active_date_key": 1,
+                    "published_at": 1,
+                    "updated_at": 1,
+                    "brand_name": 1,
+                    "dealer_name": 1,
+                    "branch": 1,
+                    "part_number": 1,
+                    "item_name": 1,
+                    "part_name": 1,
+                    "part_category": 1,
+                    "category": 1,
+                    "available_qty_number": 1,
+                    "quantity": 1,
+                    "unit_value_number": 1,
+                    "mav_value": 1,
+                    "unit_value": 1,
+                    "purchase_aging_days": 1,
+                    "sales_aging_days": 1,
+                    "last_receipt_date": 1,
+                    "last_sales_date": 1,
+                }
+            },
+            {
+                "$group": {
+                    "_id": {
+                        "date": "$active_date_key",
+                        "brand": "$brand_name",
+                        "dealer": "$dealer_name",
+                        "branch": "$branch",
+                        "part": "$part_number",
+                    },
+                    "doc": {
+                        "$top": {
+                            "output": "$$ROOT",
+                            "sortBy": {"published_at": -1, "updated_at": -1},
+                        }
+                    },
+                }
+            },
+            {
+                "$replaceRoot": {
+                    "newRoot": {
+                        "$mergeObjects": [
+                            "$doc",
+                            {
+                                "qty": {
+                                    "$ifNull": [
+                                        "$doc.available_qty_number",
+                                        {"$ifNull": ["$doc.quantity", 0]},
+                                    ]
+                                },
+                                "unit": {
+                                    "$ifNull": [
+                                        "$doc.unit_value_number",
+                                        {"$ifNull": ["$doc.mav_value", {"$ifNull": ["$doc.unit_value", 0]}]},
+                                    ]
+                                },
+                                "part_name": {
+                                    "$ifNull": ["$doc.item_name", {"$ifNull": ["$doc.part_name", ""]}]
+                                },
+                                "part_category": {
+                                    "$ifNull": [
+                                        "$doc.part_category",
+                                        {"$ifNull": ["$doc.category", "Uncategorized"]},
+                                    ]
+                                },
+                            },
+                        ]
+                    }
+                }
+            },
+        ]
+        rows = await db.products.aggregate(pipeline, allowDiskUse=True).to_list(500000)
+        for r in rows:
+            row_dk = _text(r.get("active_date_key"))
+            pk = (
+                _text(r.get("brand_name")).casefold(),
+                _text(r.get("dealer_name")).casefold(),
+                _text(r.get("branch")).casefold(),
+                _text(r.get("part_number")).casefold(),
+            )
+            qty = _num(r.get("qty"))
+            unit = _num(r.get("unit"))
+            by_date[row_dk][pk] = {
+                "brand_name": r.get("brand_name"),
+                "dealer_name": r.get("dealer_name"),
+                "branch": r.get("branch"),
+                "part_number": r.get("part_number"),
+                "part_name": r.get("part_name"),
+                "part_category": r.get("part_category"),
+                "qty": qty,
+                "unit": unit,
+                "value": qty * unit,
+                "purchase_aging_days": r.get("purchase_aging_days"),
+                "sales_aging_days": r.get("sales_aging_days"),
+                "last_receipt_date": r.get("last_receipt_date"),
+                "last_sales_date": r.get("last_sales_date"),
+            }
     return by_date
 
 
@@ -354,7 +441,7 @@ async def _uploaded_branches_by_date(scope: dict, date_keys: List[str]) -> Tuple
         {"$match": _and(_query(scope), {"publish_status": "Published", "active_date_key": {"$in": date_keys}})},
         {"$group": {"_id": {"date": "$active_date_key", "branch": "$branch"}, "rows": {"$sum": 1}}},
     ]
-    for row in await db.products.aggregate(pipeline).to_list(50000):
+    for row in await db.products.aggregate(pipeline, allowDiskUse=True).to_list(50000):
         dk = _text(row.get("_id", {}).get("date"))
         br = _text(row.get("_id", {}).get("branch"))
         if dk and br:
@@ -431,16 +518,23 @@ def _day_upload_status(
     expected = len(expected_branches)
     exp_cf = {_text(b).casefold() for b in expected_branches}
     up = uploaded_by_date.get(dk, set())
-    up_in_scope = up & exp_cf if exp_cf else up
+    # When branch master list is empty, fall back to observed upload branches so
+    # All Dealers / All Branches consolidation still surfaces available stock.
+    up_in_scope = up & exp_cf if exp_cf else set(up)
     uploaded_count = len(up_in_scope)
     missing = sorted([b for b in expected_branches if b.casefold() not in up_in_scope])
-    uploaded_names = sorted([b for b in expected_branches if b.casefold() in up_in_scope])
-    if expected == 0:
-        status = "NO_UPLOAD"
-    elif uploaded_count == 0:
+    if expected_branches:
+        uploaded_names = sorted([b for b in expected_branches if b.casefold() in up_in_scope])
+    else:
+        uploaded_names = sorted(up_in_scope)
+    if uploaded_count == 0:
         status = "NO_UPLOAD"
     elif not consolidated:
         status = "AVAILABLE"
+    elif expected == 0:
+        # No branch master rows — treat observed uploads as complete for the day.
+        status = "AVAILABLE"
+        expected = uploaded_count
     elif uploaded_count >= expected:
         status = "AVAILABLE"
     else:
@@ -466,7 +560,7 @@ async def _find_last_upload_before(before_dk: str, scope: dict, expected_branche
             {"$match": _and(_query(scope), {"publish_status": "Published", "active_date_key": {"$lt": before_dk}})},
             {"$group": {"_id": "$active_date_key"}},
         ]
-        keys = sorted([r["_id"] for r in await db.products.aggregate(pipeline).to_list(5000)], reverse=True)
+        keys = sorted([r["_id"] for r in await db.products.aggregate(pipeline, allowDiskUse=True).to_list(5000)], reverse=True)
     for dk in keys:
         up, _ = await _uploaded_branches_by_date(scope, [dk])
         st = _day_upload_status(dk, up, expected_branches, consolidated)
@@ -966,64 +1060,98 @@ async def analytics_aging_trend(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
     if not date_keys:
-        return {"buckets": [], "stacked": [], "daily": [], "data_coverage": {}}
+        return {
+            "buckets": [],
+            "bucket_keys": list(ANALYTICS_AGING_BUCKETS),
+            "stacked": [],
+            "daily": [],
+            "data_coverage": {},
+        }
     ctx = await _build_daily_stock_series(scope, date_keys, category, aging_type, metric_type, current_user)
     use_value = metric_type == "value"
+    # Item Wise = distinct part-line count (quantity of line items), Value Wise = stock value.
+    use_items = metric_type == "quantity"
     last_row = ctx["daily"][-1]
-    bucket_totals = {b: {"value": None, "quantity": None} for b in BUCKETS}
-    stacked = defaultdict(lambda: {b: None for b in BUCKETS})
+    bucket_totals = {b: {"value": None, "quantity": None, "items": None} for b in ANALYTICS_AGING_BUCKETS}
+    stacked = defaultdict(lambda: {b: None for b in ANALYTICS_AGING_BUCKETS})
     if last_row["data_status"] != "NO_UPLOAD":
         dk = _iso_to_date_key(last_row["date"])
         status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
         curr_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
-        bucket_totals = {b: {"value": 0.0, "quantity": 0.0} for b in BUCKETS}
-        stacked = defaultdict(lambda: {b: 0.0 for b in BUCKETS})
+        bucket_totals = {b: {"value": 0.0, "quantity": 0.0, "items": 0.0} for b in ANALYTICS_AGING_BUCKETS}
+        stacked = defaultdict(lambda: {b: 0.0 for b in ANALYTICS_AGING_BUCKETS})
         for row in curr_map.values():
             days = _aging_days_row(row, aging_type)
-            b = _bucket(days) or BUCKETS[0]
+            b = _analytics_bucket(days)
             bucket_totals[b]["value"] += row["value"]
             bucket_totals[b]["quantity"] += row["qty"]
+            bucket_totals[b]["items"] += 1.0
             cat = _row_category(row)
-            metric = row["value"] if use_value else row["qty"]
+            metric = row["value"] if use_value else (1.0 if use_items else row["qty"])
             stacked[cat][b] += metric
-        cat_total = sum(x["value"] if use_value else x["qty"] for x in curr_map.values()) or 1.0
+        cat_total = sum(
+            (x["value"] if use_value else 1.0) for x in curr_map.values()
+        ) or 1.0
     else:
         cat_total = 1.0
     buckets_out = []
-    for b in BUCKETS:
+    for b in ANALYTICS_AGING_BUCKETS:
         v = bucket_totals[b]["value"]
         q = bucket_totals[b]["quantity"]
-        m = v if use_value else q
+        items = bucket_totals[b]["items"]
+        m = v if use_value else items
         buckets_out.append(
             {
                 "bucket": b,
                 "value": v,
                 "quantity": q,
+                "items": items,
+                "metric": m,
                 "pct_of_total": _safe_pct(m, cat_total) if m is not None else None,
                 "data_status": last_row["data_status"],
             }
         )
-    stacked_out = [{"category": c, **{b: stacked[c][b] for b in BUCKETS}} for c in sorted(stacked.keys())]
+    stacked_out = [
+        {"category": c, **{b: stacked[c][b] for b in ANALYTICS_AGING_BUCKETS}}
+        for c in sorted(stacked.keys())
+    ]
     daily = []
     for pt in ctx["daily"]:
         if pt["data_status"] == "NO_UPLOAD":
-            daily.append({"date": pt["date"], "data_status": "NO_UPLOAD", **{b: None for b in BUCKETS}})
+            daily.append(
+                {
+                    "date": pt["date"],
+                    "data_status": "NO_UPLOAD",
+                    "total": None,
+                    **{b: None for b in ANALYTICS_AGING_BUCKETS},
+                }
+            )
             continue
         dk = _iso_to_date_key(pt["date"])
         status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
         curr_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
-        day_buckets = {b: 0.0 for b in BUCKETS}
+        day_buckets = {b: 0.0 for b in ANALYTICS_AGING_BUCKETS}
         for row in curr_map.values():
-            b = _bucket(_aging_days_row(row, aging_type)) or BUCKETS[0]
-            day_buckets[b] += row["value"] if use_value else row["qty"]
-        daily.append({"date": pt["date"], "data_status": pt["data_status"], **{b: day_buckets[b] for b in BUCKETS}})
+            b = _analytics_bucket(_aging_days_row(row, aging_type))
+            day_buckets[b] += row["value"] if use_value else 1.0
+        total = sum(day_buckets.values())
+        daily.append(
+            {
+                "date": pt["date"],
+                "data_status": pt["data_status"],
+                "total": total,
+                **{b: day_buckets[b] for b in ANALYTICS_AGING_BUCKETS},
+            }
+        )
     return {
         "buckets": buckets_out,
+        "bucket_keys": list(ANALYTICS_AGING_BUCKETS),
         "stacked": stacked_out,
         "daily": daily,
         "data_coverage": ctx["coverage"],
         "comparison_type": ctx["summary"].get("comparison_type"),
         "comparison_label": ctx["summary"].get("comparison_label"),
+        "metric_type": metric_type,
     }
 
 
@@ -1041,56 +1169,122 @@ async def analytics_order_saving(
     metric_type: str = "value",
     current_user=Depends(_current_user),
 ):
+    """Orders & Savings Analysis.
+
+    Final / Net Order = Original Order - Reduced / Cut (NMTS-sourced network supply).
+    """
     scope = _resolve_scope_params(current_user, brand, dealer, branch, brand_id, dealer_id, branch_id)
     start, end, date_keys, _, metric_type, _ = _common_params(from_date, to_date, metric_type=metric_type)
     orders = await _orders_query(scope, start, end)
-    order_ids = {o.get("id") for o in orders}
+    order_ids = {o.get("id") for o in orders if o.get("id")}
     reqs = await _requests_query(scope, start, end, "raised")
     linked = [r for r in reqs if r.get("order_id") in order_ids]
-    total_orders = len(orders)
-    total_order_value = sum(_num(o.get("total_order_value")) for o in orders)
-    sourced_v = sourced_q = 0.0
+
+    original_value = sum(_num(o.get("total_order_value")) for o in orders)
+    original_items = sum(_num(o.get("item_count"), _num(o.get("total_required_qty"), 0)) for o in orders)
+    reduced_value = 0.0
+    reduced_items = 0.0
     for r in linked:
         sq, sv = _nmts_sourced_qty_value(r)
-        sourced_q += sq
-        sourced_v += sv
-    unfulfilled = max(0.0, total_order_value - sourced_v)
-    series_map = defaultdict(lambda: {"order_count": 0, "order_value": 0.0, "sourced_value": 0.0, "sourced_qty": 0.0})
+        reduced_value += sv
+        reduced_items += sq
+    # Cap reduced so Final never goes negative from noisy source rows.
+    reduced_value = min(reduced_value, original_value) if original_value > 0 else reduced_value
+    reduced_items = min(reduced_items, original_items) if original_items > 0 else reduced_items
+    final_value = max(0.0, original_value - reduced_value)
+    final_items = max(0.0, original_items - reduced_items)
+
+    series_map = defaultdict(
+        lambda: {
+            "original_value": 0.0,
+            "original_items": 0.0,
+            "reduced_value": 0.0,
+            "reduced_items": 0.0,
+            "order_count": 0,
+        }
+    )
     for o in orders:
         d = (_dt(o.get("created_at")) or start).date().isoformat()
         series_map[d]["order_count"] += 1
-        series_map[d]["order_value"] += _num(o.get("total_order_value"))
+        series_map[d]["original_value"] += _num(o.get("total_order_value"))
+        series_map[d]["original_items"] += _num(o.get("item_count"), _num(o.get("total_required_qty"), 0))
     for r in linked:
         d = (_dt(r.get("requested_at") or r.get("created_at")) or start).date().isoformat()
         sq, sv = _nmts_sourced_qty_value(r)
-        series_map[d]["sourced_value"] += sv
-        series_map[d]["sourced_qty"] += sq
+        series_map[d]["reduced_value"] += sv
+        series_map[d]["reduced_items"] += sq
+
     series = []
     for d in sorted(series_map.keys()):
         v = series_map[d]
-        u = max(0.0, v["order_value"] - v["sourced_value"])
+        ov = v["original_value"]
+        rv = min(v["reduced_value"], ov) if ov > 0 else v["reduced_value"]
+        oi = v["original_items"]
+        ri = min(v["reduced_items"], oi) if oi > 0 else v["reduced_items"]
+        fv = max(0.0, ov - rv)
+        fi = max(0.0, oi - ri)
         series.append(
             {
                 "date": d,
                 "order_count": v["order_count"],
-                "order_value": v["order_value"],
-                "sourced_value": v["sourced_value"],
-                "external_avoided_value": v["sourced_value"],
-                "unfulfilled_value": u,
-                "saving_pct": _safe_pct(v["sourced_value"], v["order_value"]),
+                "original_order_value": ov,
+                "reduced_value": rv,
+                "final_order_value": fv,
+                "reduction_pct": _safe_pct(rv, ov),
+                "original_order_items": oi,
+                "reduced_items": ri,
+                "final_order_items": fi,
+                # Backward-compatible aliases used by older UI fragments.
+                "order_value": ov,
+                "sourced_value": rv,
+                "external_avoided_value": rv,
+                "unfulfilled_value": fv,
+                "saving_pct": _safe_pct(rv, ov),
+                "original": ov if metric_type == "value" else oi,
+                "reduced": rv if metric_type == "value" else ri,
+                "final": fv if metric_type == "value" else fi,
             }
         )
+
     return {
         "summary": {
-            "total_order_count": total_orders,
-            "total_order_value": total_order_value,
-            "nmts_sourced_value": sourced_v,
-            "external_purchase_avoided_value": sourced_v,
-            "unfulfilled_value": unfulfilled,
-            "saving_pct": _safe_pct(sourced_v, total_order_value),
+            "total_order_count": len(orders),
+            "original_order_value": original_value,
+            "reduced_value": reduced_value,
+            "final_order_value": final_value,
+            "reduction_pct": _safe_pct(reduced_value, original_value),
+            "original_order_items": original_items,
+            "reduced_items": reduced_items,
+            "final_order_items": final_items,
+            # Aliases
+            "total_order_value": original_value,
+            "nmts_sourced_value": reduced_value,
+            "external_purchase_avoided_value": reduced_value,
+            "unfulfilled_value": final_value,
+            "saving_pct": _safe_pct(reduced_value, original_value),
         },
         "series": series,
+        "metric_type": metric_type,
+        "scope": scope,
     }
+
+
+def _fulfilled_qty_value(row: dict) -> Tuple[float, float]:
+    """Qty/value actually supplied against a request line."""
+    qty = _num(row.get("completed_qty"), _approved_qty(row))
+    if qty <= 0:
+        return 0.0, 0.0
+    return qty, qty * _request_unit(row)
+
+
+def _is_branch_fulfillment(row: dict) -> bool:
+    """Same dealer network → branch supply; different dealer → co-dealer supply."""
+    req_d = _text(row.get("requesting_dealer")).casefold()
+    sup_d = _text(row.get("supplying_dealer")).casefold()
+    if req_d and sup_d:
+        return req_d == sup_d
+    # Fallback: same brand + different branch treated as branch fulfillment.
+    return _text(row.get("requesting_brand")).casefold() == _text(row.get("supplying_brand")).casefold()
 
 
 @router.get("/request-acceptance")
@@ -1103,63 +1297,142 @@ async def analytics_request_acceptance(
     brand_id: Optional[str] = None,
     dealer_id: Optional[str] = None,
     branch_id: Optional[str] = None,
-    request_direction: str = "raised",
+    request_direction: str = "received",
     metric_type: str = "value",
     current_user=Depends(_current_user),
 ):
+    """Request Fulfillment Analysis for requests received by the selected scope.
+
+    Total Request = Fulfilled + Not Fulfilled
+    Fulfilled = Given to Branches + Given to Dealers / Co-Dealers
+    """
     scope = _resolve_scope_params(current_user, brand, dealer, branch, brand_id, dealer_id, branch_id)
     start, end, _, _, metric_type, _ = _common_params(from_date, to_date, metric_type=metric_type)
-    direction = (request_direction or "raised").lower()
+    direction = (request_direction or "received").lower()
     if direction not in {"raised", "received"}:
         raise HTTPException(400, "request_direction must be raised or received")
+    # Fulfillment view defaults to requests received by the selected supplying scope.
     reqs = await _requests_query(scope, start, end, direction)
+
+    received_v = fulfilled_v = branch_v = dealer_v = 0.0
+    received_i = fulfilled_i = branch_i = dealer_i = 0.0
     groups = defaultdict(list)
     for r in reqs:
         groups[_text(r.get("request_number"), r.get("id"))].append(r)
-    total_requests = len(groups)
-    total_requested_v = total_accepted_v = partial_v = rejected_v = pending_v = 0.0
-    accepted_count = 0
-    for _, items in groups.items():
-        rq_v = sum(_request_unit(i) * _requested_qty(i) for i in items)
-        ap_v = sum(_request_unit(i) * _approved_qty(i) for i in items)
-        total_requested_v += rq_v
-        total_accepted_v += ap_v
-        st = _text(items[0].get("status")).lower()
-        if ap_v >= rq_v and rq_v > 0:
-            accepted_count += 1
-        elif ap_v > 0:
-            partial_v += ap_v
-        elif st in {"rejected", "cancelled"}:
-            rejected_v += rq_v
-        else:
-            pending_v += max(0.0, rq_v - ap_v)
-    daily = defaultdict(lambda: {"requested": 0.0, "accepted": 0.0, "partial": 0.0, "rejected": 0.0, "pending": 0.0})
+        rq = _requested_qty(r)
+        ru = _request_unit(r)
+        received_v += ru * rq
+        received_i += rq
+        fq, fv = _fulfilled_qty_value(r)
+        # Cap fulfillment to requested on the line.
+        if fq > rq > 0:
+            fv = ru * rq
+            fq = rq
+        fulfilled_v += fv
+        fulfilled_i += fq
+        if fq > 0:
+            if _is_branch_fulfillment(r):
+                branch_v += fv
+                branch_i += fq
+            else:
+                dealer_v += fv
+                dealer_i += fq
+
+    not_fulfilled_v = max(0.0, received_v - fulfilled_v)
+    not_fulfilled_i = max(0.0, received_i - fulfilled_i)
+
+    daily = defaultdict(
+        lambda: {
+            "request_received_value": 0.0,
+            "fulfilled_value": 0.0,
+            "branch_value": 0.0,
+            "dealer_value": 0.0,
+            "request_received_items": 0.0,
+            "fulfilled_items": 0.0,
+            "branch_items": 0.0,
+            "dealer_items": 0.0,
+        }
+    )
     for r in reqs:
         d = (_dt(r.get("requested_at") or r.get("created_at")) or start).date().isoformat()
-        rq = _request_unit(r) * _requested_qty(r)
-        ap = _request_unit(r) * _approved_qty(r)
-        daily[d]["requested"] += rq
-        daily[d]["accepted"] += ap
-        st = _text(r.get("status")).lower()
-        if 0 < ap < rq:
-            daily[d]["partial"] += ap
-        elif st in {"rejected", "cancelled"}:
-            daily[d]["rejected"] += rq
-        elif ap < rq:
-            daily[d]["pending"] += rq - ap
-    series = [{"date": d, **daily[d]} for d in sorted(daily.keys())]
+        rq = _requested_qty(r)
+        ru = _request_unit(r)
+        daily[d]["request_received_value"] += ru * rq
+        daily[d]["request_received_items"] += rq
+        fq, fv = _fulfilled_qty_value(r)
+        if fq > rq > 0:
+            fv = ru * rq
+            fq = rq
+        daily[d]["fulfilled_value"] += fv
+        daily[d]["fulfilled_items"] += fq
+        if fq > 0:
+            if _is_branch_fulfillment(r):
+                daily[d]["branch_value"] += fv
+                daily[d]["branch_items"] += fq
+            else:
+                daily[d]["dealer_value"] += fv
+                daily[d]["dealer_items"] += fq
+
+    series = []
+    for d in sorted(daily.keys()):
+        v = daily[d]
+        rv = v["request_received_value"]
+        fv = v["fulfilled_value"]
+        ri = v["request_received_items"]
+        fi = v["fulfilled_items"]
+        series.append(
+            {
+                "date": d,
+                "request_received_value": rv,
+                "given_to_branches_value": v["branch_value"],
+                "given_to_dealers_value": v["dealer_value"],
+                "total_fulfilled_value": fv,
+                "not_fulfilled_value": max(0.0, rv - fv),
+                "fulfillment_pct": _safe_pct(fv, rv),
+                "request_received_items": ri,
+                "given_to_branches_items": v["branch_items"],
+                "given_to_dealers_items": v["dealer_items"],
+                "total_fulfilled_items": fi,
+                "not_fulfilled_items": max(0.0, ri - fi),
+                # Metric-selected convenience fields for charts
+                "request_received": rv if metric_type == "value" else ri,
+                "given_to_branches": v["branch_value"] if metric_type == "value" else v["branch_items"],
+                "given_to_dealers": v["dealer_value"] if metric_type == "value" else v["dealer_items"],
+                "total_fulfilled": fv if metric_type == "value" else fi,
+                "not_fulfilled": (max(0.0, rv - fv) if metric_type == "value" else max(0.0, ri - fi)),
+                # Legacy aliases
+                "requested": rv,
+                "accepted": fv,
+            }
+        )
+
     return {
         "summary": {
-            "total_request_count": total_requests,
-            "total_requested_value": total_requested_v,
-            "accepted_request_count": accepted_count,
-            "fully_accepted_value": total_accepted_v - partial_v,
-            "partial_accepted_value": partial_v,
-            "rejected_value": rejected_v,
-            "pending_value": pending_v,
-            "acceptance_pct": _safe_pct(total_accepted_v, total_requested_v),
+            "total_request_count": len(groups),
+            "request_received_value": received_v,
+            "total_fulfilled_value": fulfilled_v,
+            "not_fulfilled_value": not_fulfilled_v,
+            "given_to_branches_value": branch_v,
+            "given_to_dealers_value": dealer_v,
+            "fulfillment_pct": _safe_pct(fulfilled_v, received_v),
+            "request_received_items": received_i,
+            "total_fulfilled_items": fulfilled_i,
+            "not_fulfilled_items": not_fulfilled_i,
+            "given_to_branches_items": branch_i,
+            "given_to_dealers_items": dealer_i,
+            # Legacy aliases for older cards
+            "total_requested_value": received_v,
+            "accepted_request_count": sum(1 for g in groups.values() if sum(_approved_qty(i) for i in g) > 0),
+            "fully_accepted_value": fulfilled_v,
+            "partial_accepted_value": 0.0,
+            "rejected_value": 0.0,
+            "pending_value": not_fulfilled_v,
+            "acceptance_pct": _safe_pct(fulfilled_v, received_v),
         },
         "series": series,
+        "metric_type": metric_type,
+        "request_direction": direction,
+        "scope": scope,
     }
 
 
