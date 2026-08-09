@@ -20,17 +20,17 @@ fi
 ./venv/bin/python -m pip install --upgrade pip
 ./venv/bin/python -m pip install -r requirements.txt
 
-echo "==> Frontend: node_modules + local backend URL"
+echo "==> Frontend: node_modules"
 cd "$REPO_ROOT/frontend"
 # Prefer a clean, lockfile-driven install; fall back to npm install if the
 # lockfile and package.json have drifted.
 npm ci || npm install
-# The committed frontend/.env points REACT_APP_BACKEND_URL at a dead Codespaces
-# URL. CRA loads .env.local at higher priority, so point the dev frontend at the
-# local backend. This file is gitignored and must not be committed.
-cat > .env.local <<'EOF'
-REACT_APP_BACKEND_URL=http://127.0.0.1:8000
-EOF
+# NOTE: the committed frontend/.env points REACT_APP_BACKEND_URL at a dead
+# Codespaces URL. A frontend/.env.local does NOT override it, because
+# craco.config.js calls dotenv.config() at load time (reading .env first) and
+# dotenv never overrides an already-set variable. The local backend URL is
+# instead injected as a real environment variable by .cursor/start.sh, which
+# does win. Nothing to configure here.
 
 echo "==> Mobile (Expo): best-effort dependency install"
 if [ -f "$REPO_ROOT/mobile/package.json" ]; then

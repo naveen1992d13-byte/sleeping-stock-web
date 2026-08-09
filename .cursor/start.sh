@@ -24,8 +24,14 @@ if listening 3000; then
   echo "frontend: already listening on :3000, leaving it running"
 else
   echo "frontend: starting CRA dev server on :3000"
+  # The committed frontend/.env points REACT_APP_BACKEND_URL at a dead Codespaces
+  # URL. A frontend/.env.local cannot override it here because craco.config.js
+  # calls dotenv.config() at load time (reading .env first), and dotenv never
+  # overrides an already-set variable. Exporting the variable in the shell wins,
+  # because dotenv also won't override a real environment variable.
   ( cd "$REPO_ROOT/frontend" \
-      && BROWSER=none nohup npm start >"$LOG_DIR/frontend.log" 2>&1 & )
+      && REACT_APP_BACKEND_URL="http://127.0.0.1:8000" BROWSER=none \
+         nohup npm start >"$LOG_DIR/frontend.log" 2>&1 & )
 fi
 
 # Wait for the backend to accept connections (fast). Non-fatal on timeout so a

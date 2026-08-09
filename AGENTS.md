@@ -8,8 +8,11 @@ This repo is the **NMTS / Sleeping Stock web app** — a dealer-network non-movi
 - `backend/` — FastAPI + Socket.IO app (`server.py`), data in MongoDB via `motor`.
 - `frontend/` — React (Create React App via `@craco/craco`) single-page app.
 
-Dependencies (Python venv, frontend/mobile `node_modules`) are installed by the
-Cursor Cloud update script, so you normally don't need to install them again.
+Dependencies (Python venv, frontend/mobile `node_modules`) are installed by
+`.cursor/install.sh` (the environment's install step), so you normally don't
+need to install them again. `.cursor/start.sh` launches both dev servers
+(backend on :8000, frontend on :3000) idempotently and is the environment's
+start step.
 
 ### Running the backend
 
@@ -28,14 +31,19 @@ Cursor Cloud update script, so you normally don't need to install them again.
 
 ### Running the frontend
 
-- Start it with `cd frontend && npm start` (CRA/craco dev server on port 3000).
+- Easiest: run `.cursor/start.sh`, which starts the backend and frontend and
+  points the frontend at the local backend. To run it directly, use
+  `cd frontend && REACT_APP_BACKEND_URL=http://127.0.0.1:8000 npm start`
+  (CRA/craco dev server on port 3000).
 - **Important gotcha:** the committed `frontend/.env` sets `REACT_APP_BACKEND_URL`
-  to a dead GitHub Codespaces URL. For local dev the frontend must point at the
-  local backend instead, or login fails with CORS errors. This is handled by a
-  gitignored `frontend/.env.local` (created by the update script) containing:
-  `REACT_APP_BACKEND_URL=http://127.0.0.1:8000`. CRA loads `.env.local` with
-  higher priority than `.env`. If login can't reach the backend, verify this file
-  exists. Do not commit it.
+  to a dead GitHub Codespaces URL, so `cd frontend && npm start` alone makes login
+  fail (it hits the dead URL). A `frontend/.env.local` does **not** fix this:
+  `craco.config.js` calls `dotenv.config()` at load time, which reads `.env`
+  first, and `dotenv` never overrides an already-set variable — so `.env.local`
+  is ignored. The reliable fix is to pass `REACT_APP_BACKEND_URL` as a real shell
+  environment variable (dotenv won't override that either), which is exactly what
+  `.cursor/start.sh` does. If login can't reach the backend, confirm the frontend
+  was started with that variable exported.
 
 ### Tests / lint
 
