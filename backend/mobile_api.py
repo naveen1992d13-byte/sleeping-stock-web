@@ -302,6 +302,13 @@ class StockVerificationSubmit(BaseModel):
     client_id: Optional[str] = None  # offline-queue idempotency key (Part 22)
     damage_qty: Optional[float] = 0
     verification_type: Optional[str] = "physical"  # physical | auto
+    part_name: Optional[str] = None
+    verification_session_id: Optional[str] = None  # informational; backend daily session remains authoritative
+    is_new_part: Optional[bool] = False
+
+
+class StockVerificationBatchSubmit(BaseModel):
+    items: List[StockVerificationSubmit]
 
 
 class MobileUserAttendanceUpdate(BaseModel):
@@ -1904,6 +1911,49 @@ async def stock_verification_history(
     return rows
 
 
+@router.post("/stock-verification/batch")
+async def submit_stock_verification_batch(payload: StockVerificationBatchSubmit, session=Depends(get_device_session)):
+    """Bulk offline-queue sync. Each item keeps client_id idempotency."""
+    items = payload.items or []
+    if not items:
+        raise HTTPException(400, "Provide at least one verification item")
+    if len(items) > 100:
+        raise HTTPException(400, "Batch limit is 100 items")
+
+    results = []
+    synced = 0
+    failed = 0
+    for item in items:
+        try:
+            result = await submit_stock_verification(item, session)
+            results.append({
+                "client_id": item.client_id,
+                "success": True,
+                "id": result.get("id") or result.get("verification_id"),
+                "duplicate": bool(result.get("duplicate")),
+                "session_id": result.get("session_id"),
+                "verification_status": result.get("verification_status"),
+            })
+            synced += 1
+        except HTTPException as exc:
+            failed += 1
+            detail = exc.detail
+            results.append({
+                "client_id": item.client_id,
+                "success": False,
+                "error": detail if isinstance(detail, str) else str(detail),
+            })
+        except Exception as exc:
+            failed += 1
+            results.append({
+                "client_id": item.client_id,
+                "success": False,
+                "error": str(exc) or "Verification failed",
+            })
+
+    return {"success": failed == 0, "synced": synced, "failed": failed, "results": results}
+
+
 # ==================== PERPETUAL STOCK LOOKUP (MOBILE DEVICE) ====================
 
 @router.get("/perpetual-stock/device-lookup")
@@ -1927,23 +1977,59 @@ async def perpetual_stock_device_lookup(part_number: str, session=Depends(get_de
 # ==================== STOCK SEARCH (MOBILE) ====================
 
 @router.get("/stock-search")
-async def stock_search(part_numbers: str, session=Depends(get_device_session)):
-    """part_numbers: comma or newline separated list — supports single or multi search."""
-    parts = [p.strip() for p in re.split(r"[,\n]", part_numbers) if p.strip()]
-    if not parts:
-        raise HTTPException(400, "Provide at least one part number")
-
-    q = {
+async def stock_search(
+    part_numbers: Optional[str] = None,
+    q: Optional[str] = None,
+    mode: str = "exact",
+    limit: int = 100,
+    session=Depends(get_device_session),
+):
+    """Exact multi-part search via part_numbers, or Product Hub-style prefix/description via q/mode=prefix."""
+    scope = {
         "brand_name": session["brand_name"],
         "dealer_name": session["dealer_name"],
         "branch": session["branch"],
-        "part_number": {"$in": parts},
         "publish_status": _published_status_filter(),
         "is_active_today": True,
     }
-    rows = await db.products.find(q, {"_id": 0}).to_list(2000)
+
+    search_mode = (mode or "exact").strip().lower()
+    query_text = (q or "").strip()
+    if search_mode == "prefix" or (query_text and not part_numbers):
+        needle = query_text or (part_numbers or "").strip()
+        if not needle:
+            raise HTTPException(400, "Provide a search query")
+        safe = re.escape(needle)
+        query = {
+            **scope,
+            "$or": [
+                {"part_number": {"$regex": safe, "$options": "i"}},
+                {"part_name": {"$regex": safe, "$options": "i"}},
+                {"item_name": {"$regex": safe, "$options": "i"}},
+                {"description": {"$regex": safe, "$options": "i"}},
+            ],
+        }
+        rows = await db.products.find(query, {"_id": 0}).limit(max(1, min(int(limit or 100), 500))).to_list(500)
+        # Prefer prefix matches first (26300… before …26300…)
+        upper = needle.upper()
+        rows.sort(
+            key=lambda r: (
+                0 if str(r.get("part_number") or "").upper().startswith(upper) else 1,
+                str(r.get("part_number") or ""),
+            )
+        )
+        return {"results": rows, "not_found": []}
+
+    parts = [p.strip() for p in re.split(r"[,\n;\s]+", part_numbers or "") if p.strip()]
+    if not parts:
+        raise HTTPException(400, "Provide at least one part number")
+
+    query = {**scope, "part_number": {"$in": parts}}
+    rows = await db.products.find(query, {"_id": 0}).to_list(2000)
     found_parts = {r["part_number"] for r in rows}
-    not_found = [p for p in parts if p not in found_parts]
+    # Case-insensitive found set for mobile clients that normalize casing.
+    found_upper = {str(p).upper() for p in found_parts}
+    not_found = [p for p in parts if p not in found_parts and p.upper() not in found_upper]
     return {"results": rows, "not_found": not_found}
 
 
