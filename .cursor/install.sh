@@ -9,6 +9,14 @@ cd "$REPO_ROOT"
 
 echo "==> Backend: Python venv + dependencies"
 cd "$REPO_ROOT/backend"
+# The base image may lack the stdlib venv/ensurepip support (Debian/Ubuntu split
+# these into a python3-venv package). Install it if creating a venv would fail.
+if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
+  echo "    python3 venv/ensurepip missing; installing python3-venv"
+  pyver="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+  sudo apt-get update -y
+  sudo apt-get install -y "python${pyver}-venv" || sudo apt-get install -y python3-venv
+fi
 # The venv committed to the repo was built on GitHub Codespaces and has dead
 # symlinks (no working python), so (re)create it whenever it isn't usable.
 # Require a working python that also has pip, otherwise recreate from scratch.
