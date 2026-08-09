@@ -3070,23 +3070,26 @@ def _is_all_scope(value: str) -> bool:
     return not value or str(value).startswith("All ") or value == "N/A" or value == "all"
 
 
-# Allowed Part Category values for the Product Hub. Upload never rejects a row for
-# category reasons — this only normalizes common spellings/variants to the
-# canonical label so filtering/grouping in Product Hub is consistent. Anything that
-# doesn't match a known variant is kept exactly as typed in the sheet.
-PART_CATEGORY_OPTIONS = ["Genuine Parts", "Accessories", "Non OEM parts"]
-_PART_CATEGORY_ALIASES = {
-    "genuine parts": "Genuine Parts",
-    "genuine": "Genuine Parts",
-    "genuine part": "Genuine Parts",
-    "accessories": "Accessories",
-    "accessory": "Accessories",
-    "non oem parts": "Non OEM parts",
-    "non oem": "Non OEM parts",
-    "non-oem": "Non OEM parts",
-    "non oem part": "Non OEM parts",
-    "nonoem": "Non OEM parts",
-}
+# Allowed Part Type values for Product Hub + Analytics. Upload never rejects a
+# row for category reasons — aliases normalize common spellings (including the
+# legacy "Genuine Parts" / "Non OEM parts" labels) to:
+#   OE Parts | Accessories | Others
+try:
+    from part_category import (  # type: ignore
+        PART_CATEGORY_OPTIONS,
+        PART_TYPE_OPTIONS,
+        is_all_part_type as _is_all_part_type,
+        normalize_part_category as _normalize_part_category,
+        part_type_mongo_clause as _part_type_mongo_clause,
+    )
+except ImportError:
+    from .part_category import (  # type: ignore
+        PART_CATEGORY_OPTIONS,
+        PART_TYPE_OPTIONS,
+        is_all_part_type as _is_all_part_type,
+        normalize_part_category as _normalize_part_category,
+        part_type_mongo_clause as _part_type_mongo_clause,
+    )
 
 
 def _format_uploaded_date(created_at) -> str:
@@ -3099,15 +3102,6 @@ def _format_uploaded_date(created_at) -> str:
         return datetime.fromisoformat(text).strftime("%d-%m-%Y")
     except ValueError:
         return format_date_for_display(text)
-
-
-def _normalize_part_category(value: str) -> str:
-    raw = (value or "").strip()
-    if not raw:
-        return ""
-    key = raw.lower().replace("-", " ").replace("_", " ")
-    key = re.sub(r"\s+", " ", key).strip()
-    return _PART_CATEGORY_ALIASES.get(key, raw)
 
 
 def _safe_float(value, default=0.0):
@@ -3583,17 +3577,19 @@ def _product_hub_active_query(current_user: UserResponse, brand=None, dealer=Non
 @api_router.get("/product-hub/summary")
 async def product_hub_summary(
     brand: str = None, dealer: str = None, branch: str = None, search: str = None,
+    category: str = None, stock_status: str = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
     """Fast summary cards: Total Item, Total Available Item, Total Available Quantity, Total Value.
-    When there is no search term, this reads the small pre-aggregated batch_summaries
-    collection (one row per branch per day) instead of scanning potentially lakhs of
-    raw product rows. Search only narrows within a specific text query, where a
-    (still index-assisted) aggregation over db.products is unavoidable."""
+    When there is no search/Part Type/stock filter, this reads the small pre-aggregated
+    batch_summaries collection. Part Type / search / stock filters require a products scan."""
     date_key = _nmts_date_key()
     search = (search or "").strip()
+    needs_product_scan = bool(search) or (not _is_all_part_type(category) and not _is_all_scope(category)) or (
+        (stock_status or "all").strip().lower() not in {"", "all"}
+    )
 
-    if not search:
+    if not needs_product_scan:
         batch_query = {"active_date_key": date_key}
         if not _is_all_scope(brand):
             batch_query["brand_name"] = brand
@@ -3617,11 +3613,24 @@ async def product_hub_summary(
         }
 
     query = _product_hub_active_query(current_user, brand, dealer, branch)
-    safe_search = re.escape(search)
-    query["$or"] = [
-        {"part_number": {"$regex": safe_search, "$options": "i"}},
-        {"item_name": {"$regex": safe_search, "$options": "i"}},
-    ]
+    _apply_category_filter(query, category)
+    _apply_stock_status_filter(query, stock_status)
+    if search:
+        safe_search = re.escape(search)
+        search_clause = {
+            "$or": [
+                {"part_number": {"$regex": safe_search, "$options": "i"}},
+                {"item_name": {"$regex": safe_search, "$options": "i"}},
+            ]
+        }
+        if "$and" in query:
+            query["$and"].append(search_clause)
+        elif any(k.startswith("$") for k in query.keys()):
+            existing = {k: v for k, v in list(query.items())}
+            query.clear()
+            query["$and"] = [existing, search_clause]
+        else:
+            query["$or"] = search_clause["$or"]
     pipeline = [
         {"$match": query},
         {"$group": {
@@ -3632,7 +3641,7 @@ async def product_hub_summary(
             "total_value": {"$sum": {"$toDouble": {"$ifNull": ["$total_value_number", 0]}}},
         }},
     ]
-    result = await db.products.aggregate(pipeline).to_list(1)
+    result = await db.products.aggregate(pipeline, allowDiskUse=True).to_list(1)
     row = result[0] if result else {}
     return {
         "totalItem": row.get("total_item", 0),
@@ -3670,10 +3679,28 @@ async def product_hub_branch_summary(
 
 
 def _apply_category_filter(query: dict, category: str = None):
-    """Part Category filter — additive, never required. Matches the canonical
-    label case-insensitively so aliased/raw values uploaded still match."""
-    if category and not _is_all_scope(category) and category.lower() != "all categories":
-        query["part_category"] = {"$regex": f"^{re.escape(category.strip())}$", "$options": "i"}
+    """Part Type filter — additive, never required.
+
+    Matches the final Part Type options (OE Parts / Accessories / Others) and
+    all known legacy aliases (Genuine Parts, Non OEM parts, etc.).
+    """
+    if _is_all_part_type(category) or _is_all_scope(category):
+        return
+    clause = _part_type_mongo_clause(category)
+    if not clause:
+        return
+    # Merge into existing query without dropping other $or/$and conditions.
+    if "$and" in query:
+        query["$and"].append(clause)
+    elif any(k.startswith("$") for k in query.keys()):
+        existing = {k: v for k, v in list(query.items())}
+        query.clear()
+        query["$and"] = [existing, clause]
+    else:
+        # Simple field query — attach $or via $and with a copy of fields.
+        fields = {k: v for k, v in list(query.items())}
+        query.clear()
+        query["$and"] = [fields, clause]
 
 
 def _apply_stock_status_filter(query: dict, stock_status: str = None):

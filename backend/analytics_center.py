@@ -11,8 +11,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 try:
     from . import reports_center as rc
+    from . import part_category as pc
 except ImportError:
     import reports_center as rc
+    import part_category as pc
 
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
 _security = HTTPBearer()
@@ -122,15 +124,8 @@ def _resolve_scope_params(
 
 
 def _category_clause(category: Optional[str]) -> Optional[dict]:
-    cat = _text(category)
-    if not cat or cat.lower() in {"all", "all categories"}:
-        return None
-    return {
-        "$or": [
-            {"part_category": {"$regex": f"^{re.escape(cat)}$", "$options": "i"}},
-            {"category": {"$regex": f"^{re.escape(cat)}$", "$options": "i"}},
-        ]
-    }
+    """Part Type filter shared with Product Hub (OE Parts / Accessories / Others)."""
+    return pc.part_type_mongo_clause(category)
 
 
 def _part_key(row: dict) -> Tuple[str, str, str, str]:
@@ -769,6 +764,46 @@ async def _requests_query(scope: dict, start: datetime, end: datetime, direction
     return await db.order_requests.find(_and(dateq, *side), {"_id": 0}).to_list(500000)
 
 
+async def _part_type_lookup(part_numbers: List[str], scope: Optional[dict] = None) -> Dict[str, str]:
+    """Map casefolded part_number -> canonical Part Type using Product Hub data."""
+    nums = sorted({_text(p) for p in part_numbers if _text(p)})
+    if not nums:
+        return {}
+    out: Dict[str, str] = {}
+    # Chunk $in lists to keep queries bounded.
+    for i in range(0, len(nums), 2000):
+        chunk = nums[i : i + 2000]
+        q = _and(_query(scope or {}), {"part_number": {"$in": chunk}})
+        rows = (
+            await db.products.find(
+                q,
+                {"_id": 0, "part_number": 1, "part_category": 1, "category": 1, "parts_type": 1, "active_date_key": 1},
+            )
+            .sort("active_date_key", -1)
+            .to_list(100000)
+        )
+        for row in rows:
+            pn = _text(row.get("part_number")).casefold()
+            if not pn or pn in out:
+                continue
+            raw = row.get("part_category") or row.get("category") or row.get("parts_type") or ""
+            canon = pc.normalize_part_category(str(raw))
+            if canon:
+                out[pn] = canon
+    return out
+
+
+async def _filter_rows_by_part_type(rows: List[dict], category: Optional[str], scope: Optional[dict] = None) -> List[dict]:
+    """Keep only rows whose part_number maps to the selected Part Type."""
+    if pc.is_all_part_type(category):
+        return rows
+    selected = pc.canonical_part_type(category)
+    if not selected:
+        return rows
+    lookup = await _part_type_lookup([r.get("part_number") for r in rows], scope)
+    return [r for r in rows if lookup.get(_text(r.get("part_number")).casefold()) == selected]
+
+
 def _request_unit(row: dict) -> float:
     return _num(row.get("part_value"), _num(row.get("unit_value_at_request"), _num(row.get("unit_value"), 0)))
 
@@ -823,34 +858,9 @@ def _common_params(
 
 
 @router.get("/categories")
-async def analytics_categories(
-    from_date: str,
-    to_date: str,
-    brand: Optional[str] = None,
-    dealer: Optional[str] = None,
-    branch: Optional[str] = None,
-    brand_id: Optional[str] = None,
-    dealer_id: Optional[str] = None,
-    branch_id: Optional[str] = None,
-    current_user=Depends(_current_user),
-):
-    scope = _resolve_scope_params(current_user, brand, dealer, branch, brand_id, dealer_id, branch_id)
-    _, _, date_keys, _, _, _ = _common_params(from_date, to_date)
-    if not date_keys:
-        return {"categories": []}
-    ctx = await _build_daily_stock_series(scope, date_keys, None, "purchase", "value", current_user)
-    last_avail = None
-    for row in reversed(ctx["daily"]):
-        if row["data_status"] in {"AVAILABLE", "PARTIAL_UPLOAD"}:
-            last_avail = row
-            break
-    if not last_avail:
-        return {"categories": []}
-    dk = _iso_to_date_key(last_avail["date"])
-    status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
-    part_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
-    cats = sorted({_row_category(v) for v in part_map.values()})
-    return {"categories": cats}
+async def analytics_categories(current_user=Depends(_current_user)):
+    """Final Part Type options — same source/labels as Product Hub."""
+    return {"categories": list(pc.PART_TYPE_OPTIONS), "part_types": list(pc.PART_TYPE_OPTIONS)}
 
 
 @router.get("/overall")
@@ -1174,14 +1184,35 @@ async def analytics_order_saving(
     Final / Net Order = Original Order - Reduced / Cut (NMTS-sourced network supply).
     """
     scope = _resolve_scope_params(current_user, brand, dealer, branch, brand_id, dealer_id, branch_id)
-    start, end, date_keys, _, metric_type, _ = _common_params(from_date, to_date, metric_type=metric_type)
+    start, end, date_keys, _, metric_type, category = _common_params(
+        from_date, to_date, category=category, metric_type=metric_type
+    )
     orders = await _orders_query(scope, start, end)
     order_ids = {o.get("id") for o in orders if o.get("id")}
     reqs = await _requests_query(scope, start, end, "raised")
     linked = [r for r in reqs if r.get("order_id") in order_ids]
 
-    original_value = sum(_num(o.get("total_order_value")) for o in orders)
-    original_items = sum(_num(o.get("item_count"), _num(o.get("total_required_qty"), 0)) for o in orders)
+    # Part Type filter: when set, derive Original from matching order_items and
+    # Reduced from matching request lines (Product Hub category lookup).
+    part_type_filter = not pc.is_all_part_type(category)
+    order_item_rows: List[dict] = []
+    if part_type_filter and order_ids:
+        order_item_rows = await db.order_items.find(
+            {"order_id": {"$in": list(order_ids)}},
+            {"_id": 0},
+        ).to_list(500000)
+        order_item_rows = await _filter_rows_by_part_type(order_item_rows, category, scope)
+        linked = await _filter_rows_by_part_type(linked, category, scope)
+        # Keep only orders that still have matching lines.
+        keep_ids = {r.get("order_id") for r in order_item_rows}
+        orders = [o for o in orders if o.get("id") in keep_ids]
+
+    if part_type_filter:
+        original_value = sum(_num(i.get("required_qty")) * _num(i.get("unit_value")) for i in order_item_rows)
+        original_items = sum(_num(i.get("required_qty")) for i in order_item_rows)
+    else:
+        original_value = sum(_num(o.get("total_order_value")) for o in orders)
+        original_items = sum(_num(o.get("item_count"), _num(o.get("total_required_qty"), 0)) for o in orders)
     reduced_value = 0.0
     reduced_items = 0.0
     for r in linked:
@@ -1203,11 +1234,25 @@ async def analytics_order_saving(
             "order_count": 0,
         }
     )
-    for o in orders:
-        d = (_dt(o.get("created_at")) or start).date().isoformat()
-        series_map[d]["order_count"] += 1
-        series_map[d]["original_value"] += _num(o.get("total_order_value"))
-        series_map[d]["original_items"] += _num(o.get("item_count"), _num(o.get("total_required_qty"), 0))
+    if part_type_filter:
+        order_dates = {
+            o.get("id"): (_dt(o.get("created_at")) or start).date().isoformat() for o in orders
+        }
+        counted_orders = set()
+        for i in order_item_rows:
+            oid = i.get("order_id")
+            d = order_dates.get(oid) or (_dt(i.get("created_at")) or start).date().isoformat()
+            if oid and oid not in counted_orders:
+                series_map[d]["order_count"] += 1
+                counted_orders.add(oid)
+            series_map[d]["original_value"] += _num(i.get("required_qty")) * _num(i.get("unit_value"))
+            series_map[d]["original_items"] += _num(i.get("required_qty"))
+    else:
+        for o in orders:
+            d = (_dt(o.get("created_at")) or start).date().isoformat()
+            series_map[d]["order_count"] += 1
+            series_map[d]["original_value"] += _num(o.get("total_order_value"))
+            series_map[d]["original_items"] += _num(o.get("item_count"), _num(o.get("total_required_qty"), 0))
     for r in linked:
         d = (_dt(r.get("requested_at") or r.get("created_at")) or start).date().isoformat()
         sq, sv = _nmts_sourced_qty_value(r)
@@ -1297,6 +1342,7 @@ async def analytics_request_acceptance(
     brand_id: Optional[str] = None,
     dealer_id: Optional[str] = None,
     branch_id: Optional[str] = None,
+    category: Optional[str] = None,
     request_direction: str = "received",
     metric_type: str = "value",
     current_user=Depends(_current_user),
@@ -1307,12 +1353,15 @@ async def analytics_request_acceptance(
     Fulfilled = Given to Branches + Given to Dealers / Co-Dealers
     """
     scope = _resolve_scope_params(current_user, brand, dealer, branch, brand_id, dealer_id, branch_id)
-    start, end, _, _, metric_type, _ = _common_params(from_date, to_date, metric_type=metric_type)
+    start, end, _, _, metric_type, category = _common_params(
+        from_date, to_date, category=category, metric_type=metric_type
+    )
     direction = (request_direction or "received").lower()
     if direction not in {"raised", "received"}:
         raise HTTPException(400, "request_direction must be raised or received")
     # Fulfillment view defaults to requests received by the selected supplying scope.
     reqs = await _requests_query(scope, start, end, direction)
+    reqs = await _filter_rows_by_part_type(reqs, category, scope)
 
     received_v = fulfilled_v = branch_v = dealer_v = 0.0
     received_i = fulfilled_i = branch_i = dealer_i = 0.0
