@@ -25,12 +25,34 @@ async function resolveBaseUrl(overrideUrl) {
   return normalizeApiBaseUrl(session?.apiBaseUrl || API_BASE_URL);
 }
 
+function extractFastApiDetail(data) {
+  if (!data || typeof data !== 'object') return null;
+  const detail = data.detail;
+  if (typeof detail === 'string' && detail.trim()) return detail.trim();
+  if (detail && typeof detail === 'object') {
+    if (typeof detail.message === 'string' && detail.message.trim()) return detail.message.trim();
+    if (typeof detail.msg === 'string' && detail.msg.trim()) return detail.msg.trim();
+  }
+  if (typeof data.message === 'string' && data.message.trim()) return data.message.trim();
+  return null;
+}
+
 function errorFromAxios(error) {
   if (error instanceof ApiError) return error;
   const status = error?.response?.status || 0;
-  const detail = error?.response?.data?.detail;
-  const message = typeof detail === 'string' ? detail : detail?.message || error?.message || 'Unable to connect to the NMTS server.';
-  const kind = status === 401 || status === 403 ? 'auth' : status ? 'server' : 'network';
+  if (!status) {
+    const axiosMessage = String(error?.message || '');
+    const isNetwork =
+      axiosMessage === 'Network Error' ||
+      error?.code === 'ECONNABORTED' ||
+      error?.code === 'ERR_NETWORK';
+    const message = isNetwork
+      ? 'Cannot reach the NMTS server. Check mobile data/Wi‑Fi and that the QR server URL is correct.'
+      : axiosMessage || 'Unable to connect to the NMTS server.';
+    return new ApiError(message, { status: 0, kind: 'network', data: null });
+  }
+  const message = extractFastApiDetail(error?.response?.data) || `Request failed (${status})`;
+  const kind = status === 401 || status === 403 ? 'auth' : 'server';
   return new ApiError(message, { status, kind, data: error?.response?.data || null });
 }
 
