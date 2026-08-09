@@ -888,7 +888,9 @@ async def get_uploads(
         query["branch"] = current_user.location
 
     # Sort needs an index / disk spill on large upload collections (avoids 32MB sort RAM 500).
-    cursor = db.uploads.find(query, {"_id": 0}).sort("created_at", -1)
+    # Exclude raw_file_bytes from the list payload — binary Excel blobs break JSON encoding
+    # and are not needed for Upload Center list/summary views.
+    cursor = db.uploads.find(query, {"_id": 0, "raw_file_bytes": 0}).sort("created_at", -1)
     try:
         cursor = cursor.allow_disk_use(True)
     except Exception:
