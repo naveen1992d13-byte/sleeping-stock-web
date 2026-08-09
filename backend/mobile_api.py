@@ -33,7 +33,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Header, Request, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, Header, Request, UploadFile, File, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict
 from pymongo import ReturnDocument
@@ -1922,36 +1922,89 @@ async def perpetual_stock_device_lookup(part_number: str, session=Depends(get_de
 
 # ==================== STOCK SEARCH (MOBILE) ====================
 
-@router.get("/stock-search")
-async def stock_search(
-    part_numbers: Optional[str] = None,
-    q: Optional[str] = None,
-    mode: str = "exact",
-    limit: int = 100,
-    session=Depends(get_device_session),
-):
-    """Exact multi-part search via part_numbers, or Product Hub-style prefix/description via q/mode=prefix.
+async def _stock_search_today_scope(session: dict):
+    """Authoritative Stock Availability scope: paired Brand/Dealer/Branch + IST today only.
 
-    Prefix mode uses an anchored ^prefix regex on part_number (index-friendly) plus
-    description contains matching. Never returns the prefix itself in not_found.
+    Uses active_date_key == IST YYYYMMDD. Does NOT fall back to the latest previous upload.
+    is_active_today alone is insufficient — older snapshots can remain flagged active.
     """
+    from auto_perpetual import inventory_date_key, ist_date_key
+
+    today_key = inventory_date_key()  # YYYYMMDD in Asia/Kolkata
     scope = {
         "brand_name": session["brand_name"],
         "dealer_name": session["dealer_name"],
         "branch": session["branch"],
         "publish_status": _published_status_filter(),
-        "is_active_today": True,
+        "active_date_key": today_key,
+    }
+    available = await db.products.find_one(scope, {"_id": 1}) is not None
+    message = (
+        ""
+        if available
+        else "Today's stock has not been uploaded for this branch."
+    )
+    return scope, today_key, available, message
+
+
+@router.get("/stock-search")
+async def stock_search(
+    part_numbers: Optional[str] = Query(
+        None,
+        description="Newline/comma-separated exact part numbers (Multiple Part Search).",
+    ),
+    q: Optional[str] = Query(
+        None,
+        description="Single-search query. With mode=prefix, matches part-number prefix / description.",
+    ),
+    mode: str = Query(
+        "exact",
+        description="exact = Multiple/exact part_numbers; prefix = single Stock Availability partial search.",
+    ),
+    limit: int = Query(100, ge=1, le=500),
+    session=Depends(get_device_session),
+):
+    """Stock Availability search.
+
+    - mode=prefix + q: partial/prefix part-number search (single search). part_numbers not required.
+    - mode=exact + part_numbers: exact multi-part search only (Multiple Part Search).
+    Both modes are restricted to today's IST published upload for the paired scope.
+    """
+    scope, today_key, today_available, unavailable_message = await _stock_search_today_scope(session)
+    base_meta = {
+        "inventory_date": today_key,
+        "inventory_date_ist": f"{today_key[0:4]}-{today_key[4:6]}-{today_key[6:8]}",
+        "today_upload_available": today_available,
+        "message": unavailable_message,
     }
 
     search_mode = (mode or "exact").strip().lower()
     query_text = (q or "").strip()
-    if search_mode == "prefix" or (query_text and not part_numbers):
+    use_prefix = search_mode == "prefix" or (bool(query_text) and not (part_numbers or "").strip())
+
+    if not today_available:
+        # Never fall back to yesterday/latest stock.
+        if use_prefix:
+            return {
+                **base_meta,
+                "results": [],
+                "not_found": [],
+                "mode": "prefix",
+                "query": query_text or (part_numbers or "").strip(),
+            }
+        parts = [p.strip() for p in re.split(r"[,\n;\s]+", part_numbers or "") if p.strip()]
+        return {
+            **base_meta,
+            "results": [],
+            "not_found": parts,
+            "mode": "exact",
+        }
+
+    if use_prefix:
         needle = query_text or (part_numbers or "").strip()
         if not needle:
             raise HTTPException(400, "Provide a search query")
         safe = re.escape(needle)
-        # Anchored prefix on part_number is efficient with the scoped part_number index.
-        # Description fields use contains so Product Hub-style name search still works.
         query = {
             **scope,
             "$or": [
@@ -1961,8 +2014,7 @@ async def stock_search(
                 {"description": {"$regex": safe, "$options": "i"}},
             ],
         }
-        cap = max(1, min(int(limit or 100), 500))
-        rows = await db.products.find(query, {"_id": 0}).sort("part_number", 1).limit(cap).to_list(cap)
+        rows = await db.products.find(query, {"_id": 0}).sort("part_number", 1).limit(limit).to_list(limit)
         upper = needle.upper()
         rows.sort(
             key=lambda r: (
@@ -1970,19 +2022,25 @@ async def stock_search(
                 str(r.get("part_number") or "").upper(),
             )
         )
-        # Prefix/partial queries must never list the query string as Not Found.
-        return {"results": rows, "not_found": [], "mode": "prefix", "query": needle}
+        return {
+            **base_meta,
+            "results": rows,
+            "not_found": [],
+            "mode": "prefix",
+            "query": needle,
+        }
 
     parts = [p.strip() for p in re.split(r"[,\n;\s]+", part_numbers or "") if p.strip()]
     if not parts:
         raise HTTPException(400, "Provide at least one part number")
 
+    # Exact match only — do not apply prefix logic here.
     query = {**scope, "part_number": {"$in": parts}}
     rows = await db.products.find(query, {"_id": 0}).to_list(2000)
     found_parts = {r["part_number"] for r in rows}
     found_upper = {str(p).upper() for p in found_parts}
     not_found = [p for p in parts if p not in found_parts and p.upper() not in found_upper]
-    return {"results": rows, "not_found": not_found, "mode": "exact"}
+    return {**base_meta, "results": rows, "not_found": not_found, "mode": "exact"}
 
 
 # ==================== AUDIT LOG ====================
@@ -2110,7 +2168,7 @@ async def ensure_mobile_indexes():
     except (DuplicateKeyError, OperationFailure) as exc:
         logger.error("Cannot create auto perpetual session index: %s", exc)
 
-    # Scoped part_number index for efficient mobile prefix stock-search.
+    # Scoped part_number index for efficient mobile prefix stock-search (IST today key).
     try:
         await db.products.create_index(
             [
@@ -2118,10 +2176,10 @@ async def ensure_mobile_indexes():
                 ("dealer_name", 1),
                 ("branch", 1),
                 ("publish_status", 1),
-                ("is_active_today", 1),
+                ("active_date_key", 1),
                 ("part_number", 1),
             ],
-            name="idx_mobile_stock_search_scope_part",
+            name="idx_mobile_stock_search_today_part",
         )
     except (DuplicateKeyError, OperationFailure) as exc:
         logger.error("Cannot create mobile stock-search product index: %s", exc)
