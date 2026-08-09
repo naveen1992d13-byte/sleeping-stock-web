@@ -310,7 +310,9 @@ export function Analytics() {
   );
 
   const load = useCallback(async () => {
+    // Wait until layout finishes hydrating scope (initial placeholder is "N/A").
     if (!scopeBrand || !scopeDealer || !scopeBranch) return;
+    if ([scopeBrand, scopeDealer, scopeBranch].some((v) => String(v) === 'N/A')) return;
     setLoading(true);
     try {
       // Backend contract (same as previous Analytics): metric_type + category + aging_type.
