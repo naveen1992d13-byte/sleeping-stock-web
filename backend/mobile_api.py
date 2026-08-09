@@ -1922,40 +1922,78 @@ async def perpetual_stock_device_lookup(part_number: str, session=Depends(get_de
 
 # ==================== STOCK SEARCH (MOBILE) ====================
 
-async def _stock_search_today_scope(session: dict):
-    """Authoritative Stock Availability scope: paired Brand/Dealer/Branch + IST today only.
+def _product_hub_stock_scope(session: dict, today_key: str) -> dict:
+    """Same current/active Product Hub filter used by `/product-hub/records`.
 
-    Uses active_date_key == IST YYYYMMDD. Does NOT fall back to the latest previous upload.
-    is_active_today alone is insufficient — older snapshots can remain flagged active.
+    Mirrors server._product_hub_active_query for the paired Brand/Dealer/Branch:
+    publish_status=Published + is_active_today=True + active_date_key=IST today.
+    Never falls back to history / previous-day / verification data.
     """
-    from auto_perpetual import inventory_date_key, ist_date_key
-
-    today_key = inventory_date_key()  # YYYYMMDD in Asia/Kolkata
-    scope = {
+    return {
         "brand_name": session["brand_name"],
         "dealer_name": session["dealer_name"],
         "branch": session["branch"],
-        "publish_status": _published_status_filter(),
+        "publish_status": "Published",
+        "is_active_today": True,
         "active_date_key": today_key,
     }
+
+
+async def _stock_search_product_hub_scope(session: dict):
+    """Authoritative Stock Availability scope = current Product Hub dataset."""
+    from auto_perpetual import inventory_date_key
+
+    today_key = inventory_date_key()  # YYYYMMDD in Asia/Kolkata (same as _nmts_date_key)
+    scope = _product_hub_stock_scope(session, today_key)
     available = await db.products.find_one(scope, {"_id": 1}) is not None
-    message = (
-        ""
-        if available
-        else "Today's stock has not been uploaded for this branch."
-    )
+    message = "" if available else "No stock uploaded today for this branch."
     return scope, today_key, available, message
+
+
+def _dedupe_product_hub_rows(rows: list) -> list:
+    """ONE current Product Hub part_number => ONE Mobile result card."""
+    seen = set()
+    unique = []
+    for row in rows or []:
+        key = str((row or {}).get("part_number") or "").strip().upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
+
+
+def _enrich_product_hub_stock_row(row: dict) -> dict:
+    """Attach the same aging fields Product Hub computes on read (no qty recalculation)."""
+    if not row:
+        return row
+    try:
+        # Lazy import avoids circular import at module load (server imports mobile_api).
+        from server import _order_stock_purchase_aging_days, _order_stock_sales_aging_days
+
+        row["purchase_aging_days"] = row.get("purchase_aging_days", _order_stock_purchase_aging_days(row))
+        row["sales_aging_days"] = row.get("sales_aging_days", _order_stock_sales_aging_days(row))
+        row["purchase_aging"] = row["purchase_aging_days"]
+        row["sales_aging"] = row["sales_aging_days"]
+    except Exception:
+        # Keep search working even if aging helpers are unavailable.
+        pass
+    # Prefer Product Hub numeric on-hand for Mobile mapping without changing stored data.
+    qty = row.get("available_qty_number")
+    if qty not in (None, "") and row.get("available_qty") in (None, ""):
+        row["available_qty"] = qty
+    return row
 
 
 @router.get("/stock-search")
 async def stock_search(
     part_numbers: Optional[str] = Query(
         None,
-        description="Newline/comma-separated exact part numbers (Multiple Part Search).",
+        description="Newline/comma-separated exact part numbers (Multiple Part Search). Optional for Single Search.",
     ),
     q: Optional[str] = Query(
         None,
-        description="Single-search query. With mode=prefix, matches part-number prefix / description.",
+        description="Single-search query. With mode=prefix, matches part-number prefix / description. part_numbers NOT required.",
     ),
     mode: str = Query(
         "exact",
@@ -1964,13 +2002,14 @@ async def stock_search(
     limit: int = Query(100, ge=1, le=500),
     session=Depends(get_device_session),
 ):
-    """Stock Availability search.
+    """Stock Availability search against current Product Hub data only.
 
-    - mode=prefix + q: partial/prefix part-number search (single search). part_numbers not required.
-    - mode=exact + part_numbers: exact multi-part search only (Multiple Part Search).
-    Both modes are restricted to today's IST published upload for the paired scope.
+    - mode=prefix + q: Single Search (exact or prefix). part_numbers is NOT required
+      (missing part_numbers must never yield HTTP 422).
+    - mode=exact + part_numbers: Multiple Part Search (exact matches only).
+    Scope matches Product Hub current/active records for the paired Brand/Dealer/Branch.
     """
-    scope, today_key, today_available, unavailable_message = await _stock_search_today_scope(session)
+    scope, today_key, today_available, unavailable_message = await _stock_search_product_hub_scope(session)
     base_meta = {
         "inventory_date": today_key,
         "inventory_date_ist": f"{today_key[0:4]}-{today_key[4:6]}-{today_key[6:8]}",
@@ -1980,10 +2019,11 @@ async def stock_search(
 
     search_mode = (mode or "exact").strip().lower()
     query_text = (q or "").strip()
+    # Single Search: mode=prefix + q (or q alone). Never require part_numbers.
     use_prefix = search_mode == "prefix" or (bool(query_text) and not (part_numbers or "").strip())
 
     if not today_available:
-        # Never fall back to yesterday/latest stock.
+        # Never fall back to yesterday / previous upload / history.
         if use_prefix:
             return {
                 **base_meta,
@@ -2014,7 +2054,10 @@ async def stock_search(
                 {"description": {"$regex": safe, "$options": "i"}},
             ],
         }
-        rows = await db.products.find(query, {"_id": 0}).sort("part_number", 1).limit(limit).to_list(limit)
+        # Fetch a bit extra before dedupe so prefix caps stay meaningful.
+        fetch_cap = max(1, min(int(limit or 100) * 2, 500))
+        rows = await db.products.find(query, {"_id": 0}).sort("part_number", 1).limit(fetch_cap).to_list(fetch_cap)
+        rows = _dedupe_product_hub_rows(rows)
         upper = needle.upper()
         rows.sort(
             key=lambda r: (
@@ -2022,6 +2065,7 @@ async def stock_search(
                 str(r.get("part_number") or "").upper(),
             )
         )
+        rows = [_enrich_product_hub_stock_row(r) for r in rows[: max(1, min(int(limit or 100), 500))]]
         return {
             **base_meta,
             "results": rows,
@@ -2032,14 +2076,24 @@ async def stock_search(
 
     parts = [p.strip() for p in re.split(r"[,\n;\s]+", part_numbers or "") if p.strip()]
     if not parts:
+        # Exact mode without part_numbers is a client contract mistake — 400, never 422.
         raise HTTPException(400, "Provide at least one part number")
 
-    # Exact match only — do not apply prefix logic here.
-    query = {**scope, "part_number": {"$in": parts}}
+    # Exact match only within current Product Hub scope — do not apply prefix logic here.
+    # Include upper/lower variants so Mobile-normalized inputs still match stored casing.
+    part_candidates = list({p for p in parts} | {p.upper() for p in parts} | {p.lower() for p in parts})
+    query = {**scope, "part_number": {"$in": part_candidates}}
     rows = await db.products.find(query, {"_id": 0}).to_list(2000)
-    found_parts = {r["part_number"] for r in rows}
-    found_upper = {str(p).upper() for p in found_parts}
-    not_found = [p for p in parts if p not in found_parts and p.upper() not in found_upper]
+    rows = [_enrich_product_hub_stock_row(r) for r in _dedupe_product_hub_rows(rows)]
+    found_upper = {str(r.get("part_number") or "").strip().upper() for r in rows}
+    not_found = []
+    seen_nf = set()
+    for p in parts:
+        up = p.upper()
+        if up in found_upper or up in seen_nf:
+            continue
+        not_found.append(p)
+        seen_nf.add(up)
     return {**base_meta, "results": rows, "not_found": not_found, "mode": "exact"}
 
 
