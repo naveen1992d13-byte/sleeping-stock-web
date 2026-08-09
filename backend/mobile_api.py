@@ -133,19 +133,22 @@ async def generate_mobile_user_id(branch_name: str) -> str:
     """
     code = _branch_code(branch_name)
     date_key = _now().strftime("%y%m%d")
-    counter_key = f"mobile_user:{code}:{date_key}"
-    counter = await db.counters.find_one_and_update(
-        {"_id": counter_key},
-        {"$inc": {"seq": 1}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
-    seq = counter["seq"]
-    if seq > 9999:
-        # Extremely unlikely (9999 mobile users onboarded in one branch in
-        # one day) but guard against overflow rather than truncate silently.
-        raise HTTPException(500, "Daily mobile user serial exhausted for this branch")
-    return f"MU{code}{date_key}{seq:04d}"
+    branch_key = re.sub(r"[^A-Za-z0-9]", "", (branch_name or "").upper())[:32] or "GEN"
+    counter_key = f"mobile_user:{code}:{date_key}:{branch_key}"
+    for _attempt in range(8):
+        counter = await db.counters.find_one_and_update(
+            {"_id": counter_key},
+            {"$inc": {"seq": 1}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        seq = counter["seq"]
+        if seq > 9999:
+            raise HTTPException(500, "Daily mobile user serial exhausted for this branch")
+        candidate = f"MU{code}{date_key}{seq:04d}"
+        if not await db.mobile_users.find_one({"mobile_user_id": candidate}, {"_id": 1}):
+            return candidate
+    raise HTTPException(500, "Unable to allocate a unique Mobile User ID — try again")
 
 
 def _generate_manual_code() -> str:
@@ -164,6 +167,73 @@ def _normalize_mobile_number(value: str) -> str:
     return digits
 
 
+def _scope_ci(value: str) -> dict:
+    return {"$regex": f"^{re.escape((value or '').strip())}$", "$options": "i"}
+
+
+def _is_aggregate_scope(value: str) -> bool:
+    v = (value or "").strip()
+    if not v or v.upper() == "N/A":
+        return True
+    return v.lower().startswith("all ")
+
+
+def _normalize_pairing_code(value: str) -> str:
+    """Pairing codes are six digits; tolerate stray whitespace from QR/manual entry."""
+    return re.sub(r"\D", "", (value or "").strip())
+
+
+def _dedupe_api_base_path(url: str) -> str:
+    base = (url or "").strip().rstrip("/")
+    while base.lower().endswith("/api/api"):
+        base = base[:-4]
+    return base
+
+
+async def _resolve_canonical_pairing_scope(brand: str, dealer: str, branch: str) -> tuple:
+    """Resolve Brand + Dealer + Branch to exact master-data names (generic for all dealers)."""
+    brand = (brand or "").strip()
+    dealer = (dealer or "").strip()
+    branch = (branch or "").strip()
+    if _is_aggregate_scope(brand) or _is_aggregate_scope(dealer) or _is_aggregate_scope(branch):
+        raise HTTPException(
+            400,
+            "Select a specific Brand, Dealer and Branch before pairing. "
+            "'All Branches' cannot be used for mobile pairing.",
+        )
+    if not (brand and dealer and branch):
+        raise HTTPException(400, "Brand, Dealer and Branch must all be selected before generating a pairing code")
+
+    brand_doc = await db.brands.find_one({"name": _scope_ci(brand)}, {"_id": 0, "name": 1})
+    if not brand_doc:
+        raise HTTPException(400, f"Invalid brand selected: {brand}")
+
+    dealer_doc = await db.dealers.find_one({"name": _scope_ci(dealer)}, {"_id": 0, "name": 1, "brand": 1, "brand_name": 1})
+    if not dealer_doc:
+        dealer_doc = await db.groups.find_one({"name": _scope_ci(dealer)}, {"_id": 0, "name": 1})
+    if not dealer_doc:
+        raise HTTPException(400, f"Invalid dealer selected: {dealer}")
+
+    canonical_dealer = (dealer_doc.get("name") or dealer).strip()
+    branch_doc = await db.branches.find_one(
+        {"dealer": _scope_ci(canonical_dealer), "name": _scope_ci(branch)},
+        {"_id": 0, "name": 1, "brand": 1, "brand_name": 1, "dealer": 1},
+    )
+    if not branch_doc:
+        branch_doc = await db.branches.find_one(
+            {"dealer": canonical_dealer, "name": _scope_ci(branch)},
+            {"_id": 0, "name": 1, "brand": 1, "brand_name": 1, "dealer": 1},
+        )
+    if not branch_doc:
+        raise HTTPException(400, f"Invalid branch '{branch}' for dealer '{canonical_dealer}'")
+
+    canonical_brand = (brand_doc.get("name") or brand).strip()
+    branch_brand = (branch_doc.get("brand") or branch_doc.get("brand_name") or "").strip()
+    if branch_brand and branch_brand.casefold() != canonical_brand.casefold():
+        raise HTTPException(400, "Selected branch does not belong to the selected brand")
+
+    canonical_branch = (branch_doc.get("name") or branch).strip()
+    return canonical_brand, canonical_dealer, canonical_branch
 
 
 def _public_api_base_url(request: Request) -> str:
@@ -173,10 +243,12 @@ def _public_api_base_url(request: Request) -> str:
     current request origin is used, which works with HTTPS Codespaces/preview
     URLs without rebuilding the mobile app.
     """
-    configured = (os.getenv("PUBLIC_API_BASE_URL") or "").strip().rstrip("/")
+    configured = _dedupe_api_base_path(os.getenv("PUBLIC_API_BASE_URL") or "")
     if configured:
         if not configured.lower().startswith("https://"):
             raise HTTPException(500, "PUBLIC_API_BASE_URL must use HTTPS")
+        if not configured.lower().endswith("/api"):
+            configured = f"{configured}/api"
         return configured
 
     forwarded_proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",")[0].strip()
@@ -185,9 +257,15 @@ def _public_api_base_url(request: Request) -> str:
         raise HTTPException(500, "Unable to determine the public NMTS server URL")
     if forwarded_proto != "https":
         raise HTTPException(500, "Pairing QR requires an HTTPS public backend URL")
-    return f"https://{forwarded_host}/api".rstrip("/")
+    return _dedupe_api_base_path(f"https://{forwarded_host}/api")
 
 def _require_scope_selected(brand, dealer, branch):
+    if _is_aggregate_scope(brand) or _is_aggregate_scope(dealer) or _is_aggregate_scope(branch):
+        raise HTTPException(
+            400,
+            "Select a specific Brand, Dealer and Branch before pairing. "
+            "'All Branches' cannot be used for mobile pairing.",
+        )
     if not (brand and dealer and branch):
         raise HTTPException(400, "Brand, Dealer and Branch must all be selected before generating a pairing code")
 
@@ -399,6 +477,8 @@ async def create_mobile_user(payload: MobileUserCreate, current_user: UserRespon
         brand, dealer, branch = current_user.brand, current_user.group, current_user.location
         _require_scope_selected(brand, dealer, branch)
 
+    brand, dealer, branch = await _resolve_canonical_pairing_scope(brand, dealer, branch)
+
     normalized_mobile = _normalize_mobile_number(payload.mobile_number)
     existing = await db.mobile_users.find_one({"normalized_mobile_number": normalized_mobile}, {"_id": 0})
     if existing:
@@ -569,6 +649,7 @@ async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBran
     else:
         raise HTTPException(403, "Only Master/Admin can change a mobile user's branch")
     _require_scope_selected(brand, dealer, branch)
+    brand, dealer, branch = await _resolve_canonical_pairing_scope(brand, dealer, branch)
 
     await db.mobile_users.update_one({"mobile_user_id": mobile_user_id}, {"$set": {
         "brand_name": brand, "dealer_name": dealer, "branch": branch,
@@ -615,13 +696,26 @@ async def generate_pairing_code(request: Request, payload: PairingGenerateReques
     elif current_user.role == "admin":
         brand, dealer = current_user.brand, current_user.group
         branch = payload.branch or (mobile_user or {}).get("branch")
-        if mobile_user and (mobile_user.get("brand_name") != brand or mobile_user.get("dealer_name") != dealer):
-            raise HTTPException(403, "Mobile user is outside your Brand/Dealer scope")
     else:
         brand, dealer, branch = current_user.brand, current_user.group, current_user.location
         if pairing_type == "REPAIR" and mobile_user.get("branch") != branch:
             raise HTTPException(403, "Mobile user is outside your assigned Branch")
     _require_scope_selected(brand, dealer, branch)
+    brand, dealer, branch = await _resolve_canonical_pairing_scope(brand, dealer, branch)
+
+    if current_user.role == "admin" and mobile_user:
+        if (
+            (mobile_user.get("brand_name") or "").casefold() != brand.casefold()
+            or (mobile_user.get("dealer_name") or "").casefold() != dealer.casefold()
+        ):
+            raise HTTPException(403, "Mobile user is outside your Brand/Dealer scope")
+
+    if pairing_type == "REPAIR" and mobile_user:
+        if (
+            (mobile_user.get("brand_name") or "").casefold() != brand.casefold()
+            or (mobile_user.get("dealer_name") or "").casefold() != dealer.casefold()
+        ):
+            raise HTTPException(403, "Mobile user is outside the selected Brand/Dealer scope")
 
     raw_code = _generate_manual_code()
     raw_pairing_token = _new_raw_token()
@@ -647,7 +741,17 @@ async def generate_pairing_code(request: Request, payload: PairingGenerateReques
     else:
         invalidate_query.update({"pairing_type": "NEW", "brand_name": brand, "dealer_name": dealer, "branch": branch})
     await db.mobile_pairing_codes.update_many(invalidate_query, {"$set": {"used": True, "used_at": _now_iso(), "invalidated_reason": "superseded"}})
-    await db.mobile_pairing_codes.insert_one(dict(pairing_doc))
+    for _attempt in range(6):
+        try:
+            await db.mobile_pairing_codes.insert_one(dict(pairing_doc))
+            break
+        except DuplicateKeyError:
+            pairing_doc["pairing_code"] = _generate_manual_code()
+            raw_code = pairing_doc["pairing_code"]
+            raw_pairing_token = _new_raw_token()
+            pairing_doc["pairing_token_hash"] = _hash_token(raw_pairing_token)
+    else:
+        raise HTTPException(500, "Unable to allocate a unique pairing code — try again")
     await _audit(current_user, f"generate_{pairing_type.lower()}_pairing_code", target_id or branch, {"branch": branch})
 
     expires_at_iso = pairing_doc["expires_at"].isoformat()
@@ -678,13 +782,17 @@ async def verify_pairing_and_register_device(payload: PairingVerifyRequest):
     if not payload.device_user_name.strip():
         raise HTTPException(400, "Device user name is required")
 
+    pairing_code = _normalize_pairing_code(payload.pairing_code)
+    if not pairing_code:
+        raise HTTPException(400, "Pairing code is required")
+
     # QR pairing uses the high-entropy token as the primary lookup key. A short
     # 6-digit code can legitimately collide across branches, so looking up by
     # code alone could select another branch's record.
     if payload.pairing_token:
         lookup = {
             "pairing_token_hash": _hash_token(payload.pairing_token),
-            "pairing_code": payload.pairing_code.strip(),
+            "pairing_code": pairing_code,
             "used": False,
         }
         pairing_doc = await db.mobile_pairing_codes.find_one(lookup, {"_id": 0})
@@ -692,7 +800,7 @@ async def verify_pairing_and_register_device(payload: PairingVerifyRequest):
         # Backward-compatible manual-code path. Reject an ambiguous code rather
         # than pairing the device to an arbitrary branch.
         matches = await db.mobile_pairing_codes.find(
-            {"pairing_code": payload.pairing_code.strip(), "used": False}, {"_id": 0}
+            {"pairing_code": pairing_code, "used": False}, {"_id": 0}
         ).limit(2).to_list(2)
         if len(matches) > 1:
             raise HTTPException(409, "Pairing code is ambiguous. Scan the QR code instead.")
@@ -709,27 +817,26 @@ async def verify_pairing_and_register_device(payload: PairingVerifyRequest):
         if not expected_hash or _hash_token(payload.pairing_token) != expected_hash:
             raise HTTPException(400, "This is not a valid NMTS pairing QR code")
 
+    scope_brand, scope_dealer, scope_branch = await _resolve_canonical_pairing_scope(
+        pairing_doc.get("brand_name"),
+        pairing_doc.get("dealer_name"),
+        pairing_doc.get("branch"),
+    )
+    pairing_doc = {
+        **pairing_doc,
+        "brand_name": scope_brand,
+        "dealer_name": scope_dealer,
+        "branch": scope_branch,
+    }
+
     pairing_type = (pairing_doc.get("pairing_type") or payload.pairing_type or ("REPAIR" if pairing_doc.get("mobile_user_id") else "NEW")).upper()
+    mobile_user = None
     if pairing_type == "NEW":
         existing = await db.mobile_users.find_one({"normalized_mobile_number": normalized_mobile}, {"_id": 0})
         if not existing:
             existing = await db.mobile_users.find_one({"mobile_number": normalized_mobile}, {"_id": 0})
         if existing:
             raise HTTPException(status_code=409, detail={"code": "MOBILE_USER_ALREADY_EXISTS", "message": "Mobile User ID already created for this mobile number. Ask Admin to generate a Re-pair QR.", "mobile_user_id": existing.get("mobile_user_id"), "re_pair_required": True})
-        mobile_user_id = await generate_mobile_user_id(pairing_doc["branch"])
-        mobile_user = {
-            "mobile_user_id": mobile_user_id, "name": payload.device_user_name.strip(),
-            "mobile_number": normalized_mobile, "normalized_mobile_number": normalized_mobile,
-            "brand_name": pairing_doc["brand_name"], "dealer_name": pairing_doc["dealer_name"], "branch": pairing_doc["branch"],
-            "status": "active", "created_by_user_id": pairing_doc.get("created_by_user_id", ""),
-            "created_by_name": pairing_doc.get("created_by_name", ""), "created_by_role": "pairing",
-            "created_at": now.isoformat(), "updated_at": now.isoformat(), "paired_device_count": 0, "active_device_count": 0, "last_active_at": None,
-        }
-        try:
-            await db.mobile_users.insert_one(dict(mobile_user))
-        except DuplicateKeyError:
-            existing = await db.mobile_users.find_one({"normalized_mobile_number": normalized_mobile}, {"_id": 0})
-            raise HTTPException(status_code=409, detail={"code": "MOBILE_USER_ALREADY_EXISTS", "message": "Mobile User ID already created. Use Re-pair.", "mobile_user_id": (existing or {}).get("mobile_user_id"), "re_pair_required": True})
     else:
         target_id = (pairing_doc.get("mobile_user_id") or payload.mobile_user_id or "").strip().upper()
         mobile_user = await db.mobile_users.find_one({"mobile_user_id": target_id}, {"_id": 0})
@@ -738,25 +845,67 @@ async def verify_pairing_and_register_device(payload: PairingVerifyRequest):
         stored_mobile = mobile_user.get("normalized_mobile_number") or _normalize_mobile_number(mobile_user.get("mobile_number", ""))
         if stored_mobile != normalized_mobile:
             raise HTTPException(409, "Entered mobile number does not match this Re-pair QR")
-        await db.mobile_sessions.delete_many({"mobile_user_id": target_id})
-        await db.mobile_devices.update_many({"mobile_user_id": target_id, "status": "active"}, {"$set": {"status": "inactive", "inactive_reason": "repaired", "updated_at": now.isoformat()}})
-        await db.mobile_users.update_one({"mobile_user_id": target_id}, {"$set": {"active_device_count": 0, "updated_at": now.isoformat()}})
 
     consume_filter = {"pairing_code": pairing_doc["pairing_code"], "used": False}
     if payload.pairing_token:
         consume_filter["pairing_token_hash"] = pairing_doc["pairing_token_hash"]
-    consumed = await db.mobile_pairing_codes.find_one_and_update(consume_filter, {"$set": {"used": True, "used_at": now.isoformat()}}, return_document=ReturnDocument.AFTER)
+    consumed = await db.mobile_pairing_codes.find_one_and_update(
+        consume_filter,
+        {"$set": {"used": True, "used_at": now.isoformat()}},
+        return_document=ReturnDocument.AFTER,
+    )
     if not consumed:
-        if pairing_type == "NEW":
-            await db.mobile_users.delete_one({"mobile_user_id": mobile_user["mobile_user_id"], "paired_device_count": 0})
         raise HTTPException(409, "Pairing code was already used by another device")
 
-    device_id = str(uuid.uuid4())
-    raw_session_token = _new_raw_token()
-    device_doc = {"device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "device_user_name": payload.device_user_name.strip(), "device_user_mobile": normalized_mobile, "device_name": payload.device_name, "device_info": payload.device_info or "", "push_token": payload.push_token or "", "paired_at": now.isoformat(), "last_active_at": now.isoformat(), "app_version": payload.app_version or "", "status": "active", "brand_name": mobile_user["brand_name"], "dealer_name": mobile_user["dealer_name"], "branch": mobile_user["branch"], "session_token_hash": _hash_token(raw_session_token)}
-    await db.mobile_devices.insert_one(dict(device_doc))
-    await db.mobile_sessions.insert_one({"session_token_hash": device_doc["session_token_hash"], "device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "created_at": now.isoformat()})
-    await db.mobile_users.update_one({"mobile_user_id": mobile_user["mobile_user_id"]}, {"$inc": {"paired_device_count": 1}, "$set": {"active_device_count": 1, "last_active_at": now.isoformat(), "updated_at": now.isoformat()}})
+    try:
+        if pairing_type == "NEW":
+            mobile_user_id = await generate_mobile_user_id(pairing_doc["branch"])
+            mobile_user = {
+                "mobile_user_id": mobile_user_id, "name": payload.device_user_name.strip(),
+                "mobile_number": normalized_mobile, "normalized_mobile_number": normalized_mobile,
+                "brand_name": pairing_doc["brand_name"], "dealer_name": pairing_doc["dealer_name"], "branch": pairing_doc["branch"],
+                "status": "active", "created_by_user_id": pairing_doc.get("created_by_user_id", ""),
+                "created_by_name": pairing_doc.get("created_by_name", ""), "created_by_role": "pairing",
+                "created_at": now.isoformat(), "updated_at": now.isoformat(), "paired_device_count": 0, "active_device_count": 0, "last_active_at": None,
+            }
+            try:
+                await db.mobile_users.insert_one(dict(mobile_user))
+            except DuplicateKeyError:
+                existing = await db.mobile_users.find_one(
+                    {"$or": [{"normalized_mobile_number": normalized_mobile}, {"mobile_user_id": mobile_user["mobile_user_id"]}]},
+                    {"_id": 0},
+                )
+                raise HTTPException(status_code=409, detail={
+                    "code": "MOBILE_USER_ALREADY_EXISTS",
+                    "message": "Mobile User ID already created. Use Re-pair.",
+                    "mobile_user_id": (existing or {}).get("mobile_user_id"),
+                    "re_pair_required": True,
+                })
+        else:
+            target_id = mobile_user["mobile_user_id"]
+            await db.mobile_sessions.delete_many({"mobile_user_id": target_id})
+            await db.mobile_devices.update_many({"mobile_user_id": target_id, "status": "active"}, {"$set": {"status": "inactive", "inactive_reason": "repaired", "updated_at": now.isoformat()}})
+            await db.mobile_users.update_one({"mobile_user_id": target_id}, {"$set": {"active_device_count": 0, "updated_at": now.isoformat()}})
+
+        device_id = str(uuid.uuid4())
+        raw_session_token = _new_raw_token()
+        device_doc = {"device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "device_user_name": payload.device_user_name.strip(), "device_user_mobile": normalized_mobile, "device_name": payload.device_name, "device_info": payload.device_info or "", "push_token": payload.push_token or "", "paired_at": now.isoformat(), "last_active_at": now.isoformat(), "app_version": payload.app_version or "", "status": "active", "brand_name": pairing_doc["brand_name"], "dealer_name": pairing_doc["dealer_name"], "branch": pairing_doc["branch"], "session_token_hash": _hash_token(raw_session_token)}
+        await db.mobile_devices.insert_one(dict(device_doc))
+        await db.mobile_sessions.insert_one({"session_token_hash": device_doc["session_token_hash"], "device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "created_at": now.isoformat()})
+        await db.mobile_users.update_one({"mobile_user_id": mobile_user["mobile_user_id"]}, {"$inc": {"paired_device_count": 1}, "$set": {"active_device_count": 1, "last_active_at": now.isoformat(), "updated_at": now.isoformat()}})
+    except HTTPException:
+        await db.mobile_pairing_codes.update_one(
+            {"pairing_token_hash": pairing_doc["pairing_token_hash"], "pairing_code": pairing_doc["pairing_code"]},
+            {"$set": {"used": False, "used_at": None, "invalidated_reason": "verify_failed_rollback"}},
+        )
+        raise
+    except Exception:
+        await db.mobile_pairing_codes.update_one(
+            {"pairing_token_hash": pairing_doc["pairing_token_hash"], "pairing_code": pairing_doc["pairing_code"]},
+            {"$set": {"used": False, "used_at": None, "invalidated_reason": "verify_failed_rollback"}},
+        )
+        raise
+
     await _audit(None, "device_repaired" if pairing_type == "REPAIR" else "device_paired", mobile_user["mobile_user_id"], {"device_id": device_id}, actor_override=mobile_user["mobile_user_id"])
     return {"session_token": raw_session_token, "device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "name": payload.device_user_name.strip(), "device_user_name": payload.device_user_name.strip(), "device_user_mobile": normalized_mobile, "brand_name": device_doc["brand_name"], "dealer_name": device_doc["dealer_name"], "branch": device_doc["branch"], "pairing_type": pairing_type}
 
@@ -2421,6 +2570,15 @@ async def ensure_mobile_indexes():
 
     await db.mobile_pairing_codes.create_index([("mobile_user_id", 1), ("pairing_code", 1)])
     await db.mobile_pairing_codes.create_index([("expires_at", 1)], expireAfterSeconds=0)
+    try:
+        await db.mobile_pairing_codes.create_index(
+            [("pairing_token_hash", 1)],
+            unique=True,
+            name="uq_active_pairing_token_hash",
+            partialFilterExpression={"used": False, "pairing_token_hash": {"$type": "string"}},
+        )
+    except (DuplicateKeyError, OperationFailure) as exc:
+        logger.warning("Active pairing token index not created: %s", exc)
 
     await db.mobile_notification_actions.create_index([("request_id", 1), ("mobile_user_id", 1)], unique=True)
 

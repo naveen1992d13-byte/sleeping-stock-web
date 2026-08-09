@@ -3,7 +3,10 @@ import Constants from 'expo-constants';
 const fallbackApiBaseUrl = '';
 
 export function normalizeApiBaseUrl(value) {
-  const raw = String(value || '').trim().replace(/\/+$/, '');
+  let raw = String(value || '').trim().replace(/\/+$/, '');
+  while (/\/api\/api$/i.test(raw)) {
+    raw = raw.replace(/\/api$/i, '');
+  }
   if (!raw) throw new Error('NMTS server URL is not configured. Scan the pairing QR from the NMTS website.');
 
   let parsed;
