@@ -285,6 +285,10 @@ export function Analytics() {
 
   const bounds = useMemo(() => monthBounds(month), [month]);
   const isValue = metricMode === 'value';
+  const scopeParams = useMemo(
+    () => scopeQuery(scopeBrand, scopeDealer, scopeBranch),
+    [scopeBrand, scopeDealer, scopeBranch]
+  );
 
   const fmtMetric = useCallback(
     (value) => {
@@ -294,6 +298,7 @@ export function Analytics() {
     [isValue]
   );
 
+  // Charts show ₹ Lakhs in Value Wise (sample), raw qty in Item Wise.
   const fmtChart = useCallback(
     (value) => {
       if (isNullMetric(value)) return null;
@@ -304,27 +309,26 @@ export function Analytics() {
     [isValue]
   );
 
-  const pick = useCallback(
-    (row, valueKey, qtyKey) => (isValue ? row?.[valueKey] : row?.[qtyKey]),
-    [isValue]
-  );
-
   const load = useCallback(async () => {
     if (!scopeBrand || !scopeDealer || !scopeBranch) return;
     setLoading(true);
     try {
-      const token = localStorage.getItem('token');
-      const headers = { Authorization: `Bearer ${token}` };
-      const base = {
+      // Backend contract (same as previous Analytics): metric_type + category + aging_type.
+      // Omit All* scope filters so authorized scope is consolidated server-side.
+      const common = {
         ...bounds,
-        ...scopeQuery(scopeBrand, scopeDealer, scopeBranch),
-        part_type: partType && partType !== 'All' ? partType : undefined,
+        ...scopeParams,
+        metric_type: metricMode,
+        aging_type: 'purchase',
+        ...(partType && partType !== 'All' ? { category: partType } : {}),
       };
       const [st, ag, os, ra] = await Promise.all([
-        axios.get(`${API}/analytics/stock-trend`, { headers, params: base }),
-        axios.get(`${API}/analytics/aging-trend`, { headers, params: base }),
-        axios.get(`${API}/analytics/order-saving`, { headers, params: base }),
-        axios.get(`${API}/analytics/request-acceptance`, { headers, params: base }),
+        axios.get(`${API}/analytics/stock-trend`, { params: common }),
+        axios.get(`${API}/analytics/aging-trend`, { params: common }),
+        axios.get(`${API}/analytics/order-saving`, { params: common }),
+        axios.get(`${API}/analytics/request-acceptance`, {
+          params: { ...common, request_direction: 'received' },
+        }),
       ]);
       setStockTrend(st.data);
       setAgingTrend(ag.data);
@@ -332,61 +336,60 @@ export function Analytics() {
       setRequestAcceptance(ra.data);
     } catch (err) {
       console.error(err);
-      toast.error(err?.response?.data?.detail || 'Failed to load analytics');
+      const detail = err?.response?.data?.detail;
+      toast.error(typeof detail === 'string' ? detail : 'Failed to load analytics');
     } finally {
       setLoading(false);
     }
-  }, [bounds, scopeBrand, scopeDealer, scopeBranch, partType]);
+  }, [bounds, scopeParams, scopeBrand, scopeDealer, scopeBranch, partType, metricMode]);
 
   useEffect(() => {
     load();
   }, [load]);
 
-  // —— Daily stock (uploaded days only — sample: "Days with no upload are not shown") ——
+  // —— Daily stock: series[].closing; hide NO_UPLOAD days (sample note) ——
   const stockPoints = useMemo(() => {
-    const days = stockTrend?.days || [];
-    return days
-      .filter((d) => d.has_upload && !isNullMetric(pick(d, 'stock_value', 'stock_qty')))
+    return (stockTrend?.series || [])
+      .filter((d) => d.data_status !== 'NO_UPLOAD' && !isNullMetric(d.closing))
+      .map((d) => ({
+        date: d.date,
+        label: dayLabel(d.date),
+        value: fmtChart(d.closing),
+        raw: d.closing,
+        data_status: d.data_status,
+      }));
+  }, [stockTrend, fmtChart]);
+
+  // —— Aging: daily[] with bucket keys on the row; hide NO_UPLOAD ——
+  const agingPoints = useMemo(() => {
+    return (agingTrend?.daily || [])
+      .filter((d) => d.data_status !== 'NO_UPLOAD')
       .map((d) => {
-        const raw = pick(d, 'stock_value', 'stock_qty');
-        return {
+        const point = {
           date: d.date,
           label: dayLabel(d.date),
-          value: fmtChart(raw),
-          raw,
+          totalRaw: isNullMetric(d.total) ? 0 : Number(d.total),
+          data_status: d.data_status,
         };
-      });
-  }, [stockTrend, pick, fmtChart]);
-
-  // —— Aging (uploaded days only) ——
-  const agingPoints = useMemo(() => {
-    const days = agingTrend?.days || [];
-    return days
-      .filter((d) => d.has_upload)
-      .map((d) => {
-        const point = { date: d.date, label: dayLabel(d.date), totalRaw: 0 };
-        let total = 0;
         AGING_BUCKETS.forEach((b) => {
-          const raw = pick(d.buckets?.[b], 'value', 'qty');
-          const chart = isNullMetric(raw) ? 0 : fmtChart(raw);
-          point[b] = chart;
+          const raw = d[b];
+          point[b] = isNullMetric(raw) ? 0 : fmtChart(raw);
           point[`${b}__raw`] = raw;
-          total += Number(raw || 0);
         });
-        point.totalRaw = total;
-        point.totalLabel = fmtChart(total);
+        point.totalLabel = fmtChart(point.totalRaw);
         return point;
       });
-  }, [agingTrend, pick, fmtChart]);
+  }, [agingTrend, fmtChart]);
 
-  // —— Orders (all calendar days with activity; keep zeros for order desk days) ——
+  // —— Orders: series + summary (items keys for Item Wise) ——
   const orderPoints = useMemo(() => {
-    const days = orderSaving?.days || [];
-    return days.map((d) => {
-      const original = pick(d, 'original_order_value', 'original_order_qty') || 0;
-      const reduced = pick(d, 'reduced_value', 'reduced_qty') || 0;
-      const finalOrder = pick(d, 'final_order_value', 'final_order_qty');
-      const finalVal = isNullMetric(finalOrder) ? Number(original) - Number(reduced) : finalOrder;
+    return (orderSaving?.series || []).map((d) => {
+      const original = isValue ? d.original_order_value : d.original_order_items;
+      const reduced = isValue ? d.reduced_value : d.reduced_items;
+      const finalOrder = isValue ? d.final_order_value : d.final_order_items;
+      const finalVal = isNullMetric(finalOrder)
+        ? Number(original || 0) - Number(reduced || 0)
+        : finalOrder;
       return {
         date: d.date,
         label: dayLabel(d.date),
@@ -399,72 +402,77 @@ export function Analytics() {
         finalRaw: finalVal,
       };
     });
-  }, [orderSaving, pick, fmtChart]);
+  }, [orderSaving, isValue, fmtChart]);
 
   const orderSummary = useMemo(() => {
     const s = orderSaving?.summary || {};
-    const original = pick(s, 'original_order_value', 'original_order_qty') || 0;
-    const reduced = pick(s, 'reduced_value', 'reduced_qty') || 0;
-    const finalOrder = pick(s, 'final_order_value', 'final_order_qty');
-    const finalVal = isNullMetric(finalOrder) ? Number(original) - Number(reduced) : finalOrder;
+    const original = isValue ? s.original_order_value : s.original_order_items;
+    const reduced = isValue ? s.reduced_value : s.reduced_items;
+    const finalOrder = isValue ? s.final_order_value : s.final_order_items;
+    const finalVal = isNullMetric(finalOrder)
+      ? Number(original || 0) - Number(reduced || 0)
+      : finalOrder;
     return {
-      original,
-      reduced,
-      final: finalVal,
+      original: original || 0,
+      reduced: reduced || 0,
+      final: finalVal || 0,
       reduction_pct: Number(s.reduction_pct || 0),
     };
-  }, [orderSaving, pick]);
+  }, [orderSaving, isValue]);
 
-  // —— Requests ——
+  // —— Requests: series + summary ——
   const requestPoints = useMemo(() => {
-    const days = requestAcceptance?.days || [];
-    return days.map((d) => {
-      const received = pick(d, 'request_value', 'request_qty') || 0;
-      const branch = pick(d, 'accepted_branch_value', 'accepted_branch_qty') || 0;
-      const dealer = pick(d, 'accepted_dealer_value', 'accepted_dealer_qty') || 0;
-      const fulfilled = pick(d, 'accepted_value', 'accepted_qty');
-      const fulfilledVal = isNullMetric(fulfilled) ? Number(branch) + Number(dealer) : fulfilled;
-      const notFulfilled = pick(d, 'rejected_value', 'rejected_qty');
+    return (requestAcceptance?.series || []).map((d) => {
+      const received = isValue ? d.request_received_value : d.request_received_items;
+      const branch = isValue ? d.given_to_branches_value : d.given_to_branches_items;
+      const dealer = isValue ? d.given_to_dealers_value : d.given_to_dealers_items;
+      const fulfilled = isValue ? d.total_fulfilled_value : d.total_fulfilled_items;
+      const notFulfilled = isValue ? d.not_fulfilled_value : d.not_fulfilled_items;
+      const fulfilledVal = isNullMetric(fulfilled)
+        ? Number(branch || 0) + Number(dealer || 0)
+        : fulfilled;
       const notVal = isNullMetric(notFulfilled)
-        ? Math.max(0, Number(received) - Number(fulfilledVal))
+        ? Math.max(0, Number(received || 0) - Number(fulfilledVal || 0))
         : notFulfilled;
       return {
         date: d.date,
         label: dayLabel(d.date),
-        receivedRaw: received,
-        branchRaw: branch,
-        dealerRaw: dealer,
-        fulfilledRaw: fulfilledVal,
-        notFulfilledRaw: notVal,
-        fulfillment_pct: Number(d.acceptance_pct || 0),
+        receivedRaw: received || 0,
+        branchRaw: branch || 0,
+        dealerRaw: dealer || 0,
+        fulfilledRaw: fulfilledVal || 0,
+        notFulfilledRaw: notVal || 0,
+        fulfillment_pct: Number(d.fulfillment_pct || 0),
       };
     });
-  }, [requestAcceptance, pick]);
+  }, [requestAcceptance, isValue]);
 
   const requestSummary = useMemo(() => {
     const s = requestAcceptance?.summary || {};
-    const received = pick(s, 'request_value', 'request_qty') || 0;
-    const branch = pick(s, 'accepted_branch_value', 'accepted_branch_qty') || 0;
-    const dealer = pick(s, 'accepted_dealer_value', 'accepted_dealer_qty') || 0;
-    const fulfilled = pick(s, 'accepted_value', 'accepted_qty');
-    const fulfilledVal = isNullMetric(fulfilled) ? Number(branch) + Number(dealer) : fulfilled;
-    const notFulfilled = pick(s, 'rejected_value', 'rejected_qty');
+    const received = isValue ? s.request_received_value : s.request_received_items;
+    const branch = isValue ? s.given_to_branches_value : s.given_to_branches_items;
+    const dealer = isValue ? s.given_to_dealers_value : s.given_to_dealers_items;
+    const fulfilled = isValue ? s.total_fulfilled_value : s.total_fulfilled_items;
+    const notFulfilled = isValue ? s.not_fulfilled_value : s.not_fulfilled_items;
+    const fulfilledVal = isNullMetric(fulfilled)
+      ? Number(branch || 0) + Number(dealer || 0)
+      : fulfilled;
     const notVal = isNullMetric(notFulfilled)
-      ? Math.max(0, Number(received) - Number(fulfilledVal))
+      ? Math.max(0, Number(received || 0) - Number(fulfilledVal || 0))
       : notFulfilled;
-    const branchPct = fulfilledVal > 0 ? (Number(branch) / Number(fulfilledVal)) * 100 : 0;
-    const dealerPct = fulfilledVal > 0 ? (Number(dealer) / Number(fulfilledVal)) * 100 : 0;
+    const branchPct = fulfilledVal > 0 ? (Number(branch || 0) / Number(fulfilledVal)) * 100 : 0;
+    const dealerPct = fulfilledVal > 0 ? (Number(dealer || 0) / Number(fulfilledVal)) * 100 : 0;
     return {
-      received,
-      branch,
-      dealer,
-      fulfilled: fulfilledVal,
-      notFulfilled: notVal,
-      fulfillment_pct: Number(s.acceptance_pct || 0),
+      received: received || 0,
+      branch: branch || 0,
+      dealer: dealer || 0,
+      fulfilled: fulfilledVal || 0,
+      notFulfilled: notVal || 0,
+      fulfillment_pct: Number(s.fulfillment_pct || 0),
       branchPct,
       dealerPct,
     };
-  }, [requestAcceptance, pick]);
+  }, [requestAcceptance, isValue]);
 
   const donutData = useMemo(
     () => [
@@ -476,11 +484,19 @@ export function Analytics() {
 
   // —— KPI row (live data, sample layout) ——
   const kpis = useMemo(() => {
+    const summaryStock = stockTrend?.summary?.current_total;
     const lastStock = stockPoints.length ? stockPoints[stockPoints.length - 1] : null;
     const firstStock = stockPoints.length ? stockPoints[0] : null;
+    const stockValue = !isNullMetric(summaryStock)
+      ? summaryStock
+      : lastStock
+        ? lastStock.raw
+        : null;
     let stockDelta = null;
     if (lastStock && firstStock && firstStock.raw) {
       stockDelta = ((Number(lastStock.raw) - Number(firstStock.raw)) / Number(firstStock.raw)) * 100;
+    } else if (!isNullMetric(stockTrend?.summary?.change_pct)) {
+      stockDelta = Number(stockTrend.summary.change_pct);
     }
 
     const lastAging = agingPoints.length ? agingPoints[agingPoints.length - 1] : null;
@@ -496,7 +512,7 @@ export function Analytics() {
     }
 
     return {
-      stockValue: lastStock ? lastStock.raw : null,
+      stockValue,
       stockDelta,
       ordersOriginal: orderSummary.original,
       ordersReduced: orderSummary.reduced,
@@ -506,10 +522,10 @@ export function Analytics() {
       agingOver180,
       agingPct,
     };
-  }, [stockPoints, agingPoints, orderSummary, requestSummary]);
+  }, [stockPoints, agingPoints, orderSummary, requestSummary, stockTrend]);
 
   const axisTick = { fontSize: 9, fill: '#6b7280' };
-  const yTickFormatter = (v) => (isValue ? `${v}` : `${v}`);
+  const yTickFormatter = (v) => `${v}`;
 
   return (
     <div className="analytics-sample mx-auto max-w-[1600px] space-y-2.5" data-testid="analytics-page">
