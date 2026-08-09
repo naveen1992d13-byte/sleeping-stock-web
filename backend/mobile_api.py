@@ -1088,10 +1088,20 @@ async def auto_perpetual_assignments_today(
 
 @router.get("/auto-perpetual/tasks")
 async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
-    from auto_perpetual import ist_date_key
+    from auto_perpetual import get_or_create_auto_daily_session, ist_date_key
 
     mu = session["mobile_user"]["mobile_user_id"]
     allocation_date = ist_date_key()
+    # Always use the authoritative daily get-or-create session. Do not trust
+    # per-assignment session_id stamps — those can diverge across parts.
+    session_id = await get_or_create_auto_daily_session(
+        db,
+        mobile_user_id=mu,
+        brand_name=session["brand_name"],
+        dealer_name=session["dealer_name"],
+        branch=session["branch"],
+        device_id=session["device"]["device_id"],
+    )
     rows = await db.auto_perpetual_assignments.find(
         {
             "allocation_date": allocation_date,
@@ -1101,32 +1111,15 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
         {"_id": 0},
     ).to_list(500)
     rows.sort(key=lambda r: (r.get("loc") or r.get("part_number") or "").upper())
-    session_id = ""
+    # Normalize assignment stamps to today's single session for consistency.
     if rows:
-        session_id = rows[0].get("session_id") or ""
-        if not session_id:
-            from auto_perpetual import get_or_create_auto_daily_session
-
-            session_id = await get_or_create_auto_daily_session(
-                db,
-                mobile_user_id=mu,
-                brand_name=session["brand_name"],
-                dealer_name=session["dealer_name"],
-                branch=session["branch"],
-                device_id=session["device"]["device_id"],
-            )
-    else:
-        existing = await db.stock_verification_sessions.find_one(
+        await db.auto_perpetual_assignments.update_many(
             {
-                "session_kind": "auto_perpetual",
-                "verification_date": allocation_date,
+                "allocation_date": allocation_date,
                 "mobile_user_id": mu,
-                "branch_id": session["branch"],
-                "status": {"$in": ["ACTIVE", "PENDING", "COMPLETED"]},
             },
-            {"_id": 0, "session_id": 1},
+            {"$set": {"session_id": session_id}},
         )
-        session_id = (existing or {}).get("session_id") or ""
     assigned = await db.auto_perpetual_assignments.count_documents(
         {"allocation_date": allocation_date, "mobile_user_id": mu}
     )
@@ -1139,6 +1132,7 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
         enriched.append(
             {
                 **row,
+                "session_id": session_id,
                 "part_name": resolve_product_part_name(product or {}),
                 "system_qty": _mobile_stock_qty(product),
                 "system_location": row.get("loc") or _product_pin_location(product or {}),
@@ -1874,6 +1868,8 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
             from auto_perpetual_suggestions import refresh_suggestion_status
 
             await refresh_suggestion_status(db, sid)
+        # Mark work started, but get_or_create_auto_daily_session must still
+        # reuse this same session_id for every later part on the IST day.
         await db.stock_verification_sessions.update_one(
             {"session_id": session_id},
             {"$set": {"status": "IN_PROGRESS", "updated_at": now}},
@@ -1927,24 +1923,66 @@ async def perpetual_stock_device_lookup(part_number: str, session=Depends(get_de
 # ==================== STOCK SEARCH (MOBILE) ====================
 
 @router.get("/stock-search")
-async def stock_search(part_numbers: str, session=Depends(get_device_session)):
-    """part_numbers: comma or newline separated list — supports single or multi search."""
-    parts = [p.strip() for p in re.split(r"[,\n]", part_numbers) if p.strip()]
-    if not parts:
-        raise HTTPException(400, "Provide at least one part number")
+async def stock_search(
+    part_numbers: Optional[str] = None,
+    q: Optional[str] = None,
+    mode: str = "exact",
+    limit: int = 100,
+    session=Depends(get_device_session),
+):
+    """Exact multi-part search via part_numbers, or Product Hub-style prefix/description via q/mode=prefix.
 
-    q = {
+    Prefix mode uses an anchored ^prefix regex on part_number (index-friendly) plus
+    description contains matching. Never returns the prefix itself in not_found.
+    """
+    scope = {
         "brand_name": session["brand_name"],
         "dealer_name": session["dealer_name"],
         "branch": session["branch"],
-        "part_number": {"$in": parts},
         "publish_status": _published_status_filter(),
         "is_active_today": True,
     }
-    rows = await db.products.find(q, {"_id": 0}).to_list(2000)
+
+    search_mode = (mode or "exact").strip().lower()
+    query_text = (q or "").strip()
+    if search_mode == "prefix" or (query_text and not part_numbers):
+        needle = query_text or (part_numbers or "").strip()
+        if not needle:
+            raise HTTPException(400, "Provide a search query")
+        safe = re.escape(needle)
+        # Anchored prefix on part_number is efficient with the scoped part_number index.
+        # Description fields use contains so Product Hub-style name search still works.
+        query = {
+            **scope,
+            "$or": [
+                {"part_number": {"$regex": f"^{safe}", "$options": "i"}},
+                {"part_name": {"$regex": safe, "$options": "i"}},
+                {"item_name": {"$regex": safe, "$options": "i"}},
+                {"description": {"$regex": safe, "$options": "i"}},
+            ],
+        }
+        cap = max(1, min(int(limit or 100), 500))
+        rows = await db.products.find(query, {"_id": 0}).sort("part_number", 1).limit(cap).to_list(cap)
+        upper = needle.upper()
+        rows.sort(
+            key=lambda r: (
+                0 if str(r.get("part_number") or "").upper().startswith(upper) else 1,
+                str(r.get("part_number") or "").upper(),
+            )
+        )
+        # Prefix/partial queries must never list the query string as Not Found.
+        return {"results": rows, "not_found": [], "mode": "prefix", "query": needle}
+
+    parts = [p.strip() for p in re.split(r"[,\n;\s]+", part_numbers or "") if p.strip()]
+    if not parts:
+        raise HTTPException(400, "Provide at least one part number")
+
+    query = {**scope, "part_number": {"$in": parts}}
+    rows = await db.products.find(query, {"_id": 0}).to_list(2000)
     found_parts = {r["part_number"] for r in rows}
-    not_found = [p for p in parts if p not in found_parts]
-    return {"results": rows, "not_found": not_found}
+    found_upper = {str(p).upper() for p in found_parts}
+    not_found = [p for p in parts if p not in found_parts and p.upper() not in found_upper]
+    return {"results": rows, "not_found": not_found, "mode": "exact"}
 
 
 # ==================== AUDIT LOG ====================
@@ -2048,6 +2086,12 @@ async def ensure_mobile_indexes():
         logger.error("Cannot create mobile daily verification session index: %s", exc)
 
     try:
+        # Drop the old ACTIVE-only unique index if present — it allowed a new
+        # ACTIVE session after the first verification flipped status to IN_PROGRESS.
+        try:
+            await db.stock_verification_sessions.drop_index("uq_auto_perpetual_daily_session")
+        except OperationFailure:
+            pass
         await db.stock_verification_sessions.create_index(
             [
                 ("verification_date", 1),
@@ -2058,10 +2102,29 @@ async def ensure_mobile_indexes():
             ],
             unique=True,
             name="uq_auto_perpetual_daily_session",
-            partialFilterExpression={"session_kind": "auto_perpetual", "status": "ACTIVE"},
+            partialFilterExpression={
+                "session_kind": "auto_perpetual",
+                "status": {"$in": ["ACTIVE", "IN_PROGRESS", "PENDING"]},
+            },
         )
     except (DuplicateKeyError, OperationFailure) as exc:
         logger.error("Cannot create auto perpetual session index: %s", exc)
+
+    # Scoped part_number index for efficient mobile prefix stock-search.
+    try:
+        await db.products.create_index(
+            [
+                ("brand_name", 1),
+                ("dealer_name", 1),
+                ("branch", 1),
+                ("publish_status", 1),
+                ("is_active_today", 1),
+                ("part_number", 1),
+            ],
+            name="idx_mobile_stock_search_scope_part",
+        )
+    except (DuplicateKeyError, OperationFailure) as exc:
+        logger.error("Cannot create mobile stock-search product index: %s", exc)
 
     await db.mobile_audit_logs.create_index([("created_at", -1)])
     await db.mobile_audit_logs.create_index([("target", 1)])
