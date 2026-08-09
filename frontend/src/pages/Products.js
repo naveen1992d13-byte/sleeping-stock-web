@@ -10,8 +10,21 @@ const COLORS = { primary: '#059669', dark: '#047857', soft: '#ECFDF5', border: '
 const isAll = (v) => !v || String(v).startsWith('All ') || v === 'N/A';
 const PAGE_SIZE_OPTIONS = [100, 300, 500, 1000];
 // Required Product Hub column order (Part Number → Active Status).
-const PRODUCT_HUB_COLUMNS = ['Part Number', 'Part Name', 'LOC', 'On-Hand', 'Last Receipt Date', 'Last Sales Date', 'MAV', 'Part Category', 'Branch', 'Brand', 'Dealer', 'Purchase Aging', 'Sales Aging', 'Uploaded Date', 'Uploaded User', 'Active Status'];
-const CATEGORY_OPTIONS = ['All Categories', 'Genuine Parts', 'Accessories', 'Non OEM parts'];
+const PRODUCT_HUB_COLUMNS = ['Part Number', 'Part Name', 'LOC', 'On-Hand', 'Last Receipt Date', 'Last Sales Date', 'MAV', 'Part Type', 'Branch', 'Brand', 'Dealer', 'Purchase Aging', 'Sales Aging', 'Uploaded Date', 'Uploaded User', 'Active Status'];
+// Part Type — same final options as Analytics (All | OE Parts | Accessories | Others).
+const CATEGORY_OPTIONS = ['All', 'OE Parts', 'Accessories', 'Others'];
+
+const displayPartType = (raw) => {
+  const v = String(raw || '').trim();
+  if (!v) return '-';
+  const key = v.toLowerCase().replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (['oe parts', 'oe part', 'oe', 'oem', 'oem parts', 'oem part', 'genuine parts', 'genuine part', 'genuine'].includes(key)) {
+    return 'OE Parts';
+  }
+  if (['accessories', 'accessory'].includes(key)) return 'Accessories';
+  if (['others', 'other', 'non oem parts', 'non oem part', 'non oem', 'nonoem'].includes(key)) return 'Others';
+  return v;
+};
 
 // Uploaded Date = the item's original created_at timestamp (set once at upload
 // time and carried through publish), formatted for display.
@@ -65,7 +78,7 @@ export function Products() {
   const [pageSize, setPageSize] = useState(300);
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
-  const [category, setCategory] = useState('All Categories');
+  const [category, setCategory] = useState('All');
   const [stockStatus, setStockStatus] = useState('all');
   const [loadingRecords, setLoadingRecords] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -89,7 +102,7 @@ export function Products() {
     if (!isAll(scopeBrand)) params.append('brand', scopeBrand);
     if (!isAll(scopeDealer)) params.append('dealer', scopeDealer);
     if (!isAll(effectiveBranch)) params.append('branch', effectiveBranch);
-    if (category && category !== 'All Categories') params.append('category', category);
+    if (category && category !== 'All' && category !== 'All Categories') params.append('category', category);
     if (stockStatus && stockStatus !== 'all') params.append('stock_status', stockStatus);
     Object.entries(extra).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') params.append(k, v); });
     return params.toString();
@@ -138,7 +151,7 @@ export function Products() {
     setExporting(true);
     try {
       const params = new URLSearchParams({ brand: brandName, dealer: dealerName, branch: branchName });
-      if (category && category !== 'All Categories') params.append('category', category);
+      if (category && category !== 'All' && category !== 'All Categories') params.append('category', category);
       if (stockStatus && stockStatus !== 'all') params.append('stock_status', stockStatus);
       await authenticatedDownload(`${API}/product-hub/export/branch?${params.toString()}`, `ProductHub_${branchName}.xlsx`);
       toast.success('Branch export downloaded');
@@ -182,8 +195,8 @@ export function Products() {
             <Search className="h-4 w-4 absolute left-3 top-3" style={{ color: COLORS.muted }} />
             <input value={searchInput} onChange={(e) => setSearchInput(e.target.value)} placeholder="Search Part No / Part Name" className="w-full pl-9 pr-4 py-2 rounded-xl border" />
           </div>
-          <select value={category} onChange={(e) => setCategory(e.target.value)} className="px-3 py-2 rounded-xl border text-sm" title="Part Category">
-            {CATEGORY_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
+          <select value={category} onChange={(e) => setCategory(e.target.value)} className="px-3 py-2 rounded-xl border text-sm" title="Part Type">
+            {CATEGORY_OPTIONS.map(c => <option key={c} value={c}>{c === 'All' ? 'All Part Types' : c}</option>)}
           </select>
           <select value={stockStatus} onChange={(e) => setStockStatus(e.target.value)} className="px-3 py-2 rounded-xl border text-sm" title="Stock Status">
             <option value="all">All Items</option>
@@ -216,7 +229,7 @@ export function Products() {
                 <td className="p-3 whitespace-nowrap">{p.last_receipt_date || p.receipt_date || p.last_purchase_date || '-'}</td>
                 <td className="p-3 whitespace-nowrap">{p.last_sales_date || p.sales_date || p.last_sale_date || '-'}</td>
                 <td className="p-3 whitespace-nowrap">₹{Number(p.mav_value ?? p.price ?? p.unit_value_number ?? p.value ?? 0).toLocaleString('en-IN')}</td>
-                <td className="p-3 whitespace-nowrap">{p.part_category || p.parts_type || p.category || '-'}</td>
+                <td className="p-3 whitespace-nowrap">{displayPartType(p.part_category || p.parts_type || p.category)}</td>
                 <td className="p-3 whitespace-nowrap">{p.branch || p.branch_name || p.location_name || '-'}</td>
                 <td className="p-3 whitespace-nowrap">{p.brand_name || p.brand || '-'}</td>
                 <td className="p-3 whitespace-nowrap">{p.dealer_name || p.dealer || p.group || '-'}</td>

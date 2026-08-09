@@ -25,6 +25,8 @@ import {
 const AGING_BUCKETS = ['0–90 Days', '91–180 Days', '181–270 Days', '271–361 Days', '>361 Days'];
 const AGING_COLORS = ['#85c808', '#3b82f6', '#f59e0b', '#f97316', '#ef4444'];
 const FULFILL_COLORS = { fulfilled: '#85c808', not_fulfilled: '#94a3b8', branch: '#3b82f6', dealer: '#0f766e' };
+// Same Part Type options / source as Product Hub (All | OE Parts | Accessories | Others).
+const PART_TYPE_OPTIONS = ['All', 'OE Parts', 'Accessories', 'Others'];
 
 const today = new Date();
 const isoLocal = (d) => {
@@ -86,10 +88,10 @@ function scopeQuery(scopeBrand, scopeDealer, scopeBranch) {
 
 function MetricToggle({ value, onChange }) {
   return (
-    <div className="inline-flex rounded-lg border bg-gray-50 p-0.5 text-xs font-semibold">
+    <div className="inline-flex rounded-lg border bg-gray-50 p-0.5 text-xs font-semibold" data-testid="analytics-metric-toggle">
       {[
-        { id: 'value', label: 'Value Wise' },
-        { id: 'quantity', label: 'Item Wise' },
+        { id: 'value', label: 'Value Wise (₹)' },
+        { id: 'quantity', label: 'Item Wise (Qty)' },
       ].map((opt) => (
         <button
           key={opt.id}
@@ -106,12 +108,11 @@ function MetricToggle({ value, onChange }) {
   );
 }
 
-function SectionCard({ title, actions, children }) {
+function SectionCard({ title, children }) {
   return (
-    <section className="rounded-xl border bg-white p-5 shadow-sm space-y-4" data-testid={`analytics-${title}`}>
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-3">
-        <h2 className="text-base font-bold text-gray-900">{title}</h2>
-        {actions}
+    <section className="rounded-xl border bg-white p-4 shadow-sm space-y-3" data-testid={`analytics-${title}`}>
+      <div className="border-b pb-2">
+        <h2 className="text-sm font-bold text-gray-900">{title}</h2>
       </div>
       {children}
     </section>
@@ -159,7 +160,7 @@ function CompactTable({ columns, rows, emptyLabel = 'No data for selected filter
   );
 }
 
-function StockTooltip({ active, payload }) {
+function StockTooltip({ active, payload, metricType = 'value' }) {
   if (!active || !payload?.length) return null;
   const row = payload[0]?.payload;
   if (!row) return null;
@@ -174,7 +175,9 @@ function StockTooltip({ active, payload }) {
   return (
     <div className="rounded-lg border bg-white p-3 text-sm shadow-lg">
       <p className="font-semibold">{displayDate(row.date)}</p>
-      <p className="mt-1">{formatLakhs(row.closing)}</p>
+      <p className="mt-1">
+        {metricType === 'value' ? formatLakhs(row.closing) : formatINR(row.closing)}
+      </p>
     </div>
   );
 }
@@ -182,9 +185,8 @@ function StockTooltip({ active, payload }) {
 export function Analytics() {
   const { scopeBrand, scopeDealer, scopeBranch } = useOutletContext() || {};
   const [month, setMonth] = useState(monthValue());
-  const [agingMetric, setAgingMetric] = useState('value');
-  const [orderMetric, setOrderMetric] = useState('value');
-  const [requestMetric, setRequestMetric] = useState('value');
+  const [partType, setPartType] = useState('All');
+  const [metricType, setMetricType] = useState('value');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [stockTrend, setStockTrend] = useState(null);
@@ -202,19 +204,19 @@ export function Analytics() {
     setLoading(true);
     setError(null);
     try {
-      const common = { ...bounds, ...scopeParams };
+      const common = {
+        ...bounds,
+        ...scopeParams,
+        metric_type: metricType,
+        aging_type: 'purchase',
+        ...(partType && partType !== 'All' ? { category: partType } : {}),
+      };
       const [st, at, os, ra] = await Promise.all([
-        axios.get(`${API}/analytics/stock-trend`, {
-          params: { ...common, aging_type: 'purchase', metric_type: 'value' },
-        }),
-        axios.get(`${API}/analytics/aging-trend`, {
-          params: { ...common, aging_type: 'purchase', metric_type: agingMetric },
-        }),
-        axios.get(`${API}/analytics/order-saving`, {
-          params: { ...common, metric_type: orderMetric },
-        }),
+        axios.get(`${API}/analytics/stock-trend`, { params: common }),
+        axios.get(`${API}/analytics/aging-trend`, { params: common }),
+        axios.get(`${API}/analytics/order-saving`, { params: common }),
         axios.get(`${API}/analytics/request-acceptance`, {
-          params: { ...common, metric_type: requestMetric, request_direction: 'received' },
+          params: { ...common, request_direction: 'received' },
         }),
       ]);
       setStockTrend(st.data);
@@ -228,7 +230,7 @@ export function Analytics() {
     } finally {
       setLoading(false);
     }
-  }, [bounds, scopeParams, agingMetric, orderMetric, requestMetric]);
+  }, [bounds, scopeParams, metricType, partType]);
 
   useEffect(() => {
     loadAll();
@@ -249,11 +251,16 @@ export function Analytics() {
     () =>
       (stockTrend?.series || []).map((d) => ({
         date: d.date,
-        label: d.data_status === 'NO_UPLOAD' ? 'NO DATA' : formatLakhs(d.closing),
+        label:
+          d.data_status === 'NO_UPLOAD'
+            ? 'NO DATA'
+            : metricType === 'value'
+              ? formatLakhs(d.closing)
+              : formatINR(d.closing),
         raw: d.closing,
         status: d.data_status,
       })),
-    [stockTrend]
+    [stockTrend, metricType]
   );
 
   const agingDaily = useMemo(
@@ -273,25 +280,25 @@ export function Analytics() {
 
   const agingFmt = (n) => {
     if (isNullMetric(n)) return 'NO DATA';
-    return agingMetric === 'value' ? formatINRCompact(n) : formatINR(n);
+    return metricType === 'value' ? formatINRCompact(n) : formatINR(n);
   };
 
   const orderFmt = (n) => {
     if (isNullMetric(n)) return '—';
-    return orderMetric === 'value' ? formatINRCompact(n) : formatINR(n);
+    return metricType === 'value' ? formatINRCompact(n) : formatINR(n);
   };
 
   const reqFmt = (n) => {
     if (isNullMetric(n)) return '—';
-    return requestMetric === 'value' ? formatINRCompact(n) : formatINR(n);
+    return metricType === 'value' ? formatINRCompact(n) : formatINR(n);
   };
 
   const os = useMemo(() => orderSaving?.summary || {}, [orderSaving]);
   const orderChart = useMemo(() => {
     return (orderSaving?.series || []).map((d) => {
-      const original = orderMetric === 'value' ? d.original_order_value : d.original_order_items;
-      const reduced = orderMetric === 'value' ? d.reduced_value : d.reduced_items;
-      const final = orderMetric === 'value' ? d.final_order_value : d.final_order_items;
+      const original = metricType === 'value' ? d.original_order_value : d.original_order_items;
+      const reduced = metricType === 'value' ? d.reduced_value : d.reduced_items;
+      const final = metricType === 'value' ? d.final_order_value : d.final_order_items;
       return {
         ...d,
         day: dayLabel(d.date),
@@ -301,7 +308,7 @@ export function Analytics() {
         reduction_pct: Number(d.reduction_pct || 0),
       };
     });
-  }, [orderSaving, orderMetric]);
+  }, [orderSaving, metricType]);
 
   const rs = useMemo(() => requestAcc?.summary || {}, [requestAcc]);
   const requestChart = useMemo(() => {
@@ -309,92 +316,110 @@ export function Analytics() {
       ...d,
       day: dayLabel(d.date),
       request_received: Number(
-        requestMetric === 'value' ? d.request_received_value : d.request_received_items || 0
+        metricType === 'value' ? d.request_received_value : d.request_received_items || 0
       ),
       total_fulfilled: Number(
-        requestMetric === 'value' ? d.total_fulfilled_value : d.total_fulfilled_items || 0
+        metricType === 'value' ? d.total_fulfilled_value : d.total_fulfilled_items || 0
       ),
       not_fulfilled: Number(
-        requestMetric === 'value' ? d.not_fulfilled_value : d.not_fulfilled_items || 0
+        metricType === 'value' ? d.not_fulfilled_value : d.not_fulfilled_items || 0
       ),
       given_to_branches: Number(
-        requestMetric === 'value' ? d.given_to_branches_value : d.given_to_branches_items || 0
+        metricType === 'value' ? d.given_to_branches_value : d.given_to_branches_items || 0
       ),
       given_to_dealers: Number(
-        requestMetric === 'value' ? d.given_to_dealers_value : d.given_to_dealers_items || 0
+        metricType === 'value' ? d.given_to_dealers_value : d.given_to_dealers_items || 0
       ),
     }));
-  }, [requestAcc, requestMetric]);
+  }, [requestAcc, metricType]);
 
   const donutData = useMemo(() => {
     const fulfilled = Number(
-      requestMetric === 'value' ? rs.total_fulfilled_value : rs.total_fulfilled_items || 0
+      metricType === 'value' ? rs.total_fulfilled_value : rs.total_fulfilled_items || 0
     );
     const notFulfilled = Number(
-      requestMetric === 'value' ? rs.not_fulfilled_value : rs.not_fulfilled_items || 0
+      metricType === 'value' ? rs.not_fulfilled_value : rs.not_fulfilled_items || 0
     );
     return [
       { name: 'Fulfilled', value: fulfilled, key: 'fulfilled' },
       { name: 'Not Fulfilled', value: notFulfilled, key: 'not_fulfilled' },
     ].filter((x) => x.value > 0);
-  }, [rs, requestMetric]);
+  }, [rs, metricType]);
 
   const fulfillBreakdown = useMemo(() => {
     return [
       {
         name: 'Branches',
         value: Number(
-          requestMetric === 'value' ? rs.given_to_branches_value : rs.given_to_branches_items || 0
+          metricType === 'value' ? rs.given_to_branches_value : rs.given_to_branches_items || 0
         ),
         key: 'branch',
       },
       {
         name: 'Dealers / Co-Dealers',
         value: Number(
-          requestMetric === 'value' ? rs.given_to_dealers_value : rs.given_to_dealers_items || 0
+          metricType === 'value' ? rs.given_to_dealers_value : rs.given_to_dealers_items || 0
         ),
         key: 'dealer',
       },
     ];
-  }, [rs, requestMetric]);
+  }, [rs, metricType]);
 
-  const originalOrder = orderMetric === 'value' ? os.original_order_value : os.original_order_items;
-  const reducedOrder = orderMetric === 'value' ? os.reduced_value : os.reduced_items;
-  const finalOrder = orderMetric === 'value' ? os.final_order_value : os.final_order_items;
+  const originalOrder = metricType === 'value' ? os.original_order_value : os.original_order_items;
+  const reducedOrder = metricType === 'value' ? os.reduced_value : os.reduced_items;
+  const finalOrder = metricType === 'value' ? os.final_order_value : os.final_order_items;
 
   return (
-    <div className="space-y-5" data-testid="analytics-page">
-      <div className="rounded-xl border bg-white p-4 shadow-sm">
-        <div className="flex flex-wrap items-end justify-between gap-4">
-          <div>
-            <h1 className="text-xl font-bold text-gray-900">Analytics</h1>
-            <p className="text-sm text-gray-500 mt-0.5">
-              Stock movement, aging risk, order savings, and request fulfillment
-            </p>
-          </div>
-          <label className="text-sm font-medium text-gray-700">
+    <div className="space-y-4" data-testid="analytics-page">
+      {/* Compact analytical toolbar — Brand/Dealer/Branch come from global dashboard scope only. */}
+      <div className="rounded-xl border bg-white px-4 py-3 shadow-sm">
+        <div className="flex flex-wrap items-center gap-3">
+          <h1 className="text-base font-bold text-gray-900 mr-1">Analytics</h1>
+          <label className="text-xs font-medium text-gray-600 flex items-center gap-1.5">
             Month
             <input
               type="month"
               value={month}
               max={monthValue()}
               onChange={(e) => setMonth(e.target.value)}
-              className="mt-1 block rounded-lg border px-3 py-2 text-sm"
+              className="rounded-lg border px-2.5 py-1.5 text-sm"
               data-testid="analytics-month"
             />
           </label>
+          <label className="text-xs font-medium text-gray-600 flex items-center gap-1.5">
+            Part Type
+            <select
+              value={partType}
+              onChange={(e) => setPartType(e.target.value)}
+              className="rounded-lg border px-2.5 py-1.5 text-sm min-w-[8.5rem]"
+              data-testid="analytics-part-type"
+              title="Same Part Type source as Product Hub"
+            >
+              {PART_TYPE_OPTIONS.map((opt) => (
+                <option key={opt} value={opt}>
+                  {opt}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="ml-auto">
+            <MetricToggle value={metricType} onChange={setMetricType} />
+          </div>
         </div>
-        <div className="mt-3 flex flex-wrap gap-2 text-xs">
-          <span className="rounded-md bg-gray-100 px-2.5 py-1 font-medium text-gray-700">
+        <div className="mt-2 flex flex-wrap gap-1.5 text-[11px]">
+          <span className="rounded bg-gray-100 px-2 py-0.5 font-medium text-gray-700">
             Brand: {scopeBrand || '—'}
           </span>
-          <span className="rounded-md bg-gray-100 px-2.5 py-1 font-medium text-gray-700">
+          <span className="rounded bg-gray-100 px-2 py-0.5 font-medium text-gray-700">
             Dealer: {scopeDealer || '—'}
           </span>
-          <span className="rounded-md bg-gray-100 px-2.5 py-1 font-medium text-gray-700">
+          <span className="rounded bg-gray-100 px-2 py-0.5 font-medium text-gray-700">
             Branch: {scopeBranch || '—'}
           </span>
-          <span className="rounded-md bg-gray-100 px-2.5 py-1 text-gray-500">
+          <span className="rounded bg-gray-100 px-2 py-0.5 font-medium text-gray-700">
+            Part Type: {partType}
+          </span>
+          <span className="rounded bg-gray-100 px-2 py-0.5 text-gray-500">
             {bounds.from_date} → {bounds.to_date}
           </span>
         </div>
@@ -413,21 +438,27 @@ export function Analytics() {
       {!loading && (
         <>
           {/* 1. Daily Stock Value Trend */}
-          <SectionCard title="Daily Stock Value Trend">
-            <div className="h-72">
+          <SectionCard
+            title={
+              metricType === 'value' ? 'Daily Stock Value Trend' : 'Daily Stock Item Trend'
+            }
+          >
+            <div className="h-64">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={stockSeries} margin={{ top: 16, right: 12, left: 0, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
                   <XAxis dataKey="day" tick={{ fontSize: 11 }} />
                   <YAxis
                     tick={{ fontSize: 11 }}
-                    tickFormatter={(v) => `${(Number(v) / 1e5).toFixed(1)}L`}
+                    tickFormatter={(v) =>
+                      metricType === 'value' ? `${(Number(v) / 1e5).toFixed(1)}L` : formatINR(v)
+                    }
                   />
-                  <Tooltip content={<StockTooltip />} />
+                  <Tooltip content={<StockTooltip metricType={metricType} />} />
                   <Line
                     type="monotone"
                     dataKey="chartValue"
-                    name="Stock Value"
+                    name={metricType === 'value' ? 'Stock Value' : 'Stock Items'}
                     stroke="#85c808"
                     strokeWidth={2.5}
                     dot={{ r: 3, fill: '#85c808' }}
@@ -437,7 +468,13 @@ export function Analytics() {
                     <LabelList
                       dataKey="chartValue"
                       position="top"
-                      formatter={(v) => (v == null ? '' : `${(Number(v) / 1e5).toFixed(2)}L`)}
+                      formatter={(v) =>
+                        v == null
+                          ? ''
+                          : metricType === 'value'
+                            ? `${(Number(v) / 1e5).toFixed(2)}L`
+                            : formatINR(v)
+                      }
                       style={{ fontSize: 9, fill: '#374151' }}
                     />
                   </Line>
@@ -456,7 +493,6 @@ export function Analytics() {
           {/* 2. Stock Aging Analysis */}
           <SectionCard
             title="Stock Aging Analysis"
-            actions={<MetricToggle value={agingMetric} onChange={setAgingMetric} />}
           >
             <div className="h-80">
               <ResponsiveContainer width="100%" height="100%">
@@ -466,12 +502,12 @@ export function Analytics() {
                   <YAxis
                     tick={{ fontSize: 11 }}
                     tickFormatter={(v) =>
-                      agingMetric === 'value' ? `${(Number(v) / 1e5).toFixed(1)}L` : formatINR(v)
+                      metricType === 'value' ? `${(Number(v) / 1e5).toFixed(1)}L` : formatINR(v)
                     }
                   />
                   <Tooltip
                     formatter={(v, name) => [
-                      isNullMetric(v) ? 'NO DATA' : agingMetric === 'value' ? formatINRCompact(v) : formatINR(v),
+                      isNullMetric(v) ? 'NO DATA' : metricType === 'value' ? formatINRCompact(v) : formatINR(v),
                       name,
                     ]}
                     labelFormatter={(l, items) => {
@@ -515,7 +551,6 @@ export function Analytics() {
           {/* 3. Orders & Savings Analysis */}
           <SectionCard
             title="Orders & Savings Analysis"
-            actions={<MetricToggle value={orderMetric} onChange={setOrderMetric} />}
           >
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
               <Kpi label="Original / Total Order" value={orderFmt(originalOrder)} />
@@ -540,7 +575,7 @@ export function Analytics() {
                     yAxisId="left"
                     tick={{ fontSize: 11 }}
                     tickFormatter={(v) =>
-                      orderMetric === 'value' ? `${(Number(v) / 1e5).toFixed(1)}L` : formatINR(v)
+                      metricType === 'value' ? `${(Number(v) / 1e5).toFixed(1)}L` : formatINR(v)
                     }
                   />
                   <YAxis
@@ -553,7 +588,7 @@ export function Analytics() {
                   <Tooltip
                     formatter={(v, name) => {
                       if (name === 'Reduction %') return [`${formatINR(v)}%`, name];
-                      return [orderMetric === 'value' ? formatINRCompact(v) : formatINR(v), name];
+                      return [metricType === 'value' ? formatINRCompact(v) : formatINR(v), name];
                     }}
                     labelFormatter={(l, items) => {
                       const d = items?.[0]?.payload?.date;
@@ -583,18 +618,18 @@ export function Analytics() {
                   key: 'original',
                   label: 'Original Order',
                   render: (r) =>
-                    orderFmt(orderMetric === 'value' ? r.original_order_value : r.original_order_items),
+                    orderFmt(metricType === 'value' ? r.original_order_value : r.original_order_items),
                 },
                 {
                   key: 'reduced',
                   label: 'Reduced / Cut',
-                  render: (r) => orderFmt(orderMetric === 'value' ? r.reduced_value : r.reduced_items),
+                  render: (r) => orderFmt(metricType === 'value' ? r.reduced_value : r.reduced_items),
                 },
                 {
                   key: 'final',
                   label: 'Final / Net Order',
                   render: (r) =>
-                    orderFmt(orderMetric === 'value' ? r.final_order_value : r.final_order_items),
+                    orderFmt(metricType === 'value' ? r.final_order_value : r.final_order_items),
                 },
                 {
                   key: 'pct',
@@ -609,26 +644,25 @@ export function Analytics() {
           {/* 4. Request Fulfillment Analysis */}
           <SectionCard
             title="Request Fulfillment Analysis"
-            actions={<MetricToggle value={requestMetric} onChange={setRequestMetric} />}
           >
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
               <Kpi
                 label="Request Received"
                 value={reqFmt(
-                  requestMetric === 'value' ? rs.request_received_value : rs.request_received_items
+                  metricType === 'value' ? rs.request_received_value : rs.request_received_items
                 )}
               />
               <Kpi
                 label="Total Fulfilled"
                 value={reqFmt(
-                  requestMetric === 'value' ? rs.total_fulfilled_value : rs.total_fulfilled_items
+                  metricType === 'value' ? rs.total_fulfilled_value : rs.total_fulfilled_items
                 )}
                 accent="bg-lime-50 border-lime-200"
               />
               <Kpi
                 label="Not Fulfilled"
                 value={reqFmt(
-                  requestMetric === 'value' ? rs.not_fulfilled_value : rs.not_fulfilled_items
+                  metricType === 'value' ? rs.not_fulfilled_value : rs.not_fulfilled_items
                 )}
               />
               <Kpi
@@ -656,7 +690,7 @@ export function Analytics() {
                     </Pie>
                     <Tooltip
                       formatter={(v, name) => [
-                        requestMetric === 'value' ? formatINRCompact(v) : formatINR(v),
+                        metricType === 'value' ? formatINRCompact(v) : formatINR(v),
                         name,
                       ]}
                     />
@@ -675,13 +709,13 @@ export function Analytics() {
                       type="number"
                       tick={{ fontSize: 11 }}
                       tickFormatter={(v) =>
-                        requestMetric === 'value' ? `${(Number(v) / 1e5).toFixed(1)}L` : formatINR(v)
+                        metricType === 'value' ? `${(Number(v) / 1e5).toFixed(1)}L` : formatINR(v)
                       }
                     />
                     <YAxis type="category" dataKey="name" width={120} tick={{ fontSize: 11 }} />
                     <Tooltip
                       formatter={(v) =>
-                        requestMetric === 'value' ? formatINRCompact(v) : formatINR(v)
+                        metricType === 'value' ? formatINRCompact(v) : formatINR(v)
                       }
                     />
                     <Bar dataKey="value" maxBarSize={28}>
@@ -702,12 +736,12 @@ export function Analytics() {
                   <YAxis
                     tick={{ fontSize: 11 }}
                     tickFormatter={(v) =>
-                      requestMetric === 'value' ? `${(Number(v) / 1e5).toFixed(1)}L` : formatINR(v)
+                      metricType === 'value' ? `${(Number(v) / 1e5).toFixed(1)}L` : formatINR(v)
                     }
                   />
                   <Tooltip
                     formatter={(v, name) => [
-                      requestMetric === 'value' ? formatINRCompact(v) : formatINR(v),
+                      metricType === 'value' ? formatINRCompact(v) : formatINR(v),
                       name,
                     ]}
                     labelFormatter={(l, items) => {
@@ -737,7 +771,7 @@ export function Analytics() {
                   label: 'Request Received',
                   render: (r) =>
                     reqFmt(
-                      requestMetric === 'value' ? r.request_received_value : r.request_received_items
+                      metricType === 'value' ? r.request_received_value : r.request_received_items
                     ),
                 },
                 {
@@ -745,7 +779,7 @@ export function Analytics() {
                   label: 'Given to Branches',
                   render: (r) =>
                     reqFmt(
-                      requestMetric === 'value' ? r.given_to_branches_value : r.given_to_branches_items
+                      metricType === 'value' ? r.given_to_branches_value : r.given_to_branches_items
                     ),
                 },
                 {
@@ -753,7 +787,7 @@ export function Analytics() {
                   label: 'Given to Dealers / Co-Dealers',
                   render: (r) =>
                     reqFmt(
-                      requestMetric === 'value' ? r.given_to_dealers_value : r.given_to_dealers_items
+                      metricType === 'value' ? r.given_to_dealers_value : r.given_to_dealers_items
                     ),
                 },
                 {
@@ -761,14 +795,14 @@ export function Analytics() {
                   label: 'Total Fulfilled',
                   render: (r) =>
                     reqFmt(
-                      requestMetric === 'value' ? r.total_fulfilled_value : r.total_fulfilled_items
+                      metricType === 'value' ? r.total_fulfilled_value : r.total_fulfilled_items
                     ),
                 },
                 {
                   key: 'nf',
                   label: 'Not Fulfilled',
                   render: (r) =>
-                    reqFmt(requestMetric === 'value' ? r.not_fulfilled_value : r.not_fulfilled_items),
+                    reqFmt(metricType === 'value' ? r.not_fulfilled_value : r.not_fulfilled_items),
                 },
                 {
                   key: 'pct',
