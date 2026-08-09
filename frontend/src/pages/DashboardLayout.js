@@ -498,7 +498,21 @@ export function DashboardLayout() {
 
         <main className="nmts-main-content">
           <NoticeLoginPopup />
-          <Outlet context={{ scopeBrand, scopeDealer, scopeBranch }} />
+          <Outlet
+            context={{
+              scopeBrand,
+              scopeDealer,
+              scopeBranch,
+              setScopeBrand,
+              setScopeDealer,
+              setScopeBranch,
+              brandOptions,
+              dealerOptions,
+              branchOptions,
+              isMaster,
+              isAdmin,
+            }}
+          />
         </main>
       </div>
     </div>
