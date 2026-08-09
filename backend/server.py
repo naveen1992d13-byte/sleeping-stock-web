@@ -887,7 +887,15 @@ async def get_uploads(
         query["dealer_name"] = current_user.group
         query["branch"] = current_user.location
 
-    uploads = await db.uploads.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
+    # Sort needs an index / disk spill on large upload collections (avoids 32MB sort RAM 500).
+    # Exclude raw_file_bytes from the list payload — binary Excel blobs break JSON encoding
+    # and are not needed for Upload Center list/summary views.
+    cursor = db.uploads.find(query, {"_id": 0, "raw_file_bytes": 0}).sort("created_at", -1)
+    try:
+        cursor = cursor.allow_disk_use(True)
+    except Exception:
+        pass
+    uploads = await cursor.to_list(500)
     return uploads
 
 
@@ -6067,6 +6075,7 @@ async def ensure_product_hub_indexes():
     await db.uploads.create_index([("date_key", 1)])
     await db.uploads.create_index([("brand_name", 1), ("dealer_name", 1), ("branch", 1)])
     await db.uploads.create_index([("upload_type", 1), ("created_at", -1)])
+    await db.uploads.create_index([("created_at", -1)], name="idx_uploads_created_at")
     await db.batch_summaries.create_index(
         [("brand_name", 1), ("dealer_name", 1), ("branch", 1), ("active_date_key", 1)],
         unique=True,

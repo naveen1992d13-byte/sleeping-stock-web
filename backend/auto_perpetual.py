@@ -128,8 +128,8 @@ async def get_or_create_auto_daily_session(
 ) -> str:
     """Idempotent: one Auto Perpetual session per user + brand + dealer + branch + IST day.
 
-    Must reuse the same session_id even after the first verification flips status
-    from ACTIVE → IN_PROGRESS. Never allocate a new AOPS sequence for the same day.
+    Daily identity ignores status transitions (ACTIVE/IN_PROGRESS/PENDING/COMPLETED/
+    submitted). Never allocate a new AOPS sequence for the same day scope.
     """
     verification_date = ist_date_key()
     day_scope = {
@@ -140,20 +140,16 @@ async def get_or_create_auto_daily_session(
         "dealer_id": dealer_name,
         "branch_id": branch,
     }
-    # Prefer the earliest session for the day. Include IN_PROGRESS/COMPLETED so
-    # verifying the first part cannot force a new session_id for later parts.
+    # Prefer the earliest session for the day — status must not mint a new ID.
     existing = await db.stock_verification_sessions.find_one(
-        {
-            **day_scope,
-            "status": {"$in": ["ACTIVE", "IN_PROGRESS", "PENDING", "COMPLETED"]},
-        },
+        day_scope,
         {"_id": 0, "session_id": 1, "status": 1},
         sort=[("created_at", 1)],
     )
     if existing and existing.get("session_id"):
         updates = {"updated_at": _now(), "device_id": device_id or None}
-        # Re-open a same-day completed session so later parts keep the same ID.
-        if existing.get("status") in (None, "", "PENDING", "COMPLETED"):
+        # Re-open a same-day completed/pending session so later parts keep the same ID.
+        if existing.get("status") in (None, "", "PENDING", "COMPLETED", "submitted"):
             updates["status"] = "ACTIVE"
         await db.stock_verification_sessions.update_one(
             {"session_id": existing["session_id"]},
@@ -189,10 +185,7 @@ async def get_or_create_auto_daily_session(
         await db.stock_verification_sessions.insert_one(session_doc)
     except DuplicateKeyError:
         raced = await db.stock_verification_sessions.find_one(
-            {
-                **day_scope,
-                "status": {"$in": ["ACTIVE", "IN_PROGRESS", "PENDING", "COMPLETED"]},
-            },
+            day_scope,
             {"_id": 0, "session_id": 1},
             sort=[("created_at", 1)],
         )

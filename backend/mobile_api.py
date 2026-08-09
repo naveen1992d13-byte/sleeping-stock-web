@@ -1452,6 +1452,9 @@ def _product_pin_location(product: dict) -> str:
 
 
 async def find_scoped_product(part_number: str, brand_name: str, dealer_name: str, branch: str):
+    """Lookup current Product Hub stock for verification (same day-scope as Product Hub)."""
+    from auto_perpetual import inventory_date_key
+
     clean_part = _normalize_part_number(part_number)
     if not clean_part:
         return None, clean_part
@@ -1459,9 +1462,12 @@ async def find_scoped_product(part_number: str, brand_name: str, dealer_name: st
         "brand_name": brand_name,
         "dealer_name": dealer_name,
         "branch": branch,
+        "publish_status": "Published",
+        "is_active_today": True,
+        "active_date_key": inventory_date_key(),
         "part_number": {"$regex": f"^{re.escape(clean_part)}$", "$options": "i"},
     }
-    product = await db.products.find_one(query, {"_id": 0}, sort=[("updated_at", -1)])
+    product = await db.products.find_one(query, {"_id": 0}, sort=[("part_number", 1)])
     return product, clean_part
 
 
@@ -1524,7 +1530,10 @@ async def _get_or_create_mobile_daily_verification_session(
     branch: str,
     verification_type: str = "physical",
 ) -> str:
-    """One ACTIVE session per mobile user + brand + dealer + branch + IST calendar day."""
+    """One daily session per mobile user + brand + dealer + branch + IST day + kind.
+
+    Status transitions must not mint a new MOPS ID for the same daily identity.
+    """
     india_now = _now().astimezone(ZoneInfo("Asia/Kolkata"))
     verification_date = india_now.strftime("%Y-%m-%d")
     date_key = india_now.strftime("%y%m%d")
@@ -1541,23 +1550,33 @@ async def _get_or_create_mobile_daily_verification_session(
         )
 
     session_kind = "physical_perpetual"
-    scope = {
+    day_scope = {
         "session_kind": session_kind,
         "verification_date": verification_date,
         "mobile_user_id": mobile_user_id,
         "brand_id": brand_name,
         "dealer_id": dealer_name,
         "branch_id": branch,
-        "status": "ACTIVE",
     }
-    existing = await db.stock_verification_sessions.find_one(scope, {"_id": 0, "session_id": 1})
+    existing = await db.stock_verification_sessions.find_one(
+        day_scope, {"_id": 0, "session_id": 1, "status": 1}, sort=[("created_at", 1)]
+    )
     if not existing:
-        legacy_scope = {**scope, "session_kind": "mobile_daily"}
-        existing = await db.stock_verification_sessions.find_one(legacy_scope, {"_id": 0, "session_id": 1})
+        legacy_scope = {**day_scope, "session_kind": "mobile_daily"}
+        existing = await db.stock_verification_sessions.find_one(
+            legacy_scope, {"_id": 0, "session_id": 1, "status": 1}, sort=[("created_at", 1)]
+        )
     if existing and existing.get("session_id"):
+        updates = {
+            "updated_at": _now(),
+            "device_id": device_id,
+            "session_kind": session_kind,
+        }
+        if existing.get("status") in (None, "", "PENDING", "COMPLETED", "submitted"):
+            updates["status"] = "ACTIVE"
         await db.stock_verification_sessions.update_one(
             {"session_id": existing["session_id"]},
-            {"$set": {"updated_at": _now(), "device_id": device_id, "session_kind": session_kind}},
+            {"$set": updates},
         )
         return existing["session_id"]
 
@@ -1597,10 +1616,14 @@ async def _get_or_create_mobile_daily_verification_session(
     try:
         await db.stock_verification_sessions.insert_one(session_doc)
     except DuplicateKeyError:
-        raced = await db.stock_verification_sessions.find_one(scope, {"_id": 0, "session_id": 1})
+        raced = await db.stock_verification_sessions.find_one(
+            day_scope, {"_id": 0, "session_id": 1}, sort=[("created_at", 1)]
+        )
         if not raced:
             raced = await db.stock_verification_sessions.find_one(
-                {**scope, "session_kind": "mobile_daily"}, {"_id": 0, "session_id": 1}
+                {**day_scope, "session_kind": "mobile_daily"},
+                {"_id": 0, "session_id": 1},
+                sort=[("created_at", 1)],
             )
         if raced and raced.get("session_id"):
             return raced["session_id"]
@@ -1609,7 +1632,11 @@ async def _get_or_create_mobile_daily_verification_session(
 
 
 async def _mirror_mobile_verification_to_web(doc: dict):
-    """Idempotently expose a mobile snapshot to website-only correction flows."""
+    """Idempotently expose a mobile snapshot to website-only correction flows.
+
+    Never invents an incomplete parent session — the get-or-create path must
+    have already established the canonical daily session_id.
+    """
     session_id = doc.get("session_id")
     if not session_id:
         raise HTTPException(500, "Verification session ID is missing")
@@ -1636,21 +1663,15 @@ async def _mirror_mobile_verification_to_web(doc: dict):
         "total_excess_qty": 0, "total_excess_value": 0,
     }
     summary.pop("_id", None)
-    created_at = clean_doc.get("created_at") or clean_doc.get("verified_at") or _now()
-    await db.stock_verification_sessions.update_one(
+    result = await db.stock_verification_sessions.update_one(
         {"session_id": session_id},
-        {
-            "$setOnInsert": {
-                "id": str(uuid.uuid4()), "session_id": session_id, "created_at": created_at, "date": created_at,
-                "brand_name": clean_doc.get("brand_name", ""), "dealer_name": clean_doc.get("dealer_name", ""),
-                "branch": clean_doc.get("branch", ""), "verified_by": clean_doc.get("verified_by", ""),
-                "verified_by_name": clean_doc.get("verified_by_name") or clean_doc.get("verified_user", ""),
-                "status": "submitted", "information_only": True, "affects_stock": False, "source": "MOBILE",
-            },
-            "$set": {**summary, "updated_at": _now()},
-        },
-        upsert=True,
+        {"$set": {**summary, "updated_at": _now()}},
     )
+    if result.matched_count == 0:
+        logger.error(
+            "Mirror skipped inventing orphan session for missing session_id=%s",
+            session_id,
+        )
 
 
 @router.post("/stock-verification")
@@ -2112,6 +2133,163 @@ async def _audit(current_user, action: str, target: str, details: dict, actor_ov
     })
 
 
+# ==================== DAILY SESSION CLEANUP ====================
+
+async def cleanup_duplicate_daily_verification_sessions(database=None) -> dict:
+    """Idempotent: one parent session per kind+user+brand+dealer+branch+IST day.
+
+    Canonical strategy: earliest created_at (then session_id) wins.
+    Part-level history / stock_verifications rows are re-pointed, never deleted.
+    """
+    coll_db = database if database is not None else db
+    stats = {
+        "duplicate_aops_groups": 0,
+        "duplicate_mops_groups": 0,
+        "orphan_sessions_removed": 0,
+        "history_rows_repointed": 0,
+        "mirror_rows_repointed": 0,
+        "duplicate_sessions_removed": 0,
+        "groups_merged": 0,
+    }
+
+    pipeline = [
+        {
+            "$match": {
+                "session_kind": {"$in": ["auto_perpetual", "physical_perpetual", "mobile_daily"]},
+                "mobile_user_id": {"$type": "string", "$ne": ""},
+                "brand_id": {"$type": "string", "$ne": ""},
+                "dealer_id": {"$type": "string", "$ne": ""},
+                "branch_id": {"$type": "string", "$ne": ""},
+                "verification_date": {"$type": "string", "$ne": ""},
+            }
+        },
+        {
+            "$group": {
+                "_id": {
+                    "session_kind": "$session_kind",
+                    "verification_date": "$verification_date",
+                    "mobile_user_id": "$mobile_user_id",
+                    "brand_id": "$brand_id",
+                    "dealer_id": "$dealer_id",
+                    "branch_id": "$branch_id",
+                },
+                "sessions": {
+                    "$push": {
+                        "session_id": "$session_id",
+                        "created_at": "$created_at",
+                        "status": "$status",
+                    }
+                },
+                "count": {"$sum": 1},
+            }
+        },
+        {"$match": {"count": {"$gt": 1}}},
+    ]
+    groups = await coll_db.stock_verification_sessions.aggregate(pipeline).to_list(100000)
+    for group in groups:
+        kind = (group.get("_id") or {}).get("session_kind")
+        if kind == "auto_perpetual":
+            stats["duplicate_aops_groups"] += 1
+        elif kind in ("physical_perpetual", "mobile_daily"):
+            stats["duplicate_mops_groups"] += 1
+
+        sessions = list(group.get("sessions") or [])
+
+        def _session_sort_key(s):
+            ca = s.get("created_at")
+            if ca is None:
+                return (1, "", str(s.get("session_id") or ""))
+            if hasattr(ca, "isoformat"):
+                return (0, ca.isoformat(), str(s.get("session_id") or ""))
+            return (0, str(ca), str(s.get("session_id") or ""))
+
+        sessions.sort(key=_session_sort_key)
+        canonical = (sessions[0] or {}).get("session_id")
+        if not canonical:
+            continue
+        duplicates = [s.get("session_id") for s in sessions[1:] if s.get("session_id") and s.get("session_id") != canonical]
+        if not duplicates:
+            continue
+        stats["groups_merged"] += 1
+
+        hist = await coll_db.stock_verification_history.update_many(
+            {"session_id": {"$in": duplicates}},
+            {"$set": {"session_id": canonical}},
+        )
+        stats["history_rows_repointed"] += int(hist.modified_count or 0)
+        mir = await coll_db.stock_verifications.update_many(
+            {"session_id": {"$in": duplicates}},
+            {"$set": {"session_id": canonical}},
+        )
+        stats["mirror_rows_repointed"] += int(mir.modified_count or 0)
+
+        totals = await coll_db.stock_verifications.aggregate([
+            {"$match": {"session_id": canonical}},
+            {"$group": {
+                "_id": None,
+                "total_items": {"$sum": 1},
+                "total_shortage_qty": {"$sum": {"$ifNull": ["$shortage_qty", 0]}},
+                "total_shortage_value": {"$sum": {"$ifNull": ["$shortage_value", 0]}},
+                "total_excess_qty": {"$sum": {"$ifNull": ["$excess_qty", 0]}},
+                "total_excess_value": {"$sum": {"$ifNull": ["$excess_value", 0]}},
+            }},
+        ]).to_list(1)
+        summary = totals[0] if totals else {
+            "total_items": 0, "total_shortage_qty": 0, "total_shortage_value": 0,
+            "total_excess_qty": 0, "total_excess_value": 0,
+        }
+        summary.pop("_id", None)
+        # Prefer an in-progress/active status from the group when present.
+        status_rank = {"IN_PROGRESS": 0, "ACTIVE": 1, "PENDING": 2, "COMPLETED": 3, "submitted": 4}
+        best_status = min(
+            (s.get("status") or "ACTIVE" for s in sessions),
+            key=lambda st: status_rank.get(st, 50),
+        )
+        await coll_db.stock_verification_sessions.update_one(
+            {"session_id": canonical},
+            {"$set": {**summary, "status": best_status, "updated_at": _now()}},
+        )
+        deleted = await coll_db.stock_verification_sessions.delete_many(
+            {"session_id": {"$in": duplicates}}
+        )
+        stats["duplicate_sessions_removed"] += int(deleted.deleted_count or 0)
+
+    # Incomplete/orphan parents: missing identity fields and unused by history/mirror.
+    orphan_rows = await coll_db.stock_verification_sessions.find(
+        {
+            "$or": [
+                {"session_kind": {"$exists": False}},
+                {"session_kind": None},
+                {"session_kind": ""},
+                {"mobile_user_id": {"$exists": False}},
+                {"mobile_user_id": None},
+                {"mobile_user_id": ""},
+                {"brand_id": {"$exists": False}},
+                {"brand_id": None},
+                {"brand_id": ""},
+            ]
+        },
+        {"_id": 0, "session_id": 1},
+    ).to_list(100000)
+    orphan_ids = []
+    for row in orphan_rows:
+        sid = row.get("session_id")
+        if not sid:
+            continue
+        still_used = await coll_db.stock_verification_history.find_one({"session_id": sid}, {"_id": 1})
+        if still_used:
+            continue
+        still_used = await coll_db.stock_verifications.find_one({"session_id": sid}, {"_id": 1})
+        if still_used:
+            continue
+        orphan_ids.append(sid)
+    if orphan_ids:
+        removed = await coll_db.stock_verification_sessions.delete_many({"session_id": {"$in": orphan_ids}})
+        stats["orphan_sessions_removed"] += int(removed.deleted_count or 0)
+
+    return stats
+
+
 # ==================== INDEXES ====================
 
 async def ensure_mobile_indexes():
@@ -2176,36 +2354,39 @@ async def ensure_mobile_indexes():
     await db.stock_verification_history.create_index(
         [("brand_name", 1), ("dealer_name", 1), ("branch", 1), ("verified_at", -1)]
     )
-    await db.stock_verification_history.create_index(
-        [("device_id", 1), ("client_id", 1)],
-        unique=True,
-        partialFilterExpression={"client_id": {"$type": "string"}},
-    )
     try:
-        await db.stock_verification_sessions.create_index(
-            [
-                ("verification_date", 1),
-                ("mobile_user_id", 1),
-                ("brand_id", 1),
-                ("dealer_id", 1),
-                ("branch_id", 1),
-            ],
+        await db.stock_verification_history.create_index(
+            [("device_id", 1), ("client_id", 1)],
             unique=True,
-            name="uq_mobile_daily_verification_session",
-            partialFilterExpression={"session_kind": {"$in": ["mobile_daily", "physical_perpetual"]}, "status": "ACTIVE"},
+            partialFilterExpression={"client_id": {"$type": "string"}},
+            name="uq_stock_verification_history_device_client",
         )
     except (DuplicateKeyError, OperationFailure) as exc:
-        logger.error("Cannot create mobile daily verification session index: %s", exc)
+        logger.error("Cannot create stock verification history device/client index: %s", exc)
 
+    # Collapse duplicate daily parents before enforcing uniqueness.
     try:
-        # Drop the old ACTIVE-only unique index if present — it allowed a new
-        # ACTIVE session after the first verification flipped status to IN_PROGRESS.
+        cleanup_stats = await cleanup_duplicate_daily_verification_sessions(db)
+        logger.info("Daily verification session cleanup: %s", cleanup_stats)
+    except Exception as exc:
+        logger.error("Daily verification session cleanup failed: %s", exc)
+
+    for stale_index in (
+        "uq_mobile_daily_verification_session",
+        "uq_auto_perpetual_daily_session",
+        "uq_daily_verification_session_identity",
+    ):
         try:
-            await db.stock_verification_sessions.drop_index("uq_auto_perpetual_daily_session")
+            await db.stock_verification_sessions.drop_index(stale_index)
         except OperationFailure:
             pass
+
+    try:
+        # One parent per kind + user + brand + dealer + branch + IST day.
+        # Status is intentionally NOT part of uniqueness (status flips must reuse).
         await db.stock_verification_sessions.create_index(
             [
+                ("session_kind", 1),
                 ("verification_date", 1),
                 ("mobile_user_id", 1),
                 ("brand_id", 1),
@@ -2213,14 +2394,18 @@ async def ensure_mobile_indexes():
                 ("branch_id", 1),
             ],
             unique=True,
-            name="uq_auto_perpetual_daily_session",
+            name="uq_daily_verification_session_identity",
             partialFilterExpression={
-                "session_kind": "auto_perpetual",
-                "status": {"$in": ["ACTIVE", "IN_PROGRESS", "PENDING"]},
+                "session_kind": {"$in": ["auto_perpetual", "physical_perpetual", "mobile_daily"]},
+                "mobile_user_id": {"$type": "string"},
+                "brand_id": {"$type": "string"},
+                "dealer_id": {"$type": "string"},
+                "branch_id": {"$type": "string"},
+                "verification_date": {"$type": "string"},
             },
         )
     except (DuplicateKeyError, OperationFailure) as exc:
-        logger.error("Cannot create auto perpetual session index: %s", exc)
+        logger.error("Cannot create daily verification session unique index: %s", exc)
 
     # Scoped part_number index for efficient mobile prefix stock-search (IST today key).
     try:
