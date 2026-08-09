@@ -302,6 +302,15 @@ class StockVerificationSubmit(BaseModel):
     client_id: Optional[str] = None  # offline-queue idempotency key (Part 22)
     damage_qty: Optional[float] = 0
     verification_type: Optional[str] = "physical"  # physical | auto
+    # Accepted for mobile offline-queue compatibility; backend remains session-authoritative.
+    part_name: Optional[str] = None
+    verification_session_id: Optional[str] = None
+    is_new_part: Optional[bool] = None
+
+
+class StockVerificationBatchSubmit(BaseModel):
+    """Mobile offline-queue bulk sync payload (see NMTS-Mobile BACKEND_API_CONTRACT.md)."""
+    items: List[StockVerificationSubmit] = []
 
 
 class MobileUserAttendanceUpdate(BaseModel):
@@ -1674,8 +1683,12 @@ async def _mirror_mobile_verification_to_web(doc: dict):
         )
 
 
-@router.post("/stock-verification")
-async def submit_stock_verification(payload: StockVerificationSubmit, session=Depends(get_device_session)):
+async def _process_stock_verification_submit(payload: StockVerificationSubmit, session: dict) -> dict:
+    """Core stock-verification save used by single + batch endpoints.
+
+    Preserves one daily MOPS/AOPS session via
+    `_get_or_create_mobile_daily_verification_session` and client_id idempotency.
+    """
     # Information-only physical snapshot. Unknown/unlisted parts are valid and
     # must be visible in the website correction and Excel workflows.
     try:
@@ -1905,6 +1918,72 @@ async def submit_stock_verification(payload: StockVerificationSubmit, session=De
         "duplicate": False, "system_qty": system_qty, "physical_qty": physical_qty,
         "difference_qty": difference, "verification_status": verification_status,
         "part_found_in_system": part_found,
+    }
+
+
+@router.post("/stock-verification")
+async def submit_stock_verification(payload: StockVerificationSubmit, session=Depends(get_device_session)):
+    return await _process_stock_verification_submit(payload, session)
+
+
+@router.post("/stock-verification/batch")
+@router.post("/stock-verification/batch/", include_in_schema=False)
+async def submit_stock_verification_batch(
+    payload: StockVerificationBatchSubmit,
+    session=Depends(get_device_session),
+):
+    """Bulk offline-queue sync — reuses the same single-item save/session logic."""
+    results = []
+    synced = 0
+    failed = 0
+    for item in payload.items or []:
+        try:
+            result = await _process_stock_verification_submit(item, session)
+            results.append(
+                {
+                    "client_id": item.client_id,
+                    "success": True,
+                    "id": result.get("id") or result.get("verification_id"),
+                    "verification_id": result.get("verification_id") or result.get("id"),
+                    "duplicate": bool(result.get("duplicate")),
+                    "session_id": result.get("session_id"),
+                    "system_qty": result.get("system_qty"),
+                    "physical_qty": result.get("physical_qty"),
+                    "difference_qty": result.get("difference_qty"),
+                    "verification_status": result.get("verification_status"),
+                    "part_found_in_system": result.get("part_found_in_system"),
+                    "message": result.get("message"),
+                }
+            )
+            synced += 1
+        except HTTPException as exc:
+            detail = exc.detail
+            if not isinstance(detail, str):
+                detail = str(detail)
+            results.append(
+                {
+                    "client_id": item.client_id,
+                    "success": False,
+                    "error": detail,
+                    "message": detail,
+                }
+            )
+            failed += 1
+        except Exception as exc:  # noqa: BLE001 — per-item isolation for offline sync
+            results.append(
+                {
+                    "client_id": item.client_id,
+                    "success": False,
+                    "error": str(exc),
+                    "message": str(exc),
+                }
+            )
+            failed += 1
+    return {
+        "success": failed == 0,
+        "synced": synced,
+        "failed": failed,
+        "results": results,
     }
 
 
