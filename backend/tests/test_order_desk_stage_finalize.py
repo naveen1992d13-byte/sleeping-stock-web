@@ -173,3 +173,27 @@ class TestOrderDeskStageApi:
     def test_template_still_works(self, auth):
         res = requests.get(f'{API}/order-desk/template', headers=auth, timeout=30)
         assert res.status_code == 200
+
+
+class TestRequestHeadersActiveUniqueIndex:
+    def test_partial_unique_index_allows_historical_duplicates(self):
+        """Startup index must succeed even when historical destination dups exist."""
+        import asyncio
+        import sys
+        from pathlib import Path
+
+        backend_dir = Path(__file__).resolve().parents[1]
+        if str(backend_dir) not in sys.path:
+            sys.path.insert(0, str(backend_dir))
+
+        async def _run():
+            import server as srv
+            await srv.ensure_product_hub_indexes()
+            idxs = await srv.db.request_headers.index_information()
+            assert 'uniq_active_request_destination' in idxs
+            info = idxs['uniq_active_request_destination']
+            assert info.get('unique') is True
+            assert info.get('partialFilterExpression') == {'status': 'Requested'}
+            assert 'order_id_1_supplying_dealer_1_supplying_branch_1' not in idxs
+
+        asyncio.run(_run())
