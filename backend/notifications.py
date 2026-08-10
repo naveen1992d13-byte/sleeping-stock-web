@@ -135,11 +135,12 @@ def _build_email_text(context: dict) -> str:
     return "\n".join(lines)
 
 
-def send_gmail_email(to_email: str, subject: str, context: dict) -> dict:
+def send_gmail_email(to_email: str, subject: str, context: dict, cc_email: str = "") -> dict:
     """Returns a result dict; never raises."""
     to_email = (to_email or "").strip()
     cc_email = (cc_email or "").strip()
-    if cc_email and not is_valid_email(cc_email): cc_email = ""
+    if cc_email and not is_valid_email(cc_email):
+        cc_email = ""
     if not is_valid_email(to_email):
         return {"status": "skipped", "error": "invalid_or_missing_email"}
     if not gmail_configured():
@@ -157,7 +158,10 @@ def send_gmail_email(to_email: str, subject: str, context: dict) -> dict:
         msg["Subject"] = sanitize_text(subject, 200)
         msg["From"] = f"{sender_name} <{username}>"
         msg["To"] = to_email
-        if cc_email: msg["Cc"] = cc_email
+        recipients = [to_email]
+        if cc_email:
+            msg["Cc"] = cc_email
+            recipients.append(cc_email)
         msg.attach(MIMEText(_build_email_text(context), "plain"))
         msg.attach(MIMEText(_build_email_html(context), "html"))
 
@@ -165,7 +169,7 @@ def send_gmail_email(to_email: str, subject: str, context: dict) -> dict:
         with smtplib.SMTP(host, port, timeout=15) as server:
             server.starttls(context=context_ssl)
             server.login(username, app_password)
-            server.sendmail(username, [to_email], msg.as_string())
+            server.sendmail(username, recipients, msg.as_string())
         return {"status": "sent", "provider_response": "smtp_ok"}
     except Exception as exc:  # noqa: BLE001 — a delivery failure must never propagate
         # Never log the credentials themselves, only the (safe) error message.
@@ -540,40 +544,28 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
     subject = f"Parts Transfer Request - {request_number}"
     filename = group.get("pdf_filename") or f"{request_number}.pdf"
 
-    summary_fields = [
-        ("Request Number", request_number),
-        ("Reference Number", group.get("order_number", "-")),
-        ("Requested By", group.get("requested_user_name", "-")),
-        ("Total Items", group.get("total_items", "-")),
-        ("Total Quantity", group.get("total_qty", "-")),
-        ("Total Value", group.get("total_value", "-")),
-    ]
-    fields_html = "".join(
-        f'<tr><td style="padding:4px 10px;color:#6B7280;">{k}</td>'
-        f'<td style="padding:4px 10px;font-weight:600;">{v}</td></tr>'
-        for k, v in summary_fields
+    # Temporary professional placeholder body (PDF attachment is the source of truth).
+    text_body = (
+        "Dear Team,\n\n"
+        "Please find attached the Parts Transfer Request for your review and necessary action.\n\n"
+        "Kindly check the requested parts and update the request status accordingly.\n\n"
+        "Regards,\n"
+        "Sleeping Stock Team"
     )
     html_body = f"""
     <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;border:1px solid #D1D5DB;border-radius:10px;overflow:hidden;">
       <div style="background:#047857;color:#fff;padding:16px;">
         <div style="font-size:16px;font-weight:800;">Sleeping Stock · NMTS</div>
-        <div style="font-size:13px;opacity:0.9;">Parts Transfer Request</div>
+        <div style="font-size:13px;opacity:0.9;">Parts Transfer Request - {sanitize_text(request_number, 80)}</div>
       </div>
-      <div style="padding:16px;">
+      <div style="padding:16px;font-size:13px;line-height:1.5;color:#111827;">
         <p>Dear Team,</p>
-        <p>A new Parts Transfer Request has been created for your branch.</p>
-        <table style="width:100%;border-collapse:collapse;font-size:13px;">{fields_html}</table>
-        <p style="margin-top:12px;">Please find the complete request details in the attached PDF.</p>
-        <p>Regards,<br/>Sleeping Stock – NMTS</p>
+        <p>Please find attached the Parts Transfer Request for your review and necessary action.</p>
+        <p>Kindly check the requested parts and update the request status accordingly.</p>
+        <p>Regards,<br/>Sleeping Stock Team</p>
       </div>
     </div>
     """
-    text_body = (
-        "Dear Team,\n\nA new Parts Transfer Request has been created for your branch.\n\n"
-        + "\n".join(f"{k}: {v}" for k, v in summary_fields)
-        + "\n\nPlease find the complete request details in the attached PDF.\n\n"
-          "Regards,\nSleeping Stock – NMTS"
-    )
 
     try:
         msg = MIMEMultipart("mixed")
