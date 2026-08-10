@@ -30,6 +30,7 @@ import {
   isSessionExpiredByInactivity,
   clearAuthStorage,
 } from './utils/sessionActivity';
+import { resolveApiUrl, resolveBackendUrl } from '@/backendUrl';
 
 const AuthContext = createContext(null);
 
@@ -79,8 +80,8 @@ export const useAuth = () => {
   return context;
 };
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8000';
-export const API = `${BACKEND_URL}/api`;
+export const BACKEND_URL = resolveBackendUrl();
+export const API = resolveApiUrl();
 
 axios.interceptors.request.use((config) => {
   const token = localStorage.getItem('token');

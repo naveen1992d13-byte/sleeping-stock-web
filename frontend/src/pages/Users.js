@@ -25,8 +25,9 @@ import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
 import { toast } from "sonner";
 import { NmtsConfirmDialog } from "../components/NmtsConfirmDialog";
 import { NmtsModal } from "../components/NmtsModal";
+import { resolveBackendUrl } from "../backendUrl";
 
-const API = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8000";
+const API = resolveBackendUrl();
 
 const COLORS = {
   page: "#D1FAE5",

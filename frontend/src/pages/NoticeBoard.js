@@ -8,8 +8,9 @@ import { Plus, Eye, Paperclip, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
 import { NmtsModal } from '@/components/NmtsModal';
 import { NmtsConfirmDialog } from '@/components/NmtsConfirmDialog';
+import { resolveBackendUrl } from '@/backendUrl';
 
-const BACKEND_ROOT = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8000';
+const BACKEND_ROOT = resolveBackendUrl();
 
 const NOTICE_TYPES = [
   'General Notice',
