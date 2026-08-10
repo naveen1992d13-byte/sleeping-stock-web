@@ -189,7 +189,11 @@ export function UploadCenter() {
       if (isMaster || isAdmin) fetchMasterSummary();
       if (isUser) fetchTodaySummary();
     } catch (e) {
-      toast.error(e.response?.data?.detail || 'Publish failed');
+      const detail = e.response?.data?.detail;
+      const msg = typeof detail === 'string'
+        ? detail
+        : (Array.isArray(detail) ? (detail[0]?.msg || detail[0]?.detail) : null);
+      toast.error(msg || e.message || 'Publish failed');
     } finally {
       setPublishBusy(false);
     }
