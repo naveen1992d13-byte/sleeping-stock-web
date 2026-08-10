@@ -4378,7 +4378,14 @@ async def order_desk_orders(brand: Optional[str] = None, dealer: Optional[str] =
 
 
 @api_router.get('/order-desk/orders/{order_id}')
-async def order_desk_order_detail(order_id: str, current_user: UserResponse = Depends(get_current_user)):
+async def order_desk_order_detail(
+    order_id: str,
+    branch_aging_type: Optional[str] = 'purchase',
+    branch_min_aging: float = 0,
+    dealer_aging_type: Optional[str] = 'purchase',
+    dealer_min_aging: float = 0,
+    current_user: UserResponse = Depends(get_current_user),
+):
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail='Order not found')
@@ -4386,10 +4393,19 @@ async def order_desk_order_detail(order_id: str, current_user: UserResponse = De
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
-    # Enrich with request history + derived Request Status / Remaining / Factory fields.
-    # Request Center order_requests remain authoritative; enrichment is read-time only.
-    items = await odw.enrich_order_items(db, order, items)
-    return {'order': order, 'items': items}
+    items = await odw.enrich_order_items(
+        db, order, items,
+        branch_aging_type=(branch_aging_type or 'purchase'),
+        branch_min_aging=float(branch_min_aging or 0),
+        dealer_aging_type=(dealer_aging_type or 'purchase'),
+        dealer_min_aging=float(dealer_min_aging or 0),
+    )
+    order_stage = odw.compute_order_stage(items)
+    return {
+        'order': {**order, **order_stage},
+        'items': items,
+        'stage': order_stage,
+    }
 
 
 @api_router.get('/order-desk/template')
@@ -4416,7 +4432,7 @@ async def order_desk_order_export(order_id: str, current_user: UserResponse = De
     from fastapi.responses import StreamingResponse
     from io import BytesIO
 
-    detail = await order_desk_order_detail(order_id, current_user)
+    detail = await order_desk_order_detail(order_id, current_user=current_user)
     order = detail['order']
     items = detail['items']
     wb = openpyxl.Workbook()
@@ -4647,6 +4663,10 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
     """
     level = str((payload or {}).get('level') or '').strip().lower()
     aging_type = str((payload or {}).get('aging_type') or 'purchase').strip().lower()
+    try:
+        min_aging_days = float((payload or {}).get('min_aging_days') or (payload or {}).get('aging_min_days') or 0)
+    except (TypeError, ValueError):
+        min_aging_days = 0.0
     if level not in ('branch', 'dealer'):
         raise HTTPException(status_code=400, detail="level must be 'branch' or 'dealer'")
     if aging_type not in ('purchase', 'sales'):
@@ -4665,18 +4685,32 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
     if not any(item.get('availability_checked_at') for item in items):
         raise HTTPException(status_code=400, detail='Run Check Availability before using Auto Suggest')
 
+    # Stage gate: Dealer Auto Suggest only after Branch stage exhausted for remaining items
     if level == 'dealer':
+        freezes_gate = await odw.load_today_freezes(db, [i.get('part_number') for i in items], order.get('brand_name') or '')
+        still_branch = False
+        for item in items:
+            rem = float(item.get('remaining_qty') if item.get('remaining_qty') is not None else item.get('required_qty') or 0)
+            # subtract accepted/pending roughly via enrichment later; use flag + pool
+            if item.get('branch_stage_exhausted'):
+                continue
+            pool = odw.eligible_pool(item, order, 'branch', freezes_gate, 'purchase', 0)
+            if pool and rem > 0 and not item.get('branch_stage_exhausted'):
+                # If any active branch request pending, also block
+                still_branch = True
+                break
         sent_already = await db.request_headers.find_one({'order_id': order_id}, {'_id': 0, 'id': 1})
-        if not sent_already:
-            raise HTTPException(status_code=400, detail='Dealer Auto Suggest can only run after Branch Requests have been sent')
+        if not sent_already and still_branch:
+            raise HTTPException(status_code=400, detail='Dealer Auto Suggest opens only after Branch stage is exhausted for remaining quantity')
+        if still_branch:
+            raise HTTPException(status_code=400, detail='Complete or exhaust Branch stage before Dealer Auto Suggest')
 
     selected_item_ids = {str(x) for x in ((payload or {}).get('item_ids') or []) if x}
     pool_field = 'same_dealer_sources' if level == 'branch' else 'other_dealer_sources'
 
-    # One reservation lookup for every candidate stock row in this order —
-    # already-reserved stock (by this order or any other) is never suggested.
     all_stock_ids = [s.get('stock_id') for item in items for s in (item.get(pool_field) or [])]
     reserved_map = await _reservation_qty_map(all_stock_ids)
+    freezes = await odw.load_today_freezes(db, [i.get('part_number') for i in items], order.get('brand_name') or '')
 
     now = datetime.now(timezone.utc).isoformat()
     result_items = []
@@ -4684,25 +4718,42 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
         if selected_item_ids and item.get('id') not in selected_item_ids:
             result_items.append(item)
             continue
-        if item.get('allocation_source') == 'manual' and not item.get('retry_required'):
-            result_items.append({**item, 'auto_suggest_skipped': 'manual_override'})
+        # Locked items with no remaining qty: skip
+        active_pending = await db.order_requests.find_one(
+            {'order_item_id': item.get('id'), 'status': 'Requested'}, {'_id': 0, 'id': 1},
+        )
+        if active_pending:
+            result_items.append({**item, 'auto_suggest_skipped': 'awaiting_response_lock'})
             continue
+        if item.get('allocation_source') == 'manual' and not item.get('retry_required'):
+            # Allow auto-suggest when remaining exists after partial/reject even if prior manual
+            existing_reqs = await db.order_requests.find({'order_item_id': item.get('id')}, {'_id': 0}).to_list(100)
+            if not existing_reqs:
+                result_items.append({**item, 'auto_suggest_skipped': 'manual_override'})
+                continue
 
         required_qty = float(item.get('required_qty') or 0)
         active_requests = await db.order_requests.find(
             {'order_item_id': item.get('id'), 'status': {'$nin': ['Rejected', 'Cancelled']}},
             {'_id': 0, 'requested_qty': 1, 'accepted_qty': 1, 'approved_qty': 1, 'status': 1},
         ).to_list(1000)
-        # A partially approved line reserves only the quantity actually accepted.
-        # Requested lines continue to reserve their full requested quantity.
         already_requested_qty = sum(
             float((r.get('accepted_qty') if r.get('status') == 'Approved' else r.get('requested_qty')) or 0)
             for r in active_requests
         )
         pending_qty = max(0.0, required_qty - already_requested_qty)
+        if pending_qty <= 0:
+            result_items.append({**item, 'auto_suggest_skipped': 'fully_locked'})
+            continue
 
-        excluded = {(str(x.get('dealer_name') or '').lower(), str(x.get('branch') or '').lower()) for x in (item.get('excluded_sources') or [])}
-        pool = [_with_reservation_adjustment(s, reserved_map) for s in (item.get(pool_field) or []) if (str(s.get('dealer_name') or '').lower(), str(s.get('branch') or '').lower()) not in excluded]
+        if level == 'dealer' and not item.get('branch_stage_exhausted'):
+            branch_left = odw.eligible_pool(item, order, 'branch', freezes, aging_type, min_aging_days)
+            if branch_left:
+                result_items.append({**item, 'auto_suggest_skipped': 'branch_stage_open'})
+                continue
+
+        pool = odw.eligible_pool(item, order, level, freezes, aging_type, min_aging_days)
+        pool = [_with_reservation_adjustment(s, reserved_map) for s in pool]
         pool = [s for s in pool if s.get('net_available_qty', 0) > 0]
         pool.sort(key=lambda s: _auto_suggest_sort_key(s, aging_type))
 
@@ -4729,30 +4780,25 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
                 'request_status': odw.REQUEST_STATUS_READY,
             })
             left -= take
-            # Prevent double-click / same-run duplicate allocation: a stock
-            # row picked for one item in this loop is treated as spoken for
-            # when the next item in the same run is considered.
             reserved_map[source.get('stock_id')] = reserved_map.get(source.get('stock_id'), 0) + take
 
+        preserved = [
+            a for a in (item.get('allocations') or [])
+            if a.get('request_no') or a.get('request_number')
+            or str(a.get('status') or '').lower() in (
+                'request sent', 'awaiting response', 'requested', 'accepted', 'partially accepted',
+                'rejected', 'cancelled', 'completed', 'dispatched', 'received', 'response time expired',
+            )
+        ]
         if level == 'branch':
-            # Keep already-sent allocations; replace only unsent draft suggestions.
-            preserved = [
-                a for a in (item.get('allocations') or [])
-                if a.get('request_no') or a.get('request_number')
-                or str(a.get('status') or '').lower() in (
-                    'request sent', 'requested', 'accepted', 'partially accepted',
-                    'rejected', 'cancelled', 'completed', 'dispatched', 'received',
-                )
-            ]
             new_allocations = preserved + picked
         else:
-            # Dealer suggestion only ever targets the leftover Pending Qty —
-            # the already-sent branch allocations stay untouched, only the
-            # previous (unsent) dealer-level auto suggestion is refreshed.
             existing = [
-                a for a in (item.get('allocations') or [])
+                a for a in preserved
                 if not (a.get('level') == 'dealer' and a.get('origin') == 'auto' and not (a.get('request_no') or a.get('request_number')))
             ]
+            # drop unsent dealer drafts then add new
+            existing = [a for a in (item.get('allocations') or []) if a.get('request_no') or a.get('request_number') or a.get('level') != 'dealer']
             new_allocations = existing + picked
 
         total_allocated = sum(float(a.get('request_qty') or 0) for a in new_allocations)
@@ -4762,7 +4808,6 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
             'remaining_qty': pending_qty - sum(p['request_qty'] for p in picked),
             'status': 'Source Selected' if new_allocations else item.get('status', 'Availability Checked'),
             'allocation_source': 'auto', 'retry_required': False if picked else item.get('retry_required', False),
-            're_enquire': False if picked else item.get('re_enquire', False),
             'request_status': odw.REQUEST_STATUS_READY if picked else item.get('request_status'),
             'updated_at': now,
         }})
@@ -4773,13 +4818,20 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
             'auto_suggest_unfulfilled': max(0.0, left),
         })
 
-    await db.order_headers.update_one({'id': order_id}, {'$set': {'updated_at': now}})
+    await db.order_headers.update_one({'id': order_id}, {'$set': {
+        'updated_at': now,
+        f'{level}_aging_type': aging_type,
+        f'{level}_min_aging_days': min_aging_days,
+    }})
     await db.order_activity.insert_one({
         'id': str(uuid.uuid4()), 'order_id': order_id, 'order_number': order.get('order_number'),
-        'action': f'Auto Suggest ({level.title()}, {aging_type.title()} Aging)', 'performed_by': current_user.id,
+        'action': f'Auto Suggest ({level.title()}, {aging_type.title()} Aging ≥{int(min_aging_days)}d)',
+        'performed_by': current_user.id,
         'performed_user_name': current_user.username, 'created_at': now,
     })
-    return {'order_number': order.get('order_number'), 'level': level, 'aging_type': aging_type, 'items': result_items}
+    enriched = await odw.enrich_order_items(db, order, result_items, aging_type, min_aging_days, aging_type, min_aging_days)
+    return {'order_number': order.get('order_number'), 'level': level, 'aging_type': aging_type,
+            'min_aging_days': min_aging_days, 'items': enriched}
 
 
 async def _active_recipients_for_scope(brand: str = None, dealer: str = None, branch: str = None, roles=('admin', 'master')):
@@ -4876,6 +4928,9 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         'email_sent': False, 'email_status': 'pending', 'email_sent_at': None, 'email_error': None,
         'receiver_email': '', 'pdf_filename': f'{request_number}.pdf', 'notification_log_id': None,
     }
+    # Response SLA timer — based on THIS request group's line-item count only.
+    schedule = odw.compute_response_schedule(len(line_items), datetime.now(timezone.utc))
+    group_doc.update(schedule)
 
     try:
         await db.request_headers.insert_one(dict(group_doc))
@@ -5114,7 +5169,7 @@ async def order_desk_add_items(order_id: str, payload: dict, current_user: UserR
         'count': len(new_items),
         'parts': [i['part_number'] for i in new_items],
     })
-    detail = await order_desk_order_detail(order_id, current_user)
+    detail = await order_desk_order_detail(order_id, current_user=current_user)
     return {'message': f'{len(new_items)} item(s) added to {order.get("order_number")}', **detail}
 
 
@@ -5200,7 +5255,7 @@ async def order_desk_re_enquire(order_id: str, payload: dict = None, current_use
     await odw.append_order_audit(db, order, 'Re-Enquire Remaining Qty', current_user, {
         'item_ids': item_ids or 'all_remaining', 'updated': updated,
     })
-    detail = await order_desk_order_detail(order_id, current_user)
+    detail = await order_desk_order_detail(order_id, current_user=current_user)
     return {'message': f'{updated} item(s) marked for re-enquiry', 'updated': updated, **detail}
 
 
@@ -5228,6 +5283,23 @@ async def order_desk_request_cancellation(order_id: str, item_id: str, payload: 
     now = datetime.now(timezone.utc).isoformat()
     # Safe auto-approval: no request sent, no reservation, no acceptance, no dispatch/receive.
     item_reqs = await db.order_requests.find({'order_item_id': item_id}, {'_id': 0}).to_list(1000)
+    # Block cancellation of locked awaiting requests before timeout — use cancel-timeout instead.
+    pending = [r for r in item_reqs if r.get('status') == 'Requested']
+    if pending and reason != 'Cancelled – No Response':
+        for r in pending:
+            header = await db.request_headers.find_one({'request_number': r.get('request_number')}, {'_id': 0})
+            timer = odw.evaluate_group_timer(header or {})
+            if not timer.get('cancel_allowed'):
+                raise HTTPException(
+                    status_code=400,
+                    detail='Request Sent – Awaiting Response. Cancellation is disabled until the response timer expires.',
+                )
+    # Accepted qty is never cancelled via this path for the accepted portion
+    if any(float(r.get('accepted_qty') or r.get('approved_qty') or 0) > 0 and r.get('status') in (
+        'Approved', 'Partially Approved', 'Dispatched', 'Received', 'Completed'
+    ) for r in item_reqs) and float(item.get('remaining_qty') or 0) <= 0:
+        raise HTTPException(status_code=400, detail='Accepted quantity is locked and cannot be cancelled')
+
     active_reservations = await db.stock_reservations.count_documents({'order_item_id': item_id, 'status': 'active'})
     has_sent = any(r.get('status') not in (None, '') for r in item_reqs)
     has_acceptance = any(float(r.get('accepted_qty') or r.get('approved_qty') or 0) > 0 for r in item_reqs)
@@ -5396,6 +5468,71 @@ async def resend_request_group_email(request_number: str, current_user: UserResp
     }
 
 
+@api_router.post('/requests/group/{request_number}/cancel-timeout')
+async def cancel_request_group_timeout(request_number: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    """Cancel unanswered items after response deadline. Does not unlock Accepted qty.
+    Cancellation reason: Cancelled – No Response. Does NOT create a Rejected-Today freeze.
+    """
+    group_doc = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
+    if not group_doc:
+        raise HTTPException(status_code=404, detail='Request not found')
+    role = (current_user.role or '').lower()
+    is_requester = group_doc.get('requested_by') == current_user.id or (role != 'user' and group_doc.get('requesting_dealer') == current_user.group)
+    if role != 'master' and not is_requester:
+        raise HTTPException(status_code=403, detail='Not authorized to cancel this request')
+
+    timer = odw.evaluate_group_timer(group_doc)
+    if not timer.get('cancel_allowed'):
+        raise HTTPException(status_code=400, detail='Cancel is only allowed after the response deadline expires')
+
+    now = datetime.now(timezone.utc).isoformat()
+    pending = await db.order_requests.find(
+        {'request_number': request_number, 'status': 'Requested'}, {'_id': 0},
+    ).to_list(10000)
+    if not pending:
+        return {'message': 'No unanswered items to cancel', 'cancelled': 0, 'cancel_allowed': False}
+
+    cancelled = 0
+    for req in pending:
+        updated, changed = await _request_center_transition(
+            req['id'], 'Cancelled', 'Cancelled – No Response', current_user,
+        )
+        if changed:
+            cancelled += 1
+            await db.order_requests.update_one({'id': req['id']}, {'$set': {
+                'cancellation_reason': 'Cancelled – No Response',
+                'timeout_cancelled': True,
+                'timeout_cancelled_at': now,
+            }})
+            # Prefer next source — exclude this source for current order attempts,
+            # but do NOT write a day-wide Rejected Today freeze.
+            await db.order_items.update_one({'id': req.get('order_item_id')}, {
+                '$addToSet': {'excluded_sources': {
+                    'dealer_name': req.get('supplying_dealer', ''),
+                    'branch': req.get('supplying_branch', ''),
+                    'reason': 'no_response',
+                }},
+                '$set': {'retry_required': True, 'updated_at': now},
+            })
+
+    await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {
+        'response_status': 'cancelled',
+        'timeout_cancelled': True,
+        'timeout_cancelled_at': now,
+        'updated_at': now,
+    }})
+    order = await db.order_headers.find_one({'id': group_doc.get('order_id')}, {'_id': 0}) or {}
+    await odw.append_order_audit(db, order, 'Cancelled – No Response', current_user, {
+        'request_number': request_number, 'cancelled': cancelled,
+    })
+    return {
+        'message': f'{cancelled} unanswered item(s) cancelled – no response.',
+        'cancelled': cancelled,
+        'cancel_allowed': False,
+        'request_number': request_number,
+    }
+
+
 @api_router.get('/requests/group/{request_number}')
 async def request_group_detail(request_number: str, current_user: UserResponse = Depends(get_current_user)):
     group_doc = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
@@ -5406,9 +5543,10 @@ async def request_group_detail(request_number: str, current_user: UserResponse =
     is_requester = group_doc.get('requested_by') == current_user.id or (role != 'user' and group_doc.get('requesting_dealer') == current_user.group)
     if not (is_supplier or is_requester):
         raise HTTPException(status_code=403, detail='Not authorized for this request')
-    # Expose email status separately from request status for Order Desk.
+    timer = odw.evaluate_group_timer(group_doc)
     group_doc = {
         **group_doc,
+        **timer,
         'email_status_label': odw.email_status_label(
             'sent' if group_doc.get('email_sent') else group_doc.get('email_status')
         ),
@@ -6590,6 +6728,7 @@ async def ensure_product_hub_indexes():
     await db.stock_reservations.create_index([("stock_id", 1), ("status", 1)])
     await db.stock_reservations.create_index([("order_request_id", 1)])
     await db.stock_reservations.create_index([("order_id", 1)])
+    await odw.ensure_order_desk_indexes(db)
 
 
 @app.on_event("startup")
