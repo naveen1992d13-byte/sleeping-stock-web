@@ -4935,35 +4935,27 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
     try:
         await db.request_headers.insert_one(dict(group_doc))
     except DuplicateKeyError:
-        # Same order + destination already has a header. If that prior group is
-        # Rejected/Cancelled, archive it so a fresh re-enquiry request can be
-        # created. Otherwise reuse the winning group (concurrent duplicate).
+        # Concurrent duplicate ACTIVE request to the same destination
+        # (partial unique index on status=Requested). Reuse the winner.
+        # Terminal history for the same destination is allowed and does not
+        # hit this path.
         existing = await db.request_headers.find_one(
+            {
+                'order_id': order.get('id'),
+                'supplying_dealer': supplying_dealer,
+                'supplying_branch': supplying_branch,
+                'status': 'Requested',
+            },
+            {'_id': 0},
+        )
+        await db.order_requests.delete_many({'id': {'$in': order_request_ids}})
+        if existing:
+            return existing
+        # Fallback: any matching destination header (should be rare).
+        return await db.request_headers.find_one(
             {'order_id': order.get('id'), 'supplying_dealer': supplying_dealer, 'supplying_branch': supplying_branch},
             {'_id': 0},
         )
-        if existing and existing.get('status') in ('Rejected', 'Cancelled'):
-            archive_branch = f"{supplying_branch}#archived-{existing.get('id', '')[:8]}"
-            await db.request_headers.update_one(
-                {'id': existing['id']},
-                {'$set': {
-                    'supplying_branch': archive_branch,
-                    'archived': True,
-                    'archived_at': now,
-                    'original_supplying_branch': supplying_branch,
-                }},
-            )
-            try:
-                await db.request_headers.insert_one(dict(group_doc))
-            except DuplicateKeyError:
-                await db.order_requests.delete_many({'id': {'$in': order_request_ids}})
-                return await db.request_headers.find_one(
-                    {'order_id': order.get('id'), 'supplying_dealer': supplying_dealer, 'supplying_branch': supplying_branch},
-                    {'_id': 0},
-                )
-        else:
-            await db.order_requests.delete_many({'id': {'$in': order_request_ids}})
-            return existing
 
     # Reservation-aware allocation: only once the request group is durably
     # saved (never on the DuplicateKeyError/retry path above) do we reserve
@@ -6694,10 +6686,32 @@ async def ensure_product_hub_indexes():
     await db.notification_logs.create_index([("receiver_email", 1)])
     await db.notification_logs.create_index([("status", 1)])
     await db.notification_logs.create_index([("created_at", -1)])
-    # Parts Transfer Request numbering/grouping: one request_headers document
-    # per (order, supplying dealer, supplying branch) destination — the
-    # unique index is the DB-level guarantee against duplicate groups.
-    await db.request_headers.create_index([("order_id", 1), ("supplying_dealer", 1), ("supplying_branch", 1)], unique=True)
+    # Parts Transfer Request grouping.
+    # Historical retries (Rejected / Cancelled / Approved / Dispatched) may
+    # legitimately create multiple request_headers for the same
+    # (order, supplying dealer, branch). A full unique index on that key
+    # fails against shared Atlas data and blocks Branch→Dealer retry flow.
+    # Keep uniqueness ONLY for active "Requested" groups so concurrent
+    # duplicate sends are still prevented at the DB layer.
+    try:
+        await db.request_headers.drop_index('order_id_1_supplying_dealer_1_supplying_branch_1')
+    except Exception:
+        pass
+    try:
+        # Older name if previously created under a custom name.
+        await db.request_headers.drop_index('uniq_request_destination')
+    except Exception:
+        pass
+    await db.request_headers.create_index(
+        [("order_id", 1), ("supplying_dealer", 1), ("supplying_branch", 1)],
+        unique=True,
+        name="uniq_active_request_destination",
+        partialFilterExpression={"status": "Requested"},
+    )
+    await db.request_headers.create_index(
+        [("order_id", 1), ("supplying_dealer", 1), ("supplying_branch", 1), ("created_at", -1)],
+        name="idx_request_headers_destination_history",
+    )
     await db.request_headers.create_index([("request_number", 1)], unique=True)
     await db.request_headers.create_index([("created_at", -1)])
     await db.order_requests.create_index([("request_number", 1)])

@@ -22,9 +22,11 @@ Cursor Cloud update script, so you normally don't need to install them again.
 - On startup the backend seeds a master admin if none exists. Default login:
   `admin@sleepingstock.in` / `admin123`.
 - Known non-fatal startup log: a `Product Hub index creation failed ... E11000
-  duplicate key` error on `request_headers`. It comes from pre-existing duplicate
-  data in the shared Atlas DB; the app still finishes startup ("Application
-  startup complete") and works. Not caused by env setup.
+  duplicate key` error on `request_headers` used to appear from a legacy full
+  unique index on `(order_id, supplying_dealer, supplying_branch)` while
+  historical retry/dispatch duplicates existed. Startup now uses a **partial
+  unique index** (`status: Requested` only) so history is preserved and the
+  error should no longer appear.
 
 ### Running the frontend
 
