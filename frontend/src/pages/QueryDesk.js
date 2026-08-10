@@ -16,6 +16,8 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 
+import { resolveBackendUrl } from '@/backendUrl';
+
 const QUERY_TYPES = ['System', 'General', 'Guidance'];
 const STATUS_STYLES = {
   Open: { bg: '#DBEAFE', fg: '#1E40AF' },
@@ -32,7 +34,7 @@ const STATUS_DETAIL_LABELS = {
 };
 
 const ALLOWED_EXT = ['.png', '.jpg', '.jpeg', '.pdf', '.xls', '.xlsx'];
-const BACKEND_ROOT = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8000';
+const BACKEND_ROOT = resolveBackendUrl();
 
 function formatIstDateTime(value) {
   if (!value) return '-';

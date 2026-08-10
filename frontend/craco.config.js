@@ -57,6 +57,9 @@ let webpackConfig = {
 };
 
 webpackConfig.devServer = (devServerConfig) => {
+  // Codespaces / remote tunnels must reach the CRA server on all interfaces.
+  devServerConfig.host = '0.0.0.0';
+  devServerConfig.allowedHosts = 'all';
   // Add health check endpoints if enabled
   if (config.enableHealthCheck && setupHealthEndpoints && healthPluginInstance) {
     const originalSetupMiddlewares = devServerConfig.setupMiddlewares;
