@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, OperationFailure
 import os
 import logging
 from pathlib import Path
@@ -3270,9 +3270,11 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
         "upload_type": "product",
         "file_name": file.filename,
         "file_size": file_size,
-        "raw_file_bytes": raw_bytes,
-        "raw_file_content_type": file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "rows_processed": rows_processed,
+        # Do not embed multi-MB Excel blobs in MongoDB — they blow Atlas free-tier
+    # quotas and leave half-published Product Hub state when writes get blocked.
+    # Keep file metadata only; re-upload if raw download is required later.
+    "raw_file_content_type": file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "rows_processed": rows_processed,
         "rows_imported": rows_imported,
         "failed_count": len(rejected),
         "item_count": rows_imported,
@@ -3311,6 +3313,99 @@ async def get_uploads_v2(type: str = None, brand: str = None, dealer: str = None
     return await db.uploads.find(query, {"_id": 0, "raw_file_bytes": 0}).sort("created_at", -1).to_list(1000)
 
 
+def _atlas_or_write_error_detail(exc: Exception) -> str:
+    msg = str(exc or "")
+    if "space quota" in msg.lower() or "8000" in msg:
+        return (
+            "Publish failed: MongoDB Atlas storage quota exceeded (writes blocked). "
+            "Free cluster storage or upgrade the tier, then retry Publish. "
+            "Existing Product Hub rows were left unchanged."
+        )
+    return f"Publish failed due to a database write error: {msg[:300]}"
+
+
+def _product_hub_batch_totals_from_items(items: list) -> dict:
+    batch_total_item = 0
+    batch_available_item = 0
+    batch_available_qty = 0.0
+    batch_total_value = 0.0
+    for item in items:
+        qty_num = float(item.get("available_qty_number", item.get("quantity", 0)) or 0)
+        unit_val_num = float(item.get("unit_value_number", item.get("mav_value", item.get("mav", 0)) or 0) or 0)
+        total_val_num = float(item.get("total_value_number", qty_num * unit_val_num) or 0)
+        batch_total_item += 1
+        if qty_num > 0:
+            batch_available_item += 1
+        batch_available_qty += qty_num
+        batch_total_value += total_val_num
+    return {
+        "total_item": batch_total_item,
+        "available_item": batch_available_item,
+        "available_qty": batch_available_qty,
+        "total_value": batch_total_value,
+    }
+
+
+async def _finalize_product_publish(
+    upload: dict,
+    upload_id: str,
+    date_key: str,
+    now,
+    current_user: UserResponse,
+    totals: dict,
+    *,
+    already_published_products: bool,
+):
+    """Write batch_summaries + upload status. Safe to call when products already exist."""
+    await db.batch_summaries.update_one(
+        {
+            "brand_name": upload.get("brand_name"),
+            "dealer_name": upload.get("dealer_name"),
+            "branch": upload.get("branch"),
+            "active_date_key": date_key,
+        },
+        {"$set": {
+            "brand_name": upload.get("brand_name"),
+            "dealer_name": upload.get("dealer_name"),
+            "branch": upload.get("branch"),
+            "active_date_key": date_key,
+            "upload_id": upload_id,
+            "upload_no": upload.get("upload_no"),
+            "total_item": totals["total_item"],
+            "available_item": totals["available_item"],
+            "available_qty": totals["available_qty"],
+            "total_value": totals["total_value"],
+            "published_at": now.isoformat(),
+            "uploaded_user_name": upload.get("uploaded_user_name") or current_user.username,
+        }},
+        upsert=True,
+    )
+    await db.upload_items.update_many(
+        {"upload_id": upload_id},
+        {"$set": {"publish_status": "Published", "published_at": now.isoformat()}},
+    )
+    await db.uploads.update_one({"id": upload_id}, {"$set": {
+        "publish_status": "Published",
+        "status": "Ready to Send",
+        "published_at": now.isoformat(),
+        "published_by": current_user.id,
+        "published_user_name": current_user.username,
+        # Drop embedded Excel blob after successful publish to protect Atlas free-tier quota.
+        "raw_file_cleared_reason": "cleared_after_publish",
+    }, "$unset": {"raw_file_bytes": ""}})
+    return {
+        "message": (
+            "Already published — Product Hub/status reconciled successfully"
+            if already_published_products else
+            "Published successfully"
+        ),
+        "items": totals["total_item"],
+        "available_qty": totals["available_qty"],
+        "total_value": totals["total_value"],
+        "reconciled": already_published_products,
+    }
+
+
 @api_router.put("/uploads/{upload_id}/publish-v2")
 async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends(get_current_user)):
     if current_user.role not in ["master", "admin", "user"]:
@@ -3318,113 +3413,161 @@ async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends
     upload = await db.uploads.find_one({"id": upload_id}, {"_id": 0, "raw_file_bytes": 0})
     if not upload:
         raise HTTPException(status_code=404, detail="Upload not found")
-    if upload.get("status") == "Cancelled":
+    if upload.get("status") == "Cancelled" or upload.get("publish_status") == "Cancelled":
         raise HTTPException(status_code=400, detail="Cancelled upload cannot be published")
-    # Idempotency guard: publishing the same upload twice previously duplicated every
-    # product row (doubling Total Available Quantity / Total Value in Product Hub).
-    if upload.get("publish_status") == "Published":
-        raise HTTPException(status_code=400, detail="This upload has already been published")
     if current_user.role == "admin" and (upload.get("brand_name") != current_user.brand or upload.get("dealer_name") != current_user.group):
         raise HTTPException(status_code=403, detail="Not allowed to publish this upload")
     if current_user.role == "user" and str(upload.get("uploaded_user_id") or "") != str(current_user.id):
         raise HTTPException(status_code=403, detail="Users can publish only their own uploads")
 
     now = _nmts_now()
-    date_key = _nmts_date_key(now)
+    # Prefer the upload's own business date so late publish still lands on the
+    # intended day; fall back to "today" for legacy rows without date_key.
+    date_key = str(upload.get("date_key") or _nmts_date_key(now))
+    existing_products = await db.products.count_documents({"upload_id": upload_id, "publish_status": "Published"})
     items = await db.upload_items.find({"upload_id": upload_id}, {"_id": 0}).to_list(200000)
-    if not items:
+    if not items and existing_products <= 0:
         raise HTTPException(status_code=400, detail="No upload items found")
 
-    batch_total_item = 0
-    batch_available_item = 0
-    batch_available_qty = 0.0
-    batch_total_value = 0.0
-
-    # Keep today's Product Hub clean for the same brand/dealer/branch before publishing this batch.
-    if upload.get("upload_type") == "product":
-        await db.products.update_many({
+    # Idempotent success when upload is already marked Published.
+    if upload.get("publish_status") == "Published":
+        batch = await db.batch_summaries.find_one({
             "brand_name": upload.get("brand_name"),
             "dealer_name": upload.get("dealer_name"),
             "branch": upload.get("branch"),
             "active_date_key": date_key,
-        }, {"$set": {"is_active_today": False}})
+            "upload_id": upload_id,
+        }, {"_id": 0})
+        if batch:
+            return {
+                "message": "Already published",
+                "items": int(batch.get("total_item") or existing_products or len(items)),
+                "available_qty": float(batch.get("available_qty") or 0),
+                "total_value": float(batch.get("total_value") or 0),
+                "reconciled": False,
+                "already_published": True,
+            }
+        # Published flag set but summary missing — reconcile without re-insert.
+        totals = _product_hub_batch_totals_from_items(items) if items else {
+            "total_item": existing_products,
+            "available_item": await db.products.count_documents({"upload_id": upload_id, "available_qty_number": {"$gt": 0}}),
+            "available_qty": float(upload.get("total_available_qty") or 0),
+            "total_value": float(upload.get("total_value") or 0),
+        }
+        try:
+            return await _finalize_product_publish(
+                upload, upload_id, date_key, now, current_user, totals, already_published_products=True,
+            )
+        except OperationFailure as exc:
+            raise HTTPException(status_code=507, detail=_atlas_or_write_error_detail(exc))
 
-        product_docs = []
-        for item in items:
-            doc = dict(item)
-            qty_num = float(item.get("available_qty_number", item.get("quantity", 0)) or 0)
-            unit_val_num = float(item.get("unit_value_number", item.get("mav_value", 0)) or 0)
-            total_val_num = float(item.get("total_value_number", qty_num * unit_val_num) or 0)
-            # Legacy upload_items may carry branch name in `location`; keep bin LOC in loc/bin_location only.
-            if (doc.get("loc") or doc.get("bin_location")) and doc.get("location") is not None:
-                branch_meta = str(doc.get("branch") or "").strip()
-                location_meta = str(doc.get("location") or "").strip()
-                if branch_meta and location_meta.casefold() == branch_meta.casefold():
-                    doc.pop("location", None)
-            doc.update({
-                "id": str(uuid.uuid4()),
-                "upload_id": upload_id,
-                "upload_no": upload.get("upload_no"),
-                "published_at": now.isoformat(),
-                "published_by": current_user.id,
-                "published_user_name": current_user.username,
-                "publish_status": "Published",
-                "is_active_today": True,
-                "active_date_key": date_key,
-                "price": item.get("mav_value", 0),
-                "category": "",
-                "upload_method": "excel",
-                "updated_at": now.isoformat(),
-                # Re-assert numeric fields as real floats so summary aggregation
-                # never trips on stringified numbers.
-                "available_qty_number": qty_num,
-                "unit_value_number": unit_val_num,
-                "total_value_number": total_val_num,
-                "quantity": qty_num,
-                "mav_value": unit_val_num,
-                "total_value": total_val_num,
-            })
-            product_docs.append(doc)
+    totals = _product_hub_batch_totals_from_items(items) if items else {
+        "total_item": existing_products,
+        "available_item": 0,
+        "available_qty": float(upload.get("total_available_qty") or 0),
+        "total_value": float(upload.get("total_value") or 0),
+    }
 
-            batch_total_item += 1
-            if qty_num > 0:
-                batch_available_item += 1
-            batch_available_qty += qty_num
-            batch_total_value += total_val_num
+    try:
+        if upload.get("upload_type") == "product":
+            # Partial-publish reconcile: products already exist for this upload_id.
+            if existing_products > 0:
+                await db.products.update_many(
+                    {
+                        "brand_name": upload.get("brand_name"),
+                        "dealer_name": upload.get("dealer_name"),
+                        "branch": upload.get("branch"),
+                        "is_active_today": True,
+                        "upload_id": {"$ne": upload_id},
+                    },
+                    {"$set": {"is_active_today": False}},
+                )
+                await db.products.update_many(
+                    {"upload_id": upload_id},
+                    {"$set": {
+                        "is_active_today": True,
+                        "active_date_key": date_key,
+                        "publish_status": "Published",
+                        "published_at": now.isoformat(),
+                        "published_by": current_user.id,
+                        "published_user_name": current_user.username,
+                    }},
+                )
+                return await _finalize_product_publish(
+                    upload, upload_id, date_key, now, current_user, totals, already_published_products=True,
+                )
 
-        if product_docs:
-            await db.products.insert_many(product_docs)
-
-        # Pre-calculated branch/batch summary so Product Hub never needs to scan
-        # raw stock rows just to render the summary cards or the branch list.
-        await db.batch_summaries.update_one(
-            {"brand_name": upload.get("brand_name"), "dealer_name": upload.get("dealer_name"), "branch": upload.get("branch"), "active_date_key": date_key},
-            {"$set": {
+            # Fresh publish: deactivate prior active stock for this branch scope
+            # (any previous business date), then insert today's batch once.
+            await db.products.update_many({
                 "brand_name": upload.get("brand_name"),
                 "dealer_name": upload.get("dealer_name"),
                 "branch": upload.get("branch"),
-                "active_date_key": date_key,
-                "upload_id": upload_id,
-                "upload_no": upload.get("upload_no"),
-                "total_item": batch_total_item,
-                "available_item": batch_available_item,
-                "available_qty": batch_available_qty,
-                "total_value": batch_total_value,
-                "published_at": now.isoformat(),
-                "uploaded_user_name": upload.get("uploaded_user_name") or current_user.username,
-            }},
-            upsert=True,
-        )
+                "is_active_today": True,
+            }, {"$set": {"is_active_today": False}})
 
-    await db.upload_items.update_many({"upload_id": upload_id}, {"$set": {"publish_status": "Published", "published_at": now.isoformat()}})
-    await db.uploads.update_one({"id": upload_id}, {"$set": {
-        "publish_status": "Published",
-        "status": "Ready to Send",
-        "published_at": now.isoformat(),
-        "published_by": current_user.id,
-        "published_user_name": current_user.username,
-    }})
-    return {"message": "Published successfully", "items": len(items)}
+            product_docs = []
+            for item in items:
+                doc = dict(item)
+                qty_num = float(item.get("available_qty_number", item.get("quantity", 0)) or 0)
+                unit_val_num = float(item.get("unit_value_number", item.get("mav_value", item.get("mav", 0)) or 0) or 0)
+                total_val_num = float(item.get("total_value_number", qty_num * unit_val_num) or 0)
+                if (doc.get("loc") or doc.get("bin_location")) and doc.get("location") is not None:
+                    branch_meta = str(doc.get("branch") or "").strip()
+                    location_meta = str(doc.get("location") or "").strip()
+                    if branch_meta and location_meta.casefold() == branch_meta.casefold():
+                        doc.pop("location", None)
+                doc.update({
+                    "id": str(uuid.uuid4()),
+                    "upload_id": upload_id,
+                    "upload_no": upload.get("upload_no"),
+                    "published_at": now.isoformat(),
+                    "published_by": current_user.id,
+                    "published_user_name": current_user.username,
+                    "publish_status": "Published",
+                    "is_active_today": True,
+                    "active_date_key": date_key,
+                    "price": unit_val_num,
+                    "category": "",
+                    "upload_method": "excel",
+                    "updated_at": now.isoformat(),
+                    "available_qty_number": qty_num,
+                    "unit_value_number": unit_val_num,
+                    "total_value_number": total_val_num,
+                    "quantity": qty_num,
+                    "available_qty": qty_num,
+                    "mav_value": unit_val_num,
+                    "total_value": total_val_num,
+                })
+                product_docs.append(doc)
+
+            if product_docs:
+                await db.products.insert_many(product_docs)
+
+            return await _finalize_product_publish(
+                upload, upload_id, date_key, now, current_user, totals, already_published_products=False,
+            )
+
+        # Non-product uploads: mark published only.
+        await db.upload_items.update_many(
+            {"upload_id": upload_id},
+            {"$set": {"publish_status": "Published", "published_at": now.isoformat()}},
+        )
+        await db.uploads.update_one({"id": upload_id}, {"$set": {
+            "publish_status": "Published",
+            "status": "Ready to Send",
+            "published_at": now.isoformat(),
+            "published_by": current_user.id,
+            "published_user_name": current_user.username,
+        }, "$unset": {"raw_file_bytes": ""}})
+        return {"message": "Published successfully", "items": len(items)}
+    except OperationFailure as exc:
+        raise HTTPException(status_code=507, detail=_atlas_or_write_error_detail(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("publish-v2 failed for upload %s", upload_id)
+        raise HTTPException(status_code=500, detail=f"Publish failed: {str(exc)[:300]}")
 
 
 class CancelUploadRequest(BaseModel):
@@ -3609,12 +3752,17 @@ async def product_hub_summary(
             batch_query["branch"] = current_user.location
 
         rows = await db.batch_summaries.find(batch_query, {"_id": 0}).to_list(10000)
-        return {
+        summary = {
             "totalItem": sum(int(r.get("total_item", 0)) for r in rows),
             "totalAvailableItem": sum(int(r.get("available_item", 0)) for r in rows),
             "totalAvailableQty": sum(float(r.get("available_qty", 0)) for r in rows),
             "totalValue": sum(float(r.get("total_value", 0)) for r in rows),
         }
+        # If pre-agg is missing (partial publish / quota failure), fall back to
+        # the same active products query used by /product-hub/records.
+        if rows and (summary["totalItem"] > 0 or summary["totalAvailableQty"] > 0 or summary["totalValue"] > 0):
+            return summary
+        needs_product_scan = True
 
     query = _product_hub_active_query(current_user, brand, dealer, branch)
     _apply_category_filter(query, category)
