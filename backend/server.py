@@ -25,6 +25,10 @@ try:
     from . import notifications
 except ImportError:
     import notifications
+try:
+    from . import order_desk_workflow as odw
+except ImportError:
+    import order_desk_workflow as odw
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -4382,7 +4386,29 @@ async def order_desk_order_detail(order_id: str, current_user: UserResponse = De
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    # Enrich with request history + derived Request Status / Remaining / Factory fields.
+    # Request Center order_requests remain authoritative; enrichment is read-time only.
+    items = await odw.enrich_order_items(db, order, items)
     return {'order': order, 'items': items}
+
+
+@api_router.get('/order-desk/template')
+async def order_desk_template(current_user: UserResponse = Depends(get_current_user)):
+    """Generic Order Desk Excel template (Part Number, Quantity, Description, Value)."""
+    from fastapi.responses import StreamingResponse
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Order'
+    ws.append(['Part Number', 'Quantity', 'Description', 'Value'])
+    ws.append(['86511B4000', 2, 'FRONT BUMPER', 1500])
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={'Content-Disposition': 'attachment; filename=Order_Desk_Template.xlsx'},
+    )
 
 
 @api_router.get('/order-desk/orders/{order_id}/export')
@@ -4522,21 +4548,38 @@ async def order_desk_check_availability(order_id: str, brand: Optional[str] = No
 async def order_desk_allocate(order_id: str, payload: dict, current_user: UserResponse = Depends(get_current_user)):
     allocations = payload.get('allocations') or []
     now = datetime.now(timezone.utc).isoformat()
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
     for entry in allocations:
         item_id = entry.get('item_id')
         selected = entry.get('sources') or []
         item = await db.order_items.find_one({'id': item_id, 'order_id': order_id}, {'_id': 0})
         if not item:
             continue
-        total = sum(max(0, float(s.get('request_qty') or 0)) for s in selected)
-        required = float(item.get('required_qty', 0) or 0)
-        if total > required:
-            raise HTTPException(status_code=400, detail=f'Request quantity exceeds required quantity for {item.get("part_number")}')
-        cleaned = []
+        # Preserve already-sent allocations; only replace draft/unsent selections.
+        preserved = [
+            a for a in (item.get('allocations') or [])
+            if a.get('request_no') or a.get('request_number')
+            or str(a.get('status') or '').lower() in (
+                'request sent', 'requested', 'accepted', 'partially accepted',
+                'rejected', 'cancelled', 'completed', 'dispatched', 'received',
+            )
+        ]
+        preserved_keys = {
+            (str(a.get('dealer_name') or '').lower(), str(a.get('branch') or '').lower())
+            for a in preserved
+        }
+        total_preserved = sum(max(0, float(a.get('request_qty') or 0)) for a in preserved)
+        cleaned = list(preserved)
         for source in selected:
             qty = max(0, float(source.get('request_qty') or 0))
             if qty <= 0:
                 continue
+            key = (str(source.get('dealer_name') or '').lower(), str(source.get('branch') or '').lower())
+            if key in preserved_keys:
+                continue  # do not overwrite a source that already has a sent request
+            level = odw.allocation_level({**source, 'level': source.get('level') or source.get('source_type')}, order)
             cleaned.append({
                 'dealer_name': _order_clean_text(source.get('dealer_name')),
                 'branch': _order_clean_text(source.get('branch')),
@@ -4545,18 +4588,41 @@ async def order_desk_allocate(order_id: str, payload: dict, current_user: UserRe
                 'sales_aging_days': source.get('sales_aging_days', ''),
                 'aging_days': source.get('aging_days', ''), 'loc': source.get('loc', ''),
                 'stock_id': source.get('stock_id'),
-                'status': 'Selected', 'selected_at': now, 'origin': 'manual',
+                'status': odw.REQUEST_STATUS_READY, 'selected_at': now, 'origin': 'manual',
+                'level': level, 'source_type': level,
+                'source_dealer': _order_clean_text(source.get('dealer_name')),
+                'source_branch': _order_clean_text(source.get('branch')),
+                'requested_qty': qty, 'accepted_qty': 0, 'remaining_qty': qty,
+                'request_status': odw.REQUEST_STATUS_READY,
             })
+        total = sum(max(0, float(s.get('request_qty') or 0)) for s in cleaned)
+        required = float(item.get('required_qty', 0) or 0)
+        # Cap against already-accepted + active remaining requirement
+        existing_reqs = await db.order_requests.find({'order_item_id': item_id}, {'_id': 0}).to_list(1000)
+        wf = odw.compute_item_workflow(item, order, existing_reqs)
+        # Draft allocations may only cover remaining (+ currently unsent replaced drafts)
+        if total - total_preserved > wf['remaining_qty'] + 1e-9 and total > required:
+            raise HTTPException(status_code=400, detail=f'Request quantity exceeds required quantity for {item.get("part_number")}')
+        if total > required:
+            raise HTTPException(status_code=400, detail=f'Request quantity exceeds required quantity for {item.get("part_number")}')
         # A manual save (even clearing the row back to empty) always wins over
         # Auto Suggest — once allocation_source is 'manual', Auto Suggest will
         # skip this item entirely until the user clears the selection, at
         # which point Auto Suggest is free to run for it again.
         await db.order_items.update_one({'id': item_id}, {'$set': {
-            'allocations': cleaned, 'allocated_qty': total, 'balance_qty': max(0, required-total),
+            'allocations': cleaned, 'allocated_qty': total, 'balance_qty': max(0, required - total),
+            'remaining_qty': max(0, required - float(wf.get('accepted_qty') or 0) - sum(
+                float(a.get('request_qty') or 0) for a in cleaned
+                if a.get('request_no') or a.get('request_number') or str(a.get('status') or '').lower() in (
+                    'request sent', 'requested', 'accepted', 'partially accepted', 'completed', 'dispatched', 'received',
+                )
+            )),
             'status': 'Source Selected' if cleaned else 'Availability Checked', 'updated_at': now,
-            'allocation_source': 'manual' if cleaned else None,
+            'allocation_source': 'manual' if any(not (a.get('request_no') or a.get('request_number')) for a in cleaned) else item.get('allocation_source'),
+            'request_status': odw.REQUEST_STATUS_READY if any(not (a.get('request_no') or a.get('request_number')) for a in cleaned) else wf.get('request_status'),
         }})
     await db.order_headers.update_one({'id': order_id}, {'$set': {'status': 'Source Selected', 'updated_at': now}})
+    await odw.append_order_audit(db, order, 'Manual source selected / Qty changed', current_user)
     return {'message': 'Source selections saved'}
 
 
@@ -4656,7 +4722,11 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
                 'sales_aging_days': source.get('sales_aging_days'),
                 'aging_days': source.get('aging_days'), 'loc': source.get('loc', ''),
                 'stock_id': source.get('stock_id'),
-                'status': 'Selected', 'selected_at': now, 'level': level, 'origin': 'auto',
+                'status': odw.REQUEST_STATUS_READY, 'selected_at': now, 'level': level, 'origin': 'auto',
+                'source_type': level, 'source_dealer': _order_clean_text(source.get('dealer_name')),
+                'source_branch': _order_clean_text(source.get('branch')),
+                'requested_qty': take, 'accepted_qty': 0, 'remaining_qty': take,
+                'request_status': odw.REQUEST_STATUS_READY,
             })
             left -= take
             # Prevent double-click / same-run duplicate allocation: a stock
@@ -4665,22 +4735,36 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
             reserved_map[source.get('stock_id')] = reserved_map.get(source.get('stock_id'), 0) + take
 
         if level == 'branch':
-            # Nothing has been sent yet for a fresh branch suggestion, so the
-            # full suggested set simply replaces any previous auto suggestion.
-            new_allocations = picked
+            # Keep already-sent allocations; replace only unsent draft suggestions.
+            preserved = [
+                a for a in (item.get('allocations') or [])
+                if a.get('request_no') or a.get('request_number')
+                or str(a.get('status') or '').lower() in (
+                    'request sent', 'requested', 'accepted', 'partially accepted',
+                    'rejected', 'cancelled', 'completed', 'dispatched', 'received',
+                )
+            ]
+            new_allocations = preserved + picked
         else:
             # Dealer suggestion only ever targets the leftover Pending Qty —
             # the already-sent branch allocations stay untouched, only the
             # previous (unsent) dealer-level auto suggestion is refreshed.
-            existing = [a for a in (item.get('allocations') or []) if not (a.get('level') == 'dealer' and a.get('origin') == 'auto')]
+            existing = [
+                a for a in (item.get('allocations') or [])
+                if not (a.get('level') == 'dealer' and a.get('origin') == 'auto' and not (a.get('request_no') or a.get('request_number')))
+            ]
             new_allocations = existing + picked
 
         total_allocated = sum(float(a.get('request_qty') or 0) for a in new_allocations)
         await db.order_items.update_one({'id': item['id']}, {'$set': {
             'allocations': new_allocations, 'allocated_qty': total_allocated,
             'balance_qty': max(0.0, required_qty - total_allocated),
+            'remaining_qty': pending_qty - sum(p['request_qty'] for p in picked),
             'status': 'Source Selected' if new_allocations else item.get('status', 'Availability Checked'),
-            'allocation_source': 'auto', 'retry_required': False if picked else item.get('retry_required', False), 'updated_at': now,
+            'allocation_source': 'auto', 'retry_required': False if picked else item.get('retry_required', False),
+            're_enquire': False if picked else item.get('re_enquire', False),
+            'request_status': odw.REQUEST_STATUS_READY if picked else item.get('request_status'),
+            'updated_at': now,
         }})
         updated_item = await db.order_items.find_one({'id': item['id']}, {'_id': 0})
         result_items.append({
@@ -4796,16 +4880,35 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
     try:
         await db.request_headers.insert_one(dict(group_doc))
     except DuplicateKeyError:
-        # Rare concurrent race: another simultaneous call already created the
-        # group for this exact order + destination. Undo the item rows we
-        # just inserted for this group and reuse the winning group instead —
-        # two simultaneous requests must never receive the same or duplicate
-        # request numbers/rows.
-        await db.order_requests.delete_many({'id': {'$in': order_request_ids}})
-        return await db.request_headers.find_one(
+        # Same order + destination already has a header. If that prior group is
+        # Rejected/Cancelled, archive it so a fresh re-enquiry request can be
+        # created. Otherwise reuse the winning group (concurrent duplicate).
+        existing = await db.request_headers.find_one(
             {'order_id': order.get('id'), 'supplying_dealer': supplying_dealer, 'supplying_branch': supplying_branch},
             {'_id': 0},
         )
+        if existing and existing.get('status') in ('Rejected', 'Cancelled'):
+            archive_branch = f"{supplying_branch}#archived-{existing.get('id', '')[:8]}"
+            await db.request_headers.update_one(
+                {'id': existing['id']},
+                {'$set': {
+                    'supplying_branch': archive_branch,
+                    'archived': True,
+                    'archived_at': now,
+                    'original_supplying_branch': supplying_branch,
+                }},
+            )
+            try:
+                await db.request_headers.insert_one(dict(group_doc))
+            except DuplicateKeyError:
+                await db.order_requests.delete_many({'id': {'$in': order_request_ids}})
+                return await db.request_headers.find_one(
+                    {'order_id': order.get('id'), 'supplying_dealer': supplying_dealer, 'supplying_branch': supplying_branch},
+                    {'_id': 0},
+                )
+        else:
+            await db.order_requests.delete_many({'id': {'$in': order_request_ids}})
+            return existing
 
     # Reservation-aware allocation: only once the request group is durably
     # saved (never on the DuplicateKeyError/retry path above) do we reserve
@@ -4835,7 +4938,15 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
 
 
 @api_router.post('/order-desk/orders/{order_id}/send-requests')
-async def order_desk_send_requests_v2(order_id: str, current_user: UserResponse = Depends(get_current_user)):
+async def order_desk_send_requests_v2(order_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    """Send requests for selected allocations.
+
+    Body (optional):
+      level: 'branch' | 'dealer'  — send only that stage's unsent allocations.
+      If omitted, defaults to sending all unsent allocations (legacy behaviour),
+      but the UI always passes an explicit level so Branch and Dealer stay separate.
+    Auto Suggest never calls this endpoint.
+    """
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail='Order not found')
@@ -4844,62 +4955,411 @@ async def order_desk_send_requests_v2(order_id: str, current_user: UserResponse 
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized to send requests for this order')
 
+    level = str(((payload or {}).get('level') or '')).strip().lower()
+    if level and level not in ('branch', 'dealer'):
+        raise HTTPException(status_code=400, detail="level must be 'branch' or 'dealer'")
+
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
     now = datetime.now(timezone.utc).isoformat()
-    fingerprint = _send_requests_fingerprint(order_id, items)
 
-    # Idempotency guard #1 (primary): a repeated Send Request click, a
-    # frontend retry, or an API retry with the exact same order/allocation
-    # content never creates a second request number/PDF/email — the
-    # previously created groups are simply returned again.
-    existing_groups = await db.request_headers.find({'order_id': order_id}, {'_id': 0}).sort('created_at', 1).to_list(1000)
-    if existing_groups and order.get('send_requests_fingerprint') == fingerprint:
-        return _send_requests_response(existing_groups, duplicate=True)
+    # Build the candidate set of unsent allocations (optionally filtered by level)
+    # BEFORE fingerprinting so re-sends of already-sent content stay idempotent
+    # while NEW remaining-qty allocations can still create fresh requests.
+    all_existing_requests = await db.order_requests.find({'order_id': order_id}, {'_id': 0}).to_list(20000)
+    reqs_by_item = {}
+    for r in all_existing_requests:
+        reqs_by_item.setdefault(r.get('order_item_id'), []).append(r)
 
-    # Idempotency guard #2 (legacy compatibility): older orders may already
-    # carry order_requests rows saved before this request-number/grouping
-    # feature existed. Never create a second batch on top of those either.
-    existing_requests = await db.order_requests.find({'order_id': order_id}, {'_id': 0}).to_list(1000)
-    if existing_requests and not existing_groups and order.get('status') == 'Requested':
-        return {
-            'request_created': True, 'duplicate': True,
-            'message': f'{len(existing_requests)} request(s) already saved for this order.',
-            'order_number': order.get('order_number'), 'request_numbers': [],
-            'email_sent': False, 'email_error': None,
-        }
-
-    # Group allocations by Requested-To destination (supplying dealer +
-    # branch): one request number, one PDF, and one email per destination.
-    # Unrelated source branches are never combined into a single receiver PDF.
     groups = {}
-    active_statuses = ['Requested', 'Approved', 'Partially Approved', 'Dispatched', 'Received']
     for item in items:
-        active_existing = await db.order_requests.find_one({'order_item_id': item.get('id'), 'status': {'$in': active_statuses}}, {'_id': 0, 'id': 1})
-        if active_existing:
-            continue
-        for source in item.get('allocations', []) or []:
+        item_reqs = reqs_by_item.get(item.get('id'), [])
+        if level:
+            sources = odw.filter_unsent_allocations(item, order, level, item_reqs)
+        else:
+            sources = []
+            for lvl in ('branch', 'dealer'):
+                sources.extend(odw.filter_unsent_allocations(item, order, lvl, item_reqs))
+        for source in sources:
             key = (_order_clean_text(source.get('dealer_name')), _order_clean_text(source.get('branch')))
             groups.setdefault(key, []).append((item, source))
 
     if not groups:
-        raise HTTPException(status_code=400, detail='Select at least one source before sending requests')
+        raise HTTPException(
+            status_code=400,
+            detail=f"No unsent {'branch' if level == 'branch' else 'dealer' if level == 'dealer' else ''} source selections to send".strip()
+            or 'Select at least one source before sending requests',
+        )
+
+    # Content fingerprint of THIS send batch (not the whole order) for duplicate protection.
+    fingerprint_parts = [order_id, level or 'all']
+    for key, pairs in sorted(groups.items(), key=lambda kv: kv[0]):
+        for item, source in pairs:
+            fingerprint_parts.append('|'.join([
+                item.get('id', ''), key[0], key[1], str(source.get('request_qty', '')),
+            ]))
+    fingerprint = hashlib.sha256('::'.join(fingerprint_parts).encode('utf-8')).hexdigest()
+    prior_fps = set(order.get('send_requests_fingerprints') or [])
+    if order.get('send_requests_fingerprint') == fingerprint or fingerprint in prior_fps:
+        # Return existing groups that match these destinations if present
+        existing_groups = await db.request_headers.find({'order_id': order_id}, {'_id': 0}).sort('created_at', 1).to_list(1000)
+        matched = [
+            g for g in existing_groups
+            if (_order_clean_text(g.get('supplying_dealer')), _order_clean_text(g.get('supplying_branch'))) in groups
+        ]
+        if matched:
+            return _send_requests_response(matched, duplicate=True)
 
     created_group_docs = []
     for _key, pairs in groups.items():
-        created_group_docs.append(await _create_request_group(order, pairs, current_user, now))
-        for item, _source in pairs:
-            await db.order_items.update_one({'id': item.get('id')}, {'$set': {'status': 'Requested', 'updated_at': now}})
+        group_doc = await _create_request_group(order, pairs, current_user, now)
+        created_group_docs.append(group_doc)
+        request_number = (group_doc or {}).get('request_number')
+        touched_item_ids = set()
+        for item, source in pairs:
+            touched_item_ids.add(item.get('id'))
+            # Stamp allocation rows with request number / Request Sent status
+            fresh = await db.order_items.find_one({'id': item.get('id')}, {'_id': 0})
+            if not fresh:
+                continue
+            stamped = odw.mark_allocations_sent(fresh, [source], request_number, now)
+            await db.order_items.update_one({'id': item.get('id')}, {'$set': {
+                'allocations': stamped,
+                'status': 'Requested',
+                'request_status': odw.REQUEST_STATUS_SENT,
+                'retry_required': False,
+                're_enquire': False,
+                'updated_at': now,
+            }})
+        for item_id in touched_item_ids:
+            # Store source_type on the underlying order_requests for this batch
+            await db.order_requests.update_many(
+                {'order_item_id': item_id, 'request_number': request_number},
+                {'$set': {'source_type': level or odw.allocation_level(
+                    {'dealer_name': _key[0], 'branch': _key[1]}, order
+                ), 'level': level or odw.allocation_level(
+                    {'dealer_name': _key[0], 'branch': _key[1]}, order
+                )}},
+            )
 
+    prior_fps.add(fingerprint)
     await db.order_headers.update_one({'id': order_id}, {'$set': {
-        'status': 'Requested', 'updated_at': now, 'send_requests_fingerprint': fingerprint,
+        'status': 'Requested', 'updated_at': now,
+        'send_requests_fingerprint': fingerprint,
+        'send_requests_fingerprints': list(prior_fps)[-50:],
+        'last_send_level': level or 'all',
     }})
+    action = f"{'Branch' if level == 'branch' else 'Dealer' if level == 'dealer' else ''} Request sent".strip()
     await db.order_activity.insert_one({
         'id': str(uuid.uuid4()), 'order_id': order_id, 'order_number': order.get('order_number'),
-        'action': 'Requests Sent', 'performed_by': current_user.id, 'performed_user_name': current_user.username,
-        'created_at': now,
+        'action': action or 'Requests Sent', 'performed_by': current_user.id, 'performed_user_name': current_user.username,
+        'created_at': now, 'details': {'level': level or 'all', 'request_numbers': [g.get('request_number') for g in created_group_docs if g]},
     })
 
     return _send_requests_response(created_group_docs, duplicate=False)
+
+
+@api_router.post('/order-desk/orders/{order_id}/add-items')
+async def order_desk_add_items(order_id: str, payload: dict, current_user: UserResponse = Depends(get_current_user)):
+    """Add more parts under an existing Order Number. Never creates a new order number."""
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
+    role = (current_user.role or '').lower()
+    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not authorized')
+    rows = payload.get('rows') or payload.get('items') or []
+    if not rows:
+        raise HTTPException(status_code=400, detail='No items to add')
+    now = datetime.now(timezone.utc).isoformat()
+    original_created_at = order.get('created_at')
+    new_items = []
+    add_qty = 0.0
+    add_value = 0.0
+    for row_number, row in enumerate(rows, start=1):
+        part_number = _order_clean_text(row.get('part_number'))
+        description = _order_clean_text(row.get('description') or row.get('part_name'))
+        raw_value = row.get('value', row.get('unit_value'))
+        if not part_number:
+            raise HTTPException(status_code=400, detail=f'Row {row_number}: Part Number is required')
+        try:
+            qty = float(row.get('quantity') or row.get('required_qty') or 0)
+            value = float(str(raw_value if raw_value is not None else 0).replace(',', '').replace('₹', '').strip() or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f'Row {row_number}: Invalid quantity or value')
+        if qty <= 0:
+            raise HTTPException(status_code=400, detail=f'Row {row_number}: Quantity must be greater than zero')
+        add_qty += qty
+        add_value += value * qty
+        new_items.append({
+            'id': str(uuid.uuid4()), 'order_id': order_id, 'order_number': order.get('order_number'),
+            'part_number': part_number, 'description': description,
+            'required_qty': qty, 'unit_value': value,
+            'allocated_qty': 0.0, 'balance_qty': qty, 'accepted_qty': 0.0, 'remaining_qty': qty,
+            'availability_status': 'Not Checked', 'allocations': [],
+            'status': 'Order Created', 'request_status': 'Order Created',
+            'added_after_order_creation': True,
+            'added_by': current_user.id, 'added_by_name': current_user.username, 'added_at': now,
+            'original_order_created_at': original_created_at,
+            'created_at': now, 'updated_at': now,
+        })
+    await db.order_items.insert_many([dict(i) for i in new_items])
+    await db.order_headers.update_one({'id': order_id}, {'$set': {
+        'item_count': int(order.get('item_count') or 0) + len(new_items),
+        'total_required_qty': float(order.get('total_required_qty') or 0) + add_qty,
+        'total_order_value': float(order.get('total_order_value') or 0) + add_value,
+        'availability_checked': False,
+        'updated_at': now,
+    }})
+    await odw.append_order_audit(db, order, 'Item Added', current_user, {
+        'count': len(new_items),
+        'parts': [i['part_number'] for i in new_items],
+    })
+    detail = await order_desk_order_detail(order_id, current_user)
+    return {'message': f'{len(new_items)} item(s) added to {order.get("order_number")}', **detail}
+
+
+@api_router.post('/order-desk/orders/{order_id}/re-enquire')
+async def order_desk_re_enquire(order_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    """Mark selected / remaining items for the next enquiry cycle.
+
+    Does NOT auto-suggest and does NOT send any request. Remaining qty only.
+    Accepted quantities and prior request history stay intact.
+    """
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
+    role = (current_user.role or '').lower()
+    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not authorized')
+
+    item_ids = [str(x) for x in ((payload or {}).get('item_ids') or []) if x]
+    items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    now = datetime.now(timezone.utc).isoformat()
+    enriched = await odw.enrich_order_items(db, order, items)
+    updated = 0
+    for item in enriched:
+        if item_ids and item.get('id') not in item_ids:
+            continue
+        remaining = float(item.get('remaining_qty') or 0)
+        if remaining <= 0 and not item.get('retry_required'):
+            continue
+        # Determine next stage: branch first, then dealer, then factory.
+        excluded = {
+            (str(x.get('dealer_name') or '').lower(), str(x.get('branch') or '').lower())
+            for x in (item.get('excluded_sources') or [])
+        }
+        branch_left = [
+            s for s in (item.get('same_dealer_sources') or [])
+            if (str(s.get('dealer_name') or '').lower(), str(s.get('branch') or '').lower()) not in excluded
+            and float(s.get('net_available_qty', s.get('available_qty') or 0) or 0) > 0
+        ]
+        dealer_left = [
+            s for s in (item.get('other_dealer_sources') or [])
+            if (str(s.get('dealer_name') or '').lower(), str(s.get('branch') or '').lower()) not in excluded
+            and float(s.get('net_available_qty', s.get('available_qty') or 0) or 0) > 0
+        ]
+        if branch_left:
+            next_stage = 'branch'
+            factory_qty = 0
+            no_further = False
+            status = odw.REQUEST_STATUS_REMAINING
+        elif dealer_left:
+            next_stage = 'dealer'
+            factory_qty = 0
+            no_further = False
+            status = odw.REQUEST_STATUS_REMAINING
+        else:
+            next_stage = 'factory'
+            factory_qty = remaining
+            no_further = True
+            status = odw.REQUEST_STATUS_FACTORY
+
+        await db.order_items.update_one({'id': item['id']}, {'$set': {
+            'retry_required': not no_further,
+            're_enquire': not no_further,
+            'retry_selected': True if (payload or {}).get('select', True) else item.get('retry_selected', False),
+            'enquiry_stage': next_stage,
+            'remaining_qty': remaining,
+            'factory_order_qty': factory_qty,
+            'no_further_stock': no_further,
+            'request_status': status,
+            'status': status if no_further else 'Pending Retry',
+            # Clear only unsent draft allocations so Auto Suggest can refill remaining.
+            'allocations': [
+                a for a in (item.get('allocations') or [])
+                if a.get('request_no') or a.get('request_number')
+                or str(a.get('status') or '').lower() in (
+                    'request sent', 'requested', 'accepted', 'partially accepted',
+                    'rejected', 'cancelled', 'completed', 'dispatched', 'received',
+                )
+            ],
+            'updated_at': now,
+        }})
+        updated += 1
+
+    await odw.append_order_audit(db, order, 'Re-Enquire Remaining Qty', current_user, {
+        'item_ids': item_ids or 'all_remaining', 'updated': updated,
+    })
+    detail = await order_desk_order_detail(order_id, current_user)
+    return {'message': f'{updated} item(s) marked for re-enquiry', 'updated': updated, **detail}
+
+
+CANCELLATION_REASONS = list(odw.CANCELLATION_REASONS)
+
+
+@api_router.post('/order-desk/orders/{order_id}/items/{item_id}/request-cancellation')
+async def order_desk_request_cancellation(order_id: str, item_id: str, payload: dict, current_user: UserResponse = Depends(get_current_user)):
+    """Request cancellation of an order item. No physical delete. Reason required."""
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    item = await db.order_items.find_one({'id': item_id, 'order_id': order_id}, {'_id': 0})
+    if not order or not item:
+        raise HTTPException(status_code=404, detail='Order item not found')
+    role = (current_user.role or '').lower()
+    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not authorized')
+
+    reason = _order_clean_text((payload or {}).get('reason'))
+    remarks = _order_clean_text((payload or {}).get('remarks'))
+    if reason not in CANCELLATION_REASONS:
+        raise HTTPException(status_code=400, detail=f'Cancellation reason is required. Allowed: {", ".join(CANCELLATION_REASONS)}')
+    if reason == 'Other' and not remarks:
+        raise HTTPException(status_code=400, detail='Remarks are required when reason is Other')
+
+    now = datetime.now(timezone.utc).isoformat()
+    # Safe auto-approval: no request sent, no reservation, no acceptance, no dispatch/receive.
+    item_reqs = await db.order_requests.find({'order_item_id': item_id}, {'_id': 0}).to_list(1000)
+    active_reservations = await db.stock_reservations.count_documents({'order_item_id': item_id, 'status': 'active'})
+    has_sent = any(r.get('status') not in (None, '') for r in item_reqs)
+    has_acceptance = any(float(r.get('accepted_qty') or r.get('approved_qty') or 0) > 0 for r in item_reqs)
+    has_logistics = any(r.get('status') in ('Dispatched', 'Received', 'Completed') for r in item_reqs)
+    safe_auto = (not has_sent) and active_reservations == 0 and (not has_acceptance) and (not has_logistics)
+
+    cancel_doc = {
+        'id': str(uuid.uuid4()),
+        'order_id': order_id,
+        'order_number': order.get('order_number'),
+        'order_item_id': item_id,
+        'part_number': item.get('part_number'),
+        'part_name': item.get('description'),
+        'qty': item.get('required_qty'),
+        'reason': reason,
+        'remarks': remarks,
+        'cancellation_requested_by': current_user.id,
+        'cancellation_requested_by_name': current_user.username,
+        'cancellation_requested_at': now,
+        'approval_status': 'approved' if safe_auto else 'pending',
+        'auto_approved': safe_auto,
+        'purchased_outside': reason == 'Purchased Outside',
+        'purchased_outside_qty': float(item.get('required_qty') or 0) if reason == 'Purchased Outside' else 0,
+        'brand': order.get('brand_name'),
+        'dealer': order.get('dealer_name'),
+        'branch': order.get('branch'),
+        'created_at': now,
+    }
+    if safe_auto:
+        cancel_doc.update({
+            'approved_by': 'system', 'approved_by_name': 'Auto Approval',
+            'approved_at': now, 'cancelled_by': 'system', 'cancelled_at': now,
+        })
+
+    await db.order_cancellation_requests.insert_one(dict(cancel_doc))
+
+    item_update = {
+        'cancellation_requested': True,
+        'cancellation_reason': reason,
+        'cancellation_remarks': remarks,
+        'cancellation_requested_by': current_user.id,
+        'cancellation_requested_at': now,
+        'cancellation_status': 'approved' if safe_auto else 'pending',
+        'cancellation_request_id': cancel_doc['id'],
+        'request_status': odw.REQUEST_STATUS_CANCELLED if safe_auto else odw.REQUEST_STATUS_CANCEL_REQ,
+        'status': odw.REQUEST_STATUS_CANCELLED if safe_auto else odw.REQUEST_STATUS_CANCEL_REQ,
+        'updated_at': now,
+    }
+    if reason == 'Purchased Outside':
+        item_update['purchased_outside'] = True
+        item_update['purchased_outside_qty'] = float(item.get('required_qty') or 0)
+        item_update['purchased_outside_value'] = float(item.get('unit_value') or 0) * float(item.get('required_qty') or 0)
+    if safe_auto:
+        item_update.update({'cancelled_by': 'system', 'cancelled_at': now})
+        # Clear unsent draft allocations only; keep any historical allocations if somehow present
+        item_update['allocations'] = [
+            a for a in (item.get('allocations') or [])
+            if a.get('request_no') or a.get('request_number')
+        ]
+
+    await db.order_items.update_one({'id': item_id}, {'$set': item_update})
+    await odw.append_order_audit(db, order,
+        'Cancellation approved (auto)' if safe_auto else 'Cancellation requested',
+        current_user,
+        {'reason': reason, 'remarks': remarks, 'item_id': item_id, 'auto': safe_auto, 'purchased_outside': reason == 'Purchased Outside'},
+    )
+    return {
+        'message': 'Item cancelled automatically (safe — no request/reservation).' if safe_auto
+            else 'Cancellation requested — awaiting Admin/Master approval.',
+        'auto_approved': safe_auto,
+        'cancellation': {k: v for k, v in cancel_doc.items() if k != '_id'},
+    }
+
+
+@api_router.post('/order-desk/cancellations/{cancellation_id}/decide')
+async def order_desk_decide_cancellation(cancellation_id: str, payload: dict, current_user: UserResponse = Depends(get_current_user)):
+    """Admin/Master approve or reject a cancellation request."""
+    role = (current_user.role or '').lower()
+    if role not in ('master', 'admin'):
+        raise HTTPException(status_code=403, detail='Only Admin/Master can approve cancellations')
+    doc = await db.order_cancellation_requests.find_one({'id': cancellation_id}, {'_id': 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail='Cancellation request not found')
+    if doc.get('approval_status') != 'pending':
+        return {'message': f'Already {doc.get("approval_status")}', 'cancellation': doc}
+
+    decision = str((payload or {}).get('decision') or '').strip().lower()
+    if decision not in ('approve', 'approved', 'reject', 'rejected'):
+        raise HTTPException(status_code=400, detail="decision must be 'approve' or 'reject'")
+    now = datetime.now(timezone.utc).isoformat()
+    approved = decision in ('approve', 'approved')
+    await db.order_cancellation_requests.update_one({'id': cancellation_id}, {'$set': {
+        'approval_status': 'approved' if approved else 'rejected',
+        'approved_by' if approved else 'rejected_by': current_user.id,
+        'approved_by_name' if approved else 'rejected_by_name': current_user.username,
+        'approved_at' if approved else 'rejected_at': now,
+        'decision_remarks': _order_clean_text((payload or {}).get('remarks')),
+        'updated_at': now,
+    }})
+    item_set = {
+        'cancellation_status': 'approved' if approved else 'rejected',
+        'updated_at': now,
+    }
+    if approved:
+        item_set.update({
+            'request_status': odw.REQUEST_STATUS_CANCELLED,
+            'status': odw.REQUEST_STATUS_CANCELLED,
+            'cancelled_by': current_user.id,
+            'cancelled_at': now,
+        })
+        # Also cancel any still-open Request Center lines for this item
+        open_reqs = await db.order_requests.find(
+            {'order_item_id': doc.get('order_item_id'), 'status': {'$in': ['Requested', 'Approved', 'Partially Approved']}},
+            {'_id': 0, 'id': 1},
+        ).to_list(1000)
+        for r in open_reqs:
+            await _request_center_transition(r['id'], 'Cancelled', f"Order item cancellation: {doc.get('reason')}", current_user)
+    else:
+        item_set.update({
+            'cancellation_requested': False,
+            'request_status': 'Request Sent',  # will be re-enriched on next load
+        })
+    await db.order_items.update_one({'id': doc.get('order_item_id')}, {'$set': item_set})
+    order = await db.order_headers.find_one({'id': doc.get('order_id')}, {'_id': 0}) or {}
+    await odw.append_order_audit(
+        db, order,
+        'Cancellation approved' if approved else 'Cancellation rejected',
+        current_user,
+        {'cancellation_id': cancellation_id, 'reason': doc.get('reason')},
+    )
+    updated = await db.order_cancellation_requests.find_one({'id': cancellation_id}, {'_id': 0})
+    return {'message': f'Cancellation {updated.get("approval_status")}', 'cancellation': updated}
 
 
 @api_router.post('/requests/group/{request_number}/resend-email')
@@ -4915,13 +5375,25 @@ async def resend_request_group_email(request_number: str, current_user: UserResp
     if not (is_supplier or is_requester):
         raise HTTPException(status_code=403, detail='Not authorized for this request')
     if group_doc.get('email_sent'):
-        return {'message': 'Email already sent successfully; no resend needed.', 'email_sent': True}
+        return {'message': 'Email already sent successfully; no resend needed.', 'email_sent': True, 'email_status': 'Email Sent'}
 
     await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {'retry_count': int(group_doc.get('retry_count', 0)) + 1}})
     refreshed = await db.request_headers.find_one({'id': group_doc['id']}, {'_id': 0})
     await _send_request_group_email(refreshed)
     updated = await db.request_headers.find_one({'id': group_doc['id']}, {'_id': 0})
-    return {'message': 'Resend attempted.', 'email_sent': updated.get('email_sent'), 'email_error': updated.get('email_error')}
+    order = await db.order_headers.find_one({'id': updated.get('order_id')}, {'_id': 0}) or {}
+    await odw.append_order_audit(
+        db, order,
+        'Email sent' if updated.get('email_sent') else 'Email failed/retried',
+        current_user,
+        {'request_number': request_number, 'email_status': updated.get('email_status'), 'email_error': updated.get('email_error')},
+    )
+    return {
+        'message': 'Resend attempted.',
+        'email_sent': updated.get('email_sent'),
+        'email_error': updated.get('email_error'),
+        'email_status': odw.email_status_label(updated.get('email_status') if not updated.get('email_sent') else 'sent'),
+    }
 
 
 @api_router.get('/requests/group/{request_number}')
@@ -4934,6 +5406,13 @@ async def request_group_detail(request_number: str, current_user: UserResponse =
     is_requester = group_doc.get('requested_by') == current_user.id or (role != 'user' and group_doc.get('requesting_dealer') == current_user.group)
     if not (is_supplier or is_requester):
         raise HTTPException(status_code=403, detail='Not authorized for this request')
+    # Expose email status separately from request status for Order Desk.
+    group_doc = {
+        **group_doc,
+        'email_status_label': odw.email_status_label(
+            'sent' if group_doc.get('email_sent') else group_doc.get('email_status')
+        ),
+    }
     return group_doc
 
 
@@ -5173,11 +5652,11 @@ async def _request_center_transition(request_id: str, new_status: str, remarks: 
     await db.order_requests.update_one({'id': request_id}, {'$set': update})
 
     if new_status in ('Rejected', 'Cancelled') or (new_status == 'Approved' and accepted < requested_qty):
-        failed_source = {'dealer_name': req.get('supplying_dealer', ''), 'branch': req.get('supplying_branch', '')}
-        await db.order_items.update_one({'id': req.get('order_item_id')}, {
-            '$set': {'status': 'Pending Retry', 'retry_required': True, 'updated_at': now, 'allocations': [], 'allocated_qty': 0},
-            '$addToSet': {'excluded_sources': failed_source},
-        })
+        # Preserve accepted qty + request history; mark remaining for Re-Enquire.
+        # Do NOT wipe allocations / accepted quantities (Order Desk audit requirement).
+        await odw.sync_order_item_after_request_decision(db, {**req, **update}, now)
+    elif new_status == 'Approved':
+        await odw.sync_order_item_after_request_decision(db, {**req, **update}, now)
 
     if new_status in ('Rejected', 'Cancelled'):
         await db.stock_reservations.update_many(
