@@ -5,7 +5,15 @@ __pycache__/
 *.pyo
 .pytest_cache/
 
+# Python virtualenvs (must never be committed: interpreter symlinks and
+# console-script shebangs are machine-specific and break on other hosts)
+venv/
+.venv/
+
 # Mobile / Node
 node_modules/
 mobile/node_modules/
 .expo/
+
+# OS / editor noise
+.DS_Store
