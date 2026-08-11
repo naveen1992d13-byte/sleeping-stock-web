@@ -76,6 +76,7 @@ export function UploadCenter() {
   const isMaster = user?.role === 'master';
   const isAdmin = user?.role === 'admin';
   const isUser = user?.role === 'user';
+  const canExportExcel = isMaster || isAdmin;
   const activeFile = activeType === 'product' ? productFile : orderFile;
   const activeUploads = activeType === 'product' ? productUploads : orderUploads;
   const activeTitle = activeType === 'product' ? 'Product Hub' : 'Order Desk';
@@ -351,13 +352,15 @@ export function UploadCenter() {
         <h2 className="text-lg font-bold" style={{color: COLORS.text}}>{activeTitle} Upload History</h2>
         <div className="flex gap-2 w-full md:w-auto">
           <div className="relative flex-1 md:w-96"><Search className="h-4 w-4 absolute left-3 top-3" style={{color: COLORS.muted}}/><input value={search} onChange={(e)=>setSearch(e.target.value)} placeholder="Search Upload No / File / User" className="w-full pl-9 pr-4 py-2 rounded-xl border" /></div>
+          {canExportExcel && (
           <Button onClick={exportData} disabled={!!downloadingKey} variant="outline" className="gap-2"><FileSpreadsheet className="h-4 w-4"/> {downloadingKey === 'history-export' ? 'Exporting…' : 'Export'}</Button>
+          )}
         </div>
       </div>
       <div className="overflow-x-auto rounded-xl max-h-[58vh]" style={{border:`1px solid ${COLORS.border}`}}>
         <table className="w-full text-xs"><thead><tr style={{backgroundColor: COLORS.primary, color:'#fff'}}>{['Upload No','Date','Time','Uploaded Name','User ID','File Name','Total Items','Total Qty','Total Value','Status','Action'].map(h=><th key={h} className="p-3 text-left whitespace-nowrap">{h}</th>)}</tr></thead>
         <tbody>{filteredUploads.length===0 ? <tr><td colSpan={11} className="p-5 text-center" style={{color: COLORS.muted}}>No uploads yet</td></tr> : filteredUploads.map((u,i)=><tr key={u.id||i} className="border-b" style={{backgroundColor:i%2?'#fff':COLORS.soft}}>
-          <td className="p-3 font-bold whitespace-nowrap" style={{color:u.status==='Cancelled'?COLORS.danger:COLORS.dark}}>{u.upload_no||'-'}</td><td className="p-3 whitespace-nowrap">{u.upload_date||'-'}</td><td className="p-3 whitespace-nowrap">{u.upload_time||'-'}</td><td className="p-3 whitespace-nowrap">{u.uploaded_user_name||'-'}</td><td className="p-3 whitespace-nowrap">{u.user_code||u.uploaded_user_id||'-'}</td><td className="p-3 whitespace-nowrap">{u.file_name||'-'}</td><td className="p-3 whitespace-nowrap">{u.item_count||u.rows_imported||0}</td><td className="p-3 whitespace-nowrap">{Number(u.total_available_qty||0).toLocaleString('en-IN')}</td><td className="p-3 whitespace-nowrap">₹{Number(u.total_value||0).toLocaleString('en-IN')}</td><td className="p-3"><StatusBadge u={u}/></td><td className="p-3 whitespace-nowrap"><div className="flex gap-3"><Download className="h-4 w-4 cursor-pointer" onClick={()=>downloadRaw(u)} style={{color:COLORS.blue}} title="Download Raw Excel" />{(isMaster||isAdmin||isUser)&&u.publish_status!=='Published'&&u.status!=='Cancelled'&&<Send className="h-4 w-4 cursor-pointer" onClick={()=>publishUpload(u)} style={{color:COLORS.primary, backgroundColor:COLORS.soft, borderRadius:6, padding:2, width:22, height:22}} title="Publish"/>}{(isMaster||isAdmin)&&u.status!=='Cancelled'&&<XCircle className="h-4 w-4 cursor-pointer" onClick={()=>openCancelModal(u)} style={{color:COLORS.danger}} title="Cancel"/>}</div></td>
+          <td className="p-3 font-bold whitespace-nowrap" style={{color:u.status==='Cancelled'?COLORS.danger:COLORS.dark}}>{u.upload_no||'-'}</td><td className="p-3 whitespace-nowrap">{u.upload_date||'-'}</td><td className="p-3 whitespace-nowrap">{u.upload_time||'-'}</td><td className="p-3 whitespace-nowrap">{u.uploaded_user_name||'-'}</td><td className="p-3 whitespace-nowrap">{u.user_code||u.uploaded_user_id||'-'}</td><td className="p-3 whitespace-nowrap">{u.file_name||'-'}</td><td className="p-3 whitespace-nowrap">{u.item_count||u.rows_imported||0}</td><td className="p-3 whitespace-nowrap">{Number(u.total_available_qty||0).toLocaleString('en-IN')}</td><td className="p-3 whitespace-nowrap">₹{Number(u.total_value||0).toLocaleString('en-IN')}</td><td className="p-3"><StatusBadge u={u}/></td><td className="p-3 whitespace-nowrap"><div className="flex gap-3">{canExportExcel && <Download className="h-4 w-4 cursor-pointer" onClick={()=>downloadRaw(u)} style={{color:COLORS.blue}} title="Download Raw Excel" />}{(isMaster||isAdmin||isUser)&&u.publish_status!=='Published'&&u.status!=='Cancelled'&&<Send className="h-4 w-4 cursor-pointer" onClick={()=>publishUpload(u)} style={{color:COLORS.primary, backgroundColor:COLORS.soft, borderRadius:6, padding:2, width:22, height:22}} title="Publish"/>}{(isMaster||isAdmin)&&u.status!=='Cancelled'&&<XCircle className="h-4 w-4 cursor-pointer" onClick={()=>openCancelModal(u)} style={{color:COLORS.danger}} title="Cancel"/>}</div></td>
         </tr>)}</tbody></table>
       </div>
     </div>

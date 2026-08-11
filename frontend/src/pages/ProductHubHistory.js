@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import axios from 'axios';
-import { API } from '@/App';
+import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
 import { History, Download, Search, RotateCcw } from 'lucide-react';
 import { toast } from 'sonner';
+import { canExportExcel } from '@/lib/excelPermissions';
 
 const COLORS={primary:'#059669',dark:'#047857',soft:'#ECFDF5',border:'#D1D5DB',muted:'#6B7280'};
 const isAll=(v)=>!v||String(v).startsWith('All ')||v==='N/A';
@@ -22,6 +23,8 @@ async function downloadBlob(url,fallback){
 }
 
 export function ProductHubHistory(){
+  const { user } = useAuth();
+  const canExport = canExportExcel(user);
   const outlet=useOutletContext()||{};
   const [fromDate,setFromDate]=useState(firstOfMonthIso());
   const [toDate,setToDate]=useState(todayIso());
@@ -64,9 +67,9 @@ export function ProductHubHistory(){
         <label className="text-xs font-bold" style={{color:COLORS.muted}}>To Date<input type="date" value={toDate} onChange={e=>setToDate(e.target.value)} className="block mt-1 px-3 py-2 rounded-xl border bg-white font-normal text-sm"/></label>
         <Button onClick={search} className="gap-2" style={{backgroundColor:COLORS.primary,color:'#fff'}}><Search className="h-4 w-4"/>Search</Button>
         <Button onClick={clear} variant="outline" className="gap-2"><RotateCcw className="h-4 w-4"/>Clear</Button>
-        <Button onClick={downloadFiltered} disabled={downloading} variant="outline" className="gap-2"><Download className="h-4 w-4"/>{downloading?'Downloading…':'Download Filtered'}</Button>
+        {canExport && <Button onClick={downloadFiltered} disabled={downloading} variant="outline" className="gap-2"><Download className="h-4 w-4"/>{downloading?'Downloading…':'Download Filtered'}</Button>}
       </div>
     </div>
-    <div className="overflow-x-auto rounded-2xl bg-white" style={{border:`1px solid ${COLORS.border}`}}><table className="w-full text-sm"><thead><tr style={{backgroundColor:COLORS.primary,color:'#fff'}}>{['Date','Brand','Dealer','Branch','Records','Total Qty','Total Value','Action'].map(x=><th key={x} className="p-3 text-left">{x}</th>)}</tr></thead><tbody>{!loading&&rows.length===0?<tr><td colSpan={8} className="p-5 text-center" style={{color:COLORS.muted}}>No history found for selected date range</td></tr>:rows.map((r,i)=><tr key={`${r.date_key}-${r.brand}-${r.dealer}-${r.branch}-${i}`} className="border-b" style={{backgroundColor:i%2?'#fff':COLORS.soft}}><td className="p-3">{r.date_key||'-'}</td><td className="p-3">{r.brand||'-'}</td><td className="p-3">{r.dealer||'-'}</td><td className="p-3">{r.branch||'-'}</td><td className="p-3">{r.records||0}</td><td className="p-3">{Number(r.total_available_qty||0).toLocaleString('en-IN')}</td><td className="p-3">₹{Number(r.total_value||0).toLocaleString('en-IN')}</td><td className="p-3"><Button onClick={()=>downloadRow(r)} variant="outline" className="gap-2"><Download className="h-4 w-4"/>Download</Button></td></tr>)}</tbody></table></div>
+    <div className="overflow-x-auto rounded-2xl bg-white" style={{border:`1px solid ${COLORS.border}`}}><table className="w-full text-sm"><thead><tr style={{backgroundColor:COLORS.primary,color:'#fff'}}>{['Date','Brand','Dealer','Branch','Records','Total Qty','Total Value','Action'].map(x=><th key={x} className="p-3 text-left">{x}</th>)}</tr></thead><tbody>{!loading&&rows.length===0?<tr><td colSpan={8} className="p-5 text-center" style={{color:COLORS.muted}}>No history found for selected date range</td></tr>:rows.map((r,i)=><tr key={`${r.date_key}-${r.brand}-${r.dealer}-${r.branch}-${i}`} className="border-b" style={{backgroundColor:i%2?'#fff':COLORS.soft}}><td className="p-3">{r.date_key||'-'}</td><td className="p-3">{r.brand||'-'}</td><td className="p-3">{r.dealer||'-'}</td><td className="p-3">{r.branch||'-'}</td><td className="p-3">{r.records||0}</td><td className="p-3">{Number(r.total_available_qty||0).toLocaleString('en-IN')}</td><td className="p-3">₹{Number(r.total_value||0).toLocaleString('en-IN')}</td><td className="p-3">{canExport ? <Button onClick={()=>downloadRow(r)} variant="outline" className="gap-2"><Download className="h-4 w-4"/>Download</Button> : <span className="text-xs text-gray-400">View only</span>}</td></tr>)}</tbody></table></div>
   </div>;
 }

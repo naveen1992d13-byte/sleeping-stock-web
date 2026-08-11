@@ -246,7 +246,22 @@ async def _save_pdf(file: UploadFile, notice_id: str) -> dict:
     file_id = str(uuid.uuid4())
     safe = f"notice_{notice_id}_{file_id}.pdf"
     path = NOTICE_STORAGE / safe
-    path.write_bytes(content)
+    path.write_bytes(content)  # legacy local fallback retained
+    stored = {}
+    try:
+        try:
+            import file_objects
+        except ImportError:
+            from . import file_objects
+        stored = await file_objects.store_bytes(
+            module="notices",
+            relative_key=f"{notice_id}/{safe}",
+            data=content,
+            original_filename=filename,
+            content_type="application/pdf",
+        )
+    except Exception:
+        stored = {}
     return {
         "file_id": file_id,
         "file_name": filename,
@@ -254,6 +269,10 @@ async def _save_pdf(file: UploadFile, notice_id: str) -> dict:
         "content_type": "application/pdf",
         "file_size": len(content),
         "attachment_storage_path": str(path),
+        "storage_provider": stored.get("storage_provider"),
+        "storage_key": stored.get("storage_key"),
+        "sha256": stored.get("sha256"),
+        "archived_at": stored.get("archived_at"),
     }
 
 
@@ -351,6 +370,10 @@ async def upload_notice_pdf(
             "content_type": saved["content_type"],
             "file_size": saved["file_size"],
             "storage_path": saved["attachment_storage_path"],
+            "storage_provider": saved.get("storage_provider"),
+            "storage_key": saved.get("storage_key"),
+            "sha256": saved.get("sha256"),
+            "archived_at": saved.get("archived_at"),
             "created_at": _utcnow(),
         }
     )
@@ -609,10 +632,16 @@ async def download_attachment(file_id: str, current_user=Depends(_current_user))
         if not _user_can_view_notice(notice, current_user):
             raise HTTPException(status_code=403, detail="Not authorized to access this PDF")
         await _mark_read(meta["notice_id"], current_user, source="pdf")
-    path = Path(meta.get("storage_path") or "")
-    if not path.exists() or NOTICE_STORAGE.resolve() not in path.resolve().parents:
+    try:
+        import file_objects
+    except ImportError:
+        from . import file_objects
+    # Normalize legacy field name
+    if meta.get("storage_path") and not meta.get("attachment_storage_path"):
+        meta = {**meta, "attachment_storage_path": meta.get("storage_path")}
+    if not file_objects.meta_has_readable_bytes(meta):
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path, filename=meta.get("file_name") or "notice.pdf", media_type="application/pdf")
+    return file_objects.streaming_response_from_meta(meta, filename=meta.get("file_name") or "notice.pdf")
 
 
 async def _mark_read(notice_id: str, user, source: str = "detail"):
