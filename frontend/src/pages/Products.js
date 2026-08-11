@@ -68,6 +68,7 @@ export function Products() {
   const scopeDealer = outletScope.scopeDealer || 'All Dealers';
   const scopeBranch = outletScope.scopeBranch || 'All Branches';
   const isMaster = user?.role === 'master';
+  const canExport = user?.role === 'master' || user?.role === 'admin';
 
   const [summary, setSummary] = useState({ totalItem: 0, totalAvailableItem: 0, totalAvailableQty: 0, totalValue: 0 });
 
@@ -206,9 +207,11 @@ export function Products() {
           <select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value)); setPage(1); }} className="px-3 py-2 rounded-xl border text-sm">
             {PAGE_SIZE_OPTIONS.map(sz => <option key={sz} value={sz}>{sz} / page</option>)}
           </select>
+          {canExport && (
           <Button onClick={() => exportBranch({ brand_name: scopeBrand, dealer_name: scopeDealer, branch: effectiveBranch })} disabled={exporting} variant="outline" className="gap-2">
             <Download className="h-4 w-4" /> Export
           </Button>
+          )}
         </div>
       </div>
 

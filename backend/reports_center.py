@@ -377,6 +377,11 @@ async def scope_options(brand:Optional[str]=None,dealer:Optional[str]=None,curre
 
 @router.get("/export/{report}")
 async def export_report(report:str,from_date:str,to_date:str,brand:Optional[str]=None,dealer:Optional[str]=None,branch:Optional[str]=None,current_user=Depends(_current_user)):
+    try:
+        import excel_permissions
+    except ImportError:
+        from . import excel_permissions
+    excel_permissions.require_excel_export(current_user)
     if report not in CATALOGUE_MAP: raise HTTPException(404,"Unknown report")
     start,end=_period(from_date,to_date,True); scope=_scope(current_user,brand,dealer,branch)
     inventory=await _inventory(scope); orders=await _orders(scope,start,end); items=await _order_items({o.get("id") for o in orders}); reqs=await _requests(scope,start,end)
@@ -442,13 +447,24 @@ async def upload_old_report(request_number:str,file:UploadFile=File(...),expiry_
     if ext not in {".xlsx",".xls",".zip"}: raise HTTPException(400,"Only Excel or ZIP files are allowed")
     req=await db.old_report_requests.find_one({"request_number":request_number})
     if not req: raise HTTPException(404,"Request not found")
-    content=await file.read(); safe=f"{request_number}_{uuid.uuid4().hex[:8]}{ext}"; path=REPORT_STORAGE/safe; path.write_bytes(content)
+    content=await file.read(); safe=f"{request_number}_{uuid.uuid4().hex[:8]}{ext}"
+    try:
+        import file_objects
+    except ImportError:
+        from . import file_objects
+    stored=await file_objects.store_bytes(module="old-reports",relative_key=f"{request_number}/{safe}",data=content,original_filename=Path(file.filename).name,content_type=file.content_type or "application/octet-stream")
+    path=REPORT_STORAGE/safe; path.write_bytes(content)  # keep local copy for legacy readers during transition
     expiry=_dt(expiry_date) if expiry_date else datetime.now(timezone.utc)+timedelta(days=30)
-    update={"status":"Ready for Download","file_name":Path(file.filename).name,"storage_path":str(path),"file_size":len(content),"uploaded_by":current_user.id,"uploaded_by_name":current_user.username,"uploaded_at":datetime.now(timezone.utc),"expiry_date":expiry,"admin_remarks":admin_remarks or "","updated_at":datetime.now(timezone.utc)}
+    update={"status":"Ready for Download","file_name":Path(file.filename).name,"storage_path":str(path),"storage_provider":stored.get("storage_provider"),"storage_key":stored.get("storage_key"),"content_type":stored.get("content_type"),"sha256":stored.get("sha256"),"archived_at":stored.get("archived_at"),"file_size":len(content),"uploaded_by":current_user.id,"uploaded_by_name":current_user.username,"uploaded_at":datetime.now(timezone.utc),"expiry_date":expiry,"admin_remarks":admin_remarks or "","updated_at":datetime.now(timezone.utc)}
     await db.old_report_requests.update_one({"request_number":request_number},{"$set":update}); return {"message":"File uploaded","request_number":request_number}
 
 @router.get("/old-requests/{request_number}/download")
 async def download_old_report(request_number:str,current_user=Depends(_current_user)):
+    try:
+        import excel_permissions, file_objects
+    except ImportError:
+        from . import excel_permissions, file_objects
+    excel_permissions.require_excel_export(current_user)
     req=await db.old_report_requests.find_one({"request_number":request_number})
     if not req: raise HTTPException(404,"Request not found")
     _scope(current_user,req.get("scope",{}).get("brand"),req.get("scope",{}).get("dealer"),req.get("scope",{}).get("branch"))
@@ -456,10 +472,10 @@ async def download_old_report(request_number:str,current_user=Depends(_current_u
     if req.get("status")!="Ready for Download": raise HTTPException(409,"Report is not ready")
     expiry=_dt(req.get("expiry_date"));
     if expiry and expiry<datetime.now(timezone.utc): await db.old_report_requests.update_one({"id":req["id"]},{"$set":{"status":"Expired"}}); raise HTTPException(410,"Report has expired")
-    path=Path(req.get("storage_path",''));
-    if not path.exists() or REPORT_STORAGE.resolve() not in path.resolve().parents: raise HTTPException(404,"Stored report file not found")
+    if not file_objects.meta_has_readable_bytes(req):
+        raise HTTPException(404,"Stored report file not found")
     now=datetime.now(timezone.utc); await db.old_report_requests.update_one({"id":req["id"]},{"$inc":{"download_count":1},"$set":{"last_downloaded_at":now}}); await db.old_report_downloads.insert_one({"id":str(uuid.uuid4()),"request_number":request_number,"file_name":req.get("file_name"),"downloaded_by":current_user.id,"downloaded_by_name":current_user.username,"downloaded_at":now})
-    return FileResponse(path,filename=req.get("file_name") or path.name,media_type="application/octet-stream")
+    return file_objects.streaming_response_from_meta(req, filename=req.get("file_name") or "report.bin")
 
 async def ensure_indexes():
     await db.old_report_requests.create_index("request_number",unique=True)

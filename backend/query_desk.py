@@ -183,7 +183,22 @@ async def _save_attachment(file: UploadFile, prefix: str) -> dict:
     file_id = str(uuid.uuid4())
     safe_name = f"{prefix}_{file_id}{ext}"
     path = QUERY_STORAGE / safe_name
-    path.write_bytes(content)
+    path.write_bytes(content)  # legacy local fallback retained
+    stored = {}
+    try:
+        try:
+            import file_objects
+        except ImportError:
+            from . import file_objects
+        stored = await file_objects.store_bytes(
+            module="queries",
+            relative_key=f"{prefix}/{safe_name}",
+            data=content,
+            original_filename=filename,
+            content_type=file.content_type or CONTENT_TYPES.get(ext, "application/octet-stream"),
+        )
+    except Exception:
+        stored = {}
 
     return {
         "file_id": file_id,
@@ -192,6 +207,10 @@ async def _save_attachment(file: UploadFile, prefix: str) -> dict:
         "content_type": file.content_type or CONTENT_TYPES.get(ext, "application/octet-stream"),
         "file_size": len(content),
         "attachment_storage_path": str(path),
+        "storage_provider": stored.get("storage_provider"),
+        "storage_key": stored.get("storage_key"),
+        "sha256": stored.get("sha256"),
+        "archived_at": stored.get("archived_at"),
     }
 
 
@@ -345,6 +364,10 @@ async def create_query(
                     "content_type": attachment_meta["content_type"],
                     "file_size": attachment_meta["file_size"],
                     "storage_path": attachment_meta["attachment_storage_path"],
+                    "storage_provider": attachment_meta.get("storage_provider"),
+                    "storage_key": attachment_meta.get("storage_key"),
+                    "sha256": attachment_meta.get("sha256"),
+                    "archived_at": attachment_meta.get("archived_at"),
                     "created_at": now,
                 }
             )
@@ -421,13 +444,17 @@ async def download_attachment(file_id: str, current_user=Depends(_current_user))
     meta = await db.query_attachments.find_one({"file_id": file_id})
     if not meta:
         raise HTTPException(status_code=404, detail="Attachment not found")
-    path = Path(meta.get("storage_path") or "")
-    if not path.exists() or QUERY_STORAGE.resolve() not in path.resolve().parents:
+    try:
+        import file_objects
+    except ImportError:
+        from . import file_objects
+    if meta.get("storage_path") and not meta.get("attachment_storage_path"):
+        meta = {**meta, "attachment_storage_path": meta.get("storage_path")}
+    if not file_objects.meta_has_readable_bytes(meta):
         raise HTTPException(status_code=404, detail="Attachment file not found")
-    return FileResponse(
-        path,
-        filename=meta.get("file_name") or path.name,
-        media_type=meta.get("content_type") or "application/octet-stream",
+    return file_objects.streaming_response_from_meta(
+        meta,
+        filename=meta.get("file_name") or "attachment.bin",
     )
 
 
@@ -482,6 +509,10 @@ async def reply_to_query(
                 "content_type": saved["content_type"],
                 "file_size": saved["file_size"],
                 "storage_path": saved["attachment_storage_path"],
+                "storage_provider": saved.get("storage_provider"),
+                "storage_key": saved.get("storage_key"),
+                "sha256": saved.get("sha256"),
+                "archived_at": saved.get("archived_at"),
                 "created_at": now,
             }
         )
@@ -551,6 +582,10 @@ async def add_follow_up(
                 "content_type": saved["content_type"],
                 "file_size": saved["file_size"],
                 "storage_path": saved["attachment_storage_path"],
+                "storage_provider": saved.get("storage_provider"),
+                "storage_key": saved.get("storage_key"),
+                "sha256": saved.get("sha256"),
+                "archived_at": saved.get("archived_at"),
                 "created_at": now,
             }
         )

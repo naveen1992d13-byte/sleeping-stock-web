@@ -1046,6 +1046,21 @@ async def upload_apk_file(
         raise HTTPException(400, "APK file is too small")
     with open(dest, "wb") as fh:
         fh.write(content)
+    stored = {}
+    try:
+        try:
+            import file_objects
+        except ImportError:
+            from . import file_objects
+        stored = await file_objects.store_bytes(
+            module="mobile/apk",
+            relative_key=safe_name,
+            data=content,
+            original_filename=safe_name,
+            content_type="application/vnd.android.package-archive",
+        )
+    except Exception:
+        stored = {}
     version_code = int(_now().timestamp())
     public_token = str(uuid.uuid4()).replace("-", "")
     doc = {
@@ -1053,6 +1068,11 @@ async def upload_apk_file(
         "version_code": version_code,
         "apk_filename": safe_name,
         "apk_path": dest,
+        "storage_provider": stored.get("storage_provider"),
+        "storage_key": stored.get("storage_key"),
+        "sha256": stored.get("sha256"),
+        "archived_at": stored.get("archived_at"),
+        "content_type": "application/vnd.android.package-archive",
         "public_download_token": public_token,
         "release_notes": "",
         "min_supported_version_code": 1,
@@ -1071,12 +1091,16 @@ async def download_latest_apk(current_user: UserResponse = Depends(_web_current_
     if not row:
         raise HTTPException(404, "No APK published")
     meta = row[0]
-    path = meta.get("apk_path")
-    if not path or not os.path.isfile(path):
+    try:
+        import file_objects
+    except ImportError:
+        from . import file_objects
+    if not file_objects.meta_has_readable_bytes(meta):
         raise HTTPException(404, "APK file missing on server")
-    from fastapi.responses import FileResponse
-
-    return FileResponse(path, filename=meta.get("apk_filename") or "sleeping-stock.apk", media_type="application/vnd.android.package-archive")
+    return file_objects.streaming_response_from_meta(
+        meta,
+        filename=meta.get("apk_filename") or "sleeping-stock.apk",
+    )
 
 
 @router.get("/app-versions/download-link/latest")
@@ -1094,15 +1118,15 @@ async def download_apk_public(token: str):
     meta = await db.mobile_app_versions.find_one({"public_download_token": token}, {"_id": 0})
     if not meta:
         raise HTTPException(404, "Download link invalid or expired")
-    path = meta.get("apk_path")
-    if not path or not os.path.isfile(path):
+    try:
+        import file_objects
+    except ImportError:
+        from . import file_objects
+    if not file_objects.meta_has_readable_bytes(meta):
         raise HTTPException(404, "APK file missing on server")
-    from fastapi.responses import FileResponse
-
-    return FileResponse(
-        path,
+    return file_objects.streaming_response_from_meta(
+        meta,
         filename=meta.get("apk_filename") or "sleeping-stock.apk",
-        media_type="application/vnd.android.package-archive",
     )
 
 

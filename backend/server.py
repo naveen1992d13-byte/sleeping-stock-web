@@ -29,6 +29,22 @@ try:
     from . import order_desk_workflow as odw
 except ImportError:
     import order_desk_workflow as odw
+try:
+    from . import s3_storage
+    from . import file_objects
+    from . import archive_manifest
+    from . import history_archive
+    from . import hybrid_history
+    from . import archive_scheduler
+    from . import excel_permissions
+except ImportError:
+    import s3_storage
+    import file_objects
+    import archive_manifest
+    import history_archive
+    import hybrid_history
+    import archive_scheduler
+    import excel_permissions
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -989,11 +1005,9 @@ async def download_sample_template(current_user: UserResponse = Depends(get_curr
 
 @api_router.get("/upload/export-products")
 async def export_uploaded_products(current_user: UserResponse = Depends(get_current_user)):
-    """Export all uploaded products to Excel - Master Admin only"""
+    """Export all uploaded products to Excel - Master Admin / Admin only"""
     from fastapi.responses import StreamingResponse
-    
-    if current_user.role != "master":
-        raise HTTPException(status_code=403, detail="Only Master Admin can export data")
+    excel_permissions.require_excel_export(current_user)
     
     # Fetch all products
     products = await db.products.find({}, {"_id": 0}).to_list(10000)
@@ -1466,6 +1480,7 @@ async def reset_all_order_data(current_user: UserResponse = Depends(get_current_
 async def export_order_data(current_user: UserResponse = Depends(get_current_user)):
     """Export all order data to Excel"""
     from fastapi.responses import StreamingResponse
+    excel_permissions.require_excel_export(current_user)
     
     # Get merged data
     order_stocks = await db.order_stocks.find({}, {"_id": 0}).to_list(100000)
@@ -2982,6 +2997,13 @@ async def upload_template(
 
     content = await file.read()
     template_id = str(uuid.uuid4())
+    stored = await file_objects.store_bytes(
+        module="templates",
+        relative_key=f"{brand}/{template_id}_{file.filename}",
+        data=content,
+        original_filename=file.filename or "template.xlsx",
+        content_type=file.content_type,
+    )
 
     await db.templates.insert_one({
         "id": template_id,
@@ -2990,7 +3012,12 @@ async def upload_template(
         "template_type": final_template_type,
         "fileName": file.filename,
         "contentType": file.content_type,
-        "fileBytes": content,
+        # New templates store binaries in S3/object-store; keep fileBytes absent.
+        "storage_provider": stored["storage_provider"],
+        "storage_key": stored["storage_key"],
+        "file_size": stored["file_size"],
+        "sha256": stored["sha256"],
+        "archived_at": stored["archived_at"],
         "uploadedBy": current_user.username,
         "uploadedById": current_user.id,
         "uploadedAt": _now_iso(),
@@ -3020,8 +3047,19 @@ async def download_template(template_id: str, current_user: UserResponse = Depen
     if current_user.role != "master" and template.get("brand") != current_user.brand:
         raise HTTPException(status_code=403, detail="Not authorized")
 
+    # Prefer S3/object-store; fall back to legacy fileBytes for old templates.
+    if template.get("storage_key") or template.get("fileBytes") is not None:
+        return file_objects.streaming_response_from_meta(
+            {
+                **template,
+                "original_filename": template.get("fileName") or "template.xlsx",
+                "content_type": template.get("contentType"),
+            },
+            filename=template.get("fileName") or "template.xlsx",
+        )
+
     return StreamingResponse(
-        BytesIO(template.get("fileBytes", b"")),
+        BytesIO(b""),
         media_type=template.get("contentType") or "application/octet-stream",
         headers={"Content-Disposition": f"attachment; filename={template.get('fileName', 'template.xlsx')}"}
     )
@@ -3183,6 +3221,25 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
     raw_bytes = await file.read()
     file_size = len(raw_bytes)
 
+    # Store original Product Excel in S3/object-store (never embed multi-MB blobs in Mongo).
+    stored_excel = None
+    try:
+        date_iso = _nmts_display_date(now)
+        # _nmts_display_date may return DD-MM-YYYY; prefer ISO for S3 key path
+        try:
+            date_iso = now.astimezone(NMTS_TIMEZONE).date().isoformat()
+        except Exception:
+            date_iso = datetime.now(NMTS_TIMEZONE).date().isoformat()
+        stored_excel = await file_objects.store_bytes(
+            module="uploads",
+            relative_key=f"{date_iso}/product-hub/{upload_no}_{file.filename}",
+            data=raw_bytes,
+            original_filename=file.filename or "product_upload.xlsx",
+            content_type=file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as exc:
+        logger.error("Product Excel S3 store failed (upload continues): %s", exc)
+
     wb = openpyxl.load_workbook(BytesIO(raw_bytes), data_only=True)
     # Prefer a worksheet explicitly named "Inventory" (case-insensitive) since that is
     # the required worksheet name for the Product Hub inventory upload. Fall back to
@@ -3272,8 +3329,14 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
         "file_size": file_size,
         # Do not embed multi-MB Excel blobs in MongoDB — they blow Atlas free-tier
     # quotas and leave half-published Product Hub state when writes get blocked.
-    # Keep file metadata only; re-upload if raw download is required later.
+    # Keep file metadata + S3/object-store pointer; legacy uploads without storage_key still work.
     "raw_file_content_type": file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "storage_provider": (stored_excel or {}).get("storage_provider"),
+    "storage_key": (stored_excel or {}).get("storage_key"),
+    "original_filename": file.filename,
+    "content_type": (stored_excel or {}).get("content_type") or (file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    "sha256": (stored_excel or {}).get("sha256"),
+    "archived_at": (stored_excel or {}).get("archived_at"),
     "rows_processed": rows_processed,
         "rows_imported": rows_imported,
         "failed_count": len(rejected),
@@ -3607,7 +3670,7 @@ async def cancel_upload_v2(upload_id: str, data: CancelUploadRequest, current_us
 
 @api_router.get("/uploads/{upload_id}/raw-file")
 async def download_raw_upload_file(upload_id: str, current_user: UserResponse = Depends(get_current_user)):
-    from fastapi.responses import StreamingResponse
+    excel_permissions.require_excel_export(current_user)
     upload = await db.uploads.find_one({"id": upload_id})
     if not upload:
         raise HTTPException(status_code=404, detail="Upload not found")
@@ -3615,13 +3678,11 @@ async def download_raw_upload_file(upload_id: str, current_user: UserResponse = 
         raise HTTPException(status_code=403, detail="Not authorized")
     if current_user.role == "user" and upload.get("uploaded_user_id") != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
-    raw = upload.get("raw_file_bytes")
-    if raw is None:
+    if not file_objects.meta_has_readable_bytes(upload):
         raise HTTPException(status_code=404, detail="Raw file not stored for this upload")
-    return StreamingResponse(
-        BytesIO(raw),
-        media_type=upload.get("raw_file_content_type") or "application/octet-stream",
-        headers={"Content-Disposition": f"attachment; filename={upload.get('file_name', 'raw_upload.xlsx')}"},
+    return file_objects.streaming_response_from_meta(
+        upload,
+        filename=upload.get("file_name") or upload.get("original_filename") or "raw_upload.xlsx",
     )
 
 
@@ -3638,6 +3699,21 @@ async def list_product_hub_history(
     brand: str = None, dealer: str = None, branch: str = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
+    scope = {}
+    _apply_role_scope_v2(scope, current_user, brand, dealer, branch)
+    try:
+        return await hybrid_history.summarize_product_history(
+            db,
+            date_key=date_key,
+            from_date=from_date,
+            to_date=to_date,
+            brand=scope.get("brand_name"),
+            dealer=scope.get("dealer_name"),
+            branch=scope.get("branch"),
+        )
+    except Exception as exc:
+        logger.warning("Hybrid history list failed, using Mongo-only path: %s", exc)
+
     query = {"publish_status": "Published"}
     if date_key:
         query["active_date_key"] = date_key.replace("-", "")
@@ -3676,19 +3752,19 @@ async def list_product_hub_history(
 @api_router.get("/product-hub-history/download")
 async def download_product_hub_history(date_key: str = None, from_date: str = None, to_date: str = None, brand: str = None, dealer: str = None, branch: str = None, current_user: UserResponse = Depends(get_current_user)):
     from fastapi.responses import StreamingResponse
-    query = {"publish_status": "Published"}
-    if date_key:
-        query["active_date_key"] = date_key.replace("-", "")
-    else:
-        date_range = {}
-        if from_date:
-            date_range["$gte"] = from_date.replace("-", "")
-        if to_date:
-            date_range["$lte"] = to_date.replace("-", "")
-        if date_range:
-            query["active_date_key"] = date_range
-    _apply_role_scope_v2(query, current_user, brand, dealer, branch)
-    rows = await db.products.find(query, {"_id": 0}).sort("part_number", 1).to_list(200000)
+    excel_permissions.require_excel_export(current_user)
+    scope = {}
+    _apply_role_scope_v2(scope, current_user, brand, dealer, branch)
+    result = await hybrid_history.read_product_history(
+        db,
+        date_key=date_key,
+        from_date=from_date,
+        to_date=to_date,
+        brand=scope.get("brand_name"),
+        dealer=scope.get("dealer_name"),
+        branch=scope.get("branch"),
+    )
+    rows = result.get("rows") or []
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Product Hub History"
@@ -3960,6 +4036,7 @@ async def export_product_hub_branch(
     """Single-branch Excel export, generated entirely on the backend and streamed
     to the browser as one file — never sends raw rows to the frontend for export."""
     from fastapi.responses import StreamingResponse
+    excel_permissions.require_excel_export(current_user)
 
     query = _product_hub_active_query(current_user, brand, dealer, branch)
     _apply_category_filter(query, category)
@@ -4579,6 +4656,7 @@ async def order_desk_template(current_user: UserResponse = Depends(get_current_u
 async def order_desk_order_export(order_id: str, current_user: UserResponse = Depends(get_current_user)):
     from fastapi.responses import StreamingResponse
     from io import BytesIO
+    excel_permissions.require_excel_export(current_user)
 
     detail = await order_desk_order_detail(order_id, current_user=current_user)
     order = detail['order']
@@ -6525,6 +6603,7 @@ async def export_all_mobile_stock_verifications(
     current_user: UserResponse = Depends(get_current_user),
 ):
     from fastapi.responses import StreamingResponse
+    excel_permissions.require_excel_export(current_user)
     """Download the complete permitted Perpetual Stock list.
 
     Master: all brands/dealers/branches (optional dashboard filters).
@@ -6606,6 +6685,7 @@ async def get_mobile_stock_verification_session(session_id: str, current_user: U
 @api_router.get("/mobile/perpetual-stock/sessions/{session_id}/excel")
 async def export_mobile_stock_verification_session(session_id: str, current_user: UserResponse = Depends(get_current_user)):
     from fastapi.responses import StreamingResponse
+    excel_permissions.require_excel_export(current_user)
     data = await get_mobile_stock_verification_session(session_id, current_user)
     wb = openpyxl.Workbook()
     summary = wb.active
@@ -6804,6 +6884,47 @@ mobile_api.init_mobile_api(
 )
 api_router.include_router(mobile_api.router)
 
+
+# ==================== HYBRID STORAGE ADMIN / OPS ====================
+
+@api_router.get("/storage/status")
+async def storage_status(current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master_or_admin(current_user)
+    return s3_storage.get_storage().status()
+
+
+@api_router.post("/storage/archives/product-history/run")
+async def run_product_history_archive(archive_date: str = None, force: bool = False, current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master(current_user)
+    if archive_date:
+        return await history_archive.archive_product_history_for_date(db, archive_date, force=force)
+    return await archive_scheduler.run_daily_product_archive(db, archive_date)
+
+
+@api_router.post("/storage/archives/orders-requests/run")
+async def run_orders_requests_archive(archive_month: str = None, force: bool = False, current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master(current_user)
+    if force and archive_month:
+        orders = await history_archive.archive_completed_orders_month(db, archive_month, force=True)
+        requests = await history_archive.archive_completed_requests_month(db, archive_month, force=True)
+        return {"orders": orders, "requests": requests}
+    return await archive_scheduler.run_monthly_completed_archives(db, archive_month)
+
+
+@api_router.post("/storage/archives/verifications/run")
+async def run_verification_archive(archive_date: str, force: bool = False, current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master(current_user)
+    return await history_archive.archive_verifications_for_date(db, archive_date, force=force)
+
+
+@api_router.get("/storage/archives")
+async def list_archives(module: str = None, current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master_or_admin(current_user)
+    q = {}
+    if module:
+        q["module"] = module
+    return await db.archive_manifests.find(q, {"_id": 0}).sort("created_at", -1).to_list(500)
+
 app.include_router(api_router)
 
 app.add_middleware(
@@ -6912,9 +7033,17 @@ async def seed_master_user_on_startup():
         await analytics_center.ensure_analytics_indexes()
         logger.info("Analytics indexes verified")
         await mobile_api.ensure_mobile_indexes()
+        await archive_manifest.ensure_archive_indexes(db)
+        logger.info("Archive manifest indexes verified")
+        archive_scheduler.start_archive_scheduler(db)
+        logger.info("Archive scheduler started (ARCHIVE_PRUNE_ENABLED=%s)", s3_storage.archive_prune_enabled())
     except Exception as e:
         logger.error(f"Product Hub index creation failed: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
+    try:
+        await archive_scheduler.stop_archive_scheduler()
+    except Exception:
+        pass
     client.close()
