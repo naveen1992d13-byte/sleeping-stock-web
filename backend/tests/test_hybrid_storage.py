@@ -44,6 +44,20 @@ class FakeCursor:
         self._docs = list(docs)
 
     def sort(self, *a, **k):
+        if a:
+            # support sort([("field", -1)]) and sort("field", -1)
+            if len(a) == 1 and isinstance(a[0], (list, tuple)) and a[0] and isinstance(a[0][0], (list, tuple)):
+                keys = list(a[0])
+            elif len(a) >= 2 and isinstance(a[0], str):
+                keys = [(a[0], a[1])]
+            else:
+                keys = list(a[0]) if a and isinstance(a[0], (list, tuple)) else []
+            for field, direction in reversed(keys):
+                self._docs.sort(key=lambda x: str(x.get(field) or ""), reverse=direction < 0)
+        return self
+
+    def limit(self, n):
+        self._docs = self._docs[: int(n)]
         return self
 
     async def to_list(self, n=None):
@@ -74,18 +88,6 @@ class FakeCollection:
         matches = [dict(d) for d in self.docs if self._match(d, query or {})]
         return FakeCursor(matches)
 
-    async def update_one(self, query, update, upsert=False):
-        for i, d in enumerate(self.docs):
-            if self._match(d, query):
-                self.docs[i] = self._apply(d, update)
-                return SimpleNamespace(matched_count=1, modified_count=1, upserted_id=None)
-        if upsert:
-            base = dict(query)
-            base = self._apply(base, update)
-            self.docs.append(base)
-            return SimpleNamespace(matched_count=0, modified_count=0, upserted_id="u")
-        return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=None)
-
     async def find_one_and_update(self, query, update, return_document=None, projection=None):
         await self.update_one(query, update, upsert=False)
         return await self.find_one(query)
@@ -110,6 +112,7 @@ class FakeCollection:
         return len(self.docs)
 
     def _match(self, doc, query):
+        import re
         for k, v in (query or {}).items():
             if k == "$or":
                 if not any(self._match(doc, clause) for clause in v):
@@ -123,7 +126,11 @@ class FakeCollection:
                     return False
                 if "$lte" in v and not (dv is not None and dv <= v["$lte"]):
                     return False
+                if "$lt" in v and not (dv is not None and dv < v["$lt"]):
+                    return False
                 if "$ne" in v and dv == v["$ne"]:
+                    return False
+                if "$regex" in v and not re.search(str(v["$regex"]), str(dv or "")):
                     return False
             elif dv != v:
                 return False
@@ -133,6 +140,9 @@ class FakeCollection:
         out = dict(doc)
         if "$set" in update:
             out.update(update["$set"])
+        if "$setOnInsert" in update and not doc.get("_existing"):
+            for k, v in update["$setOnInsert"].items():
+                out.setdefault(k, v)
         if "$inc" in update:
             for k, v in update["$inc"].items():
                 out[k] = (out.get(k) or 0) + v
@@ -144,6 +154,23 @@ class FakeCollection:
             if not k.startswith("$"):
                 out[k] = v
         return out
+
+    async def update_one(self, query, update, upsert=False):
+        for i, d in enumerate(self.docs):
+            if self._match(d, query):
+                applied = self._apply({**d, "_existing": True}, update)
+                applied.pop("_existing", None)
+                self.docs[i] = applied
+                return SimpleNamespace(matched_count=1, modified_count=1, upserted_id=None)
+        if upsert:
+            base = dict(query)
+            # flatten simple equality query keys
+            base = {k: v for k, v in base.items() if not isinstance(v, dict)}
+            base = self._apply(base, update)
+            base.pop("_existing", None)
+            self.docs.append(base)
+            return SimpleNamespace(matched_count=0, modified_count=0, upserted_id="u")
+        return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=None)
 
 
 class FakeDB:
@@ -315,7 +342,7 @@ def test_hybrid_history_mongo_hot_s3_cold_and_mixed():
         assert hot["mongo_count"] >= 1
         assert any(r["part_number"] == "HOT1" for r in hot["rows"])
 
-        cold = await hh.read_product_history(db, date_key=cold_day, brand="Hyundai", hot_days=90)
+        cold = await hh.read_product_history(db, date_key=cold_day, brand="Hyundai", hot_days=1)
         assert cold["s3_count"] >= 1
         assert any(r["part_number"] == "COLD1" for r in cold["rows"])
 
@@ -324,7 +351,7 @@ def test_hybrid_history_mongo_hot_s3_cold_and_mixed():
             from_date=cold_day,
             to_date=hot_day,
             brand="Hyundai",
-            hot_days=90,
+            hot_days=1,
         )
         parts = {r["part_number"] for r in mixed["rows"]}
         assert "HOT1" in parts and "COLD1" in parts
@@ -486,6 +513,177 @@ def test_no_secrets_in_status_payload():
     assert "AWS_SECRET" not in blob
     assert status["archive_prune_enabled"] is False
     assert "access_key_present" in status
+    assert status["storage_backend"] == "LOCAL FALLBACK"
+    assert status["real_s3"] is False
+    assert status["prune_authorized"] is False
+    assert "Cloud archive not active" in (status.get("warning") or "")
+
+
+def test_product_hot_days_default_is_one():
+    # Env may override in process; temporarily clear
+    prev = os.environ.pop("PRODUCT_MONGO_HOT_DAYS", None)
+    try:
+        assert s3_storage.product_mongo_hot_days() == 1
+    finally:
+        if prev is not None:
+            os.environ["PRODUCT_MONGO_HOT_DAYS"] = prev
+
+
+def test_local_fallback_never_eligible_for_prune_and_blocks_prune():
+    async def _run():
+        db = FakeDB()
+        date_iso = "2026-07-15"
+        db.products.docs = [
+            {
+                "part_number": "P1",
+                "quantity": 1,
+                "total_value": 1,
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "Branch1",
+                "publish_status": "Published",
+                "active_date_key": "20260715",
+            }
+        ]
+        archived = await ha.archive_product_history_for_date(db, date_iso)
+        assert archived["status"] == "verified"
+        assert archived["manifest"]["eligible_for_prune"] is False
+        assert archived["manifest"]["status"] == am.STATUS_VERIFIED
+
+        os.environ["ARCHIVE_PRUNE_ENABLED"] = "true"
+        try:
+            pruned = await ha.prune_product_history_date(db, date_iso)
+            assert pruned["status"] == "blocked"
+            assert "Cloud archive not active" in pruned["reason"]
+            assert len(db.products.docs) == 1  # untouched
+        finally:
+            os.environ["ARCHIVE_PRUNE_ENABLED"] = "false"
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_paginated_history_filters_and_sources():
+    async def _run():
+        db = FakeDB()
+        today = datetime.now(IST).date().isoformat()
+        for i in range(5):
+            db.products.docs.append(
+                {
+                    "part_number": f"PN{i}",
+                    "item_name": f"Part {i}",
+                    "quantity": i,
+                    "total_value": i,
+                    "brand_name": "Hyundai",
+                    "dealer_name": "DealerA",
+                    "branch": "Branch1",
+                    "publish_status": "Published",
+                    "active_date_key": today.replace("-", ""),
+                }
+            )
+        page1 = await hh.read_product_history(db, date_key=today, page=1, page_size=2, brand="Hyundai")
+        assert page1["page"]["total"] == 5
+        assert len(page1["rows"]) == 2
+        filtered = await hh.read_product_history(db, date_key=today, part_number="PN3", brand="Hyundai")
+        assert filtered["total"] == 1
+        assert filtered["rows"][0]["part_number"] == "PN3"
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_storage_usage_dealer_ranking_and_cost():
+    async def _run():
+        import storage_usage as su
+
+        db = FakeDB()
+        month = datetime.now(IST).strftime("%Y-%m")
+        await su.record_storage_usage(
+            db, operation=su.OP_UPLOAD, bytes_count=5 * 1024 ** 3, brand="Hyundai", dealer="DealerA", branch="B1", module="uploads"
+        )
+        await su.record_storage_usage(
+            db, operation=su.OP_DOWNLOAD, bytes_count=1 * 1024 ** 3, brand="Hyundai", dealer="DealerA", branch="B1", module="uploads"
+        )
+        await su.record_storage_usage(
+            db, operation=su.OP_UPLOAD, bytes_count=1 * 1024 ** 3, brand="Hyundai", dealer="DealerB", branch="B2", module="uploads"
+        )
+        ranking = await su.dealer_usage_ranking(db, month=month)
+        assert ranking[0]["dealer"] == "DealerA"
+        assert ranking[0]["estimated_cost"] >= ranking[-1]["estimated_cost"]
+        totals = await su.month_usage_totals(db, month)
+        assert totals["cost_label"] == "Estimated Cost"
+        assert totals["estimated_total_cost"] > 0
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_scheduler_archives_previous_day_helper():
+    from archive_scheduler import previous_calendar_day_iso
+
+    fixed = datetime(2026, 8, 12, 0, 20, tzinfo=IST)
+    assert previous_calendar_day_iso(fixed) == "2026-08-11"
+
+
+def test_never_prune_today_even_if_enabled():
+    async def _run():
+        db = FakeDB()
+        today = datetime.now(IST).date().isoformat()
+        db.products.docs = [
+            {
+                "part_number": "TODAY1",
+                "quantity": 1,
+                "total_value": 1,
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "Branch1",
+                "publish_status": "Published",
+                "active_date_key": today.replace("-", ""),
+                "is_active_today": True,
+            }
+        ]
+        os.environ["ARCHIVE_PRUNE_ENABLED"] = "true"
+        try:
+            pruned = await ha.prune_product_history_date(db, today)
+            assert pruned["status"] == "blocked"
+            assert "today" in pruned["reason"].lower()
+            assert db.products.docs
+        finally:
+            os.environ["ARCHIVE_PRUNE_ENABLED"] = "false"
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_migration_dry_run_lists_historical_dates():
+    async def _run():
+        db = FakeDB()
+        today = datetime.now(IST).date()
+        old = (today - timedelta(days=3)).strftime("%Y%m%d")
+        db.products.docs = [
+            {
+                "part_number": "OLD",
+                "quantity": 1,
+                "total_value": 1,
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "Branch1",
+                "publish_status": "Published",
+                "active_date_key": old,
+            },
+            {
+                "part_number": "NEW",
+                "quantity": 1,
+                "total_value": 1,
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "Branch1",
+                "publish_status": "Published",
+                "active_date_key": today.strftime("%Y%m%d"),
+            },
+        ]
+        plan = await ha.archive_historical_dates(db, dry_run=True)
+        assert plan["status"] == "dry_run"
+        assert plan["dates"] >= 1
+        assert all(p["date"] != today.isoformat() for p in plan["plan"])
+
+    asyncio.get_event_loop().run_until_complete(_run())
 
 
 @pytest.fixture(scope="session", autouse=True)

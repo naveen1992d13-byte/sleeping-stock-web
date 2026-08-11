@@ -1,6 +1,6 @@
 """Timezone-aware archive scheduler with MongoDB idempotency locks.
 
-Daily Product History archive: 23:45 Asia/Kolkata
+Daily Product History archive: 00:15 Asia/Kolkata — previous calendar day
 Monthly completed Orders/Requests: 1st day 01:30 Asia/Kolkata
 """
 
@@ -28,20 +28,26 @@ def _ist_now() -> datetime:
     return datetime.now(IST)
 
 
+def previous_calendar_day_iso(now: Optional[datetime] = None) -> str:
+    now = now or _ist_now()
+    return (now.date() - timedelta(days=1)).isoformat()
+
+
 async def run_daily_product_archive(db, archive_date: Optional[str] = None) -> dict:
-    """Archive yesterday (or explicit date) product history + analytics snapshots."""
+    """Archive the previous IST calendar day (or an explicit date).
+
+    After verified archive, optionally prune that historical date when
+    ARCHIVE_PRUNE_ENABLED=true AND storage backend is REAL S3.
+    """
     now = _ist_now()
     if not archive_date:
-        # At 23:45 we archive the *completed* day — which is "today" once the day
-        # is essentially finished. Spec: archive the completed day's Product History
-        # every day at 23:45. Use today's IST date.
-        archive_date = now.date().isoformat()
+        archive_date = previous_calendar_day_iso(now)
     lock_key = f"daily-product-history:{archive_date}"
     if not await am.acquire_job_lock(db, lock_key, _OWNER, ttl_seconds=7200):
         return {"status": "locked", "archive_date": archive_date}
     try:
         result = await ha.archive_product_history_for_date(db, archive_date)
-        # Also archive verifications older than hot window for that day if beyond retention
+        # Side-job: archive verifications only when outside verification hot window
         try:
             hot = verification_mongo_hot_days()
             cutoff = (now.date() - timedelta(days=hot)).isoformat()
@@ -49,6 +55,17 @@ async def run_daily_product_archive(db, archive_date: Optional[str] = None) -> d
                 await ha.archive_verifications_for_date(db, archive_date)
         except Exception as exc:
             logger.warning("Verification archive side-job failed: %s", exc)
+
+        # Prune only the archived date when policy allows (real S3 + flag)
+        prune_result = None
+        try:
+            if result.get("status") in {"verified", "already_verified"}:
+                prune_result = await ha.prune_product_history_date(db, archive_date)
+        except Exception as exc:
+            logger.warning("Post-archive prune skipped/failed for %s: %s", archive_date, exc)
+            prune_result = {"status": "error", "error": str(exc)[:500]}
+        if isinstance(result, dict):
+            result = {**result, "prune": prune_result}
         return result
     finally:
         await am.release_job_lock(db, lock_key, _OWNER)
@@ -78,12 +95,14 @@ async def _scheduler_loop(db) -> None:
                 await asyncio.sleep(30)
                 continue
             now = _ist_now()
-            daily_stamp = now.strftime("%Y-%m-%d")
+            # Stamp by the *previous* day being archived so a late run still
+            # only fires once per IST calendar day.
+            daily_stamp = previous_calendar_day_iso(now)
             monthly_stamp = now.strftime("%Y-%m")
 
-            # Daily at 23:45 IST
-            if now.hour == 23 and now.minute >= 45 and last_daily != daily_stamp:
-                logger.info("Triggering daily product archive for %s", daily_stamp)
+            # Daily at 00:15 IST — archive previous calendar day
+            if now.hour == 0 and now.minute >= 15 and last_daily != daily_stamp:
+                logger.info("Triggering daily product archive for previous day %s", daily_stamp)
                 try:
                     await run_daily_product_archive(db, daily_stamp)
                     last_daily = daily_stamp

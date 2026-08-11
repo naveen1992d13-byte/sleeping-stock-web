@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { useAuth, API, canAccessPermission } from '../App';
+import { useAuth, API, canAccessPermission, canAccessMenuItem } from '../App';
 import axios from 'axios';
 import {
   Bell,
@@ -70,9 +70,7 @@ export function DashboardLayout() {
 
   const navItems = APPLICATION_MENU_ITEMS;
 
-  const filteredNavItems = navItems.filter(
-    (item) => item.allRoles || canAccessPermission(user, item.permissionLabel || item.label)
-  );
+  const filteredNavItems = navItems.filter((item) => canAccessMenuItem(user, item));
 
   useEffect(() => {
     if (!user) return;

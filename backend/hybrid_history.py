@@ -108,10 +108,16 @@ async def read_product_history(
     dealer: Optional[str] = None,
     branch: Optional[str] = None,
     hot_days: Optional[int] = None,
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
+    part_number: Optional[str] = None,
+    search: Optional[str] = None,
+    record_usage: bool = True,
 ) -> Dict[str, Any]:
     """Return product history rows from Mongo and/or S3 based on date hotness.
 
     Caller does not need to know storage location.
+    Optional page/page_size apply server-side after filter (1-based page).
     """
     if date_key:
         keys = [_normalize_date_key(date_key)]
@@ -156,12 +162,56 @@ async def read_product_history(
                 sources[dk] = "mongo_fallback"
 
     combined = mongo_rows + s3_rows
+    if part_number:
+        pn = str(part_number).strip().upper()
+        combined = [r for r in combined if str(r.get("part_number") or "").strip().upper() == pn]
+    if search:
+        q = str(search).strip().lower()
+        combined = [
+            r
+            for r in combined
+            if q in str(r.get("part_number") or "").lower()
+            or q in str(r.get("item_name") or r.get("part_name") or "").lower()
+        ]
+
+    total = len(combined)
+    page_meta = None
+    if page is not None or page_size is not None:
+        ps = max(1, min(int(page_size or 50), 500))
+        pg = max(1, int(page or 1))
+        start = (pg - 1) * ps
+        end = start + ps
+        page_rows = combined[start:end]
+        page_meta = {"page": pg, "page_size": ps, "total": total, "total_pages": (total + ps - 1) // ps if ps else 0}
+        combined = page_rows
+
+    if record_usage and (s3_rows or (page_meta and any(v == "s3" for v in sources.values()))):
+        try:
+            import storage_usage as su
+
+            # Approximate viewed payload from returned rows
+            approx = sum(len(str(r)) for r in combined)
+            await su.record_storage_usage(
+                db,
+                operation=su.OP_VIEW_READ,
+                bytes_count=approx,
+                brand=brand or "",
+                dealer=dealer or "",
+                branch=branch or "",
+                module="product-history",
+                request_count=1,
+            )
+        except Exception:
+            pass
+
     return {
         "rows": combined,
         "count": len(combined),
+        "total": total,
         "sources": sources,
         "mongo_count": len(mongo_rows),
         "s3_count": len(s3_rows),
+        "page": page_meta,
     }
 
 
