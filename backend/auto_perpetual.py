@@ -219,6 +219,11 @@ async def _verified_parts_this_month(
 
 
 async def _previous_inventory_date_key(db, *, brand_name: str, dealer_name: str, branch: str, current_key: str) -> Optional[str]:
+    """Return previous inventory date for THIS brand/dealer/branch only.
+
+    Never inherit another dealer's archive calendar date.
+    """
+    cur = str(current_key or "").replace("-", "")[:8]
     row = await db.products.find(
         {
             "brand_name": brand_name,
@@ -232,34 +237,55 @@ async def _previous_inventory_date_key(db, *, brand_name: str, dealer_name: str,
     if row:
         return row[0]["active_date_key"]
 
-    # After one-day retention prune, previous day may live only in archive manifests / snapshots.
+    # Prefer scoped analytics snapshots (exact brand/dealer/branch)
     try:
-        manifests = await db.archive_manifests.find(
-            {
-                "module": "product-history",
-                "status": {"$in": ["VERIFIED", "PRUNED"]},
-                "archive_date": {"$lt": f"{current_key[0:4]}-{current_key[4:6]}-{current_key[6:8]}" if len(current_key) == 8 else current_key},
-            },
-            {"_id": 0, "archive_date": 1},
-        ).sort("archive_date", -1).limit(5).to_list(5)
-        for m in manifests:
-            dk = str(m.get("archive_date") or "").replace("-", "")[:8]
-            if dk and dk < current_key.replace("-", "")[:8]:
-                return dk
-    except Exception:
-        pass
-    try:
+        before_iso = (
+            f"{cur[0:4]}-{cur[4:6]}-{cur[6:8]}" if len(cur) == 8 else str(current_key)
+        )
         snap = await db.analytics_stock_daily_snapshots.find(
             {
                 "brand_name": brand_name,
                 "dealer_name": dealer_name,
                 "branch_name": branch,
-                "snapshot_date_ist": {"$lt": f"{current_key[0:4]}-{current_key[4:6]}-{current_key[6:8]}" if len(current_key) == 8 else current_key},
+                "snapshot_date_ist": {"$lt": before_iso},
             },
             {"_id": 0, "snapshot_date_ist": 1},
         ).sort("snapshot_date_ist", -1).limit(1).to_list(1)
         if snap:
             return str(snap[0].get("snapshot_date_ist") or "").replace("-", "")[:8] or None
+    except Exception:
+        pass
+
+    # Scoped hybrid probe: walk recent verified archive dates newest-first and
+    # accept only dates that actually contain this brand/dealer/branch.
+    try:
+        import hybrid_history as hh
+
+        before_iso = f"{cur[0:4]}-{cur[4:6]}-{cur[6:8]}" if len(cur) == 8 else str(current_key)
+        manifests = await db.archive_manifests.find(
+            {
+                "module": "product-history",
+                "status": {"$in": ["VERIFIED", "PRUNED"]},
+                "archive_date": {"$lt": before_iso},
+            },
+            {"_id": 0, "archive_date": 1},
+        ).sort("archive_date", -1).limit(14).to_list(14)
+        for m in manifests:
+            dk = str(m.get("archive_date") or "").replace("-", "")[:8]
+            if not dk or dk >= cur:
+                continue
+            probe = await hh.read_product_history(
+                db,
+                date_key=dk,
+                brand=brand_name,
+                dealer=dealer_name,
+                branch=branch,
+                page=1,
+                page_size=1,
+                record_usage=False,
+            )
+            if int(probe.get("total") or 0) > 0 or (probe.get("rows") or []):
+                return dk
     except Exception:
         pass
     return None

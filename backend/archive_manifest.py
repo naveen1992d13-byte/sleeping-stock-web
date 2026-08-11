@@ -119,29 +119,68 @@ async def mark_status(db, archive_id: str, status: str, **fields) -> Optional[Di
 
 
 async def acquire_job_lock(db, lock_key: str, owner: str, ttl_seconds: int = 3600) -> bool:
-    """Mongo-backed lock so multiple replicas cannot double-run the same job."""
+    """Atomically acquire a Mongo-backed job lock (CAS).
+
+    Rules:
+    - Only one owner may hold an unexpired lock.
+    - Expired locks may be reclaimed.
+    - The same owner may refresh its own lock.
+    """
     now = _utcnow()
-    expires = now.timestamp() + ttl_seconds
-    existing = await db.archive_job_locks.find_one({"lock_key": lock_key})
-    if existing:
-        if float(existing.get("expires_at") or 0) > now.timestamp() and existing.get("owner") != owner:
-            return False
-    await db.archive_job_locks.update_one(
-        {"lock_key": lock_key},
+    now_ts = now.timestamp()
+    expires = now_ts + float(ttl_seconds)
+    acquired_at = now.isoformat()
+    payload = {
+        "lock_key": lock_key,
+        "owner": owner,
+        "acquired_at": acquired_at,
+        "expires_at": expires,
+    }
+
+    # 1) Atomically take lock if expired or already owned by us
+    claimed = await db.archive_job_locks.find_one_and_update(
         {
-            "$set": {
-                "lock_key": lock_key,
-                "owner": owner,
-                "acquired_at": now.isoformat(),
-                "expires_at": expires,
-            }
+            "lock_key": lock_key,
+            "$or": [
+                {"owner": owner},
+                {"expires_at": {"$lte": now_ts}},
+                {"expires_at": None},
+            ],
         },
-        upsert=True,
+        {"$set": payload},
+        return_document=True,
     )
-    # Confirm we own it
+    if claimed and claimed.get("owner") == owner:
+        return True
+
+    # 2) Insert if missing (unique lock_key prevents double-insert race)
+    existing = await db.archive_job_locks.find_one({"lock_key": lock_key})
+    if existing is None:
+        try:
+            await db.archive_job_locks.insert_one(dict(payload))
+            row = await db.archive_job_locks.find_one({"lock_key": lock_key})
+            return bool(row and row.get("owner") == owner)
+        except Exception:
+            # DuplicateKeyError / race — fall through to ownership check
+            pass
+
+    # 3) One more reclaim attempt if the holder expired during the race
+    claimed = await db.archive_job_locks.find_one_and_update(
+        {"lock_key": lock_key, "expires_at": {"$lte": now_ts}},
+        {"$set": payload},
+        return_document=True,
+    )
+    if claimed and claimed.get("owner") == owner:
+        return True
+
     row = await db.archive_job_locks.find_one({"lock_key": lock_key})
-    return bool(row and row.get("owner") == owner)
+    return bool(
+        row
+        and row.get("owner") == owner
+        and float(row.get("expires_at") or 0) > now_ts
+    )
 
 
 async def release_job_lock(db, lock_key: str, owner: str) -> None:
+    """Release only if we still own the lock."""
     await db.archive_job_locks.delete_one({"lock_key": lock_key, "owner": owner})

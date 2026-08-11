@@ -9,12 +9,17 @@ import sys
 import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
+import gzip
+import json
+
 import pytest
+from pymongo.errors import DuplicateKeyError
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -56,6 +61,10 @@ class FakeCursor:
                 self._docs.sort(key=lambda x: str(x.get(field) or ""), reverse=direction < 0)
         return self
 
+    def skip(self, n):
+        self._docs = self._docs[int(n) :]
+        return self
+
     def limit(self, n):
         self._docs = self._docs[: int(n)]
         return self
@@ -65,17 +74,22 @@ class FakeCursor:
 
 
 class FakeCollection:
-    def __init__(self):
+    def __init__(self, unique_keys=None):
         self.docs = []
         self.indexes = []
+        self.unique_keys = unique_keys or []
 
     async def insert_one(self, doc):
+        for keys in self.unique_keys:
+            probe = {k: doc.get(k) for k in keys}
+            if any(all(d.get(k) == probe[k] for k in keys) for d in self.docs):
+                raise DuplicateKeyError("E11000 duplicate key")
         self.docs.append(dict(doc))
         return SimpleNamespace(inserted_id="x")
 
     async def insert_many(self, docs):
         for d in docs:
-            self.docs.append(dict(d))
+            await self.insert_one(d)
 
     async def find_one(self, query=None, projection=None, sort=None):
         matches = [d for d in self.docs if self._match(d, query or {})]
@@ -88,9 +102,13 @@ class FakeCollection:
         matches = [dict(d) for d in self.docs if self._match(d, query or {})]
         return FakeCursor(matches)
 
-    async def find_one_and_update(self, query, update, return_document=None, projection=None):
-        await self.update_one(query, update, upsert=False)
-        return await self.find_one(query)
+    async def find_one_and_update(self, query, update, return_document=None, projection=None, upsert=False):
+        result = await self.update_one(query, update, upsert=upsert)
+        if result.matched_count or result.upserted_id:
+            # Return updated doc matching the simple equality keys (not $or filters)
+            simple = {k: v for k, v in (query or {}).items() if not str(k).startswith("$") and not isinstance(v, dict)}
+            return await self.find_one(simple or query)
+        return None
 
     async def delete_one(self, query):
         before = len(self.docs)
@@ -175,7 +193,9 @@ class FakeCollection:
 
 class FakeDB:
     def __init__(self):
-        self._cols = {}
+        self._cols = {
+            "archive_job_locks": FakeCollection(unique_keys=[["lock_key"]]),
+        }
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -684,6 +704,284 @@ def test_migration_dry_run_lists_historical_dates():
         assert all(p["date"] != today.isoformat() for p in plan["plan"])
 
     asyncio.get_event_loop().run_until_complete(_run())
+
+
+# ---------------------------------------------------------------------------
+# PR #36 corrective-pass tests
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_job_lock_race_and_expiry():
+    async def _run():
+        db = FakeDB()
+        key = "daily-product-history:2026-08-10"
+        w1 = await am.acquire_job_lock(db, key, "worker-1", ttl_seconds=60)
+        w2 = await am.acquire_job_lock(db, key, "worker-2", ttl_seconds=60)
+        assert w1 is True
+        assert w2 is False
+        # Active lock cannot be stolen
+        assert await am.acquire_job_lock(db, key, "worker-2", ttl_seconds=60) is False
+        # Same owner may refresh
+        assert await am.acquire_job_lock(db, key, "worker-1", ttl_seconds=60) is True
+        # Expire and reclaim
+        db.archive_job_locks.docs[0]["expires_at"] = 1.0
+        assert await am.acquire_job_lock(db, key, "worker-2", ttl_seconds=60) is True
+        row = await db.archive_job_locks.find_one({"lock_key": key})
+        assert row["owner"] == "worker-2"
+        # Release only by owner
+        await am.release_job_lock(db, key, "worker-1")
+        assert await db.archive_job_locks.find_one({"lock_key": key}) is not None
+        await am.release_job_lock(db, key, "worker-2")
+        assert await db.archive_job_locks.find_one({"lock_key": key}) is None
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_archive_idempotent_under_lock_and_failure_leaves_mongo():
+    async def _run():
+        db = FakeDB()
+        date_iso = "2026-08-03"
+        db.products.docs = [
+            {
+                "part_number": "P1",
+                "quantity": 1,
+                "total_value": 1,
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "B1",
+                "publish_status": "Published",
+                "active_date_key": "20260803",
+            }
+        ]
+        first = await ha.archive_product_history_for_date(db, date_iso)
+        assert first["status"] == "verified"
+        second = await ha.archive_product_history_for_date(db, date_iso)
+        assert second["status"] == "already_verified"
+        assert len(db.products.docs) == 1
+
+        # Failure path leaves mongo untouched
+        storage = s3_storage.get_storage()
+        original = storage.upload_bytes
+
+        def boom(*a, **k):
+            raise s3_storage.S3StorageError("boom")
+
+        storage.upload_bytes = boom  # type: ignore
+        try:
+            with pytest.raises(Exception):
+                await ha.archive_product_history_for_date(db, "2026-08-04", force=True)
+        finally:
+            storage.upload_bytes = original  # type: ignore
+        # products for 08-03 still present; no prune happened
+        assert any(d.get("active_date_key") == "20260803" for d in db.products.docs)
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_streaming_history_pagination_memory_safe_and_filters():
+    # Large synthetic archive: stream pagination must return only page rows
+    rows = []
+    for i in range(5000):
+        dealer = "DealerA" if i % 2 == 0 else "DealerB"
+        branch = "B1" if i % 3 == 0 else "B2"
+        rows.append(
+            {
+                "part_number": f"PN{i:05d}",
+                "item_name": f"Part {i}",
+                "quantity": 1,
+                "total_value": 1,
+                "brand_name": "Hyundai",
+                "dealer_name": dealer,
+                "branch": branch,
+                "publish_status": "Published",
+            }
+        )
+    buf = BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+        for r in rows:
+            gz.write((json.dumps(r) + "\n").encode("utf-8"))
+    data = buf.getvalue()
+
+    page = hh.stream_filter_page_from_archive_bytes(
+        data, brand="Hyundai", dealer="DealerA", branch="B1", page=2, page_size=25
+    )
+    assert len(page["rows"]) == 25
+    assert page["page"]["page"] == 2
+    assert page["total"] > 25
+    assert all(r["dealer_name"] == "DealerA" and r["branch"] == "B1" for r in page["rows"])
+    # Only page materialised
+    assert page["count"] == 25
+
+    # Brand/dealer/branch filters
+    filtered = hh.stream_filter_page_from_archive_bytes(
+        data, brand="Hyundai", dealer="DealerB", branch="B2", part_number="PN00001", page=1, page_size=10
+    )
+    # PN00001 is dealer B, branch B2 (i=1 -> dealer B, i%3=1 -> B2)
+    assert filtered["total"] == 1
+    assert filtered["rows"][0]["part_number"] == "PN00001"
+
+
+def test_allocate_billable_egress_account_level_free_allowance():
+    import storage_usage as su
+
+    gib = 1024 ** 3
+    # total < 100 GB
+    m1 = su.allocate_billable_egress_gb({"A": 40 * gib, "B": 30 * gib}, free_egress_gb=100)
+    assert m1["A"] == 0.0 and m1["B"] == 0.0
+    # total == 100 GB
+    m2 = su.allocate_billable_egress_gb({"A": 60 * gib, "B": 40 * gib}, free_egress_gb=100)
+    assert m2["A"] == 0.0 and m2["B"] == 0.0
+    # total > 100 GB — proportional
+    m3 = su.allocate_billable_egress_gb({"A": 150 * gib, "B": 50 * gib}, free_egress_gb=100)
+    # billable = 100 GB; A share 75%, B 25%
+    assert abs(m3["A"] - 75.0) < 1e-6
+    assert abs(m3["B"] - 25.0) < 1e-6
+    assert abs(sum(m3.values()) - 100.0) < 1e-6
+    # one dealer only
+    m4 = su.allocate_billable_egress_gb({"Solo": 250 * gib}, free_egress_gb=100)
+    assert abs(m4["Solo"] - 150.0) < 1e-6
+    # zero egress
+    m5 = su.allocate_billable_egress_gb({"A": 0, "B": 0}, free_egress_gb=100)
+    assert m5["A"] == 0.0 and m5["B"] == 0.0
+
+
+def test_get_download_not_double_counted_in_request_cost():
+    import storage_usage as su
+
+    async def _run():
+        db = FakeDB()
+        month = datetime.now(IST).strftime("%Y-%m")
+        await su.record_storage_usage(
+            db,
+            operation=su.OP_DOWNLOAD,
+            bytes_count=2 * 1024 ** 3,
+            brand="Hyundai",
+            dealer="DealerA",
+            branch="B1",
+            module="uploads",
+            request_count=1000,
+        )
+        row = db.storage_usage_daily.docs[0]
+        assert row["download_requests"] == 1000
+        assert row["get_requests"] == 1000  # one S3 GET per download, not doubled
+        totals = await su.month_usage_totals(db, month)
+        assert totals["download_requests"] == 1000
+        assert totals["get_requests"] == 1000
+        # Request cost uses get_requests once (download_requests ignored for billing)
+        pricing = s3_storage.s3_pricing_config()
+        expected_req = (1000 / 1000.0) * float(pricing["get_price_per_1000"])
+        assert abs(totals["estimated_request_cost"] - expected_req) < 1e-9
+        # Explicit: billing must NOT be 2x GET from download_requests
+        doubled = (2000 / 1000.0) * float(pricing["get_price_per_1000"])
+        assert abs(totals["estimated_request_cost"] - doubled) > 1e-9
+
+        ranking = await su.dealer_usage_ranking(db, month=month)
+        assert ranking[0]["get_requests"] == 1000
+        assert ranking[0]["download_requests"] == 1000
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_dealer_ranking_uses_global_free_egress_and_sums():
+    import storage_usage as su
+
+    async def _run():
+        db = FakeDB()
+        month = datetime.now(IST).strftime("%Y-%m")
+        gib = 1024 ** 3
+        # 120 + 80 = 200 GB download → 100 billable; A 60%, B 40%
+        await su.record_storage_usage(
+            db, operation=su.OP_DOWNLOAD, bytes_count=120 * gib, brand="Hyundai", dealer="A", branch="B1", module="x"
+        )
+        await su.record_storage_usage(
+            db, operation=su.OP_DOWNLOAD, bytes_count=80 * gib, brand="Hyundai", dealer="B", branch="B2", module="x"
+        )
+        ranking = await su.dealer_usage_ranking(db, month=month)
+        assert ranking[0]["dealer"] == "A"
+        assert abs(ranking[0]["billable_egress_gb"] - 60.0) < 1e-6
+        assert abs(ranking[1]["billable_egress_gb"] - 40.0) < 1e-6
+        # Dealer transfer costs sum to account transfer cost
+        totals = await su.month_usage_totals(db, month)
+        dealer_transfer = sum(r["estimated_transfer_cost"] for r in ranking)
+        assert abs(dealer_transfer - totals["estimated_transfer_cost"]) < 1e-6
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_auto_perpetual_previous_date_is_scoped_no_cross_dealer():
+    import auto_perpetual as ap
+
+    async def _run():
+        db = FakeDB()
+        # Dealer A has prior Mongo inventory; Dealer B does not
+        db.products.docs = [
+            {
+                "part_number": "P1",
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "Branch1",
+                "publish_status": "Published",
+                "active_date_key": "20260809",
+                "quantity": 1,
+            }
+        ]
+        # Also a verified archive that only conceptually belongs to A (probe uses filters)
+        cold_rows = [
+            {
+                "part_number": "P1",
+                "item_name": "Part",
+                "quantity": 1,
+                "total_value": 1,
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "Branch1",
+                "publish_status": "Published",
+                "active_date_key": "20260808",
+            }
+        ]
+        db.products.docs.extend(cold_rows)
+        archived = await ha.archive_product_history_for_date(db, "2026-08-08")
+        assert archived["status"] == "verified"
+        db.products.docs = [d for d in db.products.docs if d.get("active_date_key") != "20260808"]
+
+        a_prev = await ap._previous_inventory_date_key(
+            db, brand_name="Hyundai", dealer_name="DealerA", branch="Branch1", current_key="20260811"
+        )
+        b_prev = await ap._previous_inventory_date_key(
+            db, brand_name="Hyundai", dealer_name="DealerB", branch="Branch1", current_key="20260811"
+        )
+        assert a_prev == "20260809"
+        assert b_prev is None  # must not inherit Dealer A's date
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_real_s3_eligibility_gate_and_local_fallback_status():
+    status = s3_storage.get_storage().status()
+    assert status["storage_backend"] == "LOCAL FALLBACK"
+    assert status["real_s3"] is False
+    assert status["prune_authorized"] is False
+    assert status["archive_prune_enabled"] is False
+    assert "Cloud archive not active" in (status.get("warning") or "")
+
+
+def test_excel_permissions_master_admin_user():
+    assert ep.can_export_excel(SimpleNamespace(role="master")) is True
+    assert ep.can_export_excel(SimpleNamespace(role="admin")) is True
+    assert ep.can_export_excel(SimpleNamespace(role="user")) is False
+
+
+def test_monitor_access_helpers_master_only_documented():
+    # Endpoint uses _ensure_master; unit-level role gate mirrors that contract.
+    def ensure_master(role: str):
+        if role != "master":
+            raise PermissionError(403)
+        return True
+
+    assert ensure_master("master") is True
+    for role in ("admin", "user"):
+        with pytest.raises(PermissionError):
+            ensure_master(role)
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -95,19 +95,35 @@ async def _scheduler_loop(db) -> None:
                 await asyncio.sleep(30)
                 continue
             now = _ist_now()
-            # Stamp by the *previous* day being archived so a late run still
-            # only fires once per IST calendar day.
             daily_stamp = previous_calendar_day_iso(now)
             monthly_stamp = now.strftime("%Y-%m")
 
-            # Daily at 00:15 IST — archive previous calendar day
+            # Daily at 00:15 IST — archive previous calendar day.
+            # Skip noisy re-runs when a VERIFIED/PRUNED manifest already exists
+            # (restart after 00:15 would otherwise re-enter the window).
             if now.hour == 0 and now.minute >= 15 and last_daily != daily_stamp:
-                logger.info("Triggering daily product archive for previous day %s", daily_stamp)
-                try:
-                    await run_daily_product_archive(db, daily_stamp)
+                already = await db.archive_manifests.find_one(
+                    {
+                        "module": ha.MODULE_PRODUCT_HISTORY,
+                        "archive_date": daily_stamp,
+                        "status": {"$in": [am.STATUS_VERIFIED, am.STATUS_PRUNED]},
+                    },
+                    {"_id": 0, "status": 1},
+                )
+                if already:
+                    logger.info(
+                        "Daily archive for %s already %s — skipping scheduler re-entry",
+                        daily_stamp,
+                        already.get("status"),
+                    )
                     last_daily = daily_stamp
-                except Exception as exc:
-                    logger.error("Daily archive failed: %s", exc)
+                else:
+                    logger.info("Triggering daily product archive for previous day %s", daily_stamp)
+                    try:
+                        await run_daily_product_archive(db, daily_stamp)
+                        last_daily = daily_stamp
+                    except Exception as exc:
+                        logger.error("Daily archive failed: %s", exc)
 
             # Monthly on 1st at 01:30 IST
             if now.day == 1 and now.hour == 1 and now.minute >= 30 and last_monthly != monthly_stamp:

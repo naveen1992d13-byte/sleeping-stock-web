@@ -136,16 +136,23 @@ export function StorageCostMonitor() {
         {[
           ['MongoDB Used Storage', fmtBytes(cards.mongodb_used_storage)],
           ['MongoDB Data Size', fmtBytes(cards.mongodb_data_size)],
-          ['S3 Total Stored', fmtBytes(cards.s3_total_stored)],
-          ['Estimated Current Month Cost', fmtMoney(cards.estimated_current_month_cost)],
+          ['MongoDB Index Size', fmtBytes(cards.mongodb_index_size)],
           ['Today Product Rows', String(cards.today_product_count ?? '-')],
-          ['Historical Moved to S3', fmtBytes(cards.historical_moved_to_s3_bytes)],
+          ['S3 Archived Bytes', fmtBytes(cards.s3_total_stored)],
+          ['This Month Upload', fmtBytes(data?.usage_month?.upload_bytes)],
+          ['This Month View/Read', fmtBytes(data?.usage_month?.view_bytes)],
+          ['This Month Download', fmtBytes(data?.usage_month?.download_bytes)],
+          ['PUT Requests', String(data?.usage_month?.put_requests ?? 0)],
+          ['GET Requests', String(data?.usage_month?.get_requests ?? 0)],
+          ['Estimated Storage Cost', fmtMoney(data?.usage_month?.estimated_storage_cost)],
+          ['Estimated Request Cost', fmtMoney(data?.usage_month?.estimated_request_cost)],
+          ['Estimated Transfer Cost', fmtMoney(data?.usage_month?.estimated_transfer_cost)],
+          ['Estimated Total Cost', fmtMoney(cards.estimated_current_month_cost)],
           ['Last Archive Status', String(cards.last_archive_status || '-')],
           ['Last Successful Archive', String(cards.last_successful_archive_date || '-')],
           ['Failed Archive Count', String(cards.failed_archive_count ?? 0)],
-          ['Product Hot Days', String(data?.product_mongo_hot_days ?? 1)],
           ['Storage Backend', String(data?.storage_backend || '-')],
-          ['Index Size', fmtBytes(cards.mongodb_index_size)],
+          ['Product Hot Days', String(data?.product_mongo_hot_days ?? 1)],
         ].map(([label, value]) => (
           <div key={label} className="rounded-xl border bg-white p-4" style={{ borderColor: COLORS.border, background: COLORS.soft }}>
             <div className="text-xs font-semibold uppercase tracking-wide" style={{ color: COLORS.muted }}>{label}</div>
