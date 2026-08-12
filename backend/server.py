@@ -48,6 +48,8 @@ except ImportError:
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+# Optional local overlay for corrected AWS/S3 secret mapping (gitignored; never commit).
+load_dotenv(ROOT_DIR / '.env.s3.local', override=True)
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']

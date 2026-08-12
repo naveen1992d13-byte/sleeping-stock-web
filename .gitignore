@@ -25,3 +25,7 @@ backend/report_files/
 backend/notice_files/
 backend/query_attachments/
 backend/mobile_apk_storage/
+
+# Local AWS mapping override (never commit)
+backend/.env.s3.local
+.env.s3.local
