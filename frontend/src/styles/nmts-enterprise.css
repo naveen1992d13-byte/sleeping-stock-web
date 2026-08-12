@@ -688,6 +688,131 @@
   padding: 16px;
 }
 
+/* Empty workspace (zero open tabs) */
+.nmts-empty-workspace {
+  min-height: calc(100vh - 120px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.nmts-empty-workspace-logo {
+  width: min(220px, 40vw);
+  height: auto;
+  opacity: 0.12;
+  user-select: none;
+}
+
+/* Bell notification centre */
+.nmts-bell-wrap {
+  position: relative;
+}
+
+.nmts-bell-backdrop {
+  position: fixed;
+  inset: 0;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  z-index: 40;
+}
+
+.nmts-bell-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  width: min(360px, 92vw);
+  max-height: min(420px, 70vh);
+  background: #fff;
+  border: 1px solid var(--nmts-border);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.12);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.nmts-bell-panel-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--nmts-border);
+  font-size: 0.875rem;
+  font-weight: 700;
+  color: var(--nmts-text);
+}
+
+.nmts-bell-panel-sub {
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--nmts-text-muted);
+}
+
+.nmts-bell-panel-list {
+  overflow-y: auto;
+  flex: 1;
+}
+
+.nmts-bell-empty {
+  padding: 24px 16px;
+  text-align: center;
+  font-size: 0.8125rem;
+  color: var(--nmts-text-muted);
+}
+
+.nmts-bell-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-bottom: 1px solid #f3f4f6;
+  background: #fff;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+
+.nmts-bell-item:hover {
+  background: #f9fafb;
+}
+
+.nmts-bell-item--unread {
+  background: #f0fdf4;
+}
+
+.nmts-bell-item-type {
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #059669;
+  margin-bottom: 2px;
+}
+
+.nmts-bell-item-title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--nmts-text);
+}
+
+.nmts-bell-item-msg {
+  font-size: 0.75rem;
+  color: var(--nmts-text-muted);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nmts-bell-item-time {
+  font-size: 0.65rem;
+  color: #9ca3af;
+  margin-top: 4px;
+}
+
 /* —— Reusable module / page pieces —— */
 .nmts-module-header {
   background: var(--nmts-card-bg);

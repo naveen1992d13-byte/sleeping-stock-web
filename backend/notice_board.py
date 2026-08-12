@@ -533,6 +533,13 @@ async def publish_notice(notice_id: str, current_user=Depends(_current_user)):
         projection={"_id": 0},
     )
     await _audit(notice_id, current_user, "notice_published", {"previous_status": "Draft", "new_status": "Published"})
+    # Additive in-app bell alert for eligible users (email/WhatsApp unaffected)
+    try:
+        import user_alerts as ua
+
+        await ua.alert_notice_published(doc or {})
+    except Exception:
+        pass
     return _serialize_notice(doc)
 
 

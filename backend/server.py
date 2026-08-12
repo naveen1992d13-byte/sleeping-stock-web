@@ -6092,6 +6092,12 @@ async def _notify_request_status_change(req: dict, event: str):
             await notifications.notify_request_event(db, event, req, recipients, remarks=req.get('approval_remarks', ''))
     except Exception as exc:  # noqa: BLE001
         logging.getLogger('nmts.notifications').warning('%s notification dispatch failed: %s', event, str(exc)[:300])
+    # Additive in-app bell alert (does not replace email/WhatsApp)
+    try:
+        import user_alerts as ua
+        await ua.alert_request_event(req, event)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger('nmts.user_alerts').warning('request in-app alert failed: %s', str(exc)[:300])
 
 
 @api_router.post('/requests/{request_id}/approve')
@@ -6893,6 +6899,13 @@ query_desk.init_query_desk(db, get_current_user, UserResponse)
 api_router.include_router(query_desk.router)
 
 try:
+    from . import user_alerts
+except ImportError:
+    import user_alerts
+user_alerts.init_user_alerts(db, get_current_user, UserResponse)
+api_router.include_router(user_alerts.router)
+
+try:
     from . import notice_board
 except ImportError:
     import notice_board
@@ -7231,6 +7244,12 @@ async def seed_master_user_on_startup():
         logger.info("Query Desk indexes verified")
         await notice_board.ensure_indexes()
         logger.info("Notice Board indexes verified")
+        try:
+            import user_alerts as ua
+            await ua.ensure_indexes()
+            logger.info("User alerts indexes verified")
+        except Exception as exc:
+            logger.warning("User alerts index creation failed: %s", exc)
         await analytics_center.ensure_analytics_indexes()
         logger.info("Analytics indexes verified")
         await mobile_api.ensure_mobile_indexes()
