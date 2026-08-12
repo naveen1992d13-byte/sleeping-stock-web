@@ -543,6 +543,45 @@ def test_completed_monthly_archives_skip_open_requests():
                 "requesting_branch": "B1",
             },
         ]
+        db.order_headers.docs = [
+            {
+                "id": "oh1",
+                "order_number": "ORD-DONE",
+                "status": "Order Created",
+                "brand_name": "Hyundai",
+                "dealer_name": "D1",
+                "branch": "B1",
+                "created_at": completed_at,
+                "updated_at": completed_at,
+            },
+            {
+                "id": "oh2",
+                "order_number": "ORD-OPEN",
+                "status": "Order Created",
+                "brand_name": "Hyundai",
+                "dealer_name": "D1",
+                "branch": "B1",
+                "created_at": completed_at,
+                "updated_at": completed_at,
+            },
+        ]
+        db.order_items.docs = [
+            {
+                "id": "oi1",
+                "order_id": "oh1",
+                "status": "Cancelled",
+                "part_number": "P1",
+                "updated_at": completed_at,
+                "completed_at": completed_at,
+            },
+            {
+                "id": "oi2",
+                "order_id": "oh2",
+                "status": "Pending Retry",
+                "part_number": "P2",
+                "updated_at": completed_at,
+            },
+        ]
         with _FakeS3Mode():
             result = await ha.archive_completed_requests_month(db, month)
             assert result["status"] == "verified"
@@ -553,6 +592,10 @@ def test_completed_monthly_archives_skip_open_requests():
 
             orders = await ha.archive_completed_orders_month(db, month)
             assert orders["status"] == "verified"
+            assert orders["record_count"] == 1
+            assert orders["manifest"]["source_collection"] == "order_headers+order_items"
+            assert any(x.get("number") == "ORD-DONE" for x in db.order_archive_index.docs)
+            assert not any(x.get("number") == "ORD-OPEN" for x in db.order_archive_index.docs)
 
     asyncio.get_event_loop().run_until_complete(_run())
 
@@ -1253,24 +1296,72 @@ def test_physical_s3_verify_cases():
 def test_orders_requests_terminal_date_batching():
     async def _run():
         db = FakeDB()
-        # Active order must not archive
-        db.orders.docs = [
+        # Legacy db.orders empty — must NOT drive false VERIFIED success
+        db.orders.docs = []
+        # Live Order Desk: active + terminal + partial
+        db.order_headers.docs = [
             {
-                "number": "O-OPEN",
-                "status": "Approved",
+                "id": "h-open",
+                "order_number": "O-OPEN",
+                "reference_no": "REF-OPEN",
+                "status": "Order Created",
                 "brand_name": "Hyundai",
                 "dealer_name": "DealerA",
                 "branch": "B1",
+                "created_at": "2026-08-09T10:00:00+05:30",
                 "updated_at": "2026-08-10T10:00:00+05:30",
             },
             {
-                "number": "O-DONE",
-                "status": "Completed",
+                "id": "h-done",
+                "order_number": "O-DONE",
+                "reference_no": "REF-DONE",
+                "status": "Order Created",  # header may stay non-terminal
                 "brand_name": "Hyundai",
                 "dealer_name": "DealerA",
                 "branch": "B1",
-                "completed_at": "2026-08-11T18:00:00+05:30",
+                "created_at": "2026-08-09T10:00:00+05:30",
                 "updated_at": "2026-08-11T18:00:00+05:30",
+            },
+            {
+                "id": "h-partial",
+                "order_number": "O-PARTIAL",
+                "status": "Order Created",
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "B1",
+                "created_at": "2026-08-09T10:00:00+05:30",
+                "updated_at": "2026-08-11T18:00:00+05:30",
+            },
+        ]
+        db.order_items.docs = [
+            {
+                "id": "i1",
+                "order_id": "h-open",
+                "status": "Order Created",
+                "part_number": "P1",
+                "updated_at": "2026-08-10T10:00:00+05:30",
+            },
+            {
+                "id": "i2",
+                "order_id": "h-done",
+                "status": "Cancelled",
+                "part_number": "P2",
+                "updated_at": "2026-08-11T18:00:00+05:30",
+                "completed_at": "2026-08-11T18:00:00+05:30",
+            },
+            {
+                "id": "i3",
+                "order_id": "h-partial",
+                "status": "Cancelled",
+                "part_number": "P3",
+                "updated_at": "2026-08-11T12:00:00+05:30",
+            },
+            {
+                "id": "i4",
+                "order_id": "h-partial",
+                "status": "Pending Retry",
+                "part_number": "P4",
+                "updated_at": "2026-08-11T12:00:00+05:30",
             },
         ]
         db.order_requests.docs = [
@@ -1294,15 +1385,334 @@ def test_orders_requests_terminal_date_batching():
         ]
         with _FakeS3Mode():
             day10 = await ha.archive_orders_for_date(db, "2026-08-10")
-            assert day10["record_count"] == 0
+            assert day10["status"] == "no_eligible"
+            assert day10["display_status"] == "NO ELIGIBLE ORDERS"
+            assert day10["manifest"]["status"] == am.STATUS_NO_ELIGIBLE
+            assert day10["manifest"]["status"] != am.STATUS_VERIFIED
+
             day11 = await ha.archive_orders_for_date(db, "2026-08-11")
             assert day11["record_count"] == 1
             assert day11["manifest"]["status"] == am.STATUS_VERIFIED
+            assert day11["manifest"]["source_collection"] == "order_headers+order_items"
+            assert day11["status"] == "verified"
 
             r10 = await ha.archive_requests_for_date(db, "2026-08-10")
             assert r10["record_count"] == 0
             r12 = await ha.archive_requests_for_date(db, "2026-08-12")
             assert r12["record_count"] == 1
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_orders_legacy_empty_cannot_false_success():
+    """legacy orders=0 must never produce green VERIFIED when Order Desk has no terminal rows."""
+
+    async def _run():
+        db = FakeDB()
+        db.orders.docs = []  # shared-DB evidence: orders = 0
+        db.order_headers.docs = [
+            {
+                "id": "h1",
+                "order_number": "ORXX1",
+                "status": "Order Created",
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "B1",
+                "created_at": "2026-08-01T10:00:00+00:00",
+                "updated_at": "2026-08-10T10:00:00+00:00",
+            }
+        ]
+        db.order_items.docs = [
+            {
+                "id": "i1",
+                "order_id": "h1",
+                "status": "Order Created",
+                "part_number": "P1",
+                "updated_at": "2026-08-10T10:00:00+00:00",
+            }
+        ]
+        # Even with Fake S3 available, zero eligible must be NO ELIGIBLE — not VERIFIED
+        with _FakeS3Mode():
+            out = await ha.archive_orders_for_date(db, "2026-08-10")
+        assert out["status"] == "no_eligible"
+        assert out["display_status"] == "NO ELIGIBLE ORDERS"
+        assert out["manifest"]["status"] == am.STATUS_NO_ELIGIBLE
+        assert out["manifest"]["status"] != am.STATUS_VERIFIED
+        assert out["legacy_orders_count"] == 0
+        assert out["order_headers_count"] == 1
+        assert out["manifest"].get("eligible_for_prune") is False
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_orders_created_earlier_completed_today_archives_today():
+    async def _run():
+        db = FakeDB()
+        db.order_headers.docs = [
+            {
+                "id": "h1",
+                "order_number": "OR-EARLY",
+                "reference_no": "R-1",
+                "status": "Source Selected",
+                "brand_name": "Kia",
+                "dealer_name": "DealerB",
+                "branch": "Main",
+                "created_at": "2026-08-01T08:00:00+05:30",
+                "updated_at": "2026-08-12T20:00:00+05:30",
+            }
+        ]
+        db.order_items.docs = [
+            {
+                "id": "i1",
+                "order_id": "h1",
+                "status": "No Further Stock Available",
+                "part_number": "PX",
+                "updated_at": "2026-08-12T20:00:00+05:30",
+                "completed_at": "2026-08-12T20:00:00+05:30",
+            }
+        ]
+        with _FakeS3Mode():
+            early = await ha.archive_orders_for_date(db, "2026-08-01")
+            assert early["status"] == "no_eligible"
+            today = await ha.archive_orders_for_date(db, "2026-08-12")
+            assert today["status"] == "verified"
+            assert today["record_count"] == 1
+            # Payload preserves identifiers
+            storage = s3_storage.get_storage()
+            key = today["manifest"]["storage_key"]
+            data, _ = storage.download_bytes(key)
+            import gzip
+            from io import BytesIO
+
+            with gzip.GzipFile(fileobj=BytesIO(data), mode="rb") as gz:
+                row = json.loads(gz.readline())
+            assert row["order_number"] == "OR-EARLY"
+            assert row["reference_no"] == "R-1"
+            assert row["brand_name"] == "Kia"
+            assert row["dealer_name"] == "DealerB"
+            assert row["branch"] == "Main"
+            assert len(row["items"]) == 1
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_pruned_product_history_readable_from_s3():
+    async def _run():
+        db = FakeDB()
+        date_iso = "2026-05-01"
+        date_key = "20260501"
+        db.products.docs = [
+            {
+                "part_number": "HIST1",
+                "item_name": "Historical",
+                "quantity": 4,
+                "total_value": 40,
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "B1",
+                "publish_status": "Published",
+                "active_date_key": date_key,
+                "is_active_today": False,
+            }
+        ]
+        with _FakeS3Mode():
+            archived = await ha.archive_product_history_for_date(db, date_iso)
+            assert archived["status"] == "verified"
+            # Simulate Mongo prune → PRUNED (isolated test rows only)
+            man = archived["manifest"]
+            await am.mark_status(
+                db,
+                man["archive_id"],
+                am.STATUS_PRUNED,
+                pruned_at="2026-05-02T00:00:00+00:00",
+                eligible_for_prune=False,
+                storage_backend="s3",
+            )
+            db.products.docs = []  # Mongo cleaned
+
+            # find_verified must NOT match PRUNED
+            assert await am.find_verified(db, "product-history", archive_date=date_iso) is None
+            readable = await am.find_s3_readable(db, "product-history", archive_date=date_iso)
+            assert readable and readable["status"] == am.STATUS_PRUNED
+
+            hist = await hh.read_product_history(db, date_key=date_iso, brand="Hyundai", hot_days=1)
+            assert hist["s3_count"] >= 1
+            assert any(r["part_number"] == "HIST1" for r in hist["rows"])
+
+            # From/To report path
+            ranged = await hh.read_product_history(
+                db,
+                from_date=date_iso,
+                to_date=date_iso,
+                brand="Hyundai",
+                hot_days=1,
+            )
+            assert any(r["part_number"] == "HIST1" for r in ranged["rows"])
+
+            # Local / failed must never be trusted for PRUNED
+            bad = dict(readable)
+            bad["archive_id"] = "bad-local"
+            bad["status"] = am.STATUS_PRUNED
+            bad["storage_backend"] = "local"
+            await am.upsert_manifest(db, bad)
+            # Prefer real s3 pruned over local — still returns S3 one
+            still = await am.find_s3_readable(db, "product-history", archive_date=date_iso)
+            assert still["storage_backend"] in {"s3", "REAL S3"}
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_scheduler_partial_failure_no_last_daily_stamp():
+    import archive_scheduler as sched
+
+    async def _run():
+        # Unit-level cycle evaluation
+        incomplete = sched.evaluate_daily_cycle(
+            {
+                "datasets": {
+                    "uploads": {"status": "verified"},
+                    "product-history": {"status": "verified"},
+                    "orders": {"status": "error", "error": "boom"},
+                    "requests": {"status": "verified"},
+                }
+            }
+        )
+        assert incomplete["complete"] is False
+        assert incomplete["status"] == "INCOMPLETE / FAILED"
+        assert "orders" in incomplete["failed_datasets"]
+
+        complete = sched.evaluate_daily_cycle(
+            {
+                "datasets": {
+                    "uploads": {"status": "verified"},
+                    "product-history": {"status": "already_verified"},
+                    "orders": {"status": "no_eligible"},
+                    "requests": {"status": "verified"},
+                }
+            }
+        )
+        assert complete["complete"] is True
+        assert complete["status"] == "COMPLETE"
+
+        # Integration: orders fail mid-batch → cycle incomplete; retry completes without
+        # re-duplicating already verified uploads/product-history/requests.
+        db = FakeDB()
+        date_iso = "2026-08-08"
+        db.products.docs = [
+            {
+                "part_number": "P1",
+                "quantity": 1,
+                "total_value": 1,
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "B1",
+                "publish_status": "Published",
+                "active_date_key": "20260808",
+            }
+        ]
+        db.order_headers.docs = []
+        db.order_items.docs = []
+        db.order_requests.docs = []
+        db.upload_items.docs = []
+        db.uploads.docs = []
+
+        real_orders = ha.archive_orders_for_date
+
+        async def fail_orders(db, archive_date, force=False):
+            return {"status": "error", "error": "orders intentionally failed"}
+
+        with _FakeS3Mode():
+            ha.archive_orders_for_date = fail_orders  # type: ignore
+            try:
+                first = await sched.run_daily_coordinated_archive(db, date_iso)
+            finally:
+                ha.archive_orders_for_date = real_orders  # type: ignore
+            assert first["status"] == "incomplete"
+            assert first["cycle"]["complete"] is False
+            assert "orders" in first["cycle"]["failed_datasets"]
+            assert first["datasets"]["uploads"]["status"] in {"verified", "already_verified", "no_eligible"}
+            assert first["datasets"]["product-history"]["status"] in {"verified", "already_verified"}
+            assert first["datasets"]["requests"]["status"] in {"verified", "already_verified", "no_eligible"}
+
+            # Seed a terminal order so retry can PASS
+            db.order_headers.docs = [
+                {
+                    "id": "h-retry",
+                    "order_number": "OR-RETRY",
+                    "status": "Order Created",
+                    "brand_name": "Hyundai",
+                    "dealer_name": "DealerA",
+                    "branch": "B1",
+                    "created_at": "2026-08-01T10:00:00+05:30",
+                    "updated_at": "2026-08-08T22:00:00+05:30",
+                }
+            ]
+            db.order_items.docs = [
+                {
+                    "id": "i-retry",
+                    "order_id": "h-retry",
+                    "status": "Cancelled",
+                    "part_number": "PR",
+                    "updated_at": "2026-08-08T22:00:00+05:30",
+                    "completed_at": "2026-08-08T22:00:00+05:30",
+                }
+            ]
+            second = await sched.run_daily_coordinated_archive(db, date_iso)
+            assert second["cycle"]["complete"] is True
+            assert second["status"] == "ok"
+            # Already-successful datasets stay idempotent
+            assert second["datasets"]["product-history"]["status"] in {"verified", "already_verified"}
+            assert second["datasets"]["orders"]["status"] in {"verified", "already_verified"}
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_allocated_mongo_reconciles_exactly_with_dealer_sum():
+    import storage_monitor as sm
+
+    async def _run():
+        db = FakeDB()
+        db.products.docs = [
+            {"dealer_name": "DealerA", "branch": "B1"},
+            {"dealer_name": "DealerA", "branch": "B2"},
+            {"dealer_name": "DealerB", "branch": "C1"},
+        ]
+        orig_mongo = sm.mongo_storage_metrics
+        orig_s3 = sm.s3_storage_metrics
+
+        async def fake_mongo(db):
+            return {
+                "storage_size": 1000,
+                "data_size": 800,
+                "index_size": 200,
+                "product_size": 900,
+                "capacity_reason": "test",
+                "today_product_count": 0,
+            }
+
+        async def fake_s3(db):
+            return {
+                "actual_s3_used_bytes": 5000,
+                "actual_s3_available": True,
+                "manifest_recorded_bytes": 1200,
+            }
+
+        sm.mongo_storage_metrics = fake_mongo  # type: ignore
+        sm.s3_storage_metrics = fake_s3  # type: ignore
+        try:
+            snap = await sm.dealer_storage_snapshot(db)
+        finally:
+            sm.mongo_storage_metrics = orig_mongo  # type: ignore
+            sm.s3_storage_metrics = orig_s3  # type: ignore
+        totals = snap["totals"]
+        dealer_sum = sum(d["mongodb_used_bytes"] for d in snap["dealers"])
+        assert totals["mongodb_allocated_usage_bytes"] == dealer_sum
+        assert totals["mongodb_dealer_allocated_bytes"] == dealer_sum
+        assert totals["reconciliation"]["allocated_mongo_equals_dealer_sum"] is True
+        assert totals["mongodb_physical_storage_bytes"] == 1000
+        assert totals["mongodb_allocated_usage_bytes"] != totals["mongodb_physical_storage_bytes"]
+        assert totals["s3_actual_used_bytes"] == 5000
+        assert "s3_dealer_attributed_bytes" in totals
 
     asyncio.get_event_loop().run_until_complete(_run())
 

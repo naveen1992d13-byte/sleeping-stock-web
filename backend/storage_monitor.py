@@ -189,8 +189,11 @@ async def archive_health_summary(db) -> Dict[str, Any]:
             manifest_status=str(m.get("status") or ""),
             live=live,
         )
-        if display == av.DISPLAY_VERIFIED or display == av.DISPLAY_PRUNED:
+        if display in {av.DISPLAY_VERIFIED, av.DISPLAY_PRUNED}:
             verified += 1
+        elif display == av.DISPLAY_NO_ELIGIBLE:
+            # Genuine zero-eligible — not a transfer success and not a failure
+            pass
         elif display in {av.DISPLAY_PENDING, av.DISPLAY_RUNNING}:
             pending += 1
         elif display == av.DISPLAY_VERIFICATION_FAILED:
@@ -403,14 +406,18 @@ async def dealer_storage_snapshot(db) -> Dict[str, Any]:
 
     mongo_dealer_sum = sum(r["mongodb_used_bytes"] for r in out_rows)
     s3_dealer_sum = sum(r["s3_archive_used_bytes"] for r in out_rows)
+    # Canonical allocated Mongo total — identical source of truth as dealer column sum
+    mongodb_allocated_usage_bytes = int(mongo_dealer_sum)
 
     return {
         "dealers": out_rows,
         "totals": {
             "mongodb_used_bytes": mongo_used_total,
+            "mongodb_physical_storage_bytes": mongo_used_total,
             "mongodb_data_size": mongo.get("data_size"),
             "mongodb_index_size": mongo.get("index_size"),
-            "mongodb_dealer_allocated_bytes": mongo_dealer_sum,
+            "mongodb_dealer_allocated_bytes": mongodb_allocated_usage_bytes,
+            "mongodb_allocated_usage_bytes": mongodb_allocated_usage_bytes,
             "mongodb_capacity_bytes": None,
             "mongodb_available_bytes": None,
             "mongodb_capacity_status": "Unavailable",
@@ -418,25 +425,37 @@ async def dealer_storage_snapshot(db) -> Dict[str, Any]:
             "s3_actual_used_bytes": actual_s3,
             "s3_manifest_recorded_bytes": s3m.get("manifest_recorded_bytes"),
             "s3_dealer_attributed_bytes": s3_dealer_sum,
+            "s3_verified_archive_usage_bytes": s3_dealer_sum,
             "s3_top_card_bytes": top_s3,
             "combined_top_bytes": int(mongo_used_total or 0)
             + int(top_s3 or 0),
             "reconciliation": {
-                "mongo_top_equals_dealer_sum": False,  # top uses physical dbStats; dealers use logical allocation
+                # Exact: Allocated Mongo Usage card == sum(dealer allocated Mongo bytes)
+                "allocated_mongo_equals_dealer_sum": mongodb_allocated_usage_bytes
+                == mongo_dealer_sum,
+                "allocated_mongo_bytes": mongodb_allocated_usage_bytes,
+                "dealer_allocated_sum_bytes": mongo_dealer_sum,
+                "mongo_physical_equals_dealer_sum": False,
+                "mongo_top_equals_dealer_sum": False,  # physical ≠ allocated by design
                 "mongo_note": (
-                    "Top Mongo card = physical dbStats storageSize. "
-                    "Dealer Mongo column = logical products-share allocation. "
-                    "They are related but not required to be equal."
+                    "Allocated Mongo Usage = sum of dealer logical products-share allocation "
+                    "(exact byte match). Physical MongoDB Storage = dbStats storageSize — "
+                    "a different metric; do not force them equal."
                 ),
                 "s3_dealer_sum_equals_attributed": s3_dealer_sum == s3_attributed,
+                "s3_actual_equals_attributed": (
+                    actual_s3 is not None and int(actual_s3) == int(s3_dealer_sum)
+                ),
                 "s3_note": (
-                    "Dealer S3 Archive Used sums to attributed verified archive bytes. "
-                    "Top Actual S3 Used Storage uses live bucket listing when available."
+                    "Actual S3 Used is live bucket listing. "
+                    "Dealer-attributed Verified Archive Usage is manifest scope attribution. "
+                    "They are related but not necessarily identical."
                 ),
             },
         },
         "mongodb_allocation_note": (
-            "Dealer MongoDB Used is a logical-data-size allocation, not physical disk bytes per dealer."
+            "Allocated Mongo Usage is the canonical logical data-size allocation "
+            "(same bytes as the dealer table). Physical MongoDB Storage is separate dbStats."
         ),
     }
 
@@ -554,7 +573,9 @@ async def monitor_dashboard(db, *, month: Optional[str] = None) -> Dict[str, Any
         **(external.get("mongodb") or {}),
         "status": "CONNECTED" if mongo.get("data_size") is not None else "UNKNOWN",
         "usage_bytes": mongo.get("storage_size") or mongo.get("data_size"),
-        "usage_label": "MongoDB Current Used Storage (dbStats)",
+        "usage_label": "Physical MongoDB Storage (dbStats)",
+        "allocated_usage_bytes": totals.get("mongodb_allocated_usage_bytes"),
+        "allocated_usage_label": "Allocated Mongo Usage",
         "data_size": mongo.get("data_size"),
         "index_size": mongo.get("index_size"),
         "capacity": "Unavailable",
@@ -572,14 +593,20 @@ async def monitor_dashboard(db, *, month: Optional[str] = None) -> Dict[str, Any
         "real_s3": status.get("real_s3"),
         "warning": status.get("warning"),
         "cards": {
+            "mongodb_allocated_usage": totals.get("mongodb_allocated_usage_bytes"),
             "mongodb_used_storage": mongo.get("storage_size") or mongo.get("data_size"),
+            "mongodb_physical_storage": mongo.get("storage_size") or mongo.get("data_size"),
             "mongodb_data_size": mongo.get("data_size"),
             "mongodb_index_size": mongo.get("index_size"),
             "mongodb_capacity": "Unavailable",
             "mongodb_available": "Unavailable",
             "mongodb_capacity_reason": mongo.get("capacity_reason"),
-            "mongodb_allocated_note": mongo.get("capacity_reason"),
+            "mongodb_allocated_note": (
+                "Allocated Mongo Usage matches dealer-table allocated bytes exactly. "
+                "Physical MongoDB Storage is separate dbStats."
+            ),
             "s3_actual_used": s3m.get("actual_s3_used_bytes"),
+            "s3_dealer_attributed": totals.get("s3_dealer_attributed_bytes"),
             "s3_manifest_recorded": s3m.get("manifest_recorded_bytes"),
             "s3_total_stored": s3m.get("actual_s3_used_bytes")
             if s3m.get("actual_s3_available")

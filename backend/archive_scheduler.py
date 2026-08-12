@@ -15,7 +15,7 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 import archive_manifest as am
@@ -28,6 +28,8 @@ IST = ZoneInfo("Asia/Kolkata")
 _scheduler_task: Optional[asyncio.Task] = None
 _OWNER = f"archive-scheduler-{uuid.uuid4().hex[:8]}"
 
+REQUIRED_DAILY_DATASETS = ("uploads", "product-history", "orders", "requests")
+
 
 def _ist_now() -> datetime:
     return datetime.now(IST)
@@ -38,8 +40,42 @@ def previous_calendar_day_iso(now: Optional[datetime] = None) -> str:
     return (now.date() - timedelta(days=1)).isoformat()
 
 
+def _dataset_result_ok(result: Optional[Dict[str, Any]]) -> bool:
+    """Acceptable terminal daily results: VERIFIED / already verified / genuine NO ELIGIBLE."""
+    if not isinstance(result, dict):
+        return False
+    status = str(result.get("status") or "").lower()
+    if status in {"verified", "already_verified", "no_eligible"}:
+        return True
+    manifest = result.get("manifest") or {}
+    return am.is_acceptable_daily_result(manifest.get("status"))
+
+
+def evaluate_daily_cycle(results: Dict[str, Any]) -> Dict[str, Any]:
+    """Daily cycle is COMPLETE only when every required dataset is acceptable."""
+    datasets = results.get("datasets") or {}
+    missing = [name for name in REQUIRED_DAILY_DATASETS if name not in datasets]
+    failed = [
+        name
+        for name in REQUIRED_DAILY_DATASETS
+        if name in datasets and not _dataset_result_ok(datasets.get(name))
+    ]
+    complete = not missing and not failed
+    return {
+        "complete": complete,
+        "status": "COMPLETE" if complete else "INCOMPLETE / FAILED",
+        "failed_datasets": failed,
+        "missing_datasets": missing,
+    }
+
+
 async def run_daily_coordinated_archive(db, archive_date: Optional[str] = None) -> dict:
-    """One coordinated daily batch for all archive datasets (previous IST day)."""
+    """One coordinated daily batch for all archive datasets (previous IST day).
+
+    Idempotent per dataset: already VERIFIED / NO_ELIGIBLE rows are not re-uploaded.
+    Cycle status is COMPLETE only when uploads, product-history, orders, and requests
+    are each VERIFIED (or genuine NO ELIGIBLE). Partial failure does not stamp success.
+    """
     now = _ist_now()
     if not archive_date:
         archive_date = previous_calendar_day_iso(now)
@@ -100,7 +136,9 @@ async def run_daily_coordinated_archive(db, archive_date: Optional[str] = None) 
             logger.error("Daily requests archive failed for %s: %s", archive_date, exc)
             results["datasets"]["requests"] = {"status": "error", "error": str(exc)[:500]}
 
-        results["status"] = "ok"
+        cycle = evaluate_daily_cycle(results)
+        results["cycle"] = cycle
+        results["status"] = "ok" if cycle["complete"] else "incomplete"
         return results
     finally:
         await am.release_job_lock(db, lock_key, _OWNER)
@@ -139,33 +177,42 @@ async def _scheduler_loop(db) -> None:
             monthly_stamp = now.strftime("%Y-%m")
 
             # Daily coordinated batch at 23:45 IST — archives the previous calendar day.
-            # Window: 23:45–23:59 so a single stamp is used per day.
+            # Window: 23:45–23:59 so a single stamp is used per day only after COMPLETE success.
             if now.hour == 23 and now.minute >= 45 and last_daily != daily_stamp:
-                # Skip only when ALL primary datasets already REAL-S3 verified
                 modules = [
-                    ha.MODULE_PRODUCT_HISTORY,
                     getattr(ha, "MODULE_UPLOADS", "uploads"),
+                    ha.MODULE_PRODUCT_HISTORY,
                     ha.MODULE_ORDERS,
                     ha.MODULE_REQUESTS,
                 ]
-                verified = 0
+                acceptable = 0
                 for mod in modules:
-                    # Orders/requests daily use archive_date; monthly fallback uses archive_month
-                    row = await am.find_verified(db, mod, archive_date=daily_stamp)
+                    row = await am.find_acceptable_daily(db, mod, daily_stamp)
                     if row:
-                        verified += 1
-                if verified >= 4:
+                        acceptable += 1
+                if acceptable >= 4:
                     logger.info(
                         "Daily coordinated archive for %s already complete (%s/4) — skipping",
                         daily_stamp,
-                        verified,
+                        acceptable,
                     )
                     last_daily = daily_stamp
                 else:
                     logger.info("Triggering daily coordinated archive for previous day %s", daily_stamp)
                     try:
-                        await run_daily_coordinated_archive(db, daily_stamp)
-                        last_daily = daily_stamp
+                        outcome = await run_daily_coordinated_archive(db, daily_stamp)
+                        cycle = outcome.get("cycle") or evaluate_daily_cycle(outcome)
+                        if cycle.get("complete"):
+                            last_daily = daily_stamp
+                            logger.info("Daily coordinated archive COMPLETE for %s", daily_stamp)
+                        else:
+                            # Do NOT stamp last_daily — allow same-night retry
+                            logger.error(
+                                "Daily coordinated archive INCOMPLETE for %s — failed=%s missing=%s",
+                                daily_stamp,
+                                cycle.get("failed_datasets"),
+                                cycle.get("missing_datasets"),
+                            )
                     except Exception as exc:
                         logger.error("Daily coordinated archive failed: %s", exc)
 

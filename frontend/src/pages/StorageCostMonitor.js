@@ -41,6 +41,7 @@ function fmtMoney(n) {
 
 function statusColor(display) {
   if (display === 'TRANSFERRED & VERIFIED' || display === 'PRUNED') return COLORS.green;
+  if (display === 'NO ELIGIBLE DATA' || display === 'NO ELIGIBLE ORDERS') return COLORS.muted;
   if (display === 'VERIFICATION FAILED') return COLORS.orange;
   if (display === 'PENDING' || display === 'RUNNING') return COLORS.grey;
   return COLORS.danger;
@@ -282,8 +283,9 @@ export function StorageCostMonitor() {
           extra={(
             <>
               <div>Actual S3 Used: <b style={{ color: COLORS.dark }}>{s3.actual_s3_available ? fmtBytes(s3.actual_s3_used_bytes) : 'Unavailable'}</b></div>
+              <div>Dealer-attributed Verified Archive Usage: <b style={{ color: COLORS.dark }}>{fmtBytes(totals.s3_dealer_attributed_bytes ?? s3.manifest_recorded_bytes)}</b></div>
               <div>Manifest Recorded Size: <b style={{ color: COLORS.dark }}>{fmtBytes(s3.manifest_recorded_bytes)}</b></div>
-              <div className="text-xs">Balance: N/A — S3 is elastic (no fixed capacity)</div>
+              <div className="text-xs">Actual S3 and dealer-attributed archive usage are different metrics — not necessarily identical.</div>
             </>
           )}
         />
@@ -293,9 +295,11 @@ export function StorageCostMonitor() {
           onOpen={() => openExternal(external.mongodb?.open_url, 'MongoDB')}
           extra={(
             <>
-              <div>Plan/Capacity: <b style={{ color: COLORS.dark }}>Unavailable</b></div>
-              <div>Available/Balance: <b style={{ color: COLORS.dark }}>Unavailable</b></div>
-              <div className="text-xs">{cards.mongodb_capacity_reason || 'Atlas capacity not exposed via dbStats.'}</div>
+              <div>Allocated Mongo Usage: <b style={{ color: COLORS.dark }}>{fmtBytes(cards.mongodb_allocated_usage ?? totals.mongodb_allocated_usage_bytes)}</b></div>
+              <div>Physical MongoDB Storage: <b style={{ color: COLORS.dark }}>{fmtBytes(cards.mongodb_physical_storage ?? cards.mongodb_used_storage)}</b></div>
+              <div>Data Size: <b style={{ color: COLORS.dark }}>{fmtBytes(cards.mongodb_data_size)}</b></div>
+              <div>Index Size: <b style={{ color: COLORS.dark }}>{fmtBytes(cards.mongodb_index_size)}</b></div>
+              <div className="text-xs">{cards.mongodb_allocated_note || cards.mongodb_capacity_reason || 'Allocated ≠ physical dbStats by design.'}</div>
             </>
           )}
         />
@@ -330,12 +334,14 @@ export function StorageCostMonitor() {
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         {[
-          ['MongoDB Current Used Storage', fmtBytes(cards.mongodb_used_storage)],
+          ['Allocated Mongo Usage', fmtBytes(cards.mongodb_allocated_usage ?? totals.mongodb_allocated_usage_bytes)],
+          ['Physical MongoDB Storage', fmtBytes(cards.mongodb_physical_storage ?? cards.mongodb_used_storage)],
           ['MongoDB Data Size', fmtBytes(cards.mongodb_data_size)],
           ['MongoDB Index Size', fmtBytes(cards.mongodb_index_size)],
           ['MongoDB Plan/Capacity', 'Unavailable'],
           ['MongoDB Available/Balance', 'Unavailable'],
           ['Actual S3 Used Storage', s3.actual_s3_available ? fmtBytes(s3.actual_s3_used_bytes) : 'Unavailable'],
+          ['Dealer-attributed Verified Archive Usage', fmtBytes(totals.s3_dealer_attributed_bytes ?? cards.s3_dealer_attributed)],
           ['Manifest Recorded Size', fmtBytes(s3.manifest_recorded_bytes ?? cards.s3_manifest_recorded)],
           ['Today Product Rows', String(cards.today_product_count ?? '-')],
           ['Last Archive Status', String(cards.last_archive_status || '-')],
@@ -354,14 +360,14 @@ export function StorageCostMonitor() {
       <div className="rounded-xl border bg-white p-4" style={{ borderColor: COLORS.border }}>
         <div className="mb-1 text-sm font-semibold" style={{ color: COLORS.dark }}>Dealer-wise Storage Usage</div>
         <div className="mb-3 text-xs" style={{ color: COLORS.muted }}>
-          {data?.mongodb_allocation_note || 'Dealer MongoDB Used is a logical-data-size allocation.'}
+          {data?.mongodb_allocation_note || 'Allocated Mongo Usage matches this dealer table exactly (logical allocation). Physical MongoDB Storage is separate dbStats.'}
           {totals?.reconciliation?.s3_note ? ` ${totals.reconciliation.s3_note}` : ''}
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr style={{ backgroundColor: COLORS.primary, color: '#fff' }}>
-                {['Dealer', 'Branches', 'MongoDB Used', 'S3 Archive Used', 'Combined', 'Archive Verified %', ''].map((h) => (
+                {['Dealer', 'Branches', 'Allocated Mongo', 'Verified Archive S3', 'Combined', 'Archive Verified %', ''].map((h) => (
                   <th key={h || 'x'} className="p-2 text-left font-medium">{h}</th>
                 ))}
               </tr>
@@ -397,10 +403,12 @@ export function StorageCostMonitor() {
             <tfoot>
               <tr style={{ background: COLORS.soft }}>
                 <td className="p-2 font-semibold" colSpan={2}>Totals (canonical snapshot)</td>
-                <td className="p-2 font-semibold">{fmtBytes(totals.mongodb_dealer_allocated_bytes)}</td>
+                <td className="p-2 font-semibold">{fmtBytes(totals.mongodb_dealer_allocated_bytes ?? totals.mongodb_allocated_usage_bytes)}</td>
                 <td className="p-2 font-semibold">{fmtBytes(totals.s3_dealer_attributed_bytes)}</td>
                 <td className="p-2 font-semibold" colSpan={3}>
-                  Top Mongo dbStats: {fmtBytes(totals.mongodb_used_bytes)} · Top S3: {fmtBytes(totals.s3_top_card_bytes)}
+                  Allocated Mongo: {fmtBytes(totals.mongodb_allocated_usage_bytes ?? totals.mongodb_dealer_allocated_bytes)}
+                  {' · '}Physical Mongo: {fmtBytes(totals.mongodb_physical_storage_bytes ?? totals.mongodb_used_bytes)}
+                  {' · '}Actual S3: {fmtBytes(totals.s3_actual_used_bytes ?? totals.s3_top_card_bytes)}
                 </td>
               </tr>
             </tfoot>

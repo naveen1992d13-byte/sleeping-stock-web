@@ -552,7 +552,20 @@ async def write_analytics_snapshots_for_date(db, date_iso: str, rows: Optional[L
 
 # -------------------- Orders / Requests (monthly) --------------------
 
-TERMINAL_ORDER_STATUSES = {"Completed", "Cancelled", "Cancelled – No Response", "No Further Stock Available"}
+# Order Desk item-level terminal states (header often stays non-terminal while items finish).
+TERMINAL_ORDER_ITEM_STATUSES = {
+    "Completed",
+    "Cancelled",
+    "Cancelled – No Response",
+    "No Further Stock Available",
+    "Rejected",
+}
+TERMINAL_ORDER_STATUSES = set(TERMINAL_ORDER_ITEM_STATUSES) | {
+    "Completed",
+    "Cancelled",
+    "Cancelled – No Response",
+    "No Further Stock Available",
+}
 TERMINAL_REQUEST_STATUSES = {"Completed", "Rejected", "Cancelled"}
 
 # Open / in-flight statuses must NEVER be archived
@@ -562,6 +575,19 @@ OPEN_REQUEST_STATUSES = {
     "Partially Approved",
     "Dispatched",
     "Received",
+}
+OPEN_ORDER_ITEM_STATUSES = {
+    "Order Created",
+    "Availability Checked",
+    "Source Selected",
+    "Requested",
+    "Pending Retry",
+    "Cancellation Requested",
+    "Approved",
+    "Partially Approved",
+    "Dispatched",
+    "Received",
+    "Accepted",
 }
 
 
@@ -590,6 +616,184 @@ def _parse_dt(value) -> Optional[datetime]:
         return None
 
 
+def _order_terminal_at(header: dict, items: List[dict]) -> Optional[datetime]:
+    """Real terminal/completion timestamp for an Order Desk order (IST-aware caller)."""
+    candidates: List[datetime] = []
+    for row in [header, *items]:
+        for key in ("completed_at", "cancelled_at", "rejected_at", "factory_confirmed_at", "updated_at"):
+            dt = _parse_dt(row.get(key))
+            if dt:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                candidates.append(dt)
+    return max(candidates) if candidates else None
+
+
+def _is_terminal_order_desk(header: dict, items: List[dict]) -> bool:
+    """True only when the order is fully terminal — never partial / in-progress.
+
+    Follows Order Desk workflow: items drive completion. An order archives only when
+    every item is in a terminal status (Cancelled / Completed / No Further Stock /
+    Rejected / Cancelled – No Response). Empty-item headers are terminal only when
+    the header itself is terminal.
+    """
+    if not items:
+        return str(header.get("status") or "") in TERMINAL_ORDER_STATUSES
+    statuses = [str(i.get("status") or "") for i in items]
+    if any(s in OPEN_ORDER_ITEM_STATUSES or s not in TERMINAL_ORDER_ITEM_STATUSES for s in statuses):
+        return False
+    return all(s in TERMINAL_ORDER_ITEM_STATUSES for s in statuses)
+
+
+def _order_archive_row(header: dict, items: List[dict], terminal_at: datetime) -> Dict[str, Any]:
+    """Flatten header + items while preserving Order No / Reference / Brand / Dealer / Branch."""
+    order_no = (
+        header.get("order_number")
+        or header.get("order_no")
+        or header.get("number")
+        or header.get("id")
+    )
+    return {
+        **_jsonable(header),
+        "order_number": order_no,
+        "order_no": order_no,
+        "reference_no": header.get("reference_no") or header.get("reference_number") or "",
+        "brand_name": header.get("brand_name") or header.get("brand") or "",
+        "brand_code": header.get("brand_code") or "",
+        "dealer_name": header.get("dealer_name") or header.get("dealer") or "",
+        "branch": header.get("branch") or header.get("branch_name") or "",
+        "status": header.get("status"),
+        "terminal_status": "terminal",
+        "terminal_at": terminal_at.isoformat(),
+        "completed_at": terminal_at.isoformat(),
+        "items": [_jsonable(i) for i in items],
+        "item_count": len(items),
+        "item_statuses": [str(i.get("status") or "") for i in items],
+        "source_collection": "order_headers+order_items",
+    }
+
+
+async def _probe_order_desk_source(db) -> Dict[str, Any]:
+    """Confirm live Order Desk collections exist (never treat legacy db.orders as source)."""
+    try:
+        # estimated_document_count / count — presence of collection API
+        header_count = await db.order_headers.count_documents({})
+        item_count = await db.order_items.count_documents({})
+        return {
+            "ok": True,
+            "order_headers": int(header_count),
+            "order_items": int(item_count),
+            "legacy_orders": int(await db.orders.count_documents({})),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:500]}
+
+
+async def _collect_terminal_order_desk_rows(
+    db,
+    *,
+    date_iso: Optional[str] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+) -> Tuple[List[Dict[str, Any]], set, set, set]:
+    """Collect fully-terminal Order Desk orders for a day or month window."""
+    brands, dealers, branches = set(), set(), set()
+    rows: List[Dict[str, Any]] = []
+    headers = await db.order_headers.find({}, {"_id": 0}).to_list(200000)
+    if not headers:
+        return rows, brands, dealers, branches
+
+    order_ids = [h.get("id") for h in headers if h.get("id")]
+    items_by_order: Dict[str, List[dict]] = {oid: [] for oid in order_ids}
+    if order_ids:
+        all_items = await db.order_items.find(
+            {"order_id": {"$in": order_ids}},
+            {"_id": 0},
+        ).to_list(500000)
+        for it in all_items:
+            oid = it.get("order_id")
+            if oid in items_by_order:
+                items_by_order[oid].append(it)
+            else:
+                items_by_order[oid] = [it]
+
+    for header in headers:
+        oid = header.get("id")
+        items = items_by_order.get(oid, []) if oid else []
+        if not _is_terminal_order_desk(header, items):
+            continue
+        terminal_at = _order_terminal_at(header, items)
+        if not terminal_at:
+            continue
+        terminal_ist = terminal_at.astimezone(IST)
+        if date_iso:
+            if terminal_ist.date().isoformat() != date_iso:
+                continue
+        elif start is not None and end is not None:
+            if not (start <= terminal_ist < end):
+                continue
+        else:
+            continue
+        row = _order_archive_row(header, items, terminal_at)
+        rows.append(row)
+        if row.get("brand_name"):
+            brands.add(str(row["brand_name"]))
+        if row.get("dealer_name"):
+            dealers.add(str(row["dealer_name"]))
+        if row.get("branch"):
+            branches.add(str(row["branch"]))
+    return rows, brands, dealers, branches
+
+
+async def _mark_no_eligible(
+    db,
+    *,
+    module: str,
+    archive_date: Optional[str],
+    archive_month: Optional[str],
+    source_collection: str,
+    message: str,
+    existing: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Record genuine zero-eligible result — never a green VERIFIED empty dump."""
+    manifest = existing or am.base_manifest(
+        module=module,
+        archive_date=archive_date,
+        archive_month=archive_month,
+        storage_key="",
+        format="none",
+        source_collection=source_collection,
+    )
+    manifest.update(
+        {
+            "storage_key": "",
+            "record_count": 0,
+            "file_size": 0,
+            "sha256": "",
+            "source_collection": source_collection,
+            "min_date": archive_date,
+            "max_date": archive_date,
+            "error": message,
+            "eligible_for_prune": False,
+            "storage_backend": None,
+        }
+    )
+    manifest = await am.upsert_manifest(db, manifest)
+    manifest = await am.mark_status(
+        db,
+        manifest["archive_id"],
+        am.STATUS_NO_ELIGIBLE,
+        error=message,
+        eligible_for_prune=False,
+        storage_backend=None,
+        record_count=0,
+        file_size=0,
+        sha256="",
+        storage_key="",
+    )
+    return manifest
+
+
 async def archive_completed_orders_month(db, archive_month: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
     if not archive_month:
         archive_month, start, end = _prev_calendar_month()
@@ -605,65 +809,35 @@ async def archive_completed_orders_month(db, archive_month: Optional[str] = None
     if existing and not force:
         return {"status": "already_verified", "manifest": existing}
 
-    # Prefer order_requests / order_desk structures — archive fully terminal only
-    rows = []
-    brands, dealers, branches = set(), set(), set()
+    probe = await _probe_order_desk_source(db)
+    if not probe.get("ok"):
+        raise RuntimeError(f"Order Desk source error: {probe.get('error') or 'order_headers unavailable'}")
 
-    # Primary: order_requests that are Completed/Cancelled/Rejected for the month
-    cursor = db.order_requests.find(
-        {
-            "status": {"$in": list(TERMINAL_REQUEST_STATUSES)},
-        },
-        {"_id": 0},
+    rows, brands, dealers, branches = await _collect_terminal_order_desk_rows(
+        db, start=start, end=end
     )
-    candidates = await cursor.to_list(200000)
-    for r in candidates:
-        # Skip open/incomplete
-        if r.get("status") in OPEN_REQUEST_STATUSES:
-            continue
-        completed = (
-            _parse_dt(r.get("completed_at"))
-            or _parse_dt(r.get("updated_at"))
-            or _parse_dt(r.get("created_at"))
+    existing_any = await am.find_any(db, MODULE_ORDERS, archive_month=archive_month)
+    if not rows:
+        manifest = await _mark_no_eligible(
+            db,
+            module=MODULE_ORDERS,
+            archive_date=None,
+            archive_month=archive_month,
+            source_collection="order_headers+order_items",
+            message="NO ELIGIBLE ORDERS",
+            existing=existing_any,
         )
-        if not completed:
-            continue
-        if completed.tzinfo is None:
-            completed = completed.replace(tzinfo=timezone.utc)
-        completed_ist = completed.astimezone(IST)
-        if not (start <= completed_ist < end):
-            continue
-        rows.append(r)
-        if r.get("brand_name") or r.get("brand"):
-            brands.add(str(r.get("brand_name") or r.get("brand")))
-        if r.get("dealer_name") or r.get("requesting_dealer") or r.get("supplying_dealer"):
-            dealers.add(str(r.get("dealer_name") or r.get("requesting_dealer") or r.get("supplying_dealer")))
-        if r.get("branch") or r.get("requesting_branch") or r.get("supplying_branch"):
-            branches.add(str(r.get("branch") or r.get("requesting_branch") or r.get("supplying_branch")))
+        return {
+            "status": "no_eligible",
+            "manifest": manifest,
+            "record_count": 0,
+            "display_status": "NO ELIGIBLE ORDERS",
+            "source": probe,
+        }
 
-    # Also pull completed order_desk headers if present
-    order_rows = []
-    try:
-        ocursor = db.orders.find({"status": {"$in": list(TERMINAL_ORDER_STATUSES)}}, {"_id": 0})
-        for o in await ocursor.to_list(100000):
-            completed = _parse_dt(o.get("completed_at")) or _parse_dt(o.get("updated_at")) or _parse_dt(o.get("created_at"))
-            if not completed:
-                continue
-            if completed.tzinfo is None:
-                completed = completed.replace(tzinfo=timezone.utc)
-            completed_ist = completed.astimezone(IST)
-            if start <= completed_ist < end:
-                order_rows.append(o)
-    except Exception:
-        order_rows = []
-
-    combined = {"requests": rows, "orders": order_rows}
-    # Store requests archive separately via archive_completed_requests_month;
-    # here store order headers when available, else empty verified placeholder with requests count note.
-    payload_rows = order_rows if order_rows else rows
     storage = get_storage()
     key = storage.key("orders", archive_month, "completed-orders.jsonl.gz")
-    data = _gzip_jsonl(payload_rows)
+    data = _gzip_jsonl(rows)
 
     manifest = await _upload_verified(
         db,
@@ -672,29 +846,30 @@ async def archive_completed_orders_month(db, archive_month: Optional[str] = None
         archive_month=archive_month,
         storage_key=key,
         data=data,
-        source_collection="orders",
-        record_count=len(payload_rows),
+        source_collection="order_headers+order_items",
+        record_count=len(rows),
         min_date=start.date().isoformat(),
         max_date=(end - timedelta(days=1)).date().isoformat(),
         brands=brands,
         dealers=dealers,
         branches=branches,
+        existing=existing_any,
     )
 
-    # Lightweight Mongo index for search
-    for r in payload_rows:
-        number = r.get("order_no") or r.get("order_id") or r.get("request_no") or r.get("id")
+    for r in rows:
+        number = r.get("order_number") or r.get("order_no") or r.get("id")
         idx = {
             "number": number,
-            "brand": r.get("brand_name") or r.get("brand"),
-            "dealer": r.get("dealer_name") or r.get("requesting_dealer") or r.get("supplying_dealer"),
-            "branch": r.get("branch") or r.get("requesting_branch") or r.get("supplying_branch"),
+            "reference_no": r.get("reference_no"),
+            "brand": r.get("brand_name"),
+            "dealer": r.get("dealer_name"),
+            "branch": r.get("branch"),
             "created_date": r.get("created_at"),
-            "completed_date": r.get("completed_at") or r.get("updated_at"),
+            "completed_date": r.get("terminal_at") or r.get("completed_at") or r.get("updated_at"),
             "status": r.get("status"),
-            "total_items": r.get("total_items") or r.get("item_count"),
-            "total_qty": r.get("total_qty") or r.get("quantity"),
-            "total_value": r.get("total_value"),
+            "total_items": r.get("item_count") or r.get("total_items"),
+            "total_qty": r.get("total_required_qty") or r.get("total_qty"),
+            "total_value": r.get("total_order_value") or r.get("total_value"),
             "archive_month": archive_month,
             "storage_key": key,
         }
@@ -705,7 +880,7 @@ async def archive_completed_orders_month(db, archive_month: Optional[str] = None
                 upsert=True,
             )
 
-    return {"status": "verified", "manifest": manifest, "record_count": len(payload_rows), "combined_meta": {"requests": len(rows), "orders": len(order_rows)}}
+    return {"status": "verified", "manifest": manifest, "record_count": len(rows), "source": probe}
 
 
 async def archive_completed_requests_month(db, archive_month: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
@@ -811,33 +986,83 @@ def _terminal_on_date(row: dict, date_iso: str) -> bool:
 
 
 async def archive_orders_for_date(db, archive_date: str, force: bool = False) -> Dict[str, Any]:
-    """Daily Orders dump — only rows that became terminal on archive_date (IST)."""
+    """Daily Orders dump from live Order Desk (order_headers + order_items).
+
+    - Active / partial / in-progress orders stay in MongoDB
+    - Fully terminal orders archive on their real terminal/completion IST date
+    - Zero eligible → NO ELIGIBLE ORDERS (not green VERIFIED)
+    - Never uses legacy db.orders as the archive source
+    """
     date_iso = date_key_to_iso(archive_date)
     existing = await am.find_verified(db, MODULE_ORDERS, archive_date=date_iso)
     if existing and not force:
         return {"status": "already_verified", "manifest": existing}
+    existing_any = await am.find_any(db, MODULE_ORDERS, archive_date=date_iso)
+    if (
+        existing_any
+        and existing_any.get("status") == am.STATUS_NO_ELIGIBLE
+        and not force
+    ):
+        return {
+            "status": "no_eligible",
+            "manifest": existing_any,
+            "record_count": 0,
+            "display_status": "NO ELIGIBLE ORDERS",
+        }
 
-    brands, dealers, branches = set(), set(), set()
-    rows = []
-    try:
-        cursor = db.orders.find({"status": {"$in": list(TERMINAL_ORDER_STATUSES)}}, {"_id": 0})
-        for o in await cursor.to_list(200000):
-            if not _terminal_on_date(o, date_iso):
-                continue
-            rows.append(o)
-            if o.get("brand_name") or o.get("brand"):
-                brands.add(str(o.get("brand_name") or o.get("brand")))
-            if o.get("dealer_name") or o.get("dealer"):
-                dealers.add(str(o.get("dealer_name") or o.get("dealer")))
-            if o.get("branch") or o.get("branch_name"):
-                branches.add(str(o.get("branch") or o.get("branch_name")))
-    except Exception as exc:
-        logger.warning("orders daily archive scan failed: %s", exc)
+    probe = await _probe_order_desk_source(db)
+    if not probe.get("ok"):
+        # Source mapping / collection failure — distinct from genuine zero-eligible
+        failed = existing_any or am.base_manifest(
+            module=MODULE_ORDERS,
+            archive_date=date_iso,
+            source_collection="order_headers+order_items",
+        )
+        failed = await am.upsert_manifest(db, failed)
+        failed = await am.mark_status(
+            db,
+            failed["archive_id"],
+            am.STATUS_FAILED,
+            error=f"Order Desk source error: {probe.get('error') or 'order_headers unavailable'}"[:1000],
+            eligible_for_prune=False,
+            source_collection="order_headers+order_items",
+        )
+        return {
+            "status": "error",
+            "error": failed.get("error"),
+            "manifest": failed,
+            "record_count": 0,
+            "display_status": "FAILED",
+        }
+
+    rows, brands, dealers, branches = await _collect_terminal_order_desk_rows(
+        db, date_iso=date_iso
+    )
+
+    if not rows:
+        manifest = await _mark_no_eligible(
+            db,
+            module=MODULE_ORDERS,
+            archive_date=date_iso,
+            archive_month=None,
+            source_collection="order_headers+order_items",
+            message="NO ELIGIBLE ORDERS",
+            existing=existing_any,
+        )
+        return {
+            "status": "no_eligible",
+            "manifest": manifest,
+            "record_count": 0,
+            "display_status": "NO ELIGIBLE ORDERS",
+            "source": probe,
+            # Prove legacy emptiness cannot drive success
+            "legacy_orders_count": probe.get("legacy_orders"),
+            "order_headers_count": probe.get("order_headers"),
+        }
 
     storage = get_storage()
     key = storage.key("orders", date_iso, "completed-orders.jsonl.gz")
     data = _gzip_jsonl(rows)
-    existing_any = await am.find_any(db, MODULE_ORDERS, archive_date=date_iso)
     manifest = await _upload_verified(
         db,
         module=MODULE_ORDERS,
@@ -845,7 +1070,7 @@ async def archive_orders_for_date(db, archive_date: str, force: bool = False) ->
         archive_month=None,
         storage_key=key,
         data=data,
-        source_collection="orders",
+        source_collection="order_headers+order_items",
         record_count=len(rows),
         min_date=date_iso,
         max_date=date_iso,
@@ -854,8 +1079,13 @@ async def archive_orders_for_date(db, archive_date: str, force: bool = False) ->
         branches=branches,
         existing=existing_any,
     )
-    return {"status": "verified", "manifest": manifest, "record_count": len(rows)}
-
+    return {
+        "status": "verified",
+        "manifest": manifest,
+        "record_count": len(rows),
+        "source": probe,
+        "source_collection": "order_headers+order_items",
+    }
 
 async def archive_requests_for_date(db, archive_date: str, force: bool = False) -> Dict[str, Any]:
     """Daily Requests dump — terminal on archive_date only; active requests stay in Mongo."""

@@ -158,12 +158,27 @@ async def _stream_s3_product_day_page(
     page_size: int = 50,
 ) -> Optional[Dict[str, Any]]:
     date_iso = date_key_to_iso(date_key)
-    manifest = await am.find_verified(db, MODULE_PRODUCT_HISTORY, archive_date=date_iso)
+    manifest = await am.find_s3_readable(db, MODULE_PRODUCT_HISTORY, archive_date=date_iso)
     if not manifest:
         return None
     storage = get_storage()
+    # PRUNED / historical reads must never trust local fallback
+    if not storage.is_s3():
+        logger.warning(
+            "Refusing historical S3 read for %s — storage backend is not REAL S3 (manifest status=%s)",
+            date_iso,
+            manifest.get("status"),
+        )
+        return None
+    backend = str(manifest.get("storage_backend") or "").lower()
+    if backend not in {"s3", "real s3"}:
+        return None
     try:
-        data, _ = storage.download_bytes(manifest["storage_key"])
+        data, _ctype = storage.download_bytes(manifest["storage_key"])
+        head = storage.head(manifest["storage_key"])
+        if head and str(head.get("storage_provider") or "").lower() == "local":
+            logger.warning("Refusing local-fallback object for PRUNED/historical read %s", date_iso)
+            return None
     except Exception as exc:
         logger.warning("Failed reading archive %s: %s", manifest.get("storage_key"), exc)
         return None
@@ -179,6 +194,7 @@ async def _stream_s3_product_day_page(
         need_total=True,
     )
     result["source"] = "s3"
+    result["manifest_status"] = manifest.get("status")
     result["manifest_record_count"] = manifest.get("record_count")
     return result
 
@@ -186,12 +202,26 @@ async def _stream_s3_product_day_page(
 async def _read_s3_product_day(db, date_key: str) -> List[Dict[str, Any]]:
     """Full-day load — used only for non-paginated callers (exports/summaries)."""
     date_iso = date_key_to_iso(date_key)
-    manifest = await am.find_verified(db, MODULE_PRODUCT_HISTORY, archive_date=date_iso)
+    manifest = await am.find_s3_readable(db, MODULE_PRODUCT_HISTORY, archive_date=date_iso)
     if not manifest:
         return []
     storage = get_storage()
+    if not storage.is_s3():
+        logger.warning(
+            "Refusing historical S3 read for %s — not REAL S3 (status=%s)",
+            date_iso,
+            manifest.get("status"),
+        )
+        return []
+    backend = str(manifest.get("storage_backend") or "").lower()
+    if backend not in {"s3", "real s3"}:
+        return []
     try:
-        data, _ = storage.download_bytes(manifest["storage_key"])
+        data, _ctype = storage.download_bytes(manifest["storage_key"])
+        head = storage.head(manifest["storage_key"])
+        if head and str(head.get("storage_provider") or "").lower() == "local":
+            logger.warning("Refusing local-fallback object for historical read %s", date_iso)
+            return []
     except Exception as exc:
         logger.warning("Failed reading archive %s: %s", manifest.get("storage_key"), exc)
         return []
@@ -433,7 +463,7 @@ async def read_product_history(
                 mongo_rows.extend(rows)
                 sources[dk] = "mongo"
                 continue
-            archived = await am.find_verified(db, MODULE_PRODUCT_HISTORY, archive_date=date_key_to_iso(dk))
+            archived = await am.find_s3_readable(db, MODULE_PRODUCT_HISTORY, archive_date=date_key_to_iso(dk))
             if archived:
                 rows = await _read_s3_product_day(db, dk)
                 rows = [r for r in rows if _match_scope(r, brand, dealer, branch)]

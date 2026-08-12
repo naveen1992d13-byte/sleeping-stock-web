@@ -19,6 +19,7 @@ DISPLAY_VERIFICATION_FAILED = "VERIFICATION FAILED"
 DISPLAY_PENDING = "PENDING"
 DISPLAY_RUNNING = "RUNNING"
 DISPLAY_PRUNED = "PRUNED"
+DISPLAY_NO_ELIGIBLE = "NO ELIGIBLE DATA"
 
 
 def classify_display_status(
@@ -27,6 +28,8 @@ def classify_display_status(
     live: Optional[Dict[str, Any]] = None,
 ) -> str:
     live = live or {}
+    if manifest_status == "NO_ELIGIBLE":
+        return DISPLAY_NO_ELIGIBLE
     if manifest_status == "PRUNED" and live.get("ok"):
         return DISPLAY_PRUNED
     if live.get("ok") and live.get("real_s3"):
@@ -68,6 +71,14 @@ def head_s3_status(manifest: Dict[str, Any]) -> Dict[str, Any]:
         "failure_code": "",
         "check_mode": "head",
     }
+    mstatus_early = str(manifest.get("status") or "").upper()
+    if mstatus_early == "NO_ELIGIBLE":
+        report["ok"] = False
+        report["reason"] = manifest.get("error") or "NO ELIGIBLE DATA"
+        report["display_status"] = DISPLAY_NO_ELIGIBLE
+        report["failure_code"] = ""
+        return report
+
     if not key:
         report["failure_code"] = "missing_key"
         report["reason"] = "Wrong archive key/path"
