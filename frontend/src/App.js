@@ -23,6 +23,7 @@ import { QueryDesk } from './pages/QueryDesk';
 import NMTSMobile from './pages/NMTSMobile';
 import { OrderHistory } from './pages/OrderHistory';
 import StockAudit from './pages/StockAudit';
+import { StorageCostMonitor } from './pages/StorageCostMonitor';
 import { SessionInactivityGuard } from './components/SessionInactivityGuard';
 import {
   touchSessionActivity,
@@ -46,6 +47,7 @@ export const MENU_PERMISSIONS = {
   '/requests': 'Request Center',
   '/reports': 'Reports',
   '/analytics': 'Analytics',
+  '/storage-cost-monitor': 'Storage & Cost Monitor',
   '/query': null, // Available to master, admin, and user (Query Desk).
   '/sleeping-stock-mobile': null, // Available to master, admin and user; API applies scope rules.
   '/stock-audit': null,
@@ -72,6 +74,16 @@ export const canAccessPermission = (user, permissionName) => {
   if (user.role === 'master') return true;
   if (!permissionName) return true;
   return normalizePermissions(user.permissions).includes(permissionName);
+};
+
+export const canAccessMenuItem = (user, item) => {
+  if (!user || !item) return false;
+  if (item.masterOnly) return user.role === 'master';
+  if (item.allRoles) return true;
+  if (item.adminOnly && user.role === 'user') {
+    return normalizePermissions(user.permissions).includes(item.permissionLabel || item.label);
+  }
+  return canAccessPermission(user, item.permissionLabel || item.label);
 };
 
 export const useAuth = () => {
@@ -168,7 +180,7 @@ function AuthProvider({ children }) {
   );
 }
 
-function ProtectedRoute({ children, permission }) {
+function ProtectedRoute({ children, permission, masterOnly = false }) {
   const { user, loading } = useAuth();
   const location = useLocation();
 
@@ -176,6 +188,10 @@ function ProtectedRoute({ children, permission }) {
 
   if (!user) {
     return <Navigate to="/login" replace state={{ from: location }} />;
+  }
+
+  if (masterOnly && user.role !== 'master') {
+    return <Navigate to="/" replace />;
   }
 
   if (!canAccessPermission(user, permission)) {
@@ -249,6 +265,11 @@ function App() {
             <Route path="analytics" element={
               <ProtectedRoute permission="Analytics">
                 <Analytics />
+              </ProtectedRoute>
+            } />
+            <Route path="storage-cost-monitor" element={
+              <ProtectedRoute permission="Storage & Cost Monitor" masterOnly>
+                <StorageCostMonitor />
               </ProtectedRoute>
             } />
             <Route path="requests" element={

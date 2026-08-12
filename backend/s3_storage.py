@@ -58,16 +58,54 @@ def storage_env() -> str:
 
 
 def product_mongo_hot_days() -> int:
-    return max(1, _env_int(ENV_PRODUCT_MONGO_HOT_DAYS, 90))
+    """Calendar days of live Product rows kept in Mongo (IST).
+
+    Final policy default is 1 = today/current operational Product data only.
+    Closed previous calendar days are archived; prune (when enabled + real S3)
+    removes only verified historical dates — never today's live set.
+    """
+    return max(1, _env_int(ENV_PRODUCT_MONGO_HOT_DAYS, 1))
 
 
 def verification_mongo_hot_days() -> int:
+    # Keep a longer verification hot window — Auto Perpetual / MTD still need
+    # current-month raw verification rows in Mongo.
     return max(1, _env_int(ENV_VERIFICATION_MONGO_HOT_DAYS, 90))
 
 
 def archive_prune_enabled() -> bool:
-    # Approved default: false — never mass-delete during this PR.
+    # Approved default: false — never mass-delete until Master enables after
+    # verified REAL S3 archives exist.
     return _env_bool(ENV_ARCHIVE_PRUNE_ENABLED, False)
+
+
+# Estimated S3 cost inputs (overridable). Labels must say "Estimated Cost".
+ENV_S3_STORAGE_PRICE_PER_GB_MONTH = "S3_STORAGE_PRICE_PER_GB_MONTH"
+ENV_S3_PUT_PRICE_PER_1000 = "S3_PUT_PRICE_PER_1000"
+ENV_S3_GET_PRICE_PER_1000 = "S3_GET_PRICE_PER_1000"
+ENV_S3_FREE_EGRESS_GB = "S3_FREE_EGRESS_GB"
+ENV_S3_EGRESS_PRICE_PER_GB = "S3_EGRESS_PRICE_PER_GB"
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def s3_pricing_config() -> Dict[str, float]:
+    """Transparent estimate model — not a final AWS invoice."""
+    return {
+        "storage_price_per_gb_month": _env_float(ENV_S3_STORAGE_PRICE_PER_GB_MONTH, 0.023),
+        "put_price_per_1000": _env_float(ENV_S3_PUT_PRICE_PER_1000, 0.005),
+        "get_price_per_1000": _env_float(ENV_S3_GET_PRICE_PER_1000, 0.0004),
+        "free_egress_gb": _env_float(ENV_S3_FREE_EGRESS_GB, 100.0),
+        "egress_price_per_gb": _env_float(ENV_S3_EGRESS_PRICE_PER_GB, 0.09),
+    }
 
 
 def archive_scheduler_enabled() -> bool:
@@ -367,8 +405,12 @@ class S3StorageService:
 
     def status(self) -> Dict[str, Any]:
         """Safe status for ops — never includes secret values."""
+        real_s3 = self.is_s3()
         return {
             "mode": self._mode,
+            "storage_backend": "REAL S3" if real_s3 else "LOCAL FALLBACK",
+            "real_s3": real_s3,
+            "prune_authorized": bool(real_s3 and archive_prune_enabled()),
             "bucket_configured": bool(self.bucket),
             "region": self.region,
             "env": self.env,
@@ -379,7 +421,13 @@ class S3StorageService:
             "product_mongo_hot_days": product_mongo_hot_days(),
             "verification_mongo_hot_days": verification_mongo_hot_days(),
             "local_store": str(self._local.root),
+            "pricing": s3_pricing_config(),
             "server_time_utc": datetime.now(timezone.utc).isoformat(),
+            "warning": (
+                None
+                if real_s3
+                else "Cloud archive not active — MongoDB pruning disabled."
+            ),
         }
 
 

@@ -175,7 +175,21 @@ def _and(*parts):
 
 async def _inventory(scope, current=True):
     q=_query(scope)
-    if current: q=_and(q, {"$or":[{"is_active_today":True},{"publish_status":"Published"}]})
+    if current:
+        # Today-only live Product Hub stock — never scan all Published history.
+        # Required so one-day product retention / archive prune cannot break Reports.
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _dt
+        today = _dt.now(ZoneInfo("Asia/Kolkata"))
+        today_key = today.strftime("%Y%m%d")
+        today_iso = today.date().isoformat()
+        q=_and(
+            q,
+            {
+                "publish_status": "Published",
+                "active_date_key": {"$in": [today_key, today_iso]},
+            },
+        )
     rows=await db.products.find(q,{"_id":0}).sort("part_number",1).to_list(length=300000)
     for r in rows:
         r["qty"]=_num(r.get("available_qty_number",r.get("quantity",0)))

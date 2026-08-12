@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi.responses import Response, StreamingResponse
 from io import BytesIO
 
-from s3_storage import get_storage, guess_content_type, sha256_bytes
+from s3_storage import get_storage, guess_content_type
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +21,18 @@ async def store_bytes(
     data: bytes,
     original_filename: str,
     content_type: Optional[str] = None,
+    brand: str = "",
+    dealer: str = "",
+    branch: str = "",
+    user_id: str = "",
+    db=None,
 ) -> Dict[str, Any]:
     """Store durable bytes in object storage and return Mongo-friendly metadata."""
     storage = get_storage()
     key = storage.key(module, relative_key)
     ctype = content_type or guess_content_type(original_filename)
     stored = storage.upload_bytes(key, data, content_type=ctype)
-    return {
+    meta = {
         "storage_provider": stored.storage_provider,
         "storage_key": stored.storage_key,
         "original_filename": original_filename,
@@ -37,6 +41,24 @@ async def store_bytes(
         "sha256": stored.sha256,
         "archived_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
     }
+    if db is not None:
+        try:
+            import storage_usage as su
+
+            await su.record_storage_usage(
+                db,
+                operation=su.OP_UPLOAD,
+                bytes_count=stored.file_size,
+                brand=brand,
+                dealer=dealer,
+                branch=branch,
+                module=module,
+                user_id=user_id,
+                request_count=1,
+            )
+        except Exception:
+            pass
+    return meta
 
 
 def read_bytes_from_meta(meta: Dict[str, Any]) -> Tuple[bytes, str]:
@@ -74,6 +96,38 @@ def read_bytes_from_meta(meta: Dict[str, Any]) -> Tuple[bytes, str]:
         return bytes(raw), ctype
 
     raise FileNotFoundError("No storage_key, legacy path, or embedded bytes available")
+
+
+async def read_bytes_from_meta_tracked(
+    db,
+    meta: Dict[str, Any],
+    *,
+    operation: str = "DOWNLOAD",
+    brand: str = "",
+    dealer: str = "",
+    branch: str = "",
+    module: str = "",
+    user_id: str = "",
+) -> Tuple[bytes, str]:
+    data, ctype = read_bytes_from_meta(meta)
+    try:
+        import storage_usage as su
+
+        op = su.OP_DOWNLOAD if str(operation).upper() == "DOWNLOAD" else su.OP_VIEW_READ
+        await su.record_storage_usage(
+            db,
+            operation=op,
+            bytes_count=len(data),
+            brand=brand,
+            dealer=dealer,
+            branch=branch,
+            module=module or str(meta.get("module") or "files"),
+            user_id=user_id,
+            request_count=1,
+        )
+    except Exception:
+        pass
+    return data, ctype
 
 
 def streaming_response_from_meta(meta: Dict[str, Any], filename: Optional[str] = None) -> Response:

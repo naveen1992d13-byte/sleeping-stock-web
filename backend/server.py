@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -48,6 +48,8 @@ except ImportError:
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+# Optional local overlay for corrected AWS/S3 secret mapping (gitignored; never commit).
+load_dotenv(ROOT_DIR / '.env.s3.local', override=True)
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -3784,6 +3786,41 @@ async def download_product_hub_history(date_key: str = None, from_date: str = No
     return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
+@api_router.get("/product-hub-history/rows")
+async def list_product_hub_history_rows(
+    date_key: str = None, from_date: str = None, to_date: str = None,
+    brand: str = None, dealer: str = None, branch: str = None,
+    part_number: str = None, search: str = None,
+    page: int = 1, page_size: int = 50,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Paginated historical product rows (Mongo hot or S3 cold) for on-screen viewing."""
+    scope = {}
+    _apply_role_scope_v2(scope, current_user, brand, dealer, branch)
+    result = await hybrid_history.read_product_history(
+        db,
+        date_key=date_key,
+        from_date=from_date,
+        to_date=to_date,
+        brand=scope.get("brand_name"),
+        dealer=scope.get("dealer_name"),
+        branch=scope.get("branch"),
+        page=page,
+        page_size=page_size,
+        part_number=part_number,
+        search=search,
+    )
+    return {
+        "rows": result.get("rows") or [],
+        "count": result.get("count") or 0,
+        "total": result.get("total") or result.get("count") or 0,
+        "sources": result.get("sources") or {},
+        "page": result.get("page"),
+        "mongo_count": result.get("mongo_count"),
+        "s3_count": result.get("s3_count"),
+    }
+
+
 # ==================== PRODUCT HUB V3 - SCALABLE (LAKHS OF RECORDS) ====================
 # Redesigned to avoid ever loading/scanning the full raw stock collection for
 # summary numbers, and to avoid ever sending more than one page of raw rows
@@ -6885,12 +6922,65 @@ mobile_api.init_mobile_api(
 api_router.include_router(mobile_api.router)
 
 
-# ==================== HYBRID STORAGE ADMIN / OPS ====================
+# ==================== HYBRID STORAGE ADMIN / OPS (MASTER ONLY MONITOR) ====================
 
 @api_router.get("/storage/status")
 async def storage_status(current_user: UserResponse = Depends(get_current_user)):
-    await _ensure_master_or_admin(current_user)
+    await _ensure_master(current_user)
     return s3_storage.get_storage().status()
+
+
+@api_router.get("/storage/monitor")
+async def storage_cost_monitor(month: str = None, brand: str = None, dealer: str = None, current_user: UserResponse = Depends(get_current_user)):
+    """Master-only Storage & Cost Monitor dashboard payload."""
+    await _ensure_master(current_user)
+    import storage_monitor as sm
+    import storage_usage as su
+
+    payload = await sm.monitor_dashboard(db, month=month)
+    if brand or dealer:
+        payload["dealer_ranking"] = await su.dealer_usage_ranking(db, month=month, brand=brand, dealer=dealer)
+    return payload
+
+
+@api_router.get("/storage/monitor/dealers")
+async def storage_dealer_ranking(month: str = None, brand: str = None, dealer: str = None, current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master(current_user)
+    import storage_usage as su
+    return await su.dealer_usage_ranking(db, month=month, brand=brand, dealer=dealer)
+
+
+@api_router.get("/storage/monitor/migration-report")
+async def storage_migration_report(current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master(current_user)
+    import storage_monitor as sm
+    return await sm.migration_space_report(db)
+
+
+@api_router.post("/storage/migration/archive-dates")
+async def storage_migration_archive_dates(
+    dry_run: bool = True,
+    prune_after: bool = False,
+    limit: int = None,
+    dates: list = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Master-only date-by-date historical archive. prune_after still gated by REAL S3 + flag."""
+    await _ensure_master(current_user)
+    return await history_archive.archive_historical_dates(
+        db,
+        dates=dates,
+        dry_run=dry_run,
+        prune_after=prune_after,
+        limit=limit,
+    )
+
+
+@api_router.post("/storage/migration/cleanup-published-upload-items")
+async def cleanup_published_upload_items_api(dry_run: bool = True, current_user: UserResponse = Depends(get_current_user)):
+    """Master-only: remove obsolete Published staging rows (keeps Waiting/pending)."""
+    await _ensure_master(current_user)
+    return await history_archive.cleanup_published_upload_items(db, dry_run=dry_run)
 
 
 @api_router.post("/storage/archives/product-history/run")
@@ -6899,6 +6989,12 @@ async def run_product_history_archive(archive_date: str = None, force: bool = Fa
     if archive_date:
         return await history_archive.archive_product_history_for_date(db, archive_date, force=force)
     return await archive_scheduler.run_daily_product_archive(db, archive_date)
+
+
+@api_router.post("/storage/archives/product-history/prune")
+async def prune_product_history_archive(archive_date: str, current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master(current_user)
+    return await history_archive.prune_product_history_date(db, archive_date)
 
 
 @api_router.post("/storage/archives/orders-requests/run")
@@ -6919,11 +7015,116 @@ async def run_verification_archive(archive_date: str, force: bool = False, curre
 
 @api_router.get("/storage/archives")
 async def list_archives(module: str = None, current_user: UserResponse = Depends(get_current_user)):
-    await _ensure_master_or_admin(current_user)
+    await _ensure_master(current_user)
     q = {}
     if module:
         q["module"] = module
     return await db.archive_manifests.find(q, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+@api_router.post("/storage/archives/{archive_id}/retry")
+async def retry_failed_archive(archive_id: str, current_user: UserResponse = Depends(get_current_user)):
+    """Idempotent retry for FAILED archive jobs (Master only)."""
+    await _ensure_master(current_user)
+    row = await db.archive_manifests.find_one({"archive_id": archive_id}, {"_id": 0})
+    if not row:
+        raise HTTPException(status_code=404, detail="Archive job not found")
+    if row.get("status") not in {archive_manifest.STATUS_FAILED, archive_manifest.STATUS_CREATING, archive_manifest.STATUS_UPLOADED}:
+        return {"status": "skipped", "reason": f"status={row.get('status')} is not retryable", "manifest": row}
+    module = row.get("module")
+    if module == history_archive.MODULE_PRODUCT_HISTORY:
+        return await history_archive.archive_product_history_for_date(db, row.get("archive_date"), force=True)
+    if module == history_archive.MODULE_ORDERS:
+        return await history_archive.archive_completed_orders_month(db, row.get("archive_month"), force=True)
+    if module == history_archive.MODULE_REQUESTS:
+        return await history_archive.archive_completed_requests_month(db, row.get("archive_month"), force=True)
+    if module == history_archive.MODULE_VERIFICATIONS:
+        return await history_archive.archive_verifications_for_date(db, row.get("archive_date"), force=True)
+    raise HTTPException(status_code=400, detail=f"Unsupported module for retry: {module}")
+
+
+# ---- Additive Storage Cleanup / Verify / Dry-Run / Manual Mongo Delete (Master only) ----
+
+@api_router.get("/storage/external-links")
+async def storage_external_links(current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master(current_user)
+    import archive_cleanup as ac
+    return ac.external_console_links()
+
+
+@api_router.get("/storage/archives/cleanup-table")
+async def storage_cleanup_table(
+    years: int = 3,
+    brand: str = None,
+    dealer: str = None,
+    branch: str = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Archive/history table for Data Cleanup (up to 3 years). Additive — does not replace /storage/archives."""
+    await _ensure_master(current_user)
+    import archive_cleanup as ac
+    rows = await ac.list_cleanup_archives(db, years=years, brand=brand, dealer=dealer, branch=branch)
+    return {"years": years, "count": len(rows), "rows": rows}
+
+
+@api_router.post("/storage/archives/{archive_id}/verify")
+async def storage_archive_verify(
+    archive_id: str,
+    brand: str = None,
+    dealer: str = None,
+    branch: str = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    await _ensure_master(current_user)
+    import archive_cleanup as ac
+    return await ac.verify_archive(db, archive_id=archive_id, brand=brand, dealer=dealer, branch=branch)
+
+
+@api_router.post("/storage/archives/{archive_id}/dry-run-delete")
+async def storage_archive_dry_run_delete(
+    archive_id: str,
+    brand: str = None,
+    dealer: str = None,
+    branch: str = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    await _ensure_master(current_user)
+    import archive_cleanup as ac
+    return await ac.dry_run_delete(db, archive_id=archive_id, brand=brand, dealer=dealer, branch=branch)
+
+
+class MongoArchiveDeleteRequest(BaseModel):
+    confirm_text: str
+    brand: Optional[str] = None
+    dealer: Optional[str] = None
+    branch: Optional[str] = None
+
+
+@api_router.post("/storage/archives/{archive_id}/delete-mongo")
+async def storage_archive_delete_mongo(
+    archive_id: str,
+    body: MongoArchiveDeleteRequest,
+    request: Request,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Manual Mongo-only delete for a VERIFIED SAFE archive. Never deletes S3 objects."""
+    await _ensure_master(current_user)
+    import archive_cleanup as ac
+    meta = {
+        "client_ip": request.client.host if request.client else None,
+        "user_agent": request.headers.get("user-agent"),
+    }
+    return await ac.delete_mongo_for_archive(
+        db,
+        archive_id=archive_id,
+        current_user=current_user,
+        confirm_text=body.confirm_text,
+        brand=body.brand,
+        dealer=body.dealer,
+        branch=body.branch,
+        request_meta=meta,
+    )
+
 
 app.include_router(api_router)
 
@@ -7035,6 +7236,12 @@ async def seed_master_user_on_startup():
         await mobile_api.ensure_mobile_indexes()
         await archive_manifest.ensure_archive_indexes(db)
         logger.info("Archive manifest indexes verified")
+        try:
+            import storage_usage as su
+            await su.ensure_usage_indexes(db)
+            logger.info("Storage usage indexes verified")
+        except Exception as exc:
+            logger.warning("Storage usage index creation failed: %s", exc)
         archive_scheduler.start_archive_scheduler(db)
         logger.info("Archive scheduler started (ARCHIVE_PRUNE_ENABLED=%s)", s3_storage.archive_prune_enabled())
     except Exception as e:

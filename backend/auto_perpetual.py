@@ -219,6 +219,11 @@ async def _verified_parts_this_month(
 
 
 async def _previous_inventory_date_key(db, *, brand_name: str, dealer_name: str, branch: str, current_key: str) -> Optional[str]:
+    """Return previous inventory date for THIS brand/dealer/branch only.
+
+    Never inherit another dealer's archive calendar date.
+    """
+    cur = str(current_key or "").replace("-", "")[:8]
     row = await db.products.find(
         {
             "brand_name": brand_name,
@@ -229,7 +234,61 @@ async def _previous_inventory_date_key(db, *, brand_name: str, dealer_name: str,
         },
         {"_id": 0, "active_date_key": 1},
     ).sort("active_date_key", -1).limit(1).to_list(1)
-    return row[0]["active_date_key"] if row else None
+    if row:
+        return row[0]["active_date_key"]
+
+    # Prefer scoped analytics snapshots (exact brand/dealer/branch)
+    try:
+        before_iso = (
+            f"{cur[0:4]}-{cur[4:6]}-{cur[6:8]}" if len(cur) == 8 else str(current_key)
+        )
+        snap = await db.analytics_stock_daily_snapshots.find(
+            {
+                "brand_name": brand_name,
+                "dealer_name": dealer_name,
+                "branch_name": branch,
+                "snapshot_date_ist": {"$lt": before_iso},
+            },
+            {"_id": 0, "snapshot_date_ist": 1},
+        ).sort("snapshot_date_ist", -1).limit(1).to_list(1)
+        if snap:
+            return str(snap[0].get("snapshot_date_ist") or "").replace("-", "")[:8] or None
+    except Exception:
+        pass
+
+    # Scoped hybrid probe: walk recent verified archive dates newest-first and
+    # accept only dates that actually contain this brand/dealer/branch.
+    try:
+        import hybrid_history as hh
+
+        before_iso = f"{cur[0:4]}-{cur[4:6]}-{cur[6:8]}" if len(cur) == 8 else str(current_key)
+        manifests = await db.archive_manifests.find(
+            {
+                "module": "product-history",
+                "status": {"$in": ["VERIFIED", "PRUNED"]},
+                "archive_date": {"$lt": before_iso},
+            },
+            {"_id": 0, "archive_date": 1},
+        ).sort("archive_date", -1).limit(14).to_list(14)
+        for m in manifests:
+            dk = str(m.get("archive_date") or "").replace("-", "")[:8]
+            if not dk or dk >= cur:
+                continue
+            probe = await hh.read_product_history(
+                db,
+                date_key=dk,
+                brand=brand_name,
+                dealer=dealer_name,
+                branch=branch,
+                page=1,
+                page_size=1,
+                record_usage=False,
+            )
+            if int(probe.get("total") or 0) > 0 or (probe.get("rows") or []):
+                return dk
+    except Exception:
+        pass
+    return None
 
 
 async def _inventory_qty_map(
@@ -251,6 +310,48 @@ async def _inventory_qty_map(
         if not part:
             continue
         out[part] = float(p.get("available_qty_number") or p.get("quantity") or 0)
+    if out:
+        return out
+
+    # Hybrid / snapshot fallback when historical products were archived+pruned
+    try:
+        import hybrid_history as hh
+
+        result = await hh.read_product_history(
+            db,
+            date_key=active_date_key,
+            brand=brand_name,
+            dealer=dealer_name,
+            branch=branch,
+        )
+        for p in result.get("rows") or []:
+            part = str(p.get("part_number") or "").strip().upper()
+            if not part:
+                continue
+            out[part] = float(p.get("available_qty_number") or p.get("quantity") or 0)
+        if out:
+            return out
+    except Exception:
+        pass
+    try:
+        date_iso = active_date_key
+        if len(active_date_key) == 8:
+            date_iso = f"{active_date_key[0:4]}-{active_date_key[4:6]}-{active_date_key[6:8]}"
+        snaps = await db.analytics_stock_daily_snapshots.find(
+            {
+                "brand_name": brand_name,
+                "dealer_name": dealer_name,
+                "branch_name": branch,
+                "snapshot_date_ist": {"$in": [date_iso, active_date_key]},
+            },
+            {"_id": 0, "part_number": 1, "available_qty": 1},
+        ).to_list(50000)
+        for p in snaps:
+            part = str(p.get("part_number") or "").strip().upper()
+            if part:
+                out[part] = float(p.get("available_qty") or 0)
+    except Exception:
+        pass
     return out
 
 
