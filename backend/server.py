@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -7041,6 +7041,90 @@ async def retry_failed_archive(archive_id: str, current_user: UserResponse = Dep
     if module == history_archive.MODULE_VERIFICATIONS:
         return await history_archive.archive_verifications_for_date(db, row.get("archive_date"), force=True)
     raise HTTPException(status_code=400, detail=f"Unsupported module for retry: {module}")
+
+
+# ---- Additive Storage Cleanup / Verify / Dry-Run / Manual Mongo Delete (Master only) ----
+
+@api_router.get("/storage/external-links")
+async def storage_external_links(current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master(current_user)
+    import archive_cleanup as ac
+    return ac.external_console_links()
+
+
+@api_router.get("/storage/archives/cleanup-table")
+async def storage_cleanup_table(
+    years: int = 3,
+    brand: str = None,
+    dealer: str = None,
+    branch: str = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Archive/history table for Data Cleanup (up to 3 years). Additive — does not replace /storage/archives."""
+    await _ensure_master(current_user)
+    import archive_cleanup as ac
+    rows = await ac.list_cleanup_archives(db, years=years, brand=brand, dealer=dealer, branch=branch)
+    return {"years": years, "count": len(rows), "rows": rows}
+
+
+@api_router.post("/storage/archives/{archive_id}/verify")
+async def storage_archive_verify(
+    archive_id: str,
+    brand: str = None,
+    dealer: str = None,
+    branch: str = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    await _ensure_master(current_user)
+    import archive_cleanup as ac
+    return await ac.verify_archive(db, archive_id=archive_id, brand=brand, dealer=dealer, branch=branch)
+
+
+@api_router.post("/storage/archives/{archive_id}/dry-run-delete")
+async def storage_archive_dry_run_delete(
+    archive_id: str,
+    brand: str = None,
+    dealer: str = None,
+    branch: str = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    await _ensure_master(current_user)
+    import archive_cleanup as ac
+    return await ac.dry_run_delete(db, archive_id=archive_id, brand=brand, dealer=dealer, branch=branch)
+
+
+class MongoArchiveDeleteRequest(BaseModel):
+    confirm_text: str
+    brand: Optional[str] = None
+    dealer: Optional[str] = None
+    branch: Optional[str] = None
+
+
+@api_router.post("/storage/archives/{archive_id}/delete-mongo")
+async def storage_archive_delete_mongo(
+    archive_id: str,
+    body: MongoArchiveDeleteRequest,
+    request: Request,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Manual Mongo-only delete for a VERIFIED SAFE archive. Never deletes S3 objects."""
+    await _ensure_master(current_user)
+    import archive_cleanup as ac
+    meta = {
+        "client_ip": request.client.host if request.client else None,
+        "user_agent": request.headers.get("user-agent"),
+    }
+    return await ac.delete_mongo_for_archive(
+        db,
+        archive_id=archive_id,
+        current_user=current_user,
+        confirm_text=body.confirm_text,
+        brand=body.brand,
+        dealer=body.dealer,
+        branch=body.branch,
+        request_meta=meta,
+    )
+
 
 app.include_router(api_router)
 

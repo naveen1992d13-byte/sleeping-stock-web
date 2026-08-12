@@ -236,6 +236,40 @@ async def monitor_dashboard(db, *, month: Optional[str] = None) -> Dict[str, Any
     usage = await su.month_usage_totals(db, month)
     dealers = await su.dealer_usage_ranking(db, month=month)
     today_key, _ = _today_keys()
+    # Additive external console/billing cards (same pattern for AWS + MongoDB).
+    try:
+        import archive_cleanup as ac
+
+        external = ac.external_console_links()
+    except Exception:
+        external = {"aws": {}, "mongodb": {}, "pattern": "identical_cards"}
+
+    refreshed = datetime.now(timezone.utc).isoformat()
+    aws_card = {
+        **(external.get("aws") or {}),
+        "status": status.get("storage_backend"),
+        "real_s3": status.get("real_s3"),
+        "usage_bytes": s3m.get("s3_total_stored_bytes"),
+        "usage_label": "S3 archived bytes (from manifests)",
+        "estimated_cost": usage.get("estimated_total_cost"),
+        "estimated_cost_label": "Estimated Cost (NMTS model, not AWS invoice)",
+        "billing_available": False,
+        "billing_message": (external.get("aws") or {}).get("billing_message") or "Billing data unavailable",
+        "last_refreshed": refreshed,
+    }
+    mongo_card = {
+        **(external.get("mongodb") or {}),
+        "status": "CONNECTED" if mongo.get("data_size") is not None else "UNKNOWN",
+        "usage_bytes": mongo.get("storage_size") or mongo.get("data_size"),
+        "usage_label": "MongoDB storage size (dbStats)",
+        "data_size": mongo.get("data_size"),
+        "index_size": mongo.get("index_size"),
+        "estimated_cost": None,
+        "estimated_cost_label": "Billing data unavailable",
+        "billing_available": False,
+        "billing_message": (external.get("mongodb") or {}).get("billing_message") or "Billing data unavailable",
+        "last_refreshed": refreshed,
+    }
 
     return {
         "storage_backend": status.get("storage_backend"),
@@ -264,4 +298,15 @@ async def monitor_dashboard(db, *, month: Optional[str] = None) -> Dict[str, Any
         "product_mongo_hot_days": product_mongo_hot_days(),
         "pricing": status.get("pricing"),
         "today_date_key": today_key,
+        "external_services": {
+            "pattern": "identical_cards",
+            "aws": aws_card,
+            "mongodb": mongo_card,
+        },
+        "archive_schedule": {
+            "timezone": "Asia/Kolkata",
+            "daily_product_history": "00:15 IST (previous calendar day)",
+            "monthly_orders_requests": "01:30 IST on the 1st (previous calendar month)",
+            "unchanged": True,
+        },
     }

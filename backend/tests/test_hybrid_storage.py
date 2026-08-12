@@ -123,6 +123,20 @@ class FakeCollection:
     async def count_documents(self, query):
         return len([d for d in self.docs if self._match(d, query)])
 
+    async def distinct(self, key, query=None):
+        vals = []
+        seen = set()
+        for d in self.docs:
+            if not self._match(d, query or {}):
+                continue
+            v = d.get(key)
+            marker = str(v)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            vals.append(v)
+        return vals
+
     async def create_index(self, *a, **k):
         self.indexes.append((a, k))
 
@@ -982,6 +996,105 @@ def test_monitor_access_helpers_master_only_documented():
     for role in ("admin", "user"):
         with pytest.raises(PermissionError):
             ensure_master(role)
+
+
+def test_archive_scope_enrichment_preserves_codes_and_fills_names():
+    async def _run():
+        db = FakeDB()
+        db.brands.docs = [{"code": "HY", "name": "Hyundai"}]
+        db.uploads.docs = [
+            {
+                "id": "up1",
+                "brand_name": "Hyundai",
+                "dealer_name": "FPL Hyundai",
+                "branch": "Vanagaram",
+                "brand_code": "HY",
+            }
+        ]
+        rows = [
+            {
+                "part_number": "P1",
+                "brand_name": "",
+                "brand_code": "HY",
+                "dealer_name": "",
+                "branch": "",
+                "upload_id": "up1",
+                "quantity": 2,
+            }
+        ]
+        out = await ha._enrich_product_scope_rows(db, rows)
+        assert out[0]["brand_name"] == "Hyundai"
+        assert out[0]["dealer_name"] == "FPL Hyundai"
+        assert out[0]["branch"] == "Vanagaram"
+        assert out[0]["brand_code"] == "HY"
+        fp1 = ha._source_fingerprint(out)
+        fp2 = ha._source_fingerprint(out)
+        assert fp1 == fp2
+        changed = ha._source_fingerprint([{**out[0], "quantity": 9}])
+        assert changed != fp1
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_archive_scheduler_timing_unchanged():
+    src = Path(ROOT, "archive_scheduler.py").read_text(encoding="utf-8")
+    assert "now.hour == 0 and now.minute >= 15" in src
+    assert "now.day == 1 and now.hour == 1 and now.minute >= 30" in src
+
+
+def test_cleanup_verify_blocks_without_real_s3_and_wrong_confirm():
+    import archive_cleanup as ac
+
+    async def _run():
+        db = FakeDB()
+        # Local-fallback archive cannot be SAFE for delete
+        db.archive_manifests.docs = [
+            {
+                "archive_id": "a1",
+                "module": "product-history",
+                "archive_date": "2026-08-02",
+                "status": "VERIFIED",
+                "storage_key": "dev/product-history/2026-08-02/products.jsonl.gz",
+                "record_count": 1,
+                "file_size": 10,
+                "sha256": "abc",
+                "storage_backend": "local",
+                "source_fingerprint": "x",
+            }
+        ]
+        report = await ac.verify_archive(db, archive_id="a1")
+        assert report["safe_to_delete"] is False
+        blocked = await ac.delete_mongo_for_archive(
+            db,
+            archive_id="a1",
+            current_user=SimpleNamespace(role="master", id="m1", username="Master", email="a@b.c"),
+            confirm_text="please",
+        )
+        assert blocked["status"] == "blocked"
+        assert blocked["deleted"] == 0
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_external_console_links_have_identical_pattern():
+    import archive_cleanup as ac
+
+    links = ac.external_console_links()
+    assert links["pattern"] == "identical_cards"
+    assert "open_label" in links["aws"] and "open_label" in links["mongodb"]
+    assert links["aws"]["billing_available"] is False
+    assert links["mongodb"]["billing_available"] is False
+    assert links["mongodb"]["open_url"]  # generic Atlas portal fallback (no secrets)
+
+
+def test_cleanup_product_query_includes_misflagged_historical_rows():
+    """Historical rows with is_active_today=True must still be in delete scope by date."""
+    import archive_cleanup as ac
+
+    q = ac._product_query("2026-08-02")
+    assert q["publish_status"] == "Published"
+    assert "$in" in q["active_date_key"]
+    assert "is_active_today" not in q
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import logging
@@ -52,6 +53,159 @@ def _jsonable(doc: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+async def _enrich_product_scope_rows(db, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fill brand/dealer/branch names on archive payload when source rows omit them.
+
+    Additive mapping only — does not invent values. Uses:
+    - brand/dealer/branch fields already on the row
+    - brands master (code → name) when brand_code is a real code (not XX)
+    - dealers master (id/code/name) when dealer_code is present
+    - parent upload document (upload_id) when present
+    - batch_summaries for the same upload_id as a last resort
+    Codes are always preserved. Empty/placeholder codes (XX) are kept as-is.
+    """
+    if not rows:
+        return rows
+
+    brand_docs = await db.brands.find({}, {"_id": 0, "code": 1, "name": 1}).to_list(5000)
+    brand_by_code = {
+        _text(b.get("code")).upper(): _text(b.get("name"))
+        for b in brand_docs
+        if _text(b.get("code")) and _text(b.get("name"))
+    }
+
+    upload_ids = {_text(r.get("upload_id")) for r in rows if _text(r.get("upload_id"))}
+    upload_map: Dict[str, Dict[str, Any]] = {}
+    if upload_ids:
+        uploads = await db.uploads.find(
+            {"id": {"$in": list(upload_ids)}},
+            {
+                "_id": 0,
+                "id": 1,
+                "brand": 1,
+                "brand_name": 1,
+                "dealer_name": 1,
+                "branch": 1,
+                "branch_name": 1,
+                "brand_code": 1,
+                "dealer_code": 1,
+            },
+        ).to_list(len(upload_ids) + 10)
+        upload_map = {_text(u.get("id")): u for u in uploads if _text(u.get("id"))}
+
+    dealer_codes = {
+        _text(r.get("dealer_code"))
+        for r in rows
+        if _text(r.get("dealer_code"))
+    } | {
+        _text(u.get("dealer_code"))
+        for u in upload_map.values()
+        if _text(u.get("dealer_code"))
+    }
+    dealer_by_key: Dict[str, str] = {}
+    if dealer_codes:
+        dealer_docs = await db.dealers.find(
+            {
+                "$or": [
+                    {"id": {"$in": list(dealer_codes)}},
+                    {"code": {"$in": list(dealer_codes)}},
+                    {"dealer_code": {"$in": list(dealer_codes)}},
+                    {"name": {"$in": list(dealer_codes)}},
+                    {"dealer_name": {"$in": list(dealer_codes)}},
+                ]
+            },
+            {"_id": 0, "id": 1, "code": 1, "dealer_code": 1, "name": 1, "dealer_name": 1},
+        ).to_list(len(dealer_codes) + 50)
+        for d in dealer_docs:
+            name = _text(d.get("dealer_name") or d.get("name"))
+            if not name:
+                continue
+            for key in (d.get("id"), d.get("code"), d.get("dealer_code"), d.get("name"), d.get("dealer_name")):
+                k = _text(key)
+                if k:
+                    dealer_by_key[k] = name
+                    dealer_by_key[k.upper()] = name
+
+    summary_map: Dict[str, Dict[str, Any]] = {}
+    if upload_ids:
+        summaries = await db.batch_summaries.find(
+            {"upload_id": {"$in": list(upload_ids)}},
+            {"_id": 0, "upload_id": 1, "brand_name": 1, "dealer_name": 1, "branch": 1, "brand_code": 1},
+        ).to_list(len(upload_ids) + 50)
+        for s in summaries:
+            uid = _text(s.get("upload_id"))
+            if uid and uid not in summary_map:
+                summary_map[uid] = s
+
+    enriched: List[Dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        brand_name = _text(row.get("brand_name") or row.get("brand"))
+        dealer_name = _text(row.get("dealer_name") or row.get("dealer"))
+        branch = _text(row.get("branch") or row.get("branch_name"))
+        brand_code = _text(row.get("brand_code"))
+        dealer_code = _text(row.get("dealer_code"))
+
+        upload = upload_map.get(_text(row.get("upload_id"))) or {}
+        summary = summary_map.get(_text(row.get("upload_id"))) or {}
+        if not brand_name:
+            brand_name = _text(upload.get("brand_name") or upload.get("brand")) or _text(summary.get("brand_name"))
+        if not dealer_name:
+            dealer_name = _text(upload.get("dealer_name")) or _text(summary.get("dealer_name"))
+        if not branch:
+            branch = (
+                _text(upload.get("branch") or upload.get("branch_name"))
+                or _text(summary.get("branch"))
+            )
+        if not brand_code:
+            brand_code = _text(upload.get("brand_code")) or _text(summary.get("brand_code"))
+        if not dealer_code:
+            dealer_code = _text(upload.get("dealer_code"))
+
+        if not brand_name and brand_code and brand_code.upper() != "XX":
+            brand_name = brand_by_code.get(brand_code.upper()) or ""
+        if not dealer_name and dealer_code:
+            dealer_name = dealer_by_key.get(dealer_code) or dealer_by_key.get(dealer_code.upper()) or ""
+
+        if brand_name:
+            row["brand_name"] = brand_name
+            row["brand"] = row.get("brand") or brand_name
+        if dealer_name:
+            row["dealer_name"] = dealer_name
+        if branch:
+            row["branch"] = branch
+        if brand_code:
+            row["brand_code"] = brand_code
+        if dealer_code:
+            row["dealer_code"] = dealer_code
+        enriched.append(row)
+    return enriched
+
+
+def _source_fingerprint(rows: Iterable[Dict[str, Any]]) -> str:
+    """Deterministic fingerprint of archived product scope rows for change detection."""
+    lines: List[str] = []
+    for r in rows:
+        qty = float(r.get("available_qty_number", r.get("quantity", 0)) or 0)
+        lines.append(
+            "|".join(
+                [
+                    _text(r.get("part_number")).upper(),
+                    _text(r.get("brand_name") or r.get("brand")),
+                    _text(r.get("dealer_name") or r.get("dealer")),
+                    _text(r.get("branch") or r.get("branch_name")),
+                    f"{qty:.6f}",
+                ]
+            )
+        )
+    lines.sort()
+    return sha256_bytes("\n".join(lines).encode("utf-8"))
+
+
 def _gzip_jsonl(rows: Iterable[Dict[str, Any]]) -> bytes:
     buf = BytesIO()
     with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
@@ -85,6 +239,7 @@ async def _upload_verified(
     dealers: set,
     branches: set,
     existing: Optional[Dict[str, Any]] = None,
+    extra_fields: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     storage = get_storage()
     digest = sha256_bytes(data)
@@ -109,10 +264,15 @@ async def _upload_verified(
             "brand_count": len(brands),
             "dealer_count": len(dealers),
             "branch_count": len(branches),
+            "scope_brands": sorted(str(x) for x in brands if x)[:200],
+            "scope_dealers": sorted(str(x) for x in dealers if x)[:200],
+            "scope_branches": sorted(str(x) for x in branches if x)[:200],
             "error": None,
             "eligible_for_prune": False,
         }
     )
+    if extra_fields:
+        manifest.update(extra_fields)
     manifest = await am.upsert_manifest(db, manifest)
 
     try:
@@ -213,6 +373,8 @@ async def archive_product_history_for_date(db, archive_date: str, force: bool = 
     }
     cursor = db.products.find(query, {"_id": 0})
     rows = await cursor.to_list(500000)
+    # Enrich empty brand/dealer/branch from codes / upload metadata before packaging.
+    rows = await _enrich_product_scope_rows(db, rows)
 
     # Also include batch summaries + a compact analytics snapshot payload for the day
     summaries = await db.batch_summaries.find(
@@ -221,13 +383,18 @@ async def archive_product_history_for_date(db, archive_date: str, force: bool = 
     ).to_list(50000)
 
     brands, dealers, branches = set(), set(), set()
+    brand_codes, dealer_codes = set(), set()
     for r in rows:
-        if r.get("brand_name"):
-            brands.add(str(r["brand_name"]))
-        if r.get("dealer_name"):
-            dealers.add(str(r["dealer_name"]))
-        if r.get("branch"):
-            branches.add(str(r["branch"]))
+        if r.get("brand_name") or r.get("brand"):
+            brands.add(str(r.get("brand_name") or r.get("brand")))
+        if r.get("dealer_name") or r.get("dealer"):
+            dealers.add(str(r.get("dealer_name") or r.get("dealer")))
+        if r.get("branch") or r.get("branch_name"):
+            branches.add(str(r.get("branch") or r.get("branch_name")))
+        if r.get("brand_code"):
+            brand_codes.add(str(r.get("brand_code")))
+        if r.get("dealer_code"):
+            dealer_codes.add(str(r.get("dealer_code")))
 
     storage = get_storage()
     products_key = storage.key("product-history", date_iso, "products.jsonl.gz")
@@ -236,6 +403,7 @@ async def archive_product_history_for_date(db, archive_date: str, force: bool = 
 
     products_bytes = _gzip_jsonl(rows)
     summary_bytes = json.dumps(summaries, ensure_ascii=False, default=str).encode("utf-8")
+    source_fp = _source_fingerprint(rows)
 
     # Build analytics snapshot payload in-memory first. Upload/verify the
     # authoritative products archive BEFORE writing snapshots back to Mongo so
@@ -265,13 +433,26 @@ async def archive_product_history_for_date(db, archive_date: str, force: bool = 
         dealers=dealers,
         branches=branches,
         existing=None if force else failed_or_partial,
+        extra_fields={
+            "scope_brand_codes": sorted(brand_codes)[:200],
+            "scope_dealer_codes": sorted(dealer_codes)[:200],
+            "source_fingerprint": source_fp,
+            "source_fingerprint_algo": "part|brand|dealer|branch|qty_v1",
+        },
     )
 
-    # Best-effort Mongo snapshot upsert (may fail when cluster is over quota)
+    # Do NOT block the HTTP response on per-row analytics Mongo upserts.
+    # Integrity of the S3 archive is already verified above.
+    async def _bg_analytics():
+        try:
+            await write_analytics_snapshots_for_date(db, date_iso, rows)
+        except Exception as exc:
+            logger.warning("Analytics snapshot Mongo write skipped for %s: %s", date_iso, exc)
+
     try:
-        await write_analytics_snapshots_for_date(db, date_iso, rows)
+        asyncio.create_task(_bg_analytics())
     except Exception as exc:
-        logger.warning("Analytics snapshot Mongo write skipped for %s: %s", date_iso, exc)
+        logger.warning("Could not schedule analytics snapshot task for %s: %s", date_iso, exc)
 
     try:
         import storage_usage as su
