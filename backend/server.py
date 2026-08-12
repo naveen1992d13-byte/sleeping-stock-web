@@ -6953,15 +6953,15 @@ async def storage_status(current_user: UserResponse = Depends(get_current_user))
 
 @api_router.get("/storage/monitor")
 async def storage_cost_monitor(month: str = None, brand: str = None, dealer: str = None, current_user: UserResponse = Depends(get_current_user)):
-    """Master-only Storage & Cost Monitor dashboard payload."""
+    """Master-only Storage & Data Cleanup dashboard payload.
+
+    Brand/Dealer filters are intentionally ignored — this page always shows overall health.
+    """
     await _ensure_master(current_user)
     import storage_monitor as sm
-    import storage_usage as su
 
-    payload = await sm.monitor_dashboard(db, month=month)
-    if brand or dealer:
-        payload["dealer_ranking"] = await su.dealer_usage_ranking(db, month=month, brand=brand, dealer=dealer)
-    return payload
+    _ = (brand, dealer)  # do not filter Storage page
+    return await sm.monitor_dashboard(db, month=month)
 
 
 @api_router.get("/storage/monitor/dealers")
@@ -7004,12 +7004,19 @@ async def cleanup_published_upload_items_api(dry_run: bool = True, current_user:
     return await history_archive.cleanup_published_upload_items(db, dry_run=dry_run)
 
 
+@api_router.post("/storage/archives/daily/run")
+async def run_daily_coordinated_archive(archive_date: str = None, current_user: UserResponse = Depends(get_current_user)):
+    """Master-only: run the coordinated daily archive batch (uploads/PH/orders/requests)."""
+    await _ensure_master(current_user)
+    return await archive_scheduler.run_daily_coordinated_archive(db, archive_date)
+
+
 @api_router.post("/storage/archives/product-history/run")
 async def run_product_history_archive(archive_date: str = None, force: bool = False, current_user: UserResponse = Depends(get_current_user)):
     await _ensure_master(current_user)
     if archive_date:
         return await history_archive.archive_product_history_for_date(db, archive_date, force=force)
-    return await archive_scheduler.run_daily_product_archive(db, archive_date)
+    return await archive_scheduler.run_daily_coordinated_archive(db, archive_date)
 
 
 @api_router.post("/storage/archives/product-history/prune")
@@ -7045,23 +7052,150 @@ async def list_archives(module: str = None, current_user: UserResponse = Depends
 
 @api_router.post("/storage/archives/{archive_id}/retry")
 async def retry_failed_archive(archive_id: str, current_user: UserResponse = Depends(get_current_user)):
-    """Idempotent retry for FAILED archive jobs (Master only)."""
+    """Retry Archive for a failed/unverified dataset only (Master only).
+
+    Before re-uploading: reconcile existing REAL S3 object when valid.
+    """
     await _ensure_master(current_user)
+    import archive_verify as av
+
     row = await db.archive_manifests.find_one({"archive_id": archive_id}, {"_id": 0})
     if not row:
         raise HTTPException(status_code=404, detail="Archive job not found")
-    if row.get("status") not in {archive_manifest.STATUS_FAILED, archive_manifest.STATUS_CREATING, archive_manifest.STATUS_UPLOADED}:
-        return {"status": "skipped", "reason": f"status={row.get('status')} is not retryable", "manifest": row}
+
+    # Always attempt live reconcile first when a key exists
+    live = await av.live_verify_manifest(row)
+    if live.get("ok") and live.get("real_s3"):
+        updated = await archive_manifest.mark_status(
+            db,
+            archive_id,
+            archive_manifest.STATUS_VERIFIED,
+            eligible_for_prune=True,
+            storage_backend="s3",
+            error=None,
+            reconciled=True,
+        )
+        return {
+            "status": "reconciled",
+            "action": "Retry Archive",
+            "display_status": av.DISPLAY_VERIFIED,
+            "live_verification": live,
+            "manifest": updated,
+        }
+
     module = row.get("module")
-    if module == history_archive.MODULE_PRODUCT_HISTORY:
-        return await history_archive.archive_product_history_for_date(db, row.get("archive_date"), force=True)
-    if module == history_archive.MODULE_ORDERS:
-        return await history_archive.archive_completed_orders_month(db, row.get("archive_month"), force=True)
-    if module == history_archive.MODULE_REQUESTS:
-        return await history_archive.archive_completed_requests_month(db, row.get("archive_month"), force=True)
-    if module == history_archive.MODULE_VERIFICATIONS:
-        return await history_archive.archive_verifications_for_date(db, row.get("archive_date"), force=True)
-    raise HTTPException(status_code=400, detail=f"Unsupported module for retry: {module}")
+    try:
+        if module == history_archive.MODULE_PRODUCT_HISTORY:
+            result = await history_archive.archive_product_history_for_date(
+                db, row.get("archive_date"), force=True
+            )
+        elif module == history_archive.MODULE_UPLOADS:
+            result = await history_archive.archive_uploads_for_date(
+                db, row.get("archive_date"), force=True
+            )
+        elif module == history_archive.MODULE_ORDERS:
+            if row.get("archive_date"):
+                result = await history_archive.archive_orders_for_date(
+                    db, row.get("archive_date"), force=True
+                )
+            else:
+                result = await history_archive.archive_completed_orders_month(
+                    db, row.get("archive_month"), force=True
+                )
+        elif module == history_archive.MODULE_REQUESTS:
+            if row.get("archive_date"):
+                result = await history_archive.archive_requests_for_date(
+                    db, row.get("archive_date"), force=True
+                )
+            else:
+                result = await history_archive.archive_completed_requests_month(
+                    db, row.get("archive_month"), force=True
+                )
+        elif module == history_archive.MODULE_VERIFICATIONS:
+            result = await history_archive.archive_verifications_for_date(
+                db, row.get("archive_date"), force=True
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported module for retry: {module}")
+    except Exception as exc:
+        refreshed = await db.archive_manifests.find_one({"archive_id": archive_id}, {"_id": 0})
+        return {
+            "status": "failed",
+            "action": "Retry Archive",
+            "display_status": av.DISPLAY_VERIFICATION_FAILED,
+            "reason": str(exc)[:1000],
+            "prior_live_verification": live,
+            "manifest": refreshed or row,
+        }
+
+    manifest = (result or {}).get("manifest") or await db.archive_manifests.find_one(
+        {"archive_id": archive_id}, {"_id": 0}
+    )
+    post = await av.live_verify_manifest(manifest) if manifest else live
+    return {
+        "status": "ok" if post.get("ok") else "failed",
+        "action": "Retry Archive",
+        "display_status": post.get("display_status"),
+        "reason": None if post.get("ok") else (post.get("reason") or (result or {}).get("error")),
+        "result": result,
+        "live_verification": post,
+        "manifest": manifest,
+    }
+
+
+@api_router.get("/storage/archives/{archive_id}/download")
+async def download_archive(archive_id: str, current_user: UserResponse = Depends(get_current_user)):
+    """Download archived dataset from REAL S3 (Master only). Local fallback is not offered as S3."""
+    await _ensure_master(current_user)
+    from fastapi.responses import Response, RedirectResponse
+    import archive_verify as av
+
+    row = await db.archive_manifests.find_one({"archive_id": archive_id}, {"_id": 0})
+    if not row:
+        raise HTTPException(status_code=404, detail="Archive job not found")
+    key = row.get("storage_key")
+    if not key:
+        raise HTTPException(status_code=404, detail="Archive has no storage key")
+    storage = s3_storage.get_storage()
+    if not storage.is_s3():
+        raise HTTPException(
+            status_code=503,
+            detail="S3 credentials/config unavailable — cannot download REAL S3 archive",
+        )
+    live = av.physical_s3_verify(
+        storage_key=key,
+        expected_sha256=str(row.get("sha256") or ""),
+        expected_size=int(row.get("file_size") or 0),
+        expected_record_count=int(row.get("record_count") or 0) if str(key).endswith(".jsonl.gz") else None,
+        require_jsonl_count=str(key).endswith(".jsonl.gz"),
+    )
+    if not live.get("object_exists"):
+        raise HTTPException(status_code=404, detail=live.get("reason") or "S3 object missing")
+    url = storage.presigned_url(key, expires_seconds=900)
+    if url:
+        try:
+            import storage_usage as su
+
+            await su.record_storage_usage(
+                db,
+                operation=su.OP_DOWNLOAD,
+                bytes_count=int(row.get("file_size") or 0),
+                module=str(row.get("module") or "archive"),
+                user_id=getattr(current_user, "id", "") or "",
+            )
+        except Exception:
+            pass
+        return RedirectResponse(url=url, status_code=302)
+    try:
+        data, ctype = storage.download_bytes(key)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"file unreadable: {type(exc).__name__}") from exc
+    filename = key.split("/")[-1] or f"{archive_id}.jsonl.gz"
+    return Response(
+        content=data,
+        media_type=ctype or "application/gzip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---- Additive Storage Cleanup / Verify / Dry-Run / Manual Mongo Delete (Master only) ----

@@ -11,6 +11,7 @@ STATUS_UPLOADED = "UPLOADED"
 STATUS_VERIFIED = "VERIFIED"
 STATUS_FAILED = "FAILED"
 STATUS_PRUNED = "PRUNED"
+STATUS_NO_ELIGIBLE = "NO_ELIGIBLE"
 
 VALID_STATUSES = {
     STATUS_CREATING,
@@ -18,7 +19,14 @@ VALID_STATUSES = {
     STATUS_VERIFIED,
     STATUS_FAILED,
     STATUS_PRUNED,
+    STATUS_NO_ELIGIBLE,
 }
+
+
+def is_acceptable_daily_result(status: Optional[str]) -> bool:
+    """Daily cycle may complete only on VERIFIED / PRUNED / genuine NO_ELIGIBLE."""
+    s = (status or "").upper()
+    return s in (STATUS_VERIFIED, STATUS_PRUNED, STATUS_NO_ELIGIBLE)
 
 
 def _utcnow() -> datetime:
@@ -79,12 +87,58 @@ async def ensure_archive_indexes(db) -> None:
 
 
 async def find_verified(db, module: str, archive_date: Optional[str] = None, archive_month: Optional[str] = None):
-    q: Dict[str, Any] = {"module": module, "status": STATUS_VERIFIED}
+    """Return a REAL-S3 verified (not yet pruned) archive only.
+
+    Used to short-circuit re-archive. Local-fallback VERIFIED rows must never match.
+    """
+    q: Dict[str, Any] = {
+        "module": module,
+        "status": STATUS_VERIFIED,
+        "eligible_for_prune": True,
+        "storage_backend": {"$in": ["s3", "REAL S3"]},
+    }
     if archive_date:
         q["archive_date"] = archive_date
     if archive_month:
         q["archive_month"] = archive_month
     return await db.archive_manifests.find_one(q, {"_id": 0})
+
+
+async def find_s3_readable(db, module: str, archive_date: Optional[str] = None, archive_month: Optional[str] = None):
+    """Return a REAL-S3 archive trusted for historical reads (VERIFIED or PRUNED).
+
+    PRUNED remains a trusted historical source when the object is on REAL S3.
+    Local fallback / failed rows never qualify.
+    """
+    q: Dict[str, Any] = {
+        "module": module,
+        "status": {"$in": [STATUS_VERIFIED, STATUS_PRUNED]},
+        "storage_backend": {"$in": ["s3", "REAL S3"]},
+    }
+    if archive_date:
+        q["archive_date"] = archive_date
+    if archive_month:
+        q["archive_month"] = archive_month
+    # Prefer VERIFIED then PRUNED (newest first within status preference via sort)
+    rows = await db.archive_manifests.find(q, {"_id": 0}).sort("created_at", -1).to_list(20)
+    if not rows:
+        return None
+    verified = [r for r in rows if r.get("status") == STATUS_VERIFIED and r.get("eligible_for_prune")]
+    if verified:
+        return verified[0]
+    pruned = [r for r in rows if r.get("status") == STATUS_PRUNED]
+    return pruned[0] if pruned else None
+
+
+async def find_acceptable_daily(db, module: str, archive_date: str):
+    """Return VERIFIED (REAL S3) or genuine NO_ELIGIBLE for a daily dataset stamp."""
+    verified = await find_verified(db, module, archive_date=archive_date)
+    if verified:
+        return verified
+    row = await find_any(db, module, archive_date=archive_date)
+    if row and row.get("status") == STATUS_NO_ELIGIBLE:
+        return row
+    return None
 
 
 async def find_any(db, module: str, archive_date: Optional[str] = None, archive_month: Optional[str] = None):
