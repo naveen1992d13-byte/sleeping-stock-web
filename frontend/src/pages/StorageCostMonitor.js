@@ -413,8 +413,14 @@ export function StorageCostMonitor() {
                       <Button
                         size="sm"
                         className="gap-1"
-                        style={{ backgroundColor: COLORS.danger, color: '#fff' }}
-                        disabled={!(verifyReport?.archive_id === r.archive_id && verifyReport?.safe_to_delete)}
+                        style={{
+                          backgroundColor: COLORS.danger,
+                          color: '#fff',
+                          opacity: (verifyReport?.archive_id === r.archive_id && verifyReport?.safe_to_delete && dryRunReport?.archive_id === r.archive_id && dryRunReport?.safe_to_delete) ? 1 : 0.4,
+                          cursor: (verifyReport?.archive_id === r.archive_id && verifyReport?.safe_to_delete && dryRunReport?.archive_id === r.archive_id && dryRunReport?.safe_to_delete) ? 'pointer' : 'not-allowed',
+                        }}
+                        title="Requires View/Verify SAFE and Dry Run for this archive"
+                        disabled={!(verifyReport?.archive_id === r.archive_id && verifyReport?.safe_to_delete && dryRunReport?.archive_id === r.archive_id && dryRunReport?.safe_to_delete)}
                         onClick={() => { setDeleteTarget(r); setConfirmText(''); }}
                       >
                         <Trash2 className="h-3 w-3" />Delete from MongoDB
