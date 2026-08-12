@@ -49,15 +49,23 @@ def _text(value: Any) -> str:
 async def ensure_indexes() -> None:
     if db is None:
         return
-    await db.user_alerts.create_index(
-        [("recipient_id", 1), ("is_read", 1), ("created_at", -1)],
-        name="user_alerts_recipient_unread_created",
-    )
-    await db.user_alerts.create_index(
-        [("recipient_id", 1), ("source_type", 1), ("source_id", 1), ("event", 1)],
-        unique=True,
-        name="user_alerts_dedupe",
-    )
+    # Prefer idempotent create; tolerate an existing equivalent index under another name.
+    try:
+        await db.user_alerts.create_index([("recipient_id", 1), ("is_read", 1), ("created_at", -1)])
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already exists" not in msg and "indexoption" not in msg.replace(" ", ""):
+            raise
+    try:
+        await db.user_alerts.create_index(
+            [("recipient_id", 1), ("source_type", 1), ("source_id", 1), ("event", 1)],
+            unique=True,
+            name="user_alerts_dedupe",
+        )
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already exists" not in msg and "indexoption" not in msg.replace(" ", ""):
+            raise
 
 
 def _default_link(source_type: str) -> str:
