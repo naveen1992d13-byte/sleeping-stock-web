@@ -79,7 +79,17 @@ async def ensure_archive_indexes(db) -> None:
 
 
 async def find_verified(db, module: str, archive_date: Optional[str] = None, archive_month: Optional[str] = None):
-    q: Dict[str, Any] = {"module": module, "status": STATUS_VERIFIED}
+    """Return a REAL-S3 verified archive only.
+
+    Manifest status alone is never enough. Local-fallback VERIFIED rows must not
+    short-circuit re-archive or unlock Mongo prune/delete.
+    """
+    q: Dict[str, Any] = {
+        "module": module,
+        "status": STATUS_VERIFIED,
+        "eligible_for_prune": True,
+        "storage_backend": {"$in": ["s3", "REAL S3"]},
+    }
     if archive_date:
         q["archive_date"] = archive_date
     if archive_month:

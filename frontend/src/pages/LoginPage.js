@@ -11,7 +11,7 @@ function seedHomeTab(user) {
   try {
     let tab = null;
     if (canAccessPermission(user, 'Analytics')) {
-      tab = { id: 'analytics', label: 'Dashboard', path: '/analytics', permission: 'Analytics' };
+      tab = { id: 'analytics', label: 'Analytics', path: '/analytics', permission: 'Analytics' };
     } else {
       const first = getFirstAllowedMenuItem(user, canAccessMenuItem);
       if (first) {

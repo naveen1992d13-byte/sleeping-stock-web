@@ -9,8 +9,8 @@ export const APPLICATION_MENU_ITEMS = [
   { path: '/order-history', label: 'Order History', icon: History, id: 'order-history', permissionLabel: 'Order Desk' },
   { path: '/requests', label: 'Request Center', icon: ClipboardList, id: 'requests' },
   { path: '/reports', label: 'Reports', icon: BarChart3, id: 'reports', adminOnly: true },
-  // User-facing name "Dashboard"; permission key remains "Analytics"
-  { path: '/analytics', label: 'Dashboard', icon: Globe, id: 'analytics', adminOnly: true, permissionLabel: 'Analytics' },
+  // User-facing name "Analytics"; permission key remains "Analytics"
+  { path: '/analytics', label: 'Analytics', icon: Globe, id: 'analytics', adminOnly: true, permissionLabel: 'Analytics' },
   { path: '/storage-cost-monitor', label: 'Storage & Data Cleanup', icon: HardDrive, id: 'storage-cost-monitor', masterOnly: true, permissionLabel: 'Storage & Cost Monitor' },
   { path: '/notice-board', label: 'Notice Board', icon: Megaphone, id: 'dashboard' },
   { path: '/query', label: 'Query Desk', icon: HelpCircle, id: 'query', allRoles: true },

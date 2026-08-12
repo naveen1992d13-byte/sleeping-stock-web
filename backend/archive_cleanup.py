@@ -118,24 +118,37 @@ async def list_cleanup_archives(
     dealer: Optional[str] = None,
     branch: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Archive/history rows for cleanup UI (up to N years)."""
+    """Archive transfer/cleanup rows (all datasets, up to N years).
+
+    Brand/dealer/branch filters are ignored for Storage page global health —
+    retained as no-ops so callers stay compatible. Always returns overall rows.
+    """
+    import archive_verify as av
+
+    _ = (brand, dealer, branch)  # intentionally unused — Storage page is global
     cutoff = (datetime.now(IST).date() - timedelta(days=max(1, int(years)) * 366)).isoformat()
     q: Dict[str, Any] = {
-        "module": ha.MODULE_PRODUCT_HISTORY,
-        "archive_date": {"$gte": cutoff},
+        "$or": [
+            {"archive_date": {"$gte": cutoff}},
+            {"archive_month": {"$gte": cutoff[:7]}},
+        ],
     }
-    rows = await db.archive_manifests.find(q, {"_id": 0}).sort("archive_date", -1).to_list(5000)
+    rows = await db.archive_manifests.find(q, {"_id": 0}).sort("created_at", -1).to_list(5000)
     out = []
     for m in rows:
-        date_iso = m.get("archive_date")
-        date_key = ha.iso_to_date_key(date_iso or "")
+        date_iso = m.get("archive_date") or m.get("archive_month")
+        date_key = ha.iso_to_date_key(date_iso or "") if m.get("archive_date") else ""
         scope_brands = _clean_names(m.get("scope_brands") or [])
         scope_dealers = _clean_names(m.get("scope_dealers") or [])
         scope_branches = _clean_names(m.get("scope_branches") or [])
         brand_codes = _clean_names(m.get("scope_brand_codes") or [])
         dealer_codes = _clean_names(m.get("scope_dealer_codes") or [])
-        # Legacy manifests (archived before scope_* fields): derive display scope from Mongo only.
-        if not scope_brands and not scope_dealers and not scope_branches:
+        if (
+            m.get("module") == ha.MODULE_PRODUCT_HISTORY
+            and not scope_brands
+            and not scope_dealers
+            and not scope_branches
+        ):
             derived = await _scope_from_mongo(db, date_iso or "")
             scope_brands = derived["brands"] or scope_brands
             scope_dealers = derived["dealers"] or scope_dealers
@@ -143,23 +156,52 @@ async def list_cleanup_archives(
             brand_codes = brand_codes or derived["brand_codes"]
             dealer_codes = dealer_codes or derived["dealer_codes"]
 
-        if brand and scope_brands and brand not in scope_brands:
-            continue
-        if dealer and scope_dealers and dealer not in scope_dealers:
-            continue
-        if branch and scope_branches and branch not in scope_branches:
-            continue
-
-        mongo_count = await db.products.count_documents(
-            {
-                "publish_status": "Published",
-                "active_date_key": {"$in": [date_key, date_iso]},
-            }
-        )
+        mongo_count = 0
+        if m.get("module") == ha.MODULE_PRODUCT_HISTORY and date_key:
+            mongo_count = await db.products.count_documents(
+                {
+                    "publish_status": "Published",
+                    "active_date_key": {"$in": [date_key, date_iso]},
+                }
+            )
         s3_count = int(m.get("record_count") or 0)
+        live = av.head_s3_status(m)
+        display = live.get("display_status") or av.classify_display_status(
+            manifest_status=str(m.get("status") or ""),
+            live=live,
+        )
+        physically_ok = bool(live.get("ok") and live.get("real_s3"))
+        delete_locked = not (
+            physically_ok
+            and m.get("module") == ha.MODULE_PRODUCT_HISTORY
+            and m.get("status") == am.STATUS_VERIFIED
+            and m.get("eligible_for_prune")
+            and mongo_count > 0
+        )
+        if physically_ok and m.get("status") == am.STATUS_VERIFIED and m.get("eligible_for_prune"):
+            lock_reason = None if m.get("module") == ha.MODULE_PRODUCT_HISTORY and mongo_count > 0 else (
+                "Locked — only Product History archives support Mongo delete"
+                if m.get("module") != ha.MODULE_PRODUCT_HISTORY
+                else "Locked — no Mongo rows to delete"
+            )
+        else:
+            code = live.get("failure_code") or ""
+            if code == "object_missing":
+                lock_reason = "Locked — S3 object missing"
+            elif code == "checksum_mismatch":
+                lock_reason = "Locked — checksum mismatch"
+            elif code == "count_mismatch":
+                lock_reason = "Locked — row count mismatch"
+            elif not live.get("real_s3"):
+                lock_reason = "Locked — S3 credentials/config unavailable"
+            else:
+                lock_reason = f"Locked — {live.get('reason') or m.get('error') or 'not verified'}"
+
         has_fp = bool(m.get("source_fingerprint"))
         if m.get("status") == am.STATUS_PRUNED:
             data_changed = "ARCHIVED / PRUNED"
+        elif m.get("module") != ha.MODULE_PRODUCT_HISTORY:
+            data_changed = "N/A"
         elif mongo_count == 0:
             data_changed = "MONGO ABSENT"
         elif not has_fp and mongo_count != s3_count:
@@ -178,6 +220,8 @@ async def list_cleanup_archives(
         out.append(
             {
                 "archive_id": m.get("archive_id"),
+                "dataset": m.get("module"),
+                "module": m.get("module"),
                 "archive_date": date_iso,
                 "brand": brand_label or None,
                 "dealer": dealer_label or None,
@@ -188,23 +232,41 @@ async def list_cleanup_archives(
                 "brand_codes": brand_codes,
                 "dealer_codes": dealer_codes,
                 "mongo_source_count": mongo_count,
+                "source_record_count": mongo_count if m.get("module") == ha.MODULE_PRODUCT_HISTORY else s3_count,
                 "s3_record_count": s3_count,
+                "archived_record_count": s3_count,
                 "file_size": m.get("file_size"),
                 "archive_status": m.get("status"),
+                "display_status": display,
+                "failure_reason": None if physically_ok else (live.get("reason") or m.get("error")),
+                "s3_object_status": "EXISTS" if live.get("object_exists") else "MISSING",
+                "s3_readable": bool(live.get("object_readable")),
+                "sha256_match": "MATCH" if live.get("sha256_match") else "MISMATCH",
                 "data_changed_status": data_changed,
                 "sha256_status": "PRESENT" if m.get("sha256") else "MISSING",
                 "storage_backend": m.get("storage_backend"),
                 "sha256": m.get("sha256"),
                 "storage_key": m.get("storage_key"),
                 "eligible_for_prune": m.get("eligible_for_prune"),
+                "delete_locked": delete_locked,
+                "lock_reason": lock_reason if delete_locked else None,
                 "mongo_data_status": (
                     "PRUNED"
                     if m.get("status") == am.STATUS_PRUNED
                     else ("PRESENT" if mongo_count > 0 else "ABSENT")
                 ),
+                "transferred_at": m.get("verified_at") or m.get("created_at"),
                 "verified_at": m.get("verified_at"),
                 "created_at": m.get("created_at"),
                 "source_fingerprint_present": has_fp,
+                "retryable": display
+                in {
+                    av.DISPLAY_NOT_TRANSFERRED,
+                    av.DISPLAY_VERIFICATION_FAILED,
+                    av.DISPLAY_PENDING,
+                    av.DISPLAY_RUNNING,
+                }
+                or m.get("status") in {am.STATUS_FAILED, am.STATUS_CREATING, am.STATUS_UPLOADED},
             }
         )
     return out
@@ -253,79 +315,96 @@ async def verify_archive(
     dealer: Optional[str] = None,
     branch: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Fresh verification of a product-history archive for safe-delete eligibility."""
+    """Fresh verification of a product-history archive for safe-delete eligibility.
+
+    Manifest VERIFIED alone is never sufficient — requires live physical S3 checks.
+    """
+    import archive_verify as av
+
     manifest = await db.archive_manifests.find_one({"archive_id": archive_id}, {"_id": 0})
     if not manifest:
-        return {"ok": False, "safe_to_delete": False, "reason": "Archive not found", "archive_id": archive_id}
+        return {
+            "ok": False,
+            "safe_to_delete": False,
+            "delete_locked": True,
+            "lock_reason": "Locked — archive not found",
+            "reason": "Archive not found",
+            "archive_id": archive_id,
+            "display_status": av.DISPLAY_NOT_TRANSFERRED,
+        }
 
     storage = get_storage()
     status = storage.status()
     date_iso = manifest.get("archive_date")
     key = manifest.get("storage_key")
+    live = await av.live_verify_manifest(manifest)
+
     checks: Dict[str, Any] = {
-        "real_s3": bool(storage.is_s3()),
+        "real_s3": bool(live.get("real_s3")),
         "archive_exists": True,
         "verified_manifest": manifest.get("status") in {am.STATUS_VERIFIED, am.STATUS_PRUNED},
-        "object_exists": False,
-        "object_readable": False,
-        "sha256_match": False,
-        "record_count_match": False,
+        "object_exists": bool(live.get("object_exists")),
+        "object_readable": bool(live.get("object_readable")),
+        "sha256_match": bool(live.get("sha256_match")),
+        "record_count_match": live.get("record_count_match") is not False,
         "date_scope_match": bool(date_iso),
         "source_unchanged": False,
         "archive_prune_enabled": bool(status.get("archive_prune_enabled")),
+        "physical_ok": bool(live.get("ok")),
+        "storage_backend_real": str(manifest.get("storage_backend") or "").lower() in {"s3", "real s3"},
     }
     reasons = []
+    lock_reason = None
 
-    if not storage.is_s3():
+    if not live.get("real_s3"):
         reasons.append("REAL S3 is not active")
+        lock_reason = lock_reason or "Locked — S3 credentials/config unavailable"
     if manifest.get("module") != ha.MODULE_PRODUCT_HISTORY:
         reasons.append("Only product-history archives are supported for Mongo delete")
         checks["verified_manifest"] = False
+        lock_reason = lock_reason or "Locked — only Product History archives support Mongo delete"
     if manifest.get("status") == am.STATUS_PRUNED:
         reasons.append("Archive already marked PRUNED")
-    if not checks["verified_manifest"]:
-        reasons.append(f"Manifest status is {manifest.get('status')}, need VERIFIED")
+        lock_reason = lock_reason or "Locked — already pruned"
+    if not checks["verified_manifest"] or not live.get("ok"):
+        if not live.get("ok"):
+            reasons.append(str(live.get("reason") or "Physical S3 verification failed"))
+            code = live.get("failure_code") or ""
+            if code == "object_missing":
+                lock_reason = lock_reason or "Locked — S3 object missing"
+            elif code == "checksum_mismatch":
+                lock_reason = lock_reason or "Locked — checksum mismatch"
+            elif code == "count_mismatch":
+                lock_reason = lock_reason or "Locked — row count mismatch"
+            elif code == "unreadable":
+                lock_reason = lock_reason or "Locked — file unreadable"
+            elif code in {"s3_unavailable", "local_masquerade"}:
+                lock_reason = lock_reason or "Locked — S3 credentials/config unavailable"
+            else:
+                lock_reason = lock_reason or f"Locked — {live.get('reason') or 'verification failed'}"
+        else:
+            reasons.append(f"Manifest status is {manifest.get('status')}, need VERIFIED")
+            lock_reason = lock_reason or "Locked — archive not TRANSFERRED & VERIFIED"
 
     today = datetime.now(IST).date().isoformat()
     if date_iso == today:
         reasons.append("Cannot delete today's live Product dataset")
         checks["date_scope_match"] = False
-
-    head = storage.head(key) if key else None
-    checks["object_exists"] = bool(head)
-    if not head:
-        reasons.append("S3 object missing")
+        lock_reason = lock_reason or "Locked — cannot delete today's live Product data"
 
     expected_sha = manifest.get("sha256") or ""
-    expected_size = int(manifest.get("file_size") or 0)
     expected_count = int(manifest.get("record_count") or 0)
     archive_rows: List[Dict[str, Any]] = []
     try:
-        if key:
-            ok = storage.verify_object(key, expected_sha, expected_size)
-            checks["sha256_match"] = bool(ok)
-            data, _ = storage.download_bytes(key)
-            got_sha = sha256_bytes(data)
-            checks["object_readable"] = True
-            checks["sha256_match"] = checks["sha256_match"] and got_sha == expected_sha
-            with gzip.GzipFile(fileobj=BytesIO(data), mode="rb") as gz:
-                for line in gz:
-                    if line.strip():
-                        archive_rows.append(json.loads(line.decode("utf-8")))
-            checks["record_count_match"] = len(archive_rows) == expected_count
-            if not checks["sha256_match"]:
-                reasons.append("SHA256 mismatch")
-            if not checks["record_count_match"]:
-                reasons.append(
-                    f"Record count mismatch archive_lines={len(archive_rows)} manifest={expected_count}"
-                )
+        if key and live.get("object_readable") and live.get("real_s3"):
+            archive_rows = await _load_archive_rows(key)
     except Exception as exc:
         checks["object_readable"] = False
         reasons.append(f"S3 read failed: {type(exc).__name__}")
+        lock_reason = lock_reason or "Locked — file unreadable"
 
     q = _product_query(date_iso, brand, dealer, branch)
     mongo_rows = await db.products.find(q, {"_id": 0}).to_list(500000)
-    # Enrich both sides the same way archive does, for fair fingerprint compare
     mongo_rows = await ha._enrich_product_scope_rows(db, mongo_rows)
     if archive_rows:
         archive_rows = await ha._enrich_product_scope_rows(db, archive_rows)
@@ -335,18 +414,22 @@ async def verify_archive(
         ha._source_fingerprint(archive_rows) if archive_rows else ""
     )
     source_changed = bool(archived_fp and mongo_fp and archived_fp != mongo_fp)
-    # Also treat count drift as change when fingerprint missing on legacy manifests
     if not archived_fp and mongo_count != expected_count:
         source_changed = True
     checks["source_unchanged"] = (mongo_count == 0) or (not source_changed and mongo_count == expected_count)
 
-    source_status = "NO_MONGO_ROWS" if mongo_count == 0 else ("SOURCE CHANGED AFTER ARCHIVE" if source_changed else "MATCHES ARCHIVE")
+    source_status = (
+        "NO_MONGO_ROWS"
+        if mongo_count == 0
+        else ("SOURCE CHANGED AFTER ARCHIVE" if source_changed else "MATCHES ARCHIVE")
+    )
     if source_changed and mongo_count > 0:
         reasons.append("SOURCE CHANGED AFTER ARCHIVE")
+        lock_reason = lock_reason or "Locked — source changed after archive"
 
-    # Manual delete is allowed even when ARCHIVE_PRUNE_ENABLED=false — that flag only blocks auto prune.
     safe = (
         checks["real_s3"]
+        and checks["physical_ok"]
         and checks["verified_manifest"]
         and checks["object_exists"]
         and checks["object_readable"]
@@ -354,12 +437,18 @@ async def verify_archive(
         and checks["record_count_match"]
         and checks["date_scope_match"]
         and checks["source_unchanged"]
+        and checks["storage_backend_real"]
         and mongo_count > 0
         and manifest.get("status") == am.STATUS_VERIFIED
+        and bool(manifest.get("eligible_for_prune"))
     )
     if mongo_count <= 0:
         reasons.append("No matching Mongo source rows to delete")
         safe = False
+        lock_reason = lock_reason or "Locked — no Mongo rows to delete"
+
+    if not safe and not lock_reason:
+        lock_reason = "Locked — archive not fully verified"
 
     scope_brands = _clean_names(manifest.get("scope_brands") or [])
     scope_dealers = _clean_names(manifest.get("scope_dealers") or [])
@@ -384,17 +473,26 @@ async def verify_archive(
         "collection": COLLECTION,
         "storage_key": key,
         "manifest_status": manifest.get("status"),
+        "display_status": live.get("display_status"),
         "storage_backend": manifest.get("storage_backend") or status.get("storage_backend"),
         "sha256": expected_sha,
         "sha256_status": "MATCH" if checks["sha256_match"] else "MISMATCH",
         "s3_readable": checks["object_readable"],
+        "s3_object_status": "EXISTS" if checks["object_exists"] else "MISSING",
         "archive_timestamp": manifest.get("verified_at") or manifest.get("created_at"),
+        "verified_at": manifest.get("verified_at"),
         "mongo_count": mongo_count,
         "s3_count": expected_count,
+        "source_record_count": mongo_count,
+        "archived_record_count": expected_count,
+        "file_size": manifest.get("file_size"),
         "source_change_status": source_status,
         "safe_to_delete": bool(safe),
+        "delete_locked": not bool(safe),
+        "lock_reason": None if safe else lock_reason,
         "reason": "SAFE TO DELETE" if safe else ("; ".join(reasons) or "NOT SAFE"),
         "checks": checks,
+        "live_verification": live,
         "brands": scope_brands,
         "dealers": scope_dealers,
         "branches": scope_branches,

@@ -242,6 +242,31 @@ export function DashboardLayout() {
     }
   }, [location.pathname, tabs, activeTabId]);
 
+  // Ensure deep links / first menu click always open the matching module tab.
+  // Fixes Storage & Data Cleanup requiring a second click when tabs were empty.
+  useEffect(() => {
+    const path = location.pathname;
+    if (!path || path === '/' || path === '/login') return;
+    const menuItem = navItems.find((item) => item.path === path);
+    if (!menuItem) return;
+    if (!canAccessMenuItem(user, menuItem) && menuItem.id !== 'profile') return;
+    setTabs((prev) => {
+      if (prev.some((t) => t.id === menuItem.id)) return prev;
+      return [
+        ...prev,
+        {
+          id: menuItem.id,
+          label: menuItem.label,
+          path: menuItem.path,
+          permission: menuItem.permissionLabel || menuItem.label,
+        },
+      ];
+    });
+    setActiveTabId(menuItem.id);
+    // navItems is a stable module constant (APPLICATION_MENU_ITEMS)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.pathname, user]);
+
   const fetchUnreadCount = async () => {
     try {
       const res = await axios.get(`${API}/user-alerts/unread-count`);
@@ -313,7 +338,7 @@ export function DashboardLayout() {
 
   const goHome = () => {
     if (canAccessPermission(user, 'Analytics')) {
-      openTab('analytics', 'Dashboard', '/analytics', 'Analytics');
+      openTab('analytics', 'Analytics', '/analytics', 'Analytics');
     } else {
       const first = filteredNavItems[0];
       if (first) {
@@ -623,7 +648,7 @@ export function DashboardLayout() {
 
         <main className="nmts-main-content">
           <NoticeLoginPopup />
-          {tabs.length === 0 ? (
+          {tabs.length === 0 && (location.pathname === '/' || location.pathname === '') ? (
             <div className="nmts-empty-workspace" aria-label="Empty workspace">
               <img
                 src="/sleeping-stock-logo-transparent.png"

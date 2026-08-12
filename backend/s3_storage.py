@@ -18,7 +18,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +394,64 @@ class S3StorageService:
         except Exception as exc:
             logger.warning("presign failed: %s", exc)
             return None
+
+    def list_prefix(self, prefix: str = "", *, max_keys: int = 100000) -> List[Dict[str, Any]]:
+        """List objects under a prefix. REAL S3 only — empty when local/unavailable."""
+        out: List[Dict[str, Any]] = []
+        if not self.is_s3():
+            return out
+        try:
+            token = None
+            remaining = max(1, int(max_keys))
+            while remaining > 0:
+                kwargs: Dict[str, Any] = {
+                    "Bucket": self.bucket,
+                    "Prefix": str(prefix or ""),
+                    "MaxKeys": min(1000, remaining),
+                }
+                if token:
+                    kwargs["ContinuationToken"] = token
+                resp = self._client.list_objects_v2(**kwargs)
+                for obj in resp.get("Contents") or []:
+                    out.append(
+                        {
+                            "storage_key": obj.get("Key"),
+                            "file_size": int(obj.get("Size") or 0),
+                            "last_modified": obj.get("LastModified").isoformat()
+                            if obj.get("LastModified")
+                            else None,
+                            "storage_provider": "s3",
+                        }
+                    )
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
+                if not resp.get("IsTruncated"):
+                    break
+                token = resp.get("NextContinuationToken")
+                if not token:
+                    break
+        except Exception as exc:
+            logger.warning("S3 list_prefix failed: %s", type(exc).__name__)
+        return out
+
+    def sum_prefix_bytes(self, prefix: str = "") -> Dict[str, Any]:
+        """Sum actual object sizes under prefix from REAL S3 listing."""
+        if not self.is_s3():
+            return {
+                "ok": False,
+                "actual_s3_bytes": None,
+                "object_count": 0,
+                "reason": "S3 credentials/config unavailable — cannot measure Actual S3 Used Storage",
+            }
+        objects = self.list_prefix(prefix)
+        total = sum(int(o.get("file_size") or 0) for o in objects)
+        return {
+            "ok": True,
+            "actual_s3_bytes": total,
+            "object_count": len(objects),
+            "reason": None,
+        }
 
     def delete(self, key: str) -> bool:
         if self.is_s3():

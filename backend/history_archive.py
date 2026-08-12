@@ -24,6 +24,7 @@ MODULE_ORDERS = "orders"
 MODULE_REQUESTS = "requests"
 MODULE_VERIFICATIONS = "verifications"
 MODULE_ANALYTICS_SNAPSHOT = "analytics-snapshots"
+MODULE_UPLOADS = "uploads"
 
 
 def _ist_now() -> datetime:
@@ -275,58 +276,60 @@ async def _upload_verified(
         manifest.update(extra_fields)
     manifest = await am.upsert_manifest(db, manifest)
 
-    try:
-        storage.upload_bytes(storage_key, data, content_type="application/gzip")
-        await am.mark_status(db, manifest["archive_id"], am.STATUS_UPLOADED)
-    except Exception as exc:
-        await am.mark_status(
-            db,
-            manifest["archive_id"],
-            am.STATUS_FAILED,
-            error=str(exc)[:1000],
-            eligible_for_prune=False,
-        )
-        raise
+    import archive_verify as av
 
-    # Verify exists + size + sha256
-    ok = storage.verify_object(storage_key, digest, len(data))
-    if not ok:
-        await am.mark_status(
-            db,
-            manifest["archive_id"],
-            am.STATUS_FAILED,
-            error="S3 integrity verification failed",
-            eligible_for_prune=False,
+    # Idempotent retry: if the expected object already exists and passes physical
+    # verification, reconcile the manifest instead of blindly re-uploading.
+    if storage.is_s3() and storage.exists(storage_key):
+        pre = av.physical_s3_verify(
+            storage_key=storage_key,
+            expected_sha256=digest,
+            expected_size=len(data),
+            expected_record_count=record_count,
+            require_jsonl_count=storage_key.endswith(".jsonl.gz")
+            or (manifest.get("format") == "jsonl.gz"),
         )
-        raise RuntimeError("Archive integrity verification failed")
+        if pre.get("ok"):
+            return await am.mark_status(
+                db,
+                manifest["archive_id"],
+                am.STATUS_VERIFIED,
+                eligible_for_prune=True,
+                storage_backend="s3",
+                error=None,
+                reconciled=True,
+            )
 
-    # Verify archive can be read and record count matches (jsonl.gz only)
     try:
-        read_back, _ = storage.download_bytes(storage_key)
-        if storage_key.endswith(".jsonl.gz") or (manifest.get("format") == "jsonl.gz"):
-            read_count = 0
-            with gzip.GzipFile(fileobj=BytesIO(read_back), mode="rb") as gz:
-                for line in gz:
-                    if line.strip():
-                        read_count += 1
-            if int(read_count) != int(record_count):
-                await am.mark_status(
-                    db,
-                    manifest["archive_id"],
-                    am.STATUS_FAILED,
-                    error=f"Archive record count mismatch: expected={record_count} got={read_count}",
-                    eligible_for_prune=False,
-                )
-                raise RuntimeError("Archive record count verification failed")
-        elif sha256_bytes(read_back) != digest:
+        if not storage.is_s3():
+            # Still write local for diagnostics, but never claim REAL S3 success.
+            try:
+                storage.upload_bytes(storage_key, data, content_type="application/gzip")
+            except Exception:
+                pass
             await am.mark_status(
                 db,
                 manifest["archive_id"],
                 am.STATUS_FAILED,
-                error="Archive read-back checksum mismatch",
+                error="S3 credentials/config unavailable — local fallback is not REAL S3",
                 eligible_for_prune=False,
+                storage_backend=storage.mode,
             )
-            raise RuntimeError("Archive read-back verification failed")
+            raise RuntimeError("REAL S3 unavailable — archive not TRANSFERRED & VERIFIED")
+
+        stored = storage.upload_bytes(storage_key, data, content_type="application/gzip")
+        await am.mark_status(db, manifest["archive_id"], am.STATUS_UPLOADED)
+        provider = str(getattr(stored, "storage_provider", None) or storage.mode or "").lower()
+        if provider == "local":
+            await am.mark_status(
+                db,
+                manifest["archive_id"],
+                am.STATUS_FAILED,
+                error="Upload resolved to local fallback, not REAL S3",
+                eligible_for_prune=False,
+                storage_backend="local",
+            )
+            raise RuntimeError("Upload failed — local fallback masquerading as S3 success blocked")
     except RuntimeError:
         raise
     except Exception as exc:
@@ -334,19 +337,37 @@ async def _upload_verified(
             db,
             manifest["archive_id"],
             am.STATUS_FAILED,
-            error=f"Archive read-back failed: {exc}"[:1000],
+            error=f"upload failed: {exc}"[:1000],
             eligible_for_prune=False,
         )
         raise
 
-    # Prune eligibility requires REAL S3 — local fallback never authorizes prune.
-    eligible = bool(storage.is_s3())
+    # Physical REAL S3 verification (exists, size, sha256, readable count)
+    live = av.physical_s3_verify(
+        storage_key=storage_key,
+        expected_sha256=digest,
+        expected_size=len(data),
+        expected_record_count=record_count,
+        require_jsonl_count=storage_key.endswith(".jsonl.gz") or (manifest.get("format") == "jsonl.gz"),
+    )
+    if not live.get("ok"):
+        await am.mark_status(
+            db,
+            manifest["archive_id"],
+            am.STATUS_FAILED,
+            error=str(live.get("reason") or "S3 integrity verification failed")[:1000],
+            eligible_for_prune=False,
+            storage_backend=live.get("storage_backend") or storage.mode,
+        )
+        raise RuntimeError(live.get("reason") or "Archive integrity verification failed")
+
+    # Prune eligibility requires REAL S3 — never authorize prune without it.
     return await am.mark_status(
         db,
         manifest["archive_id"],
         am.STATUS_VERIFIED,
-        eligible_for_prune=eligible,
-        storage_backend="s3" if eligible else storage.mode,
+        eligible_for_prune=True,
+        storage_backend="s3",
     )
 
 
@@ -432,7 +453,7 @@ async def archive_product_history_for_date(db, archive_date: str, force: bool = 
         brands=brands,
         dealers=dealers,
         branches=branches,
-        existing=None if force else failed_or_partial,
+        existing=failed_or_partial,
         extra_fields={
             "scope_brand_codes": sorted(brand_codes)[:200],
             "scope_dealer_codes": sorted(dealer_codes)[:200],
@@ -770,6 +791,175 @@ async def archive_completed_requests_month(db, archive_month: Optional[str] = No
                 upsert=True,
             )
 
+    return {"status": "verified", "manifest": manifest, "record_count": len(rows)}
+
+
+def _terminal_on_date(row: dict, date_iso: str) -> bool:
+    """True when the row reached a terminal state on the given IST calendar date."""
+    completed = (
+        _parse_dt(row.get("completed_at"))
+        or _parse_dt(row.get("cancelled_at"))
+        or _parse_dt(row.get("rejected_at"))
+        or _parse_dt(row.get("updated_at"))
+        or _parse_dt(row.get("created_at"))
+    )
+    if not completed:
+        return False
+    if completed.tzinfo is None:
+        completed = completed.replace(tzinfo=timezone.utc)
+    return completed.astimezone(IST).date().isoformat() == date_iso
+
+
+async def archive_orders_for_date(db, archive_date: str, force: bool = False) -> Dict[str, Any]:
+    """Daily Orders dump — only rows that became terminal on archive_date (IST)."""
+    date_iso = date_key_to_iso(archive_date)
+    existing = await am.find_verified(db, MODULE_ORDERS, archive_date=date_iso)
+    if existing and not force:
+        return {"status": "already_verified", "manifest": existing}
+
+    brands, dealers, branches = set(), set(), set()
+    rows = []
+    try:
+        cursor = db.orders.find({"status": {"$in": list(TERMINAL_ORDER_STATUSES)}}, {"_id": 0})
+        for o in await cursor.to_list(200000):
+            if not _terminal_on_date(o, date_iso):
+                continue
+            rows.append(o)
+            if o.get("brand_name") or o.get("brand"):
+                brands.add(str(o.get("brand_name") or o.get("brand")))
+            if o.get("dealer_name") or o.get("dealer"):
+                dealers.add(str(o.get("dealer_name") or o.get("dealer")))
+            if o.get("branch") or o.get("branch_name"):
+                branches.add(str(o.get("branch") or o.get("branch_name")))
+    except Exception as exc:
+        logger.warning("orders daily archive scan failed: %s", exc)
+
+    storage = get_storage()
+    key = storage.key("orders", date_iso, "completed-orders.jsonl.gz")
+    data = _gzip_jsonl(rows)
+    existing_any = await am.find_any(db, MODULE_ORDERS, archive_date=date_iso)
+    manifest = await _upload_verified(
+        db,
+        module=MODULE_ORDERS,
+        archive_date=date_iso,
+        archive_month=None,
+        storage_key=key,
+        data=data,
+        source_collection="orders",
+        record_count=len(rows),
+        min_date=date_iso,
+        max_date=date_iso,
+        brands=brands,
+        dealers=dealers,
+        branches=branches,
+        existing=existing_any,
+    )
+    return {"status": "verified", "manifest": manifest, "record_count": len(rows)}
+
+
+async def archive_requests_for_date(db, archive_date: str, force: bool = False) -> Dict[str, Any]:
+    """Daily Requests dump — terminal on archive_date only; active requests stay in Mongo."""
+    date_iso = date_key_to_iso(archive_date)
+    existing = await am.find_verified(db, MODULE_REQUESTS, archive_date=date_iso)
+    if existing and not force:
+        return {"status": "already_verified", "manifest": existing}
+
+    brands, dealers, branches = set(), set(), set()
+    rows = []
+    cursor = db.order_requests.find({"status": {"$in": list(TERMINAL_REQUEST_STATUSES)}}, {"_id": 0})
+    for r in await cursor.to_list(200000):
+        if r.get("status") in OPEN_REQUEST_STATUSES:
+            continue
+        if not _terminal_on_date(r, date_iso):
+            continue
+        rows.append(r)
+        if r.get("requesting_brand") or r.get("supplying_brand") or r.get("brand"):
+            brands.add(str(r.get("requesting_brand") or r.get("supplying_brand") or r.get("brand")))
+        if r.get("requesting_dealer") or r.get("supplying_dealer"):
+            dealers.add(str(r.get("requesting_dealer") or r.get("supplying_dealer")))
+        if r.get("requesting_branch") or r.get("supplying_branch"):
+            branches.add(str(r.get("requesting_branch") or r.get("supplying_branch")))
+
+    storage = get_storage()
+    key = storage.key("requests", date_iso, "completed-requests.jsonl.gz")
+    data = _gzip_jsonl(rows)
+    existing_any = await am.find_any(db, MODULE_REQUESTS, archive_date=date_iso)
+    manifest = await _upload_verified(
+        db,
+        module=MODULE_REQUESTS,
+        archive_date=date_iso,
+        archive_month=None,
+        storage_key=key,
+        data=data,
+        source_collection="order_requests",
+        record_count=len(rows),
+        min_date=date_iso,
+        max_date=date_iso,
+        brands=brands,
+        dealers=dealers,
+        branches=branches,
+        existing=existing_any,
+    )
+    return {"status": "verified", "manifest": manifest, "record_count": len(rows)}
+
+
+async def archive_uploads_for_date(db, archive_date: str, force: bool = False) -> Dict[str, Any]:
+    """Consolidated daily Uploaded Data Dump across all brands/dealers/branches."""
+    date_iso = date_key_to_iso(archive_date)
+    date_key = iso_to_date_key(date_iso)
+    existing = await am.find_verified(db, MODULE_UPLOADS, archive_date=date_iso)
+    if existing and not force:
+        return {"status": "already_verified", "manifest": existing}
+
+    brands, dealers, branches = set(), set(), set()
+    rows = []
+    # Prefer upload_items for the day; fall back to uploads metadata
+    try:
+        cursor = db.upload_items.find(
+            {"$or": [{"date_key": {"$in": [date_key, date_iso]}}, {"upload_date": date_iso}, {"active_date_key": {"$in": [date_key, date_iso]}}]},
+            {"_id": 0},
+        )
+        rows = await cursor.to_list(500000)
+    except Exception:
+        rows = []
+    if not rows:
+        try:
+            cursor = db.uploads.find(
+                {"$or": [{"date_key": {"$in": [date_key, date_iso]}}, {"upload_date": date_iso}]},
+                {"_id": 0},
+            )
+            rows = await cursor.to_list(100000)
+        except Exception:
+            rows = []
+
+    for r in rows:
+        if r.get("brand_name") or r.get("brand"):
+            brands.add(str(r.get("brand_name") or r.get("brand")))
+        if r.get("dealer_name") or r.get("dealer"):
+            dealers.add(str(r.get("dealer_name") or r.get("dealer")))
+        if r.get("branch") or r.get("branch_name"):
+            branches.add(str(r.get("branch") or r.get("branch_name")))
+
+    storage = get_storage()
+    key = storage.key("uploads", date_iso, "uploaded-data.jsonl.gz")
+    data = _gzip_jsonl(rows)
+    existing_any = await am.find_any(db, MODULE_UPLOADS, archive_date=date_iso)
+    manifest = await _upload_verified(
+        db,
+        module=MODULE_UPLOADS,
+        archive_date=date_iso,
+        archive_month=None,
+        storage_key=key,
+        data=data,
+        source_collection="upload_items",
+        record_count=len(rows),
+        min_date=date_iso,
+        max_date=date_iso,
+        brands=brands,
+        dealers=dealers,
+        branches=branches,
+        existing=existing_any,
+    )
     return {"status": "verified", "manifest": manifest, "record_count": len(rows)}
 
 

@@ -1,7 +1,12 @@
-"""Timezone-aware archive scheduler with MongoDB idempotency locks.
+"""Timezone-aware archive scheduler — one coordinated daily batch at 23:45 IST.
 
-Daily Product History archive: 00:15 Asia/Kolkata — previous calendar day
-Monthly completed Orders/Requests: 1st day 01:30 Asia/Kolkata
+Daily coordinated archive (23:45 Asia/Kolkata) for the previous calendar day:
+  - uploads dump
+  - product-history dump
+  - orders terminal dump (by completion date)
+  - requests terminal dump (by completion date)
+
+Monthly completed Orders/Requests retained as a safety net on the 1st at 01:30 IST.
 """
 
 from __future__ import annotations
@@ -33,42 +38,77 @@ def previous_calendar_day_iso(now: Optional[datetime] = None) -> str:
     return (now.date() - timedelta(days=1)).isoformat()
 
 
-async def run_daily_product_archive(db, archive_date: Optional[str] = None) -> dict:
-    """Archive the previous IST calendar day (or an explicit date).
-
-    After verified archive, optionally prune that historical date when
-    ARCHIVE_PRUNE_ENABLED=true AND storage backend is REAL S3.
-    """
+async def run_daily_coordinated_archive(db, archive_date: Optional[str] = None) -> dict:
+    """One coordinated daily batch for all archive datasets (previous IST day)."""
     now = _ist_now()
     if not archive_date:
         archive_date = previous_calendar_day_iso(now)
-    lock_key = f"daily-product-history:{archive_date}"
-    if not await am.acquire_job_lock(db, lock_key, _OWNER, ttl_seconds=7200):
+    lock_key = f"daily-coordinated:{archive_date}"
+    if not await am.acquire_job_lock(db, lock_key, _OWNER, ttl_seconds=10800):
         return {"status": "locked", "archive_date": archive_date}
-    try:
-        result = await ha.archive_product_history_for_date(db, archive_date)
-        # Side-job: archive verifications only when outside verification hot window
-        try:
-            hot = verification_mongo_hot_days()
-            cutoff = (now.date() - timedelta(days=hot)).isoformat()
-            if archive_date <= cutoff:
-                await ha.archive_verifications_for_date(db, archive_date)
-        except Exception as exc:
-            logger.warning("Verification archive side-job failed: %s", exc)
 
-        # Prune only the archived date when policy allows (real S3 + flag)
-        prune_result = None
+    results: dict = {"archive_date": archive_date, "datasets": {}}
+    try:
+        # A. Uploads dump
         try:
-            if result.get("status") in {"verified", "already_verified"}:
-                prune_result = await ha.prune_product_history_date(db, archive_date)
+            results["datasets"]["uploads"] = await ha.archive_uploads_for_date(db, archive_date)
         except Exception as exc:
-            logger.warning("Post-archive prune skipped/failed for %s: %s", archive_date, exc)
-            prune_result = {"status": "error", "error": str(exc)[:500]}
-        if isinstance(result, dict):
-            result = {**result, "prune": prune_result}
-        return result
+            logger.error("Daily uploads archive failed for %s: %s", archive_date, exc)
+            results["datasets"]["uploads"] = {"status": "error", "error": str(exc)[:500]}
+
+        # B. Product History dump
+        try:
+            ph = await ha.archive_product_history_for_date(db, archive_date)
+            results["datasets"]["product-history"] = ph
+            # Side-job: verifications outside hot window
+            try:
+                hot = verification_mongo_hot_days()
+                cutoff = (now.date() - timedelta(days=hot)).isoformat()
+                if archive_date <= cutoff:
+                    results["datasets"]["verifications"] = await ha.archive_verifications_for_date(
+                        db, archive_date
+                    )
+            except Exception as exc:
+                logger.warning("Verification archive side-job failed: %s", exc)
+
+            # Optional prune only when REAL S3 verified
+            prune_result = None
+            try:
+                if ph.get("status") in {"verified", "already_verified"}:
+                    prune_result = await ha.prune_product_history_date(db, archive_date)
+            except Exception as exc:
+                logger.warning("Post-archive prune skipped/failed for %s: %s", archive_date, exc)
+                prune_result = {"status": "error", "error": str(exc)[:500]}
+            if isinstance(ph, dict):
+                ph = {**ph, "prune": prune_result}
+                results["datasets"]["product-history"] = ph
+        except Exception as exc:
+            logger.error("Daily product-history archive failed for %s: %s", archive_date, exc)
+            results["datasets"]["product-history"] = {"status": "error", "error": str(exc)[:500]}
+
+        # C. Orders dump (terminal on that date)
+        try:
+            results["datasets"]["orders"] = await ha.archive_orders_for_date(db, archive_date)
+        except Exception as exc:
+            logger.error("Daily orders archive failed for %s: %s", archive_date, exc)
+            results["datasets"]["orders"] = {"status": "error", "error": str(exc)[:500]}
+
+        # D. Requests dump (terminal on that date)
+        try:
+            results["datasets"]["requests"] = await ha.archive_requests_for_date(db, archive_date)
+        except Exception as exc:
+            logger.error("Daily requests archive failed for %s: %s", archive_date, exc)
+            results["datasets"]["requests"] = {"status": "error", "error": str(exc)[:500]}
+
+        results["status"] = "ok"
+        return results
     finally:
         await am.release_job_lock(db, lock_key, _OWNER)
+
+
+# Backward-compatible alias used by older callers / tests
+async def run_daily_product_archive(db, archive_date: Optional[str] = None) -> dict:
+    return await run_daily_coordinated_archive(db, archive_date)
 
 
 async def run_monthly_completed_archives(db, archive_month: Optional[str] = None) -> dict:
@@ -98,34 +138,38 @@ async def _scheduler_loop(db) -> None:
             daily_stamp = previous_calendar_day_iso(now)
             monthly_stamp = now.strftime("%Y-%m")
 
-            # Daily at 00:15 IST — archive previous calendar day.
-            # Skip noisy re-runs when a VERIFIED/PRUNED manifest already exists
-            # (restart after 00:15 would otherwise re-enter the window).
-            if now.hour == 0 and now.minute >= 15 and last_daily != daily_stamp:
-                already = await db.archive_manifests.find_one(
-                    {
-                        "module": ha.MODULE_PRODUCT_HISTORY,
-                        "archive_date": daily_stamp,
-                        "status": {"$in": [am.STATUS_VERIFIED, am.STATUS_PRUNED]},
-                    },
-                    {"_id": 0, "status": 1},
-                )
-                if already:
+            # Daily coordinated batch at 23:45 IST — archives the previous calendar day.
+            # Window: 23:45–23:59 so a single stamp is used per day.
+            if now.hour == 23 and now.minute >= 45 and last_daily != daily_stamp:
+                # Skip only when ALL primary datasets already REAL-S3 verified
+                modules = [
+                    ha.MODULE_PRODUCT_HISTORY,
+                    getattr(ha, "MODULE_UPLOADS", "uploads"),
+                    ha.MODULE_ORDERS,
+                    ha.MODULE_REQUESTS,
+                ]
+                verified = 0
+                for mod in modules:
+                    # Orders/requests daily use archive_date; monthly fallback uses archive_month
+                    row = await am.find_verified(db, mod, archive_date=daily_stamp)
+                    if row:
+                        verified += 1
+                if verified >= 4:
                     logger.info(
-                        "Daily archive for %s already %s — skipping scheduler re-entry",
+                        "Daily coordinated archive for %s already complete (%s/4) — skipping",
                         daily_stamp,
-                        already.get("status"),
+                        verified,
                     )
                     last_daily = daily_stamp
                 else:
-                    logger.info("Triggering daily product archive for previous day %s", daily_stamp)
+                    logger.info("Triggering daily coordinated archive for previous day %s", daily_stamp)
                     try:
-                        await run_daily_product_archive(db, daily_stamp)
+                        await run_daily_coordinated_archive(db, daily_stamp)
                         last_daily = daily_stamp
                     except Exception as exc:
-                        logger.error("Daily archive failed: %s", exc)
+                        logger.error("Daily coordinated archive failed: %s", exc)
 
-            # Monthly on 1st at 01:30 IST
+            # Monthly safety-net on 1st at 01:30 IST (previous calendar month)
             if now.day == 1 and now.hour == 1 and now.minute >= 30 and last_monthly != monthly_stamp:
                 logger.info("Triggering monthly completed archives for previous month")
                 try:
