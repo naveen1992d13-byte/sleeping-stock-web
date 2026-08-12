@@ -57,7 +57,7 @@ def external_console_links() -> Dict[str, Any]:
             "billing_available": False,
             "billing_message": "Billing data unavailable",
             "bucket": bucket or None,
-            "region": region,
+            "region": region_out,
         },
         "mongodb": {
             "label": "MongoDB",
