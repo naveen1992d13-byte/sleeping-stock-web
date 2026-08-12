@@ -102,16 +102,25 @@ def test_create_user_alert_dedupes_and_filters_sources():
         a1 = await ua.create_user_alert(
             recipient_id="u1",
             source_type="request",
-            source_id="r1:Request Accepted",
-            event="Request Accepted",
+            source_id="r1",
+            event="Request Accepted@t1",
             title="Request Accepted",
             message="RN1",
         )
         a2 = await ua.create_user_alert(
             recipient_id="u1",
             source_type="request",
-            source_id="r1:Request Accepted",
-            event="Request Accepted",
+            source_id="r1",
+            event="Request Accepted@t1",
+            title="Request Accepted",
+            message="RN1",
+        )
+        # Same event name at a later transition time must NOT be suppressed
+        a3 = await ua.create_user_alert(
+            recipient_id="u1",
+            source_type="request",
+            source_id="r1",
+            event="Request Accepted@t2",
             title="Request Accepted",
             message="RN1",
         )
@@ -124,8 +133,9 @@ def test_create_user_alert_dedupes_and_filters_sources():
         )
         assert a1 is not None
         assert a2 is None
+        assert a3 is not None
         assert bad is None
-        assert len(database.user_alerts.docs) == 1
+        assert len(database.user_alerts.docs) == 2
 
     asyncio.get_event_loop().run_until_complete(_run())
 
@@ -150,6 +160,7 @@ def test_alert_query_reply_targets_creator_only():
         assert n == 1
         assert database.user_alerts.docs[0]["recipient_id"] == "creator-uuid"
         assert database.user_alerts.docs[0]["source_type"] == "query"
+        assert database.user_alerts.docs[0]["source_id"] == "q1:reply:r1"
 
     asyncio.get_event_loop().run_until_complete(_run())
 
@@ -160,6 +171,8 @@ def test_ensure_indexes_creates_dedupe_and_list_indexes():
         ua.init_user_alerts(database, None, None)
         await ua.ensure_indexes()
         assert len(database.user_alerts.indexes) >= 2
+        names = [kwargs.get("name") for (_a, kwargs) in database.user_alerts.indexes]
+        assert "user_alerts_dedupe" in names
 
     asyncio.get_event_loop().run_until_complete(_run())
 
@@ -172,6 +185,7 @@ def test_alert_notice_published_scopes_selected_brand():
             {"id": "a1", "role": "admin", "status": "Active", "brand": "Honda"},
             {"id": "a2", "role": "admin", "status": "Active", "brand": "Yamaha"},
             {"id": "u1", "role": "user", "status": "Active", "brand": "Honda"},
+            {"id": "inactive", "role": "user", "status": "Inactive", "brand": "Honda"},
         ]
         ua.init_user_alerts(database, None, None)
         n = await ua.alert_notice_published(
@@ -181,12 +195,14 @@ def test_alert_notice_published_scopes_selected_brand():
                 "priority": "High",
                 "audience_type": "selected_brand",
                 "brand_name": "Honda",
+                "published_at": "2026-08-12T00:00:00+00:00",
             }
         )
         recipients = {d["recipient_id"] for d in database.user_alerts.docs}
         assert n == 3
         assert recipients == {"m1", "a1", "u1"}
         assert "a2" not in recipients
+        assert "inactive" not in recipients
 
     asyncio.get_event_loop().run_until_complete(_run())
 
@@ -213,5 +229,77 @@ def test_alert_query_follow_up_targets_masters():
         recipients = {d["recipient_id"] for d in database.user_alerts.docs}
         assert n == 2
         assert recipients == {"m1", "m2"}
+        assert database.user_alerts.docs[0]["source_id"] == "q1:followup:f1"
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_request_scope_excludes_unrelated_and_actor():
+    async def _run():
+        database = FakeDB()
+        database.users.docs = [
+            {"id": "requester", "email": "req@x.com", "role": "user", "status": "Active", "user_id": "U1"},
+            {
+                "id": "supplier_admin",
+                "role": "admin",
+                "status": "Active",
+                "group": "Supply Dealer",
+                "location": "Supply Branch",
+            },
+            {
+                "id": "other_admin",
+                "role": "admin",
+                "status": "Active",
+                "group": "Other Dealer",
+                "location": "Other Branch",
+            },
+            {"id": "brand_master", "role": "master", "status": "Active", "brand": "Hyundai"},
+            {"id": "other_master", "role": "master", "status": "Active", "brand": "Honda"},
+            {"id": "actor_admin", "role": "admin", "status": "Active", "group": "Supply Dealer", "location": "Supply Branch"},
+        ]
+        ua.init_user_alerts(database, None, None)
+        n = await ua.alert_request_event(
+            {
+                "id": "req-1",
+                "request_number": "RN1",
+                "part_number": "P1",
+                "requested_by": "requester",
+                "requester_email": "req@x.com",
+                "supplying_brand": "Hyundai",
+                "supplying_dealer": "Supply Dealer",
+                "supplying_branch": "Supply Branch",
+                "decided_at": "2026-08-12T01:00:00+00:00",
+                "decided_by": "actor_admin",
+            },
+            "Request Accepted",
+            actor_id="actor_admin",
+        )
+        recipients = {d["recipient_id"] for d in database.user_alerts.docs}
+        assert "requester" in recipients
+        assert "supplier_admin" in recipients
+        assert "brand_master" in recipients
+        assert "other_admin" not in recipients
+        assert "other_master" not in recipients
+        assert "actor_admin" not in recipients
+        assert n == 3
+        assert all(d["event"].startswith("Request Accepted@") for d in database.user_alerts.docs)
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_request_scope_empty_without_dealer_branch():
+    async def _run():
+        database = FakeDB()
+        database.users.docs = [
+            {"id": "m1", "role": "master", "status": "Active", "brand": "Hyundai"},
+            {"id": "a1", "role": "admin", "status": "Active", "group": "D", "location": "B"},
+        ]
+        ua.init_user_alerts(database, None, None)
+        # brand-only still reaches brand masters
+        ids = await ua.active_user_ids_for_request_scope("Hyundai", None, None)
+        assert ids == ["m1"]
+        # no brand/dealer/branch → nobody
+        ids2 = await ua.active_user_ids_for_request_scope(None, None, None)
+        assert ids2 == []
 
     asyncio.get_event_loop().run_until_complete(_run())

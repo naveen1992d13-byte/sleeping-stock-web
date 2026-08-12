@@ -49,7 +49,10 @@ def _text(value: Any) -> str:
 async def ensure_indexes() -> None:
     if db is None:
         return
-    await db.user_alerts.create_index([("recipient_id", 1), ("is_read", 1), ("created_at", -1)])
+    await db.user_alerts.create_index(
+        [("recipient_id", 1), ("is_read", 1), ("created_at", -1)],
+        name="user_alerts_recipient_unread_created",
+    )
     await db.user_alerts.create_index(
         [("recipient_id", 1), ("source_type", 1), ("source_id", 1), ("event", 1)],
         unique=True,
@@ -63,6 +66,28 @@ def _default_link(source_type: str) -> str:
         "notice": "/notice-board",
         "query": "/query",
     }.get(source_type, "/")
+
+
+def _request_event_identity(req: dict, event: str) -> str:
+    """Immutable per-transition identity so legitimate re-fires at different
+    times are not suppressed, while exact duplicate inserts still dedupe."""
+    event_l = _text(event).lower()
+    token = ""
+    if "accept" in event_l or "reject" in event_l:
+        token = _text(req.get("decided_at") or req.get("updated_at"))
+    elif "dispatch" in event_l:
+        token = _text(req.get("dispatched_at") or req.get("updated_at"))
+    elif "receive" in event_l:
+        token = _text(req.get("received_at") or req.get("updated_at"))
+    elif "complete" in event_l:
+        token = _text(req.get("completed_at") or req.get("updated_at"))
+    elif "cancel" in event_l:
+        token = _text(req.get("cancelled_at") or req.get("updated_at") or req.get("decided_at"))
+    else:
+        token = _text(req.get("updated_at"))
+    if not token:
+        token = _utcnow_iso()
+    return f"{_text(event)}@{token}"
 
 
 async def create_user_alert(
@@ -195,6 +220,8 @@ async def resolve_user_id_flexible(value: str) -> Optional[str]:
 async def active_user_ids_for_request_scope(
     brand: str = None, dealer: str = None, branch: str = None
 ) -> List[str]:
+    """Match server._active_recipients_for_scope: admin at supplying
+    dealer+branch, plus masters for the supplying brand only."""
     if db is None:
         return []
     query: Dict[str, Any] = {
@@ -203,17 +230,24 @@ async def active_user_ids_for_request_scope(
     }
     scope_or = []
     if dealer and branch:
+        # Prefer legacy group/location (email/WhatsApp path) and also dealer/branch
+        # field variants used by some user records.
         scope_or.append({"group": dealer, "location": branch})
         scope_or.append({"dealer": dealer, "branch": branch})
     if brand:
         scope_or.append({"brand": brand, "role": "master"})
     if scope_or:
         query["$or"] = scope_or
+    else:
+        # No scope → do not fan out to every admin/master
+        return []
     users = await db.users.find(query, {"_id": 0, "id": 1}).to_list(200)
     return [_text(u.get("id")) for u in users if _text(u.get("id"))]
 
 
 async def alert_request_event(req: dict, event: str, *, actor_id: str = "") -> int:
+    """Bell recipients mirror email/WhatsApp: requester + supplying-scope
+    admin/master. Actor is excluded."""
     source_id = _text(req.get("id") or req.get("request_number"))
     if not source_id:
         return 0
@@ -234,19 +268,51 @@ async def alert_request_event(req: dict, event: str, *, actor_id: str = "") -> i
     part = _text(req.get("part_number"))
     req_no = _text(req.get("request_number") or req.get("id"))
     message = f"{req_no}" + (f" · {part}" if part else "")
+    event_key = _request_event_identity(req, event)
+    exclude = [actor_id] if actor_id else []
+    # Also exclude decided_by / *_by fields when actor_id was omitted
+    for key in ("decided_by", "dispatched_by", "received_by", "completed_by", "cancelled_by"):
+        if req.get(key):
+            exclude.append(_text(req.get(key)))
     return await create_alerts_for_recipients(
         recipient_ids,
         source_type="request",
-        source_id=f"{source_id}:{event}",
-        event=event,
+        source_id=source_id,
+        event=event_key,
         title=title,
         message=message,
         link_path="/requests",
         brand=_text(req.get("supplying_brand") or req.get("requesting_brand")),
         dealer=_text(req.get("supplying_dealer") or req.get("requesting_dealer")),
         branch=_text(req.get("supplying_branch") or req.get("requesting_branch")),
-        exclude_ids=[actor_id] if actor_id else None,
+        exclude_ids=exclude,
     )
+
+
+async def eligible_notice_recipient_ids(notice: dict) -> List[str]:
+    """Align with notice_board._eligible_users_query (admin/user by brand)
+    plus active masters who can always view notices."""
+    if db is None or not notice:
+        return []
+    # Eligible admin/user (same as Notice Board ack audience)
+    filt: Dict[str, Any] = {
+        "role": {"$in": ["admin", "user"]},
+        "status": {"$regex": "^active$", "$options": "i"},
+    }
+    if notice.get("audience_type") == "selected_brand":
+        brand = _text(notice.get("brand_name"))
+        if brand:
+            filt["brand"] = {"$regex": f"^{re.escape(brand)}$", "$options": "i"}
+        else:
+            return []
+    users = await db.users.find(filt, {"_id": 0, "id": 1}).to_list(5000)
+    ids = [_text(u.get("id")) for u in users if _text(u.get("id"))]
+    masters = await db.users.find(
+        {"role": "master", "status": {"$regex": "^active$", "$options": "i"}},
+        {"_id": 0, "id": 1},
+    ).to_list(200)
+    ids.extend(_text(u.get("id")) for u in masters if _text(u.get("id")))
+    return ids
 
 
 async def alert_notice_published(notice: dict) -> int:
@@ -255,31 +321,14 @@ async def alert_notice_published(notice: dict) -> int:
     notice_id = _text(notice.get("id"))
     if not notice_id:
         return 0
-    if notice.get("audience_type") == "selected_brand":
-        brand = _text(notice.get("brand_name"))
-        filt: Dict[str, Any] = {
-            "status": {"$regex": "^active$", "$options": "i"},
-            "$or": [
-                {"role": "master"},
-                {
-                    "role": {"$in": ["admin", "user"]},
-                    "brand": {"$regex": f"^{re.escape(brand)}$", "$options": "i"} if brand else {"$exists": True},
-                },
-            ],
-        }
-    else:
-        filt = {
-            "role": {"$in": ["admin", "user", "master"]},
-            "status": {"$regex": "^active$", "$options": "i"},
-        }
-    users = await db.users.find(filt, {"_id": 0, "id": 1}).to_list(5000)
-    ids = [_text(u.get("id")) for u in users if _text(u.get("id"))]
+    ids = await eligible_notice_recipient_ids(notice)
     title = _text(notice.get("title")) or "New notice published"
+    published_token = _text(notice.get("published_at") or notice.get("updated_at")) or _utcnow_iso()
     return await create_alerts_for_recipients(
         ids,
         source_type="notice",
         source_id=notice_id,
-        event="notice_published",
+        event=f"notice_published@{published_token}",
         title=title,
         message=_text(notice.get("priority") or "Notice"),
         link_path="/notice-board",
@@ -288,18 +337,20 @@ async def alert_notice_published(notice: dict) -> int:
 
 
 async def alert_query_reply(query_doc: dict) -> int:
+    """Software Team (master) reply → notify query creator only."""
     raised = (query_doc or {}).get("raised_by") or {}
     creator = await resolve_user_id_flexible(raised.get("user_id") or "")
     if not creator:
         return 0
     qid = _text(query_doc.get("id"))
     qno = _text(query_doc.get("query_no"))
-    # Dedupe key includes reply count so each reply can alert once
-    reply_n = len(query_doc.get("replies") or [])
+    replies = query_doc.get("replies") or []
+    last = replies[-1] if replies else {}
+    reply_id = _text(last.get("reply_id")) or f"n{len(replies)}"
     return await create_alerts_for_recipients(
         [creator],
         source_type="query",
-        source_id=f"{qid}:reply:{reply_n}",
+        source_id=f"{qid}:reply:{reply_id}",
         event="query_reply",
         title=f"Reply on {qno or 'query'}",
         message=_text(query_doc.get("subject")),
@@ -308,6 +359,7 @@ async def alert_query_reply(query_doc: dict) -> int:
 
 
 async def alert_query_follow_up(query_doc: dict, *, actor_id: str = "") -> int:
+    """Creator follow-up → notify Software Team (all active masters)."""
     if db is None:
         return 0
     masters = await db.users.find(
@@ -317,11 +369,13 @@ async def alert_query_follow_up(query_doc: dict, *, actor_id: str = "") -> int:
     ids = [_text(u.get("id")) for u in masters if _text(u.get("id"))]
     qid = _text(query_doc.get("id"))
     qno = _text(query_doc.get("query_no"))
-    follow_n = len(query_doc.get("follow_ups") or [])
+    follow_ups = query_doc.get("follow_ups") or []
+    last = follow_ups[-1] if follow_ups else {}
+    follow_id = _text(last.get("follow_up_id")) or f"n{len(follow_ups)}"
     return await create_alerts_for_recipients(
         ids,
         source_type="query",
-        source_id=f"{qid}:followup:{follow_n}",
+        source_id=f"{qid}:followup:{follow_id}",
         event="query_follow_up",
         title=f"Follow-up on {qno or 'query'}",
         message=_text(query_doc.get("subject")),
