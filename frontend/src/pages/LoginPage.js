@@ -1,10 +1,38 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useAuth } from '@/App';
+import { useAuth, canAccessPermission, canAccessMenuItem } from '@/App';
+import { getFirstAllowedMenuItem } from '@/config/menuConfig';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { User, Key, ArrowRight, Eye, EyeOff } from 'lucide-react';
 import './LoginPage.css';
+
+function seedHomeTab(user) {
+  try {
+    let tab = null;
+    if (canAccessPermission(user, 'Analytics')) {
+      tab = { id: 'analytics', label: 'Dashboard', path: '/analytics', permission: 'Analytics' };
+    } else {
+      const first = getFirstAllowedMenuItem(user, canAccessMenuItem);
+      if (first) {
+        tab = {
+          id: first.id,
+          label: first.label,
+          path: first.path,
+          permission: first.permissionLabel || first.label,
+        };
+      }
+    }
+    if (tab) {
+      localStorage.setItem('openTabs', JSON.stringify([tab]));
+      localStorage.setItem('activeTab', tab.id);
+      return tab.path;
+    }
+  } catch {
+    /* ignore */
+  }
+  return '/';
+}
 
 export function LoginPage() {
   const [email, setEmail] = useState('');
@@ -19,9 +47,10 @@ export function LoginPage() {
     setLoading(true);
 
     try {
-      await login(email.trim(), password);
+      const loggedUser = await login(email.trim(), password);
       toast.success('Login successful!');
-      navigate('/');
+      const path = seedHomeTab(loggedUser);
+      navigate(path || '/');
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Login failed');
     } finally {

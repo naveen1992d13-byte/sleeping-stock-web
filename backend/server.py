@@ -6081,7 +6081,7 @@ def sanitize_text_safe(value):
     return notifications.sanitize_text(value, 500) if value else ''
 
 
-async def _notify_request_status_change(req: dict, event: str):
+async def _notify_request_status_change(req: dict, event: str, actor_id: str = ""):
     try:
         recipients = []
         if req.get('requester_email') or req.get('requester_mobile'):
@@ -6092,6 +6092,20 @@ async def _notify_request_status_change(req: dict, event: str):
             await notifications.notify_request_event(db, event, req, recipients, remarks=req.get('approval_remarks', ''))
     except Exception as exc:  # noqa: BLE001
         logging.getLogger('nmts.notifications').warning('%s notification dispatch failed: %s', event, str(exc)[:300])
+    # Additive in-app bell alert (does not replace email/WhatsApp); non-blocking
+    try:
+        import asyncio
+        import user_alerts as ua
+
+        async def _bg_alert():
+            try:
+                await ua.alert_request_event(req, event, actor_id=actor_id or "")
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger('nmts.user_alerts').warning('request in-app alert failed: %s', str(exc)[:300])
+
+        asyncio.create_task(_bg_alert())
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger('nmts.user_alerts').warning('request in-app alert schedule failed: %s', str(exc)[:300])
 
 
 @api_router.post('/requests/{request_id}/approve')
@@ -6108,7 +6122,7 @@ async def request_center_approve(request_id: str, payload: dict = None, current_
     if accepted < requested and not str(remarks).strip(): raise HTTPException(status_code=400, detail='Remark is required for Partial or Rejected responses')
     target = 'Rejected' if accepted == 0 else 'Approved'
     updated, changed = await _request_center_transition(request_id, target, remarks, current_user, accepted_qty=accepted)
-    if changed: await _notify_request_status_change(updated, 'Request Rejected' if target == 'Rejected' else ('Request Partially Accepted' if accepted < requested else 'Request Accepted'))
+    if changed: await _notify_request_status_change(updated, 'Request Rejected' if target == 'Rejected' else ('Request Partially Accepted' if accepted < requested else 'Request Accepted'), actor_id=current_user.id)
     return updated
 
 
@@ -6119,7 +6133,7 @@ async def request_center_reject(request_id: str, payload: dict = None, current_u
         raise HTTPException(status_code=400, detail='A rejection reason or remark is required')
     updated, changed = await _request_center_transition(request_id, 'Rejected', remarks, current_user)
     if changed:
-        await _notify_request_status_change(updated, 'Request Rejected')
+        await _notify_request_status_change(updated, 'Request Rejected', actor_id=current_user.id)
     return updated
 
 
@@ -6128,7 +6142,7 @@ async def request_center_cancel(request_id: str, payload: dict = None, current_u
     remarks = (payload or {}).get('remarks', '') if payload else ''
     updated, changed = await _request_center_transition(request_id, 'Cancelled', remarks, current_user)
     if changed:
-        await _notify_request_status_change(updated, 'Request Cancelled')
+        await _notify_request_status_change(updated, 'Request Cancelled', actor_id=current_user.id)
     return updated
 
 
@@ -6175,7 +6189,7 @@ async def _request_logistics_transition(request_id: str, new_status: str, remark
 async def request_center_dispatch(request_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     updated, changed = await _request_logistics_transition(request_id, 'Dispatched', (payload or {}).get('remarks', ''), current_user)
     if changed:
-        await _notify_request_status_change(updated, 'Request Dispatched')
+        await _notify_request_status_change(updated, 'Request Dispatched', actor_id=current_user.id)
     return updated
 
 
@@ -6183,7 +6197,7 @@ async def request_center_dispatch(request_id: str, payload: dict = None, current
 async def request_center_receive(request_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     updated, changed = await _request_logistics_transition(request_id, 'Received', (payload or {}).get('remarks', ''), current_user)
     if changed:
-        await _notify_request_status_change(updated, 'Request Received')
+        await _notify_request_status_change(updated, 'Request Received', actor_id=current_user.id)
     return updated
 
 
@@ -6191,7 +6205,7 @@ async def request_center_receive(request_id: str, payload: dict = None, current_
 async def request_center_complete(request_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     updated, changed = await _request_logistics_transition(request_id, 'Completed', (payload or {}).get('remarks', ''), current_user)
     if changed:
-        await _notify_request_status_change(updated, 'Request Completed')
+        await _notify_request_status_change(updated, 'Request Completed', actor_id=current_user.id)
     return updated
 
 
@@ -6893,6 +6907,13 @@ query_desk.init_query_desk(db, get_current_user, UserResponse)
 api_router.include_router(query_desk.router)
 
 try:
+    from . import user_alerts
+except ImportError:
+    import user_alerts
+user_alerts.init_user_alerts(db, get_current_user, UserResponse)
+api_router.include_router(user_alerts.router)
+
+try:
     from . import notice_board
 except ImportError:
     import notice_board
@@ -7231,6 +7252,12 @@ async def seed_master_user_on_startup():
         logger.info("Query Desk indexes verified")
         await notice_board.ensure_indexes()
         logger.info("Notice Board indexes verified")
+        try:
+            import user_alerts as ua
+            await ua.ensure_indexes()
+            logger.info("User alerts indexes verified")
+        except Exception as exc:
+            logger.warning("User alerts index creation failed: %s", exc)
         await analytics_center.ensure_analytics_indexes()
         logger.info("Analytics indexes verified")
         await mobile_api.ensure_mobile_indexes()

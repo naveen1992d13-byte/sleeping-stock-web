@@ -9,8 +9,9 @@ export const APPLICATION_MENU_ITEMS = [
   { path: '/order-history', label: 'Order History', icon: History, id: 'order-history', permissionLabel: 'Order Desk' },
   { path: '/requests', label: 'Request Center', icon: ClipboardList, id: 'requests' },
   { path: '/reports', label: 'Reports', icon: BarChart3, id: 'reports', adminOnly: true },
-  { path: '/analytics', label: 'Analytics', icon: Globe, id: 'analytics', adminOnly: true },
-  { path: '/storage-cost-monitor', label: 'Storage & Cost Monitor', icon: HardDrive, id: 'storage-cost-monitor', masterOnly: true },
+  // User-facing name "Dashboard"; permission key remains "Analytics"
+  { path: '/analytics', label: 'Dashboard', icon: Globe, id: 'analytics', adminOnly: true, permissionLabel: 'Analytics' },
+  { path: '/storage-cost-monitor', label: 'Storage & Data Cleanup', icon: HardDrive, id: 'storage-cost-monitor', masterOnly: true, permissionLabel: 'Storage & Cost Monitor' },
   { path: '/notice-board', label: 'Notice Board', icon: Megaphone, id: 'dashboard' },
   { path: '/query', label: 'Query Desk', icon: HelpCircle, id: 'query', allRoles: true },
   { path: '/sleeping-stock-mobile', label: 'Sleeping Stock Mobile', icon: Smartphone, id: 'sleeping-stock-mobile', allRoles: true },
@@ -20,3 +21,9 @@ export const APPLICATION_MENU_ITEMS = [
 export const APPLICATION_PERMISSION_LABELS = APPLICATION_MENU_ITEMS
   .filter((item) => !item.masterOnly)
   .map((item) => item.permissionLabel || item.label);
+
+/** First sidebar module the user may open (for home fallback). */
+export function getFirstAllowedMenuItem(user, canAccessMenuItem) {
+  if (!user || typeof canAccessMenuItem !== 'function') return null;
+  return APPLICATION_MENU_ITEMS.find((item) => canAccessMenuItem(user, item)) || null;
+}

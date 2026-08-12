@@ -32,6 +32,8 @@ export function DashboardLayout() {
   const navigate = useNavigate();
 
   const [unreadCount, setUnreadCount] = useState(0);
+  const [bellOpen, setBellOpen] = useState(false);
+  const [alerts, setAlerts] = useState([]);
   const [sidebarOpen, setSidebarOpen] = useState(() => {
     try {
       const stored = localStorage.getItem('nmtsSidebarOpen');
@@ -202,7 +204,10 @@ export function DashboardLayout() {
       try {
         const parsedTabs = JSON.parse(savedTabs);
         const allowedTabs = Array.isArray(parsedTabs)
-          ? parsedTabs.filter((tab) => canAccessPermission(user, tab.label) || tab.label === 'My Profile')
+          ? parsedTabs.filter(
+              (tab) =>
+                canAccessPermission(user, tab.permission || tab.label) || tab.label === 'My Profile'
+            )
           : [];
         setTabs(allowedTabs);
       } catch {
@@ -215,6 +220,7 @@ export function DashboardLayout() {
     }
 
     return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -238,10 +244,19 @@ export function DashboardLayout() {
 
   const fetchUnreadCount = async () => {
     try {
-      const res = await axios.get(`${API}/notifications/unread-count`);
+      const res = await axios.get(`${API}/user-alerts/unread-count`);
       setUnreadCount(res.data.count || 0);
     } catch {
       setUnreadCount(0);
+    }
+  };
+
+  const fetchAlerts = async () => {
+    try {
+      const res = await axios.get(`${API}/user-alerts?limit=30`);
+      setAlerts(Array.isArray(res.data) ? res.data : []);
+    } catch {
+      setAlerts([]);
     }
   };
 
@@ -253,8 +268,14 @@ export function DashboardLayout() {
   };
 
   const openTab = (id, label, path, permissionLabel) => {
-    const perm = permissionLabel || label;
-    if (!canAccessPermission(user, perm) && label !== 'My Profile') {
+    const menuItem = navItems.find((m) => m.id === id);
+    const perm = permissionLabel !== undefined
+      ? permissionLabel
+      : (menuItem?.permissionLabel || label);
+    const allowed =
+      label === 'My Profile' ||
+      (menuItem ? canAccessMenuItem(user, menuItem) : canAccessPermission(user, perm));
+    if (!allowed) {
       toast.error('You do not have permission to open this screen');
       navigate('/');
       return;
@@ -263,7 +284,7 @@ export function DashboardLayout() {
     const existingTab = tabs.find(tab => tab.id === id);
 
     if (!existingTab) {
-      setTabs([...tabs, { id, label, path }]);
+      setTabs([...tabs, { id, label, path, permission: perm }]);
     }
 
     setActiveTabId(id);
@@ -291,8 +312,75 @@ export function DashboardLayout() {
   };
 
   const goHome = () => {
-    setActiveTabId(null);
-    navigate('/');
+    if (canAccessPermission(user, 'Analytics')) {
+      openTab('analytics', 'Dashboard', '/analytics', 'Analytics');
+    } else {
+      const first = filteredNavItems[0];
+      if (first) {
+        openTab(first.id, first.label, first.path, first.permissionLabel || first.label);
+      } else {
+        setActiveTabId(null);
+        navigate('/');
+      }
+    }
+  };
+
+  const toggleBell = async () => {
+    const next = !bellOpen;
+    setBellOpen(next);
+    if (next) {
+      await fetchAlerts();
+      await fetchUnreadCount();
+    }
+  };
+
+  const handleAlertClick = async (alert) => {
+    try {
+      if (!alert.is_read) {
+        await axios.put(`${API}/user-alerts/${alert.id}/read`);
+      }
+    } catch {
+      /* non-blocking */
+    }
+    setBellOpen(false);
+    await fetchUnreadCount();
+    const path = alert.link_path || '/';
+    const source = alert.source_type;
+    if (source === 'request') {
+      openTab('requests', 'Request Center', '/requests', 'Request Center');
+    } else if (source === 'notice') {
+      openTab('dashboard', 'Notice Board', '/notice-board', 'Notice Board');
+    } else if (source === 'query') {
+      openTab('query', 'Query Desk', '/query', null);
+    } else {
+      navigate(path);
+    }
+  };
+
+  const sourceLabel = (t) => {
+    if (t === 'request') return 'Request';
+    if (t === 'notice') return 'Notice';
+    if (t === 'query') return 'Query';
+    return t || 'Alert';
+  };
+
+  const formatAlertTime = (iso) => {
+    if (!iso) return '';
+    try {
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return '';
+      const diffMs = Date.now() - d.getTime();
+      const mins = Math.floor(diffMs / 60000);
+      if (mins < 1) return 'Just now';
+      if (mins < 60) return `${mins}m ago`;
+      const hours = Math.floor(mins / 60);
+      if (hours < 24) return `${hours}h ago`;
+      const days = Math.floor(hours / 24);
+      if (days < 7) return `${days}d ago`;
+      return d.toLocaleString();
+    } catch {
+      return '';
+    }
   };
 
   return (
@@ -323,7 +411,8 @@ export function DashboardLayout() {
             const Icon = item.icon;
             const isActive =
               location.pathname === item.path ||
-              (item.path === '/notice-board' && location.pathname === '/');
+              (item.path === '/analytics' &&
+                (location.pathname === '/' || location.pathname === '/dashboard'));
 
             return (
               <button
@@ -433,17 +522,55 @@ export function DashboardLayout() {
                 />
               </div>
 
-              <button
-                type="button"
-                className="nmts-bell-btn"
-                onClick={() => openTab('dashboard', 'Notice Board', '/notice-board')}
-                aria-label="Notifications"
-              >
-                <Bell className="h-5 w-5" />
-                {unreadCount > 0 && (
-                  <span className="nmts-bell-badge">{unreadCount > 9 ? '9+' : unreadCount}</span>
+              <div className="nmts-bell-wrap">
+                <button
+                  type="button"
+                  className="nmts-bell-btn"
+                  onClick={toggleBell}
+                  aria-label="Notifications"
+                  aria-expanded={bellOpen}
+                >
+                  <Bell className="h-5 w-5" />
+                  {unreadCount > 0 && (
+                    <span className="nmts-bell-badge">{unreadCount > 9 ? '9+' : unreadCount}</span>
+                  )}
+                </button>
+                {bellOpen && (
+                  <>
+                    <button
+                      type="button"
+                      className="nmts-bell-backdrop"
+                      aria-label="Close notifications"
+                      onClick={() => setBellOpen(false)}
+                    />
+                    <div className="nmts-bell-panel" role="dialog" aria-label="Notification centre">
+                      <div className="nmts-bell-panel-head">
+                        <span>Notifications</span>
+                        <span className="nmts-bell-panel-sub">Request · Notice · Query</span>
+                      </div>
+                      <div className="nmts-bell-panel-list">
+                        {alerts.length === 0 ? (
+                          <div className="nmts-bell-empty">No notifications</div>
+                        ) : (
+                          alerts.map((a) => (
+                            <button
+                              key={a.id}
+                              type="button"
+                              className={`nmts-bell-item${a.is_read ? '' : ' nmts-bell-item--unread'}`}
+                              onClick={() => handleAlertClick(a)}
+                            >
+                              <div className="nmts-bell-item-type">{sourceLabel(a.source_type)}</div>
+                              <div className="nmts-bell-item-title">{a.title || 'Alert'}</div>
+                              {a.message ? <div className="nmts-bell-item-msg">{a.message}</div> : null}
+                              <div className="nmts-bell-item-time">{formatAlertTime(a.created_at)}</div>
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  </>
                 )}
-              </button>
+              </div>
 
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -496,21 +623,31 @@ export function DashboardLayout() {
 
         <main className="nmts-main-content">
           <NoticeLoginPopup />
-          <Outlet
-            context={{
-              scopeBrand,
-              scopeDealer,
-              scopeBranch,
-              setScopeBrand,
-              setScopeDealer,
-              setScopeBranch,
-              brandOptions,
-              dealerOptions,
-              branchOptions,
-              isMaster,
-              isAdmin,
-            }}
-          />
+          {tabs.length === 0 ? (
+            <div className="nmts-empty-workspace" aria-label="Empty workspace">
+              <img
+                src="/sleeping-stock-logo-transparent.png"
+                alt="Sleeping Stock"
+                className="nmts-empty-workspace-logo"
+              />
+            </div>
+          ) : (
+            <Outlet
+              context={{
+                scopeBrand,
+                scopeDealer,
+                scopeBranch,
+                setScopeBrand,
+                setScopeDealer,
+                setScopeBranch,
+                brandOptions,
+                dealerOptions,
+                branchOptions,
+                isMaster,
+                isAdmin,
+              }}
+            />
+          )}
         </main>
       </div>
     </div>

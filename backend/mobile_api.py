@@ -1582,7 +1582,7 @@ async def submit_part_response(payload: RequestPartResponse, session=Depends(get
                 event = "Request Partially Accepted"
             else:
                 event = "Request Accepted"
-            await notify_request_status_change(updated, event)
+            await notify_request_status_change(updated, event, getattr(acting_user, "id", "") or "")
         results.append({
             "order_request_id": part.order_request_id,
             "part_number": part.part_number,

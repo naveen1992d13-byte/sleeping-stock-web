@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import uuid
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -536,6 +537,19 @@ async def reply_to_query(
     )
     if not doc:
         raise HTTPException(status_code=400, detail="Query is not waiting for a Software Team reply")
+    try:
+        import asyncio
+        import user_alerts as ua
+
+        async def _bg():
+            try:
+                await ua.alert_query_reply(doc)
+            except Exception:
+                pass
+
+        asyncio.create_task(_bg())
+    except Exception:
+        pass
     return _serialize_query(doc)
 
 
@@ -608,6 +622,21 @@ async def add_follow_up(
     )
     if not doc:
         raise HTTPException(status_code=400, detail="Unable to send follow-up for this query state")
+    try:
+        import asyncio
+        import user_alerts as ua
+
+        actor = getattr(current_user, "id", "") or ""
+
+        async def _bg():
+            try:
+                await ua.alert_query_follow_up(doc, actor_id=actor)
+            except Exception:
+                pass
+
+        asyncio.create_task(_bg())
+    except Exception:
+        pass
     return _serialize_query(doc)
 
 

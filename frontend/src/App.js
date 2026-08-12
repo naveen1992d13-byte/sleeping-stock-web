@@ -32,11 +32,13 @@ import {
   clearAuthStorage,
 } from './utils/sessionActivity';
 import { resolveApiUrl, resolveBackendUrl } from '@/backendUrl';
+import { getFirstAllowedMenuItem } from './config/menuConfig';
 
 const AuthContext = createContext(null);
 
 export const MENU_PERMISSIONS = {
-  '/': 'Notice Board',
+  '/': 'Analytics',
+  '/dashboard': 'Analytics',
   '/notice-board': 'Notice Board',
   '/users': 'User Hub',
   '/upload': 'Upload Center',
@@ -201,6 +203,29 @@ function ProtectedRoute({ children, permission, masterOnly = false }) {
   return children;
 }
 
+/** Default home: Analytics/Dashboard when allowed; otherwise first permitted module. */
+function HomeEntry() {
+  const { user, loading } = useAuth();
+
+  if (loading) return null;
+  if (!user) return <Navigate to="/login" replace />;
+
+  if (canAccessPermission(user, 'Analytics')) {
+    return <Navigate to="/analytics" replace />;
+  }
+
+  const first = getFirstAllowedMenuItem(user, canAccessMenuItem);
+  if (first?.path) {
+    return <Navigate to={first.path} replace />;
+  }
+
+  return (
+    <div className="p-8 text-sm text-center" style={{ color: '#6B7280' }}>
+      No modules are available for your account. Contact Master Admin.
+    </div>
+  );
+}
+
 function App() {
   return (
     <ProcessingProvider>
@@ -215,9 +240,10 @@ function App() {
               <DashboardLayout />
             </ProtectedRoute>
           }>
-            <Route index element={
-              <ProtectedRoute permission="Notice Board">
-                <NoticeBoard />
+            <Route index element={<HomeEntry />} />
+            <Route path="dashboard" element={
+              <ProtectedRoute permission="Analytics">
+                <Analytics />
               </ProtectedRoute>
             } />
             <Route path="notice-board" element={

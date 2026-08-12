@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import uuid
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -533,6 +534,21 @@ async def publish_notice(notice_id: str, current_user=Depends(_current_user)):
         projection={"_id": 0},
     )
     await _audit(notice_id, current_user, "notice_published", {"previous_status": "Draft", "new_status": "Published"})
+    # Additive in-app bell alert — non-blocking so publish stays fast
+    try:
+        import user_alerts as ua
+
+        notice_doc = doc or {}
+
+        async def _bg_notice_alerts():
+            try:
+                await ua.alert_notice_published(notice_doc)
+            except Exception:
+                pass
+
+        asyncio.create_task(_bg_notice_alerts())
+    except Exception:
+        pass
     return _serialize_notice(doc)
 
 

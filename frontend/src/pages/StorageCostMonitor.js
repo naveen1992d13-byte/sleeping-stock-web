@@ -115,7 +115,7 @@ export function StorageCostMonitor() {
   if (user?.role !== 'master') {
     return (
       <div className="rounded-xl border bg-white p-6 text-sm" style={{ borderColor: COLORS.border, color: COLORS.muted }}>
-        Storage & Cost Monitor is available to Master Admin only.
+        Storage & Data Cleanup is available to Master Admin only.
       </div>
     );
   }
@@ -220,7 +220,7 @@ export function StorageCostMonitor() {
       <div className="flex flex-wrap items-center gap-3 rounded-xl border bg-white p-4 shadow-sm" style={{ borderColor: COLORS.border }}>
         <HardDrive className="h-5 w-5" style={{ color: COLORS.primary }} />
         <div className="mr-auto">
-          <div className="text-sm font-semibold" style={{ color: COLORS.dark }}>Storage & Cost Monitor</div>
+          <div className="text-sm font-semibold" style={{ color: COLORS.dark }}>Storage & Data Cleanup</div>
           <div className="text-xs" style={{ color: COLORS.muted }}>Master Admin only · estimated costs, not final AWS invoice</div>
         </div>
         <label className="text-xs font-semibold" style={{ color: COLORS.muted }}>
