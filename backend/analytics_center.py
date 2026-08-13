@@ -480,6 +480,14 @@ async def _aggregate_parts_for_dates(
         if rows:
             by_date: Dict[str, Dict[Tuple[str, str, str, str], dict]] = defaultdict(dict)
             for r in rows:
+                # Part Type filter on snapshot path (was previously dropped).
+                if category and not pc.is_all_part_type(category):
+                    row_cat = pc.normalize_part_category(
+                        str(r.get("category") or r.get("part_category") or "")
+                    )
+                    want = pc.normalize_part_category(str(category))
+                    if row_cat != want:
+                        continue
                 raw = _text(r.get("snapshot_date_ist")).replace("-", "")[:8]
                 pk = (
                     _text(r.get("brand_name")).casefold(),
@@ -495,12 +503,29 @@ async def _aggregate_parts_for_dates(
                     "branch": r.get("branch_name"),
                     "part_number": r.get("part_number"),
                     "part_name": r.get("part_name"),
-                    "part_category": r.get("category"),
+                    "part_category": r.get("category") or r.get("part_category"),
+                    "category": r.get("category") or r.get("part_category"),
                     "qty": qty,
                     "unit": unit,
                     "value": _num(r.get("total_value"), qty * unit),
+                    # Preserve aging for Purchase/Sales Aging Analytics filters.
+                    "purchase_aging_days": r.get("purchase_aging_days"),
+                    "sales_aging_days": r.get("sales_aging_days"),
                 }
-            return by_date
+            # If snapshots exist globally but none matched this date/filter set,
+            # fall through to products only when snapshots for the requested dates
+            # are entirely missing — not when Part Type simply filtered to empty.
+            if by_date:
+                return by_date
+            # Snapshots queried but empty after scope — treat as no snapshot data
+            # for these dates (avoid silent wrong empty when dates missing).
+            have_dates = {
+                _text(r.get("snapshot_date_ist")).replace("-", "")[:8]
+                for r in rows
+            }
+            missing = [dk for dk in date_keys if _text(dk).replace("-", "")[:8] not in have_dates]
+            if not missing:
+                return by_date
     return await _aggregate_latest_parts_for_date_keys(date_keys, scope, category)
 
 

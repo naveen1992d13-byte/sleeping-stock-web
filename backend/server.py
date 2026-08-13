@@ -36,6 +36,8 @@ try:
     from . import history_archive
     from . import hybrid_history
     from . import archive_scheduler
+    from . import archive_runs
+    from . import maintenance as maint
     from . import excel_permissions
 except ImportError:
     import s3_storage
@@ -44,6 +46,8 @@ except ImportError:
     import history_archive
     import hybrid_history
     import archive_scheduler
+    import archive_runs
+    import maintenance as maint
     import excel_permissions
 
 ROOT_DIR = Path(__file__).parent
@@ -462,6 +466,14 @@ async def login(login_data: LoginRequest):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is inactive. Please contact administrator."
+        )
+
+    # Nightly maintenance (23:00–04:00 IST): block normal-user login.
+    # Master may still log in for read-only Storage/archive monitoring.
+    if maint.in_maintenance_window() and str(user.get("role") or "").lower() != "master":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=maint.MAINTENANCE_MESSAGE,
         )
 
     now = datetime.now(timezone.utc).isoformat()
@@ -3223,15 +3235,18 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
     raw_bytes = await file.read()
     file_size = len(raw_bytes)
 
-    # Store original Product Excel in S3/object-store (never embed multi-MB blobs in Mongo).
-    stored_excel = None
+    # HARD REQUIRE: original Excel must land in private REAL S3 before upload succeeds.
+    storage = s3_storage.get_storage()
+    if not storage.is_s3():
+        raise HTTPException(
+            status_code=503,
+            detail="Upload failed: private REAL S3 is unavailable. Product Excel cannot be stored safely.",
+        )
     try:
-        date_iso = _nmts_display_date(now)
-        # _nmts_display_date may return DD-MM-YYYY; prefer ISO for S3 key path
-        try:
-            date_iso = now.astimezone(NMTS_TIMEZONE).date().isoformat()
-        except Exception:
-            date_iso = datetime.now(NMTS_TIMEZONE).date().isoformat()
+        date_iso = now.astimezone(NMTS_TIMEZONE).date().isoformat()
+    except Exception:
+        date_iso = datetime.now(NMTS_TIMEZONE).date().isoformat()
+    try:
         stored_excel = await file_objects.store_bytes(
             module="uploads",
             relative_key=f"{date_iso}/product-hub/{upload_no}_{file.filename}",
@@ -3240,7 +3255,17 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
             content_type=file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     except Exception as exc:
-        logger.error("Product Excel S3 store failed (upload continues): %s", exc)
+        logger.error("Product Excel S3 store failed (upload aborted): %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Upload failed: could not store Excel in private REAL S3 ({type(exc).__name__}).",
+        )
+    provider = str((stored_excel or {}).get("storage_provider") or "").lower()
+    if not (stored_excel or {}).get("storage_key") or provider not in {"s3", "real s3"}:
+        raise HTTPException(
+            status_code=503,
+            detail="Upload failed: Excel was not stored on private REAL S3 (missing storage_key).",
+        )
 
     wb = openpyxl.load_workbook(BytesIO(raw_bytes), data_only=True)
     # Prefer a worksheet explicitly named "Inventory" (case-insensitive) since that is
@@ -3818,6 +3843,8 @@ async def list_product_hub_history_rows(
         "page": result.get("page"),
         "mongo_count": result.get("mongo_count"),
         "s3_count": result.get("s3_count"),
+        "archive_unavailable": bool(result.get("archive_unavailable")),
+        "message": result.get("message"),
     }
 
 
@@ -4636,6 +4663,67 @@ async def order_desk_orders(brand: Optional[str] = None, dealer: Optional[str] =
     if role == 'admin': query['dealer_name'] = current_user.group
     if role == 'user': query.update({'created_by': current_user.id, 'branch': current_user.location})
     rows = await db.order_headers.find(query, {'_id': 0}).sort('created_at', -1).limit(1000).to_list(1000)
+    # Enrich for Order History (batched — avoid N+1 that stalls the page).
+    order_ids = [r.get('id') for r in rows if r.get('id')]
+    items_by_order = {}
+    reqs_by_item = {}
+    if order_ids:
+        all_items = await db.order_items.find({'order_id': {'$in': order_ids}}, {'_id': 0}).to_list(200000)
+        for it in all_items:
+            items_by_order.setdefault(it.get('order_id'), []).append(it)
+        item_ids = [it.get('id') for it in all_items if it.get('id')]
+        if item_ids:
+            all_reqs = await db.order_requests.find({'order_item_id': {'$in': item_ids}}, {'_id': 0}).to_list(500000)
+            for r in all_reqs:
+                reqs_by_item.setdefault(r.get('order_item_id'), []).append(r)
+
+    for row in rows:
+        fulfillment = []
+        for it in items_by_order.get(row.get('id'), []):
+            reqs = reqs_by_item.get(it.get('id'), [])
+            accepted = float(it.get('accepted_qty') or 0)
+            required = float(it.get('required_qty') or 0)
+            factory_no = it.get('system_order_number')
+            factory_qty = float(it.get('factory_fulfilled_qty') or 0)
+            sources = []
+            for r in reqs:
+                st = r.get('status')
+                if st in ('Approved', 'Partially Approved', 'Dispatched', 'Received', 'Completed') and float(r.get('accepted_qty', r.get('approved_qty', 0)) or 0) > 0:
+                    level = odw.allocation_level(
+                        {'dealer_name': r.get('supplying_dealer'), 'branch': r.get('supplying_branch'), 'level': r.get('source_type') or r.get('level')},
+                        row,
+                    )
+                    sources.append({
+                        'source_type': (level or 'branch').title(),
+                        'source_branch': r.get('supplying_branch'),
+                        'source_dealer': r.get('supplying_dealer'),
+                        'accepted_qty': float(r.get('accepted_qty', r.get('approved_qty', 0)) or 0),
+                        'request_number': r.get('request_number'),
+                        'accepted_by': r.get('approved_by') or r.get('accepted_by'),
+                        'accepted_at': r.get('approved_at') or r.get('accepted_at'),
+                        'status': 'Accepted' if st == 'Approved' else st,
+                    })
+            if factory_no:
+                sources.append({
+                    'source_type': 'Factory',
+                    'system_order_number': factory_no,
+                    'accepted_qty': factory_qty,
+                    'accepted_by': it.get('factory_system_order_saved_by_name'),
+                    'accepted_at': it.get('factory_system_order_saved_at'),
+                    'status': 'Completed',
+                })
+            fulfillment.append({
+                'part_number': it.get('part_number'),
+                'part_name': it.get('description') or it.get('part_name'),
+                'ordered_qty': required,
+                'fulfilled_qty': accepted + factory_qty,
+                'remaining_qty': max(0.0, required - accepted - factory_qty),
+                'request_status': it.get('request_status') or it.get('status'),
+                'system_order_number': factory_no,
+                'sources': sources,
+            })
+        row['fulfillment_lines'] = fulfillment
+        row['overall_status'] = row.get('overall_status') or row.get('status')
     return rows
 
 
@@ -5809,13 +5897,129 @@ async def request_group_detail(request_number: str, current_user: UserResponse =
     return group_doc
 
 
+# Simplified logistics: Dispatched → Completed (no mandatory Received).
+# Historical Received remains readable; Approved remains the stored accept status.
 REQUEST_CENTER_TRANSITIONS = {
     'Requested': {'Approved', 'Rejected', 'Cancelled'},
     'Approved': {'Dispatched', 'Cancelled'},
     'Partially Approved': {'Dispatched', 'Cancelled'},
-    'Dispatched': {'Received'},
+    'Dispatched': {'Completed'},
+    # Legacy readability: allow Complete from Received if any old rows exist.
     'Received': {'Completed'},
 }
+
+
+
+class FactorySystemOrderBody(BaseModel):
+    system_order_number: str
+    remarks: str = ""
+    correction_reason: str = ""
+
+
+@api_router.post('/order-desk/items/{item_id}/factory-system-order')
+async def save_factory_system_order(
+    item_id: str,
+    body: FactorySystemOrderBody,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Save generic System Order Number for Factory-stage remaining qty.
+
+    Brand-agnostic (DPS / OEM / other). Closes remaining Factory sourcing qty.
+    Master Admin / Admin may save; Master may correct with audit reason.
+    """
+    role = (current_user.role or '').lower()
+    if role not in ('master', 'admin'):
+        raise HTTPException(status_code=403, detail='Only Master/Admin can save System Order Number')
+    item = await db.order_items.find_one({'id': item_id}, {'_id': 0})
+    if not item:
+        raise HTTPException(status_code=404, detail='Order item not found')
+    order = await db.order_headers.find_one({'id': item.get('order_id')}, {'_id': 0}) or {}
+    if role == 'admin' and order.get('dealer_name') and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not allowed for this dealer scope')
+
+    number = (body.system_order_number or '').strip()
+    if not number:
+        raise HTTPException(status_code=400, detail='System Order Number is required')
+    if len(number) > 120:
+        raise HTTPException(status_code=400, detail='System Order Number is too long')
+
+    existing = (item.get('system_order_number') or '').strip()
+    now = datetime.now(timezone.utc).isoformat()
+    if existing and existing != number:
+        if role != 'master':
+            raise HTTPException(status_code=403, detail='Only Master Admin can correct System Order Number')
+        reason = (body.correction_reason or '').strip()
+        if not reason:
+            raise HTTPException(status_code=400, detail='correction_reason is required to change System Order Number')
+
+    # Determine remaining to fulfill via factory
+    item_requests = await db.order_requests.find({'order_item_id': item_id}, {'_id': 0}).to_list(5000)
+    wf = odw.compute_item_workflow(item, order, item_requests)
+    remaining = float(wf.get('remaining_qty') or 0)
+    if remaining <= 0 and not existing:
+        raise HTTPException(status_code=400, detail='No remaining Factory quantity to fulfill')
+    fulfill_qty = remaining if remaining > 0 else float(item.get('factory_fulfilled_qty') or item.get('factory_order_qty') or 0)
+
+    update = {
+        'system_order_number': number,
+        'factory_fulfilled_qty': fulfill_qty,
+        'factory_order_qty': 0,
+        'remaining_qty': 0,
+        'no_further_stock': False,
+        'request_status': odw.REQUEST_STATUS_COMPLETED,
+        'status': 'Completed',
+        'retry_required': False,
+        'factory_system_order_saved_by': current_user.id,
+        'factory_system_order_saved_by_name': current_user.username,
+        'factory_system_order_saved_at': now,
+        'factory_system_order_remarks': sanitize_text_safe(body.remarks or ''),
+        'source_type_fulfilled': 'Factory',
+        'updated_at': now,
+    }
+    if existing and existing != number:
+        update['factory_system_order_previous'] = existing
+        update['factory_system_order_correction_reason'] = sanitize_text_safe(reason)
+        update['factory_system_order_corrected_by'] = current_user.id
+        update['factory_system_order_corrected_at'] = now
+
+    await db.order_items.update_one({'id': item_id}, {'$set': update})
+    await db.order_activity.insert_one({
+        'id': str(uuid.uuid4()),
+        'order_id': item.get('order_id'),
+        'order_number': order.get('order_number'),
+        'order_item_id': item_id,
+        'action': 'Factory System Order Number Saved' if not existing or existing == number else 'Factory System Order Number Corrected',
+        'performed_by': current_user.id,
+        'performed_user_name': current_user.username,
+        'role': role,
+        'system_order_number': number,
+        'quantity': fulfill_qty,
+        'source_type': 'Factory',
+        'remarks': sanitize_text_safe(body.remarks or body.correction_reason or ''),
+        'created_at': now,
+    })
+    refreshed = await db.order_items.find_one({'id': item_id}, {'_id': 0})
+    # Roll up order header when all items sourced
+    siblings = await db.order_items.find({'order_id': item.get('order_id')}, {'_id': 0}).to_list(5000)
+    all_closed = True
+    for sib in siblings:
+        reqs = await db.order_requests.find({'order_item_id': sib.get('id')}, {'_id': 0}).to_list(5000)
+        sw = odw.compute_item_workflow(sib, order, reqs)
+        if float(sw.get('remaining_qty') or 0) > 0:
+            all_closed = False
+            break
+    if all_closed:
+        await db.order_headers.update_one(
+            {'id': item.get('order_id')},
+            {'$set': {'status': 'Completed', 'overall_status': 'Completed', 'sourcing_completed_at': now, 'updated_at': now}},
+        )
+    return {
+        'message': 'System Order Number saved',
+        'item': refreshed,
+        'system_order_number': number,
+        'fulfilled_qty': fulfill_qty,
+        'order_closed': all_closed,
+    }
 
 
 @api_router.get('/requests')
@@ -6155,8 +6359,11 @@ async def _request_logistics_transition(request_id: str, new_status: str, remark
     is_requester = role == 'master' or req.get('requested_by') == current_user.id or (role != 'user' and req.get('requesting_dealer') == current_user.group)
     if new_status == 'Dispatched' and not is_supplier:
         raise HTTPException(status_code=403, detail='Only the supplying scope can dispatch accepted parts')
-    if new_status in ('Received', 'Completed') and not is_requester:
-        raise HTTPException(status_code=403, detail='Only the requesting scope can receive or complete accepted parts')
+    # Completed is marked by requesting scope after physical receipt (replaces Receive step).
+    if new_status == 'Completed' and not is_requester:
+        raise HTTPException(status_code=403, detail='Only the requesting scope can complete accepted parts')
+    if new_status == 'Received' and not is_requester:
+        raise HTTPException(status_code=403, detail='Only the requesting scope can receive accepted parts')
     old_status = req.get('status')
     if old_status == new_status:
         return req, False
@@ -6943,12 +7150,42 @@ mobile_api.init_mobile_api(
 api_router.include_router(mobile_api.router)
 
 
+
+@api_router.get("/maintenance/status")
+async def maintenance_status_public():
+    """Public maintenance window status (no auth) for login/UI banners."""
+    return maint.maintenance_status()
+
+
 # ==================== HYBRID STORAGE ADMIN / OPS (MASTER ONLY MONITOR) ====================
+
 
 @api_router.get("/storage/status")
 async def storage_status(current_user: UserResponse = Depends(get_current_user)):
     await _ensure_master(current_user)
-    return s3_storage.get_storage().status()
+    status_payload = s3_storage.get_storage().status()
+    status_payload["maintenance"] = maint.maintenance_status()
+    run = await archive_runs.latest_run(db)
+    status_payload["tonight_archive"] = archive_runs.tonight_card(
+        run, maintenance_active=bool(status_payload["maintenance"].get("maintenance_active"))
+    )
+    return status_payload
+
+
+@api_router.get("/storage/archive-runs/latest")
+async def storage_archive_run_latest(current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master(current_user)
+    run = await archive_runs.latest_run(db)
+    return archive_runs.tonight_card(run, maintenance_active=maint.in_maintenance_window())
+
+
+@api_router.get("/storage/archive-runs/{run_id}")
+async def storage_archive_run_get(run_id: str, current_user: UserResponse = Depends(get_current_user)):
+    await _ensure_master(current_user)
+    run = await archive_runs.find_run(db, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Archive run not found")
+    return run
 
 
 @api_router.get("/storage/monitor")
@@ -7283,6 +7520,63 @@ async def storage_archive_delete_mongo(
 
 app.include_router(api_router)
 
+@app.middleware("http")
+async def maintenance_guard(request: Request, call_next):
+    """Block mutating APIs for non-master users during 23:00–04:00 IST.
+
+    Master retains read-only access to Storage/archive monitoring paths.
+    Application reopens at 04:00 even if archive modules failed.
+    """
+    if not maint.in_maintenance_window():
+        return await call_next(request)
+
+    path = request.url.path or ""
+    method = request.method or "GET"
+    # Always allow CORS preflight and public health/docs
+    if method == "OPTIONS" or path in {"/docs", "/openapi.json", "/redoc"}:
+        return await call_next(request)
+    if path.endswith("/auth/login") or path.endswith("/api/auth/login"):
+        return await call_next(request)  # login handler enforces role rule
+    if path.endswith("/maintenance/status") or path.endswith("/api/maintenance/status"):
+        return await call_next(request)
+
+    # Identify caller (best-effort)
+    role = None
+    try:
+        auth = request.headers.get("authorization") or ""
+        if auth.lower().startswith("bearer "):
+            token = auth.split(" ", 1)[1]
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            uid = payload.get("sub")
+            if uid:
+                user = await db.users.find_one({"id": uid}, {"_id": 0, "role": 1})
+                role = str((user or {}).get("role") or "").lower()
+    except Exception:
+        role = None
+
+    api_path = path[4:] if path.startswith("/api") else path
+    if not api_path.startswith("/"):
+        api_path = "/" + api_path
+
+    if role == "master":
+        if maint.is_mutating_method(method) and not maint.is_master_readonly_path(api_path):
+            # Allow archive retry / storage read helpers that are monitoring-critical
+            if api_path.startswith("/storage/archives") and method == "POST" and (
+                api_path.endswith("/retry") or "/daily/run" in api_path or "/product-history/run" in api_path
+            ):
+                return await call_next(request)
+            from starlette.responses import JSONResponse
+            return JSONResponse(status_code=503, content={"detail": maint.MAINTENANCE_MESSAGE})
+        return await call_next(request)
+
+    # Non-master: block mutations; allow GETs only if already authenticated session
+    # (login already blocked for non-master). Still block write methods.
+    if maint.is_mutating_method(method):
+        from starlette.responses import JSONResponse
+        return JSONResponse(status_code=503, content={"detail": maint.MAINTENANCE_MESSAGE})
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -7397,6 +7691,8 @@ async def seed_master_user_on_startup():
         await mobile_api.ensure_mobile_indexes()
         await archive_manifest.ensure_archive_indexes(db)
         logger.info("Archive manifest indexes verified")
+        await archive_runs.ensure_run_indexes(db)
+        logger.info("Archive run ledger indexes verified")
         try:
             import storage_usage as su
             await su.ensure_usage_indexes(db)

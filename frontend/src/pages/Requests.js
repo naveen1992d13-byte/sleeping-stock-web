@@ -8,18 +8,32 @@ import { toast } from 'sonner';
 
 const CLOSED_STATUSES = new Set(['Rejected', 'Cancelled', 'Completed']);
 const STATUS_STYLES = {
-  Requested: { bg: '#FEF3C7', fg: '#92400E' }, Approved: { bg: '#D1FAE5', fg: '#065F46' },
-  'Partially Approved': { bg: '#DBEAFE', fg: '#1E40AF' }, Rejected: { bg: '#FEE2E2', fg: '#991B1B' },
-  Cancelled: { bg: '#E5E7EB', fg: '#374151' }, Dispatched: { bg: '#E0F2FE', fg: '#075985' },
-  Received: { bg: '#EDE9FE', fg: '#5B21B6' }, Completed: { bg: '#D1FAE5', fg: '#065F46' },
+  Requested: { bg: '#FEF3C7', fg: '#92400E' },
+  Approved: { bg: '#D1FAE5', fg: '#065F46' },
+  Accepted: { bg: '#D1FAE5', fg: '#065F46' },
+  'Partially Approved': { bg: '#DBEAFE', fg: '#1E40AF' },
+  'Partially Accepted': { bg: '#DBEAFE', fg: '#1E40AF' },
+  Rejected: { bg: '#FEE2E2', fg: '#991B1B' },
+  Cancelled: { bg: '#E5E7EB', fg: '#374151' },
+  Dispatched: { bg: '#E0F2FE', fg: '#075985' },
+  Received: { bg: '#EDE9FE', fg: '#5B21B6' },
+  Completed: { bg: '#D1FAE5', fg: '#065F46' },
 };
 const nfmt = (v) => Number(v || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 const dtfmt = (v) => v ? String(v).slice(0, 16).replace('T', ' ') : '-';
 const esc = (v) => String(v ?? '').replace(/[&<>'"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c]));
 
+/** UI display mapping — DB may still store Approved; show Accepted. */
+function displayStatus(status) {
+  if (status === 'Approved') return 'Accepted';
+  if (status === 'Partially Approved') return 'Partially Accepted';
+  return status || 'Requested';
+}
+
 function StatusBadge({ status }) {
-  const s = STATUS_STYLES[status] || { bg: '#F3F4F6', fg: '#374151' };
-  return <span className="inline-block rounded-full px-2.5 py-1 text-xs font-semibold" style={{ backgroundColor: s.bg, color: s.fg }}>{status || 'Requested'}</span>;
+  const label = displayStatus(status);
+  const s = STATUS_STYLES[label] || STATUS_STYLES[status] || { bg: '#F3F4F6', fg: '#374151' };
+  return <span className="inline-block rounded-full px-2.5 py-1 text-xs font-semibold" style={{ backgroundColor: s.bg, color: s.fg }}>{label}</span>;
 }
 
 function ScopeCard({ title, subtitle, brand, dealer, branch, users, requestedBy }) {
@@ -42,10 +56,17 @@ function getGroupStatus(items) {
   if (pending) return 'Requested';
   if (items.every(i => i.status === 'Rejected')) return 'Rejected';
   if (items.every(i => i.status === 'Cancelled')) return 'Cancelled';
+  if (items.every(i => i.status === 'Completed')) return 'Completed';
+  if (items.every(i => ['Dispatched', 'Received', 'Completed'].includes(i.status))) {
+    if (items.some(i => i.status === 'Received') && items.every(i => ['Received', 'Completed'].includes(i.status))) {
+      return 'Received';
+    }
+    return 'Dispatched';
+  }
   const allApproved = items.every(i => i.status === 'Approved');
   const partialQty = items.some(i => Number(i.accepted_qty ?? i.approved_qty ?? 0) < Number(i.requested_qty || 0));
-  if (allApproved && !partialQty) return 'Approved';
-  return 'Partially Approved';
+  if (allApproved && !partialQty) return 'Accepted';
+  return 'Partially Accepted';
 }
 
 function openRequestPrint(group) {
@@ -65,7 +86,7 @@ function openRequestPrint(group) {
         <div class="metric"><small>REQUEST QTY</small><strong>${nfmt(group.total_qty)}</strong></div>
         <div class="metric"><small>ACCEPT QTY</small><strong>${nfmt(totalAccepted)}</strong></div>
         <div class="metric"><small>TOTAL VALUE</small><strong>₹ ${nfmt(group.total_value)}</strong></div>
-        <div class="metric"><small>STATUS</small><strong class="status">${esc(group.status)}</strong></div>
+        <div class="metric"><small>STATUS</small><strong class="status">${esc(displayStatus(group.status))}</strong></div>
       </div>
       <div class="route">
         <div><h3>STOCK SOURCE (FROM)</h3><p><b>Brand:</b> ${esc(group.supplying_brand || group.requesting_brand || '-')}</p><p><b>Dealer:</b> ${esc(group.supplying_dealer || '-')}</p><p><b>Branch:</b> ${esc(group.supplying_branch || '-')}</p><p><b>Requested To:</b> ${esc((group.receiver_users || []).map(u => `${u.name || 'User'}${u.id ? ` (${u.id})` : ''}`).join(', ') || 'Supplying Branch Team')}</p></div>
@@ -73,7 +94,7 @@ function openRequestPrint(group) {
         <div><h3>STOCK DESTINATION (TO)</h3><p><b>Brand:</b> ${esc(group.requesting_brand || '-')}</p><p><b>Dealer:</b> ${esc(group.requesting_dealer || '-')}</p><p><b>Branch:</b> ${esc(group.requesting_branch || '-')}</p><p><b>Requested By:</b> ${esc(group.requested_user_name || '-')} ${group.requested_user_id ? `(${esc(group.requested_user_id)})` : ''}</p></div>
       </div>
       <table><thead><tr><th>S.No</th><th>PART NUMBER</th><th>PART DESCRIPTION</th><th>LOC</th><th>REQUEST QTY</th><th>ACCEPT QTY</th><th>PURCHASE AGING</th><th>SALES AGING</th><th>STATUS / REMARKS</th></tr></thead>
-      <tbody>${items.map((i, idx) => `<tr><td>${pageIndex * itemsPerPage + idx + 1}</td><td>${esc(i.part_number)}</td><td>${esc(i.description || '-')}</td><td>${esc(i.loc_at_request || '-')}</td><td>${nfmt(i.requested_qty)}</td><td>${nfmt(i.accepted_qty ?? i.approved_qty ?? 0)}</td><td>${esc(i.purchase_aging_days_at_request ?? i.purchase_aging_at_request ?? '-')}</td><td>${esc(i.sales_aging_days_at_request ?? i.sales_aging_at_request ?? '-')}</td><td>${esc(i.status || 'Requested')}<br/><small>${esc(i.approval_remarks || i.remarks || '')}</small></td></tr>`).join('')}</tbody></table>
+      <tbody>${items.map((i, idx) => `<tr><td>${pageIndex * itemsPerPage + idx + 1}</td><td>${esc(i.part_number)}</td><td>${esc(i.description || '-')}</td><td>${esc(i.loc_at_request || '-')}</td><td>${nfmt(i.requested_qty)}</td><td>${nfmt(i.accepted_qty ?? i.approved_qty ?? 0)}</td><td>${esc(i.purchase_aging_days_at_request ?? i.purchase_aging_at_request ?? '-')}</td><td>${esc(i.sales_aging_days_at_request ?? i.sales_aging_at_request ?? '-')}</td><td>${esc(displayStatus(i.status))}<br/><small>${esc(i.approval_remarks || i.remarks || '')}</small></td></tr>`).join('')}</tbody></table>
       ${pageIndex === pages.length - 1 ? `<div class="signatures"><div>REQUESTED BY<span></span><small>Signature</small></div><div>RECEIVED BY<span></span><small>Signature</small></div><div>APPROVED BY<span></span><small>Signature</small></div><div>DISPATCHED BY<span></span><small>Signature</small></div></div><div class="notes"><b>Notes:</b> Please verify part number, accepted quantity and LOC before dispatch.</div>` : `<div class="continued">(Contd... Page ${pageIndex + 2})</div>`}
     </section>`).join('');
 
@@ -169,11 +190,16 @@ export function Requests() {
   const transitionGroup = async (group, action) => {
     setLoading(true);
     try {
-      const statusMap = { dispatch: ['Approved'], receive: ['Dispatched'], complete: ['Received'] };
+      // New workflow: Requested → Accepted(Approved) → Dispatched → Completed.
+      // Legacy Received rows remain readable and can still Complete.
+      const statusMap = {
+        dispatch: ['Approved'],
+        complete: ['Dispatched', 'Received'],
+      };
       const actionable = group.items.filter(i => statusMap[action]?.includes(i.status) && Number(i.accepted_qty ?? i.approved_qty ?? 0) > 0);
       if (!actionable.length) throw new Error(`No items are ready to ${action}`);
       await Promise.all(actionable.map(i => axios.post(`${API}/requests/${i.id}/${action}`, {})));
-      toast.success(`Accepted items ${action === 'dispatch' ? 'dispatched' : action === 'receive' ? 'received' : 'completed'}`);
+      toast.success(`Accepted items ${action === 'dispatch' ? 'dispatched' : 'completed'}`);
       await load();
     } catch (e) { toast.error(e.response?.data?.detail || e.message || `Unable to ${action} request`); }
     finally { setLoading(false); }
@@ -212,7 +238,7 @@ export function Requests() {
             {open && <div className="mt-5 rounded-xl border bg-white p-4">
               <div className="grid gap-4 lg:grid-cols-[1fr_48px_1fr]"><ScopeCard title="Stock Source (From)" subtitle="Supplying Location" brand={g.supplying_brand || g.requesting_brand} dealer={g.supplying_dealer} branch={g.supplying_branch} users={g.receiver_users}/><div className="hidden items-center justify-center lg:flex"><ArrowRight className="h-7 w-7 text-emerald-600"/></div><ScopeCard title="Stock Destination (To)" subtitle="Requesting Location" brand={g.requesting_brand} dealer={g.requesting_dealer} branch={g.requesting_branch} requestedBy={{name:g.requested_user_name,id:g.requested_user_id}}/></div>
               <div className="mt-5 overflow-x-auto"><div className="mb-2 flex items-center gap-2 font-semibold"><Package className="h-4 w-4 text-emerald-600"/>Item-wise Acceptance</div><table className="w-full min-w-[1450px] text-sm"><thead className="bg-emerald-50"><tr>{['Part Number','Part Name','Request Qty','Accept Quantity','Purchase Aging','Sales Aging','LOC','Part Value','Status','Remarks','Action'].map(h=><th key={h} className="p-3 text-left">{h}</th>)}</tr></thead><tbody>{g.items.map(i=>{ const d=draftFor(i); const editable=view!=='outgoing' && i.status==='Requested'; return <tr key={i.id} className="border-t"><td className="p-3 font-semibold">{i.part_number}</td><td className="p-3">{i.description||'-'}</td><td className="p-3">{nfmt(i.requested_qty)}</td><td className="p-3">{editable?<input type="number" min="0" max={Number(i.requested_qty||0)} step="any" value={d.accepted_qty} onChange={e=>updateDraft(i,'accepted_qty',e.target.value)} className="h-9 w-28 rounded border px-2 font-semibold"/>:<span className="font-semibold">{nfmt(i.accepted_qty ?? i.approved_qty ?? 0)}</span>}</td><td className="p-3">{i.purchase_aging_days_at_request ?? i.purchase_aging_at_request ?? '-'}</td><td className="p-3">{i.sales_aging_days_at_request ?? i.sales_aging_at_request ?? '-'}</td><td className="p-3 font-medium">{i.loc_at_request || '-'}</td><td className="p-3">₹{nfmt(i.value_at_request)}</td><td className="p-3"><StatusBadge status={i.status}/>{i.decision_type==='Partial'&&<div className="mt-1 text-xs font-semibold text-blue-700">Partially Accepted</div>}{i.decided_at&&<div className="mt-1 text-xs text-slate-500">Sent: {dtfmt(i.decided_at)}</div>}</td><td className="p-3">{editable?<input value={d.remarks} onChange={e=>updateDraft(i,'remarks',e.target.value)} placeholder={Number(d.accepted_qty)<Number(i.requested_qty||0)?'Remark required':'Item remarks'} className="h-9 w-44 rounded border px-2"/>:(i.approval_remarks||i.remarks||'-')}</td><td className="p-3">{editable?<Button size="sm" disabled={loading} onClick={()=>decideItem(i)}><Send className="mr-1 h-4 w-4"/>Send</Button>:'Sent'}</td></tr>})}</tbody></table></div>
-              <div className="mt-4 flex flex-wrap justify-end gap-2"><Button variant="outline" onClick={()=>openRequestPrint(g)}><Printer className="mr-1 h-4 w-4"/>Print Request</Button>{view!=='outgoing' && g.items.some(i=>i.status==='Approved' && Number(i.accepted_qty ?? i.approved_qty ?? 0)>0) && <Button disabled={loading} onClick={()=>transitionGroup(g,'dispatch')}>Dispatch Accepted</Button>}{view!=='incoming' && g.items.some(i=>i.status==='Dispatched') && <Button disabled={loading} onClick={()=>transitionGroup(g,'receive')}>Receive</Button>}{view!=='incoming' && g.items.some(i=>i.status==='Received') && <Button disabled={loading} onClick={()=>transitionGroup(g,'complete')}>Complete</Button>}{(view==='outgoing'||view==='all') && g.items.some(i=>['Requested','Approved'].includes(i.status)) && <Button variant="outline" disabled={loading} onClick={()=>cancelGroup(g)}><Ban className="mr-1 h-4 w-4"/>Cancel Request</Button>}</div>
+              <div className="mt-4 flex flex-wrap justify-end gap-2"><Button variant="outline" onClick={()=>openRequestPrint(g)}><Printer className="mr-1 h-4 w-4"/>Print Request</Button>{view!=='outgoing' && g.items.some(i=>i.status==='Approved' && Number(i.accepted_qty ?? i.approved_qty ?? 0)>0) && <Button disabled={loading} onClick={()=>transitionGroup(g,'dispatch')}>Dispatch Accepted</Button>}{view!=='incoming' && g.items.some(i=>['Dispatched','Received'].includes(i.status) && Number(i.accepted_qty ?? i.approved_qty ?? 0)>0) && <Button disabled={loading} onClick={()=>transitionGroup(g,'complete')}>Complete</Button>}{(view==='outgoing'||view==='all') && g.items.some(i=>['Requested','Approved'].includes(i.status)) && <Button variant="outline" disabled={loading} onClick={()=>cancelGroup(g)}><Ban className="mr-1 h-4 w-4"/>Cancel Request</Button>}</div>
             </div>}
           </div>;
         })}

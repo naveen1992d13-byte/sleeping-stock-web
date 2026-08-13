@@ -505,7 +505,6 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
     has_partial = False
     has_rejected = False
     has_cancel_req = False
-    any_completed = False
     pending_timer = None
     qty_locked = False
     source_locked = False
@@ -578,10 +577,11 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
             has_partial = True
         if status == 'Rejected':
             has_rejected = True
-        if status == 'Completed':
-            any_completed = True
 
-    remaining = max(0.0, required - accepted_total - active_requested)
+    factory_fulfilled = 0.0
+    if item.get('system_order_number'):
+        factory_fulfilled = _f(item.get('factory_fulfilled_qty') or item.get('factory_order_qty'))
+    remaining = max(0.0, required - accepted_total - active_requested - factory_fulfilled)
 
     unsent_alloc_qty = 0.0
     for alloc in item.get('allocations') or []:
@@ -601,12 +601,21 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
         request_status = REQUEST_STATUS_EXPIRED
     elif has_sent and active_requested > 0:
         request_status = REQUEST_STATUS_AWAITING if (pending_timer or True) else REQUEST_STATUS_SENT
-    elif factory_order_qty > 0 and remaining > 0 and not unsent_alloc_qty and not active_requested:
+    elif (
+        factory_order_qty > 0
+        and remaining > 0
+        and not unsent_alloc_qty
+        and not active_requested
+        and not item.get('system_order_number')
+    ):
         request_status = REQUEST_STATUS_FACTORY
-    elif any_completed and remaining <= 0 and active_requested <= 0:
+    elif remaining <= 0 and active_requested <= 0 and (
+        accepted_total >= required or bool(item.get('system_order_number'))
+    ):
+        # Order Desk sourcing completion is independent of Request Center logistics.
+        # Accepted qty and/or Factory System Order Number close OD without waiting
+        # for RC Dispatched / Received / Completed.
         request_status = REQUEST_STATUS_COMPLETED
-    elif accepted_total >= required and remaining <= 0 and active_requested <= 0:
-        request_status = REQUEST_STATUS_ACCEPTED if not has_partial else REQUEST_STATUS_PARTIAL
     elif has_partial and remaining > 0:
         request_status = REQUEST_STATUS_PARTIAL
     elif has_rejected and remaining > 0 and accepted_total <= 0 and not unsent_alloc_qty:

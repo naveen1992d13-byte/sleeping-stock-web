@@ -140,7 +140,9 @@ function compactRequestedFrom(item, selectedAllocations = []) {
 }
 
 export function Orders() {
-  useAuth();
+  const { user } = useAuth();
+  const canSaveSystemOrder = ['master', 'admin'].includes(String(user?.role || '').toLowerCase());
+  const isMaster = String(user?.role || '').toLowerCase() === 'master';
   const { scopeBrand = 'All Brands', scopeDealer = 'All Dealers', scopeBranch = 'All Branches' } = useOutletContext() || {};
   const isAllScope = value => !value || String(value).startsWith('All ') || value === 'N/A';
   const scopeReady = !isAllScope(scopeBrand) && !isAllScope(scopeDealer) && !isAllScope(scopeBranch);
@@ -180,6 +182,8 @@ export function Orders() {
   const [resendingNumber, setResendingNumber] = useState('');
   const [autoSuggestLoading, setAutoSuggestLoading] = useState('');
   const [tick, setTick] = useState(0);
+  const [factoryDrafts, setFactoryDrafts] = useState({});
+  const [factorySaving, setFactorySaving] = useState('');
 
   // Countdown tick for awaiting timers
   useEffect(() => {
@@ -226,6 +230,31 @@ export function Orders() {
       toast.error(error.response?.data?.detail || 'Unable to open order');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const saveFactorySystemOrder = async (item) => {
+    const draft = factoryDrafts[item.id] || {};
+    const number = String(draft.system_order_number || item.system_order_number || '').trim();
+    if (!number) return toast.error('System Order Number is required');
+    const existing = String(item.system_order_number || '').trim();
+    if (existing && existing !== number && !String(draft.correction_reason || '').trim()) {
+      return toast.error('Correction reason is required to change System Order Number');
+    }
+    setFactorySaving(item.id);
+    try {
+      await axios.post(`${API}/order-desk/items/${item.id}/factory-system-order`, {
+        system_order_number: number,
+        remarks: draft.remarks || '',
+        correction_reason: draft.correction_reason || '',
+      });
+      toast.success('System Order Number saved — Factory quantity fulfilled');
+      setFactoryDrafts((p) => ({ ...p, [item.id]: { ...(p[item.id] || {}), correction_reason: '' } }));
+      if (currentOrder?.id) await loadOrder(currentOrder.id, false);
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Unable to save System Order Number');
+    } finally {
+      setFactorySaving('');
     }
   };
 
@@ -704,9 +733,67 @@ export function Orders() {
                       <tr className="bg-slate-50 border-t">
                         <td colSpan={8} className="p-4 space-y-4">
                           {showFactory && activeStage === 'factory' ? (
-                            <div className="rounded-lg border bg-white p-4">
+                            <div className="rounded-lg border bg-white p-4 space-y-3">
                               <div className="font-semibold mb-1">Factory / Other Source</div>
                               <div className="text-sm text-slate-600">Remaining Qty for factory / external procurement: <b>{formatNumber(item.factory_order_qty || remaining)}</b></div>
+                              {item.system_order_number ? (
+                                <div className="text-sm">
+                                  <div className="text-xs text-slate-500">System Order Number</div>
+                                  <div className="font-semibold text-emerald-800">{item.system_order_number}</div>
+                                  {item.factory_system_order_saved_at && (
+                                    <div className="text-xs text-slate-500 mt-1">
+                                      Saved by {item.factory_system_order_saved_by_name || '-'} · {String(item.factory_system_order_saved_at).slice(0, 16).replace('T', ' ')}
+                                    </div>
+                                  )}
+                                </div>
+                              ) : null}
+                              {canSaveSystemOrder && ((remaining > 0 && !item.system_order_number) || (item.system_order_number && isMaster)) ? (
+                                <div className="grid gap-2 md:grid-cols-[1fr_auto] items-end max-w-xl">
+                                  <label className="text-xs text-slate-600">
+                                    System Order Number
+                                    <input
+                                      type="text"
+                                      className="mt-1 h-9 w-full rounded border px-2 text-sm"
+                                      placeholder="Type or paste System Order Number"
+                                      value={factoryDrafts[item.id]?.system_order_number ?? item.system_order_number ?? ''}
+                                      onChange={(e) => setFactoryDrafts((p) => ({
+                                        ...p,
+                                        [item.id]: { ...(p[item.id] || {}), system_order_number: e.target.value },
+                                      }))}
+                                      disabled={!canSaveSystemOrder || (!!item.system_order_number && !isMaster)}
+                                    />
+                                  </label>
+                                  <Button
+                                    size="sm"
+                                    disabled={factorySaving === item.id || (!remaining && !item.system_order_number)}
+                                    onClick={() => saveFactorySystemOrder(item)}
+                                  >
+                                    {factorySaving === item.id ? 'Saving…' : (item.system_order_number && isMaster ? 'Correct & Save' : 'Save & Close Factory')}
+                                  </Button>
+                                  {item.system_order_number && isMaster && (
+                                    <label className="text-xs text-slate-600 md:col-span-2">
+                                      Correction reason (required to change)
+                                      <input
+                                        type="text"
+                                        className="mt-1 h-9 w-full rounded border px-2 text-sm"
+                                        value={factoryDrafts[item.id]?.correction_reason || ''}
+                                        onChange={(e) => setFactoryDrafts((p) => ({
+                                          ...p,
+                                          [item.id]: { ...(p[item.id] || {}), correction_reason: e.target.value },
+                                        }))}
+                                      />
+                                    </label>
+                                  )}
+                                </div>
+                              ) : (
+                                !item.system_order_number && (
+                                  <div className="text-xs text-amber-700">
+                                    {canSaveSystemOrder
+                                      ? 'Enter System Order Number to fulfill remaining Factory quantity.'
+                                      : 'View only — Admin / Master Admin enter the System Order Number.'}
+                                  </div>
+                                )
+                              )}
                             </div>
                           ) : (
                             <div>

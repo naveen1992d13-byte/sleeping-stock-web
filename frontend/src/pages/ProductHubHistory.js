@@ -39,6 +39,7 @@ export function ProductHubHistory(){
   const [detailSources,setDetailSources]=useState({});
   const [detailLoading,setDetailLoading]=useState(false);
   const [detailSearch,setDetailSearch]=useState('');
+  const [archiveUnavailableMsg,setArchiveUnavailableMsg]=useState('');
   const scopeBrand=outlet.scopeBrand||'All Brands';
   const scopeDealer=outlet.scopeDealer||'All Dealers';
   const scopeBranch=outlet.scopeBranch||'All Branches';
@@ -64,7 +65,7 @@ export function ProductHubHistory(){
   const downloadFiltered=async()=>{if(!rows.length)return toast.error('No filtered data to download'); setDownloading(true); try{const p=buildParams({from_date:appliedRange.from,to_date:appliedRange.to}); await downloadBlob(`${API}/product-hub-history/download?${p.toString()}`,`Product_Hub_History_${appliedRange.from}_to_${appliedRange.to}.xlsx`); toast.success('Filtered history downloaded')}catch{toast.error('Download failed')}finally{setDownloading(false)}};
 
   const openView=async(r,page=1,searchText=detailSearch)=>{
-    setViewRow(r); setDetailPage(page); setDetailLoading(true);
+    setViewRow(r); setDetailPage(page); setDetailLoading(true); setArchiveUnavailableMsg('');
     try{
       const p=buildParams({
         date_key:r.date_key,
@@ -76,9 +77,17 @@ export function ProductHubHistory(){
         search:searchText||undefined,
       });
       const res=await axios.get(`${API}/product-hub-history/rows?${p.toString()}`);
-      setDetailRows(Array.isArray(res.data?.rows)?res.data.rows:[]);
-      setDetailMeta(res.data?.page||null);
-      setDetailSources(res.data?.sources||{});
+      if(res.data?.archive_unavailable){
+        setDetailRows([]);
+        setDetailMeta(null);
+        setDetailSources(res.data?.sources||{});
+        setArchiveUnavailableMsg(res.data?.message||'Archive temporarily unavailable. Please retry.');
+        toast.error(res.data?.message||'Archive temporarily unavailable. Please retry.');
+      }else{
+        setDetailRows(Array.isArray(res.data?.rows)?res.data.rows:[]);
+        setDetailMeta(res.data?.page||null);
+        setDetailSources(res.data?.sources||{});
+      }
     }catch{toast.error('Failed to load historical rows')}finally{setDetailLoading(false)};
   };
 
@@ -114,6 +123,7 @@ export function ProductHubHistory(){
             <thead><tr style={{backgroundColor:COLORS.dark,color:'#fff'}}>{['Part No','Part Name','Qty','Value','Category'].map(h=><th key={h} className="p-2 text-left">{h}</th>)}</tr></thead>
             <tbody>
               {detailLoading?<tr><td colSpan={5} className="p-4 text-center text-gray-500">Loading…</td></tr>:
+               archiveUnavailableMsg?<tr><td colSpan={5} className="p-4 text-center text-amber-700 font-medium">{archiveUnavailableMsg}</td></tr>:
                detailRows.length===0?<tr><td colSpan={5} className="p-4 text-center text-gray-500">No rows</td></tr>:
                detailRows.map((p,i)=><tr key={`${p.part_number}-${i}`} className="border-b"><td className="p-2">{p.part_number||'-'}</td><td className="p-2">{p.item_name||p.part_name||'-'}</td><td className="p-2">{p.available_qty_number??p.quantity??0}</td><td className="p-2">{p.total_value_number??p.total_value??0}</td><td className="p-2">{p.part_category||p.category||'-'}</td></tr>)}
             </tbody>

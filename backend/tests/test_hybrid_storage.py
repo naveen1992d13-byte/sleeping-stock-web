@@ -1174,9 +1174,11 @@ def test_archive_scope_enrichment_preserves_codes_and_fills_names():
     asyncio.get_event_loop().run_until_complete(_run())
 
 
-def test_archive_scheduler_timing_unchanged():
+def test_archive_scheduler_timing_same_day_window():
     src = Path(ROOT, "archive_scheduler.py").read_text(encoding="utf-8")
-    assert "now.hour == 23 and now.minute >= 45" in src
+    assert "now.hour == 23 and now.minute >= 45" not in src
+    assert "in_nightly_archive_window" in src
+    assert "same_business_day_iso" in src
     assert "now.day == 1 and now.hour == 1 and now.minute >= 30" in src
     assert "run_daily_coordinated_archive" in src
 
