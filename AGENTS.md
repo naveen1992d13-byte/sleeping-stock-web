@@ -11,14 +11,26 @@ This repo is the **NMTS / Sleeping Stock web app** — a dealer-network non-movi
 Dependencies (Python venv, frontend/mobile `node_modules`) are installed by the
 Cursor Cloud update script, so you normally don't need to install them again.
 
+**Codespaces / Dev Containers:** use `.devcontainer/` (`post-create.sh` creates
+`backend/venv` and installs `backend/requirements.txt`, including `boto3`).
+Starting the API with system Python causes `ModuleNotFoundError: boto3` and the
+storage layer falls back to local mode even when AWS secrets are set. Always
+run from the project venv (see below). Details: `.devcontainer/README.md`.
+
 ### Running the backend
 
 - The ASGI entrypoint that includes Socket.IO is `server:socket_app` (not just
-  `server:app`). Run it with the venv uvicorn:
-  `cd backend && ./venv/bin/uvicorn server:socket_app --host 0.0.0.0 --port 8000`
+  `server:app`). Run it **only** with the project venv:
+  `cd backend && ./venv/bin/python -m uvicorn server:socket_app --host 0.0.0.0 --port 8000`
+  (equivalent: `./venv/bin/uvicorn server:socket_app --host 0.0.0.0 --port 8000`).
+  Do not use system `python` / system `uvicorn`.
 - Config comes from `backend/.env` (committed). `MONGO_URL` points at a **shared
   hosted MongoDB Atlas cluster** with real-ish data — there is no local Mongo.
   Treat writes as affecting shared data; prefer clearly-labelled test values.
+- For REAL S3, Codespaces secrets (or gitignored `backend/.env.s3.local`) must
+  provide `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `NMTS_S3_BUCKET`,
+  `AWS_REGION` (optional `NMTS_STORAGE_ENV`). Keep `ARCHIVE_PRUNE_ENABLED=false`
+  unless prune is explicitly authorized.
 - On startup the backend seeds a master admin if none exists. Default login:
   `admin@sleepingstock.in` / `admin123`.
 - Known non-fatal startup log: a `Product Hub index creation failed ... E11000
