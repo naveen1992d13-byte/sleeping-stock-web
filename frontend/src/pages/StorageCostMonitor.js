@@ -311,6 +311,73 @@ export function StorageCostMonitor() {
         </div>
       )}
 
+      {/* Tonight's Archive — frozen date / run ledger */}
+      {(() => {
+        const tonight = data?.tonight_archive || {};
+        const modules = tonight.modules || {};
+        const maint = data?.maintenance || {};
+        return (
+          <div className="rounded-xl border bg-white p-4" style={{ borderColor: COLORS.border }} data-testid="tonight-archive-card">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div className="text-sm font-semibold" style={{ color: COLORS.dark }}>Tonight&apos;s Archive</div>
+              <div className="text-xs" style={{ color: maint.maintenance_active ? COLORS.warn : COLORS.muted }}>
+                {maint.maintenance_active ? 'Maintenance window active (23:00–04:00 IST)' : 'Outside maintenance window'}
+              </div>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4 mb-3">
+              {[
+                ['Frozen Archive Date', tonight.archive_date || '-'],
+                ['Run ID', tonight.run_id || '-'],
+                ['Started Time', tonight.started_at ? String(tonight.started_at).slice(0, 19).replace('T', ' ') : '-'],
+                ['Current Status', tonight.overall_status || '-'],
+              ].map(([label, value]) => (
+                <div key={label} className="rounded-lg border p-3" style={{ borderColor: COLORS.border, background: COLORS.soft }}>
+                  <div className="text-xs uppercase tracking-wide" style={{ color: COLORS.muted }}>{label}</div>
+                  <div className="mt-1 text-sm font-semibold break-all" style={{ color: COLORS.dark }}>{value}</div>
+                </div>
+              ))}
+            </div>
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wide" style={{ color: COLORS.muted }}>Per-module result</div>
+            <div className="overflow-x-auto rounded-lg border" style={{ borderColor: COLORS.border }}>
+              <table className="w-full text-xs">
+                <thead style={{ background: COLORS.soft }}>
+                  <tr>
+                    {['Module', 'Status', 'Retries', 'Error / note'].map((h) => (
+                      <th key={h} className="p-2 text-left">{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.keys(modules).length === 0 ? (
+                    <tr><td colSpan={4} className="p-3" style={{ color: COLORS.muted }}>No run ledger yet for tonight.</td></tr>
+                  ) : Object.entries(modules).map(([name, mod]) => (
+                    <tr key={name} className="border-t" style={{ borderColor: COLORS.border }}>
+                      <td className="p-2 font-medium">{name}</td>
+                      <td className="p-2" style={{ color: statusColor(String(mod?.status || '').toUpperCase() === 'VERIFIED' ? 'TRANSFERRED & VERIFIED' : String(mod?.status || '')) }}>
+                        {mod?.status || '-'}
+                      </td>
+                      <td className="p-2">{mod?.retries ?? 0}</td>
+                      <td className="p-2" style={{ color: COLORS.danger }}>{mod?.error || (mod?.result?.status ? String(mod.result.status) : '-')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-3 grid gap-2 text-sm" style={{ color: COLORS.muted }}>
+              <div>Verification result: <b style={{ color: COLORS.dark }}>{tonight.overall_status || '-'}</b>
+                {tonight.completed_at ? ` · completed ${String(tonight.completed_at).slice(0, 19).replace('T', ' ')}` : ''}
+              </div>
+              <div>Retry count: <b style={{ color: COLORS.dark }}>{tonight.retry_count ?? 0}</b></div>
+              {tonight.last_error && (
+                <div className="rounded-lg border px-3 py-2 text-xs" style={{ borderColor: '#FECACA', background: '#FEF2F2', color: COLORS.danger }}>
+                  Failure / retry info: {tonight.last_error}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Archive Health */}
       <div className="rounded-xl border bg-white p-4" style={{ borderColor: COLORS.border }}>
         <div className="mb-3 text-sm font-semibold" style={{ color: COLORS.dark }}>Archive Health</div>

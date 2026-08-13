@@ -169,19 +169,52 @@ async def _stream_s3_product_day_page(
             date_iso,
             manifest.get("status"),
         )
-        return None
+        return {
+            "rows": [],
+            "count": 0,
+            "total": 0,
+            "source": "s3_unavailable",
+            "archive_unavailable": True,
+            "message": "Archive temporarily unavailable. Please retry.",
+            "manifest_status": manifest.get("status"),
+        }
     backend = str(manifest.get("storage_backend") or "").lower()
     if backend not in {"s3", "real s3"}:
-        return None
+        return {
+            "rows": [],
+            "count": 0,
+            "total": 0,
+            "source": "s3_unavailable",
+            "archive_unavailable": True,
+            "message": "Archive temporarily unavailable. Please retry.",
+            "manifest_status": manifest.get("status"),
+        }
     try:
         data, _ctype = storage.download_bytes(manifest["storage_key"])
         head = storage.head(manifest["storage_key"])
         if head and str(head.get("storage_provider") or "").lower() == "local":
             logger.warning("Refusing local-fallback object for PRUNED/historical read %s", date_iso)
-            return None
+            return {
+                "rows": [],
+                "count": 0,
+                "total": 0,
+                "source": "s3_unavailable",
+                "archive_unavailable": True,
+                "message": "Archive temporarily unavailable. Please retry.",
+                "manifest_status": manifest.get("status"),
+            }
     except Exception as exc:
         logger.warning("Failed reading archive %s: %s", manifest.get("storage_key"), exc)
-        return None
+        return {
+            "rows": [],
+            "count": 0,
+            "total": 0,
+            "source": "s3_unavailable",
+            "archive_unavailable": True,
+            "message": "Archive temporarily unavailable. Please retry.",
+            "manifest_status": manifest.get("status"),
+            "error": str(exc)[:300],
+        }
     result = stream_filter_page_from_archive_bytes(
         data,
         brand=brand,
@@ -194,6 +227,7 @@ async def _stream_s3_product_day_page(
         need_total=True,
     )
     result["source"] = "s3"
+    result["archive_unavailable"] = False
     result["manifest_status"] = manifest.get("status")
     result["manifest_record_count"] = manifest.get("record_count")
     return result
@@ -406,10 +440,31 @@ async def read_product_history(
                 page=pg,
                 page_size=ps,
             )
+            if streamed and streamed.get("archive_unavailable"):
+                # VERIFIED archive exists but cannot be read — never pretend empty.
+                return {
+                    "rows": [],
+                    "count": 0,
+                    "total": 0,
+                    "sources": {dk: "s3_unavailable"},
+                    "mongo_count": 0,
+                    "s3_count": 0,
+                    "archive_unavailable": True,
+                    "message": streamed.get("message")
+                    or "Archive temporarily unavailable. Please retry.",
+                    "page": {
+                        "page": pg,
+                        "page_size": ps,
+                        "total": 0,
+                        "total_pages": 0,
+                        "has_more": False,
+                    },
+                }
             if streamed:
                 result = streamed
                 sources[dk] = "s3"
             else:
+                # Transitional Mongo fallback only when no VERIFIED S3 manifest exists.
                 result = await _read_mongo_product_day_page(
                     db,
                     dk,
@@ -448,6 +503,7 @@ async def read_product_history(
             "sources": sources,
             "mongo_count": result.get("total") if sources.get(dk) == "mongo" else 0,
             "s3_count": result.get("total") if sources.get(dk) == "s3" else 0,
+            "archive_unavailable": False,
             "page": result.get("page"),
         }
 

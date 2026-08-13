@@ -1,12 +1,11 @@
-"""Timezone-aware archive scheduler — one coordinated daily batch at 23:45 IST.
+"""Timezone-aware archive scheduler — nightly same-business-day archive.
 
-Daily coordinated archive (23:45 Asia/Kolkata) for the previous calendar day:
-  - uploads dump
-  - product-history dump
-  - orders terminal dump (by completion date)
-  - requests terminal dump (by completion date)
+Maintenance window: 23:00–04:00 Asia/Kolkata.
+At run start (23:00 IST), freeze archive_date = that IST calendar date for the
+entire coordinated run, even if work continues after midnight.
 
-Monthly completed Orders/Requests retained as a safety net on the 1st at 01:30 IST.
+Catch-up / retry of incomplete modules continues until 04:00 IST.
+Monthly completed Orders/Requests safety-net remains on the 1st at 01:30 IST.
 """
 
 from __future__ import annotations
@@ -19,7 +18,9 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 import archive_manifest as am
+import archive_runs as ar
 import history_archive as ha
+import maintenance as maint
 from s3_storage import archive_scheduler_enabled, verification_mongo_hot_days
 
 logger = logging.getLogger(__name__)
@@ -30,14 +31,28 @@ _OWNER = f"archive-scheduler-{uuid.uuid4().hex[:8]}"
 
 REQUIRED_DAILY_DATASETS = ("uploads", "product-history", "orders", "requests")
 
+# Large nightly runs may exceed 3h — allow up to full maintenance window.
+JOB_LOCK_TTL_SECONDS = 5 * 60 * 60
+
 
 def _ist_now() -> datetime:
     return datetime.now(IST)
 
 
 def previous_calendar_day_iso(now: Optional[datetime] = None) -> str:
+    """Legacy helper retained for tests/callers that still need yesterday."""
     now = now or _ist_now()
     return (now.date() - timedelta(days=1)).isoformat()
+
+
+def same_business_day_iso(now: Optional[datetime] = None) -> str:
+    """IST calendar date for the nightly same-day archive."""
+    return ar.ist_calendar_date_iso(now)
+
+
+def in_nightly_archive_window(now: Optional[datetime] = None) -> bool:
+    """23:00 inclusive through 03:59 IST (ends at 04:00)."""
+    return maint.in_maintenance_window(now)
 
 
 def _dataset_result_ok(result: Optional[Dict[str, Any]]) -> bool:
@@ -69,8 +84,14 @@ def evaluate_daily_cycle(results: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-async def run_daily_coordinated_archive(db, archive_date: Optional[str] = None) -> dict:
-    """One coordinated daily batch for all archive datasets (previous IST day).
+async def run_daily_coordinated_archive(
+    db,
+    archive_date: Optional[str] = None,
+    *,
+    run_id: Optional[str] = None,
+    freeze_date: bool = True,
+) -> dict:
+    """Coordinated daily batch for the frozen same-business-day archive_date.
 
     Idempotent per dataset: already VERIFIED / NO_ELIGIBLE rows are not re-uploaded.
     Cycle status is COMPLETE only when uploads, product-history, orders, and requests
@@ -78,25 +99,64 @@ async def run_daily_coordinated_archive(db, archive_date: Optional[str] = None) 
     """
     now = _ist_now()
     if not archive_date:
-        archive_date = previous_calendar_day_iso(now)
+        # Default for manual/API callers: same business day (not previous day).
+        archive_date = same_business_day_iso(now)
+
+    run = None
+    if freeze_date:
+        run = await ar.start_or_resume_run(db, archive_date=archive_date)
+        # CRITICAL: never recompute — use frozen date from ledger
+        archive_date = run["archive_date"]
+        run_id = run["run_id"]
+
     lock_key = f"daily-coordinated:{archive_date}"
-    if not await am.acquire_job_lock(db, lock_key, _OWNER, ttl_seconds=10800):
-        return {"status": "locked", "archive_date": archive_date}
+    if not await am.acquire_job_lock(db, lock_key, _OWNER, ttl_seconds=JOB_LOCK_TTL_SECONDS):
+        return {"status": "locked", "archive_date": archive_date, "run_id": run_id}
 
-    results: dict = {"archive_date": archive_date, "datasets": {}}
+    results: dict = {
+        "archive_date": archive_date,
+        "run_id": run_id,
+        "datasets": {},
+    }
     try:
-        # A. Uploads dump
-        try:
-            results["datasets"]["uploads"] = await ha.archive_uploads_for_date(db, archive_date)
-        except Exception as exc:
-            logger.error("Daily uploads archive failed for %s: %s", archive_date, exc)
-            results["datasets"]["uploads"] = {"status": "error", "error": str(exc)[:500]}
+        async def _run_module(name: str, coro):
+            try:
+                outcome = await coro
+                results["datasets"][name] = outcome
+                ok = _dataset_result_ok(outcome)
+                if run_id:
+                    await ar.mark_module(
+                        db,
+                        run_id,
+                        name,
+                        status=ar.STATUS_VERIFIED if ok else ar.STATUS_FAILED,
+                        result={
+                            "status": (outcome or {}).get("status"),
+                            "record_count": (outcome or {}).get("record_count"),
+                        },
+                        error=None if ok else str((outcome or {}).get("error") or (outcome or {}).get("status") or "failed")[:500],
+                        increment_retry=not ok,
+                    )
+            except Exception as exc:
+                logger.error("Daily %s archive failed for %s: %s", name, archive_date, exc)
+                results["datasets"][name] = {"status": "error", "error": str(exc)[:500]}
+                if run_id:
+                    await ar.mark_module(
+                        db,
+                        run_id,
+                        name,
+                        status=ar.STATUS_FAILED,
+                        result=None,
+                        error=str(exc)[:500],
+                        increment_retry=True,
+                    )
 
-        # B. Product History dump
+        await _run_module("uploads", ha.archive_uploads_for_date(db, archive_date))
+
+        # Product history (+ optional side jobs; prune stays gated by ARCHIVE_PRUNE_ENABLED)
         try:
             ph = await ha.archive_product_history_for_date(db, archive_date)
             results["datasets"]["product-history"] = ph
-            # Side-job: verifications outside hot window
             try:
                 hot = verification_mongo_hot_days()
                 cutoff = (now.date() - timedelta(days=hot)).isoformat()
@@ -107,7 +167,6 @@ async def run_daily_coordinated_archive(db, archive_date: Optional[str] = None) 
             except Exception as exc:
                 logger.warning("Verification archive side-job failed: %s", exc)
 
-            # Optional prune only when REAL S3 verified
             prune_result = None
             try:
                 if ph.get("status") in {"verified", "already_verified"}:
@@ -118,27 +177,46 @@ async def run_daily_coordinated_archive(db, archive_date: Optional[str] = None) 
             if isinstance(ph, dict):
                 ph = {**ph, "prune": prune_result}
                 results["datasets"]["product-history"] = ph
+
+            ok = _dataset_result_ok(ph)
+            if run_id:
+                await ar.mark_module(
+                    db,
+                    run_id,
+                    "product-history",
+                    status=ar.STATUS_VERIFIED if ok else ar.STATUS_FAILED,
+                    result={"status": ph.get("status"), "record_count": ph.get("record_count")},
+                    error=None if ok else str(ph.get("error") or ph.get("status") or "failed")[:500],
+                    increment_retry=not ok,
+                )
         except Exception as exc:
             logger.error("Daily product-history archive failed for %s: %s", archive_date, exc)
             results["datasets"]["product-history"] = {"status": "error", "error": str(exc)[:500]}
+            if run_id:
+                await ar.mark_module(
+                    db,
+                    run_id,
+                    "product-history",
+                    status=ar.STATUS_FAILED,
+                    error=str(exc)[:500],
+                    increment_retry=True,
+                )
 
-        # C. Orders dump (terminal on that date)
-        try:
-            results["datasets"]["orders"] = await ha.archive_orders_for_date(db, archive_date)
-        except Exception as exc:
-            logger.error("Daily orders archive failed for %s: %s", archive_date, exc)
-            results["datasets"]["orders"] = {"status": "error", "error": str(exc)[:500]}
-
-        # D. Requests dump (terminal on that date)
-        try:
-            results["datasets"]["requests"] = await ha.archive_requests_for_date(db, archive_date)
-        except Exception as exc:
-            logger.error("Daily requests archive failed for %s: %s", archive_date, exc)
-            results["datasets"]["requests"] = {"status": "error", "error": str(exc)[:500]}
+        await _run_module("orders", ha.archive_orders_for_date(db, archive_date))
+        await _run_module("requests", ha.archive_requests_for_date(db, archive_date))
 
         cycle = evaluate_daily_cycle(results)
         results["cycle"] = cycle
         results["status"] = "ok" if cycle["complete"] else "incomplete"
+        if run_id:
+            await ar.finalize_run(
+                db,
+                run_id,
+                complete=bool(cycle["complete"]),
+                last_error=None
+                if cycle["complete"]
+                else f"failed={cycle.get('failed_datasets')} missing={cycle.get('missing_datasets')}",
+            )
         return results
     finally:
         await am.release_job_lock(db, lock_key, _OWNER)
@@ -153,7 +231,7 @@ async def run_monthly_completed_archives(db, archive_month: Optional[str] = None
     if not archive_month:
         archive_month, _, _ = ha._prev_calendar_month()
     lock_key = f"monthly-completed:{archive_month}"
-    if not await am.acquire_job_lock(db, lock_key, _OWNER, ttl_seconds=10800):
+    if not await am.acquire_job_lock(db, lock_key, _OWNER, ttl_seconds=JOB_LOCK_TTL_SECONDS):
         return {"status": "locked", "archive_month": archive_month}
     try:
         orders = await ha.archive_completed_orders_month(db, archive_month)
@@ -164,57 +242,79 @@ async def run_monthly_completed_archives(db, archive_month: Optional[str] = None
 
 
 async def _scheduler_loop(db) -> None:
-    logger.info("Archive scheduler started (owner=%s)", _OWNER)
-    last_daily = None
+    logger.info("Archive scheduler started (owner=%s) — same-day window 23:00–04:00 IST", _OWNER)
     last_monthly = None
+    active_archive_date: Optional[str] = None
+
     while True:
         try:
             if not archive_scheduler_enabled():
                 await asyncio.sleep(30)
                 continue
             now = _ist_now()
-            daily_stamp = previous_calendar_day_iso(now)
             monthly_stamp = now.strftime("%Y-%m")
 
-            # Daily coordinated batch at 23:45 IST — archives the previous calendar day.
-            # Window: 23:45–23:59 so a single stamp is used per day only after COMPLETE success.
-            if now.hour == 23 and now.minute >= 45 and last_daily != daily_stamp:
-                modules = [
-                    getattr(ha, "MODULE_UPLOADS", "uploads"),
-                    ha.MODULE_PRODUCT_HISTORY,
-                    ha.MODULE_ORDERS,
-                    ha.MODULE_REQUESTS,
-                ]
-                acceptable = 0
-                for mod in modules:
-                    row = await am.find_acceptable_daily(db, mod, daily_stamp)
-                    if row:
-                        acceptable += 1
-                if acceptable >= 4:
+            # Nightly same-business-day archive + catch-up inside maintenance window.
+            if in_nightly_archive_window(now):
+                # Freeze date at first entry into tonight's window (23:00–23:59).
+                # After midnight (00:00–03:59), continue the SAME frozen date.
+                if now.hour >= 23:
+                    candidate = same_business_day_iso(now)
+                    if active_archive_date != candidate:
+                        active_archive_date = candidate
+                        logger.info(
+                            "Freezing nightly archive_date=%s run start IST=%s",
+                            active_archive_date,
+                            now.isoformat(),
+                        )
+                elif not active_archive_date:
+                    # Process restart after midnight: resume prior IST calendar day.
+                    active_archive_date = (now.date() - timedelta(days=1)).isoformat()
                     logger.info(
-                        "Daily coordinated archive for %s already complete (%s/4) — skipping",
-                        daily_stamp,
-                        acceptable,
+                        "Resuming nightly archive after restart; frozen archive_date=%s",
+                        active_archive_date,
                     )
-                    last_daily = daily_stamp
+
+                run = await ar.find_run_for_date(db, active_archive_date)
+                if run and run.get("overall_status") == ar.STATUS_VERIFIED:
+                    pass  # done for tonight
                 else:
-                    logger.info("Triggering daily coordinated archive for previous day %s", daily_stamp)
-                    try:
-                        outcome = await run_daily_coordinated_archive(db, daily_stamp)
-                        cycle = outcome.get("cycle") or evaluate_daily_cycle(outcome)
-                        if cycle.get("complete"):
-                            last_daily = daily_stamp
-                            logger.info("Daily coordinated archive COMPLETE for %s", daily_stamp)
-                        else:
-                            # Do NOT stamp last_daily — allow same-night retry
-                            logger.error(
-                                "Daily coordinated archive INCOMPLETE for %s — failed=%s missing=%s",
-                                daily_stamp,
-                                cycle.get("failed_datasets"),
-                                cycle.get("missing_datasets"),
+                    modules_ok = 0
+                    for mod in REQUIRED_DAILY_DATASETS:
+                        row = await am.find_acceptable_daily(db, mod, active_archive_date)
+                        if row:
+                            modules_ok += 1
+                    if modules_ok >= 4 and run:
+                        await ar.finalize_run(db, run["run_id"], complete=True)
+                    elif modules_ok < 4:
+                        logger.info(
+                            "Triggering/catch-up same-day archive for frozen date %s (%s/4 ready)",
+                            active_archive_date,
+                            modules_ok,
+                        )
+                        try:
+                            outcome = await run_daily_coordinated_archive(
+                                db, active_archive_date, freeze_date=True
                             )
-                    except Exception as exc:
-                        logger.error("Daily coordinated archive failed: %s", exc)
+                            cycle = outcome.get("cycle") or evaluate_daily_cycle(outcome)
+                            if cycle.get("complete"):
+                                logger.info(
+                                    "Daily coordinated archive COMPLETE for %s run_id=%s",
+                                    active_archive_date,
+                                    outcome.get("run_id"),
+                                )
+                            else:
+                                logger.error(
+                                    "Daily coordinated archive INCOMPLETE for %s — failed=%s missing=%s",
+                                    active_archive_date,
+                                    cycle.get("failed_datasets"),
+                                    cycle.get("missing_datasets"),
+                                )
+                        except Exception as exc:
+                            logger.error("Daily coordinated archive failed: %s", exc)
+            else:
+                # Outside window — clear in-memory freeze so next night starts fresh.
+                active_archive_date = None
 
             # Monthly safety-net on 1st at 01:30 IST (previous calendar month)
             if now.day == 1 and now.hour == 1 and now.minute >= 30 and last_monthly != monthly_stamp:

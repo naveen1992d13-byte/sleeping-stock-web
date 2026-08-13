@@ -8,8 +8,10 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import archive_manifest as am
+import archive_runs as ar
 import archive_verify as av
 import history_archive as ha
+import maintenance as maint
 import storage_usage as su
 from s3_storage import get_storage, product_mongo_hot_days
 
@@ -650,11 +652,16 @@ async def monitor_dashboard(db, *, month: Optional[str] = None) -> Dict[str, Any
         },
         "archive_schedule": {
             "timezone": "Asia/Kolkata",
-            "daily_coordinated_batch": "23:45 IST (previous calendar day — uploads, product-history, orders, requests)",
-            "daily_product_history": "23:45 IST (previous calendar day, part of coordinated batch)",
+            "daily_coordinated_batch": "23:00–04:00 IST maintenance window (same business day — uploads, product-history, orders, requests)",
+            "daily_product_history": "23:00 IST start; frozen same-business-day archive_date (part of coordinated batch)",
             "monthly_orders_requests": "01:30 IST on the 1st (previous calendar month safety-net)",
             "unchanged": False,
         },
+        "maintenance": maint.maintenance_status(),
+        "tonight_archive": ar.tonight_card(
+            await ar.latest_run(db),
+            maintenance_active=maint.in_maintenance_window(),
+        ),
         "filters_note": (
             "Storage & Data Cleanup always shows overall health. "
             "Global Brand/Dealer/Branch header filters do not apply on this page."

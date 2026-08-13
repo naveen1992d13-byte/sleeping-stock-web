@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useAuth, canAccessPermission, canAccessMenuItem } from '@/App';
+import axios from 'axios';
+import { API, useAuth, canAccessPermission, canAccessMenuItem } from '@/App';
 import { getFirstAllowedMenuItem } from '@/config/menuConfig';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
@@ -39,8 +40,22 @@ export function LoginPage() {
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [maintenance, setMaintenance] = useState(null);
   const { login } = useAuth();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await axios.get(`${API}/maintenance/status`);
+        if (!cancelled) setMaintenance(res.data || null);
+      } catch {
+        if (!cancelled) setMaintenance(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -82,6 +97,17 @@ export function LoginPage() {
               <p>Non Moving Tracking System</p>
               <div className="nmts-title-accent" />
             </header>
+
+            {maintenance?.maintenance_active && (
+              <div
+                className="rounded-lg border px-3 py-2 text-sm mb-3"
+                style={{ background: '#FEF3C7', borderColor: '#F59E0B', color: '#92400E' }}
+                data-testid="maintenance-banner"
+              >
+                {maintenance.message || 'System maintenance in progress. Please try again after 4:00 AM.'}
+                <div className="text-xs mt-1 opacity-90">Master Admin may sign in for Storage / Archive monitoring (read-only).</div>
+              </div>
+            )}
 
             <form onSubmit={handleSubmit} className="nmts-login-form">
               <div className="nmts-login-field">
