@@ -241,7 +241,11 @@ async def list_cleanup_archives(
                 "failure_reason": None if physically_ok else (live.get("reason") or m.get("error")),
                 "s3_object_status": "EXISTS" if live.get("object_exists") else "MISSING",
                 "s3_readable": bool(live.get("object_readable")),
-                "sha256_match": "MATCH" if live.get("sha256_match") else "MISMATCH",
+                "sha256_match": (
+                    "MATCH"
+                    if live.get("sha256_match") is True
+                    else ("MISMATCH" if live.get("sha256_match") is False else "Not Checked")
+                ),
                 "data_changed_status": data_changed,
                 "sha256_status": "PRESENT" if m.get("sha256") else "MISSING",
                 "storage_backend": m.get("storage_backend"),
@@ -476,7 +480,11 @@ async def verify_archive(
         "display_status": live.get("display_status"),
         "storage_backend": manifest.get("storage_backend") or status.get("storage_backend"),
         "sha256": expected_sha,
-        "sha256_status": "MATCH" if checks["sha256_match"] else "MISMATCH",
+        "sha256_status": (
+            "MATCH"
+            if checks.get("sha256_match") is True
+            else ("MISMATCH" if checks.get("sha256_match") is False else "Not Checked")
+        ),
         "s3_readable": checks["object_readable"],
         "s3_object_status": "EXISTS" if checks["object_exists"] else "MISSING",
         "archive_timestamp": manifest.get("verified_at") or manifest.get("created_at"),
