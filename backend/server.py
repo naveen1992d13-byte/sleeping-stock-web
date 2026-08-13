@@ -4663,12 +4663,24 @@ async def order_desk_orders(brand: Optional[str] = None, dealer: Optional[str] =
     if role == 'admin': query['dealer_name'] = current_user.group
     if role == 'user': query.update({'created_by': current_user.id, 'branch': current_user.location})
     rows = await db.order_headers.find(query, {'_id': 0}).sort('created_at', -1).limit(1000).to_list(1000)
-    # Enrich for Order History: sourcing/fulfillment summary (null-safe for legacy rows)
+    # Enrich for Order History (batched — avoid N+1 that stalls the page).
+    order_ids = [r.get('id') for r in rows if r.get('id')]
+    items_by_order = {}
+    reqs_by_item = {}
+    if order_ids:
+        all_items = await db.order_items.find({'order_id': {'$in': order_ids}}, {'_id': 0}).to_list(200000)
+        for it in all_items:
+            items_by_order.setdefault(it.get('order_id'), []).append(it)
+        item_ids = [it.get('id') for it in all_items if it.get('id')]
+        if item_ids:
+            all_reqs = await db.order_requests.find({'order_item_id': {'$in': item_ids}}, {'_id': 0}).to_list(500000)
+            for r in all_reqs:
+                reqs_by_item.setdefault(r.get('order_item_id'), []).append(r)
+
     for row in rows:
-        items = await db.order_items.find({'order_id': row.get('id')}, {'_id': 0}).to_list(5000)
         fulfillment = []
-        for it in items:
-            reqs = await db.order_requests.find({'order_item_id': it.get('id')}, {'_id': 0}).to_list(5000)
+        for it in items_by_order.get(row.get('id'), []):
+            reqs = reqs_by_item.get(it.get('id'), [])
             accepted = float(it.get('accepted_qty') or 0)
             required = float(it.get('required_qty') or 0)
             factory_no = it.get('system_order_number')

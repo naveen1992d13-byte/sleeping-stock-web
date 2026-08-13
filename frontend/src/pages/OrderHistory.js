@@ -16,17 +16,21 @@ export function OrderHistory() {
   const isAllScope = (value) => !value || String(value).startsWith('All ') || value === 'N/A';
   const [orders, setOrders] = useState([]);
   const [expanded, setExpanded] = useState({});
+  const [loading, setLoading] = useState(false);
 
   const loadHistory = async () => {
+    setLoading(true);
     try {
       const params = new URLSearchParams();
       if (!isAllScope(scopeBrand)) params.set('brand', scopeBrand);
       if (!isAllScope(scopeDealer)) params.set('dealer', scopeDealer);
       if (!isAllScope(scopeBranch)) params.set('branch', scopeBranch);
-      const res = await axios.get(`${API}/order-desk/orders?${params.toString()}`);
+      const res = await axios.get(`${API}/order-desk/orders?${params.toString()}`, { timeout: 120000 });
       setOrders(res.data || []);
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Unable to load order history');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -185,7 +189,14 @@ export function OrderHistory() {
                   </React.Fragment>
                 );
               })}
-              {!orders.length && (
+              {loading && (
+                <tr>
+                  <td colSpan={11} className="p-8 text-center text-slate-500">
+                    Loading order history…
+                  </td>
+                </tr>
+              )}
+              {!loading && !orders.length && (
                 <tr>
                   <td colSpan={11} className="p-8 text-center text-slate-500">
                     No saved orders
