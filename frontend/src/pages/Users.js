@@ -20,14 +20,11 @@ import {
 } from "lucide-react";
 import { useOutletContext } from "react-router-dom";
 import { Button } from "../components/ui/button";
-import { useAuth, API as NMTS_API } from "../App";
+import { useAuth, API } from "../App";
 import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
 import { toast } from "sonner";
 import { NmtsConfirmDialog } from "../components/NmtsConfirmDialog";
 import { NmtsModal } from "../components/NmtsModal";
-import { resolveBackendUrl } from "../backendUrl";
-
-const API = resolveBackendUrl();
 
 const COLORS = {
   page: "#D1FAE5",
@@ -43,6 +40,28 @@ const COLORS = {
 };
 
 const MENU_LIST = APPLICATION_PERMISSION_LABELS;
+
+async function apiErrorMessage(res, fallback) {
+  try {
+    const data = await res.json();
+    const detail = data?.detail;
+    if (typeof detail === "string" && detail.trim()) return detail;
+    if (Array.isArray(detail) && detail.length) {
+      return detail.map((item) => item?.msg || item?.detail || String(item)).filter(Boolean).join("; ");
+    }
+  } catch {
+    /* ignore non-JSON bodies */
+  }
+  return fallback;
+}
+
+function networkErrorMessage(error) {
+  const msg = String(error?.message || error || "");
+  if (error?.name === "TypeError" || msg.toLowerCase().includes("failed to fetch")) {
+    return "Could not reach the backend. Confirm the API is running in this same environment.";
+  }
+  return msg || "Request failed";
+}
 
 export default function UsersPage() {
   const { user } = useAuth();
@@ -90,7 +109,7 @@ export default function UsersPage() {
     mobile: "",
     email: "",
     role: "user",
-    state: "Tamil Nadu",
+    state: "",
     brand: "",
     dealer: "",
     branch: "",
@@ -146,12 +165,20 @@ export default function UsersPage() {
 
   const loadData = async () => {
     try {
+      const [stRes, bRes, dRes, brRes, uRes] = await Promise.all([
+        fetch(`${API}/masters/states`, { headers }),
+        fetch(`${API}/masters/brands`, { headers }),
+        fetch(`${API}/masters/dealers`, { headers }),
+        fetch(`${API}/masters/branches`, { headers }),
+        fetch(`${API}/users/list`, { headers }),
+      ]);
+
       const [st, b, d, br, u] = await Promise.all([
-        fetch(`${API}/api/masters/states`, { headers }).then((r) => r.json()),
-        fetch(`${NMTS_API}/masters/brands`, { headers }).then((r) => r.json()),
-        fetch(`${API}/api/masters/dealers`, { headers }).then((r) => r.json()),
-        fetch(`${API}/api/masters/branches`, { headers }).then((r) => r.json()),
-        fetch(`${API}/api/users/list`, { headers }).then((r) => r.json()),
+        stRes.json().catch(() => []),
+        bRes.json().catch(() => []),
+        dRes.json().catch(() => []),
+        brRes.json().catch(() => []),
+        uRes.json().catch(() => []),
       ]);
 
       setStates(Array.isArray(st) ? st : []);
@@ -161,12 +188,13 @@ export default function UsersPage() {
       setUsers(Array.isArray(u) ? u : []);
     } catch (error) {
       console.error("User Hub data load failed", error);
+      toast.error(networkErrorMessage(error));
     }
   };
 
   const loadTemplates = async () => {
     try {
-      const res = await fetch(`${API}/api/templates`, { headers });
+      const res = await fetch(`${API}/templates`, { headers });
       const data = await res.json();
       setTemplates(Array.isArray(data) ? data : []);
     } catch {
@@ -185,7 +213,7 @@ export default function UsersPage() {
       setNewUser((prev) => ({
         ...prev,
         role: "user",
-        state: user?.state || "Tamil Nadu",
+        state: user?.state || "",
         brand: user?.brand || "",
         dealer: user?.dealer || user?.group || "",
         branch: user?.branch || user?.location || "",
@@ -289,18 +317,20 @@ export default function UsersPage() {
 
   const getStateCode = (stateName) => {
     const value = String(stateName || "").trim();
+    if (!value) return "";
     const selectedState = states.find(
       (st) => String(st.name || "").trim() === value || String(st.code || "").trim().toUpperCase() === value.toUpperCase()
     );
-    return selectedState?.code || value;
+    return selectedState?.code ? String(selectedState.code).trim().toUpperCase() : "";
   };
 
   const getBrandCode = (brandName) => {
     const value = String(brandName || "").trim();
+    if (!value) return "";
     const selectedBrand = brands.find(
       (b) => String(b.name || "").trim() === value || String(b.code || "").trim().toUpperCase() === value.toUpperCase()
     );
-    return selectedBrand?.code || value;
+    return selectedBrand?.code ? String(selectedBrand.code).trim().toUpperCase() : "";
   };
 
   const generateUserId = async (stateName, brandName) => {
@@ -313,8 +343,8 @@ export default function UsersPage() {
         state_code: stateCode,
         brand_code: brandCode,
       });
-      const res = await fetch(`${API}/api/users/generate-id?${params.toString()}`, { headers });
-      const data = await res.json();
+      const res = await fetch(`${API}/users/generate-id?${params.toString()}`, { headers });
+      const data = await res.json().catch(() => ({}));
       return res.ok ? data.user_id || "" : "";
     } catch {
       return "";
@@ -327,7 +357,7 @@ export default function UsersPage() {
   };
 
   const handleBrandChange = async (brandName) => {
-    const id = await generateUserId(newUser.state || "Tamil Nadu", brandName);
+    const id = newUser.state ? await generateUserId(newUser.state, brandName) : "";
     setNewUser({ ...newUser, brand: brandName, userId: id });
   };
 
@@ -345,7 +375,7 @@ export default function UsersPage() {
       setNewUser({
         ...blankUser,
         role: "user",
-        state: user?.state || "Tamil Nadu",
+        state: user?.state || "",
         brand: user?.brand || "",
         dealer: user?.dealer || user?.group || "",
         branch: user?.branch || user?.location || "",
@@ -365,6 +395,8 @@ export default function UsersPage() {
     setConfirmBusy(true);
     try {
       await action();
+    } catch (error) {
+      toast.error(networkErrorMessage(error));
     } finally {
       setConfirmBusy(false);
     }
@@ -373,23 +405,31 @@ export default function UsersPage() {
   const addOrUpdateState = async () => {
     if (!stateForm.code || !stateForm.name) return toast.warning("State Code and Name required");
 
-    const method = editingState ? "PUT" : "POST";
-    const url = editingState
-      ? `${API}/api/masters/states/${editingState.code}`
-      : `${API}/api/masters/states`;
+    try {
+      const method = editingState ? "PUT" : "POST";
+      const url = editingState
+        ? `${API}/masters/states/${encodeURIComponent(editingState.code)}`
+        : `${API}/masters/states`;
 
-    const res = await fetch(url, { method, headers, body: JSON.stringify(stateForm) });
-    if (!res.ok) return toast.error((await res.json()).detail || "State save failed");
+      const res = await fetch(url, { method, headers, body: JSON.stringify(stateForm) });
+      if (!res.ok) return toast.error(await apiErrorMessage(res, "State save failed"));
 
-    setStateForm({ code: "", name: "" });
-    setEditingState(null);
-    loadData();
+      setStateForm({ code: "", name: "" });
+      setEditingState(null);
+      await loadData();
+    } catch (error) {
+      toast.error(networkErrorMessage(error));
+    }
   };
 
   const performDeleteState = async (code) => {
-    const res = await fetch(`${API}/api/masters/states/${code}`, { method: "DELETE", headers });
-    if (!res.ok) return toast.error((await res.json()).detail || "State delete failed");
-    loadData();
+    try {
+      const res = await fetch(`${API}/masters/states/${encodeURIComponent(code)}`, { method: "DELETE", headers });
+      if (!res.ok) return toast.error(await apiErrorMessage(res, "State delete failed"));
+      await loadData();
+    } catch (error) {
+      toast.error(networkErrorMessage(error));
+    }
   };
 
   const deleteState = (code) => {
@@ -405,23 +445,31 @@ export default function UsersPage() {
   const addOrUpdateBrand = async () => {
     if (!brandForm.code || !brandForm.name) return toast.warning("Brand Code and Name required");
 
-    const method = editingBrand ? "PUT" : "POST";
-    const url = editingBrand
-      ? `${NMTS_API}/masters/brands/${editingBrand.code}`
-      : `${NMTS_API}/masters/brands`;
+    try {
+      const method = editingBrand ? "PUT" : "POST";
+      const url = editingBrand
+        ? `${API}/masters/brands/${encodeURIComponent(editingBrand.code)}`
+        : `${API}/masters/brands`;
 
-    const res = await fetch(url, { method, headers, body: JSON.stringify(brandForm) });
-    if (!res.ok) return toast.error((await res.json()).detail || "Brand save failed");
+      const res = await fetch(url, { method, headers, body: JSON.stringify(brandForm) });
+      if (!res.ok) return toast.error(await apiErrorMessage(res, "Brand save failed"));
 
-    setBrandForm({ code: "", name: "" });
-    setEditingBrand(null);
-    loadData();
+      setBrandForm({ code: "", name: "" });
+      setEditingBrand(null);
+      await loadData();
+    } catch (error) {
+      toast.error(networkErrorMessage(error));
+    }
   };
 
   const performDeleteBrand = async (code) => {
-    const res = await fetch(`${NMTS_API}/masters/brands/${code}`, { method: "DELETE", headers });
-    if (!res.ok) return toast.error((await res.json()).detail || "Brand delete failed");
-    loadData();
+    try {
+      const res = await fetch(`${API}/masters/brands/${encodeURIComponent(code)}`, { method: "DELETE", headers });
+      if (!res.ok) return toast.error(await apiErrorMessage(res, "Brand delete failed"));
+      await loadData();
+    } catch (error) {
+      toast.error(networkErrorMessage(error));
+    }
   };
 
   const deleteBrand = (code) => {
@@ -439,8 +487,8 @@ export default function UsersPage() {
 
     const method = editingDealer ? "PUT" : "POST";
     const url = editingDealer
-      ? `${API}/api/masters/dealers/${encodeURIComponent(editingDealer.name)}`
-      : `${API}/api/masters/dealers`;
+      ? `${API}/masters/dealers/${encodeURIComponent(editingDealer.name)}`
+      : `${API}/masters/dealers`;
 
     const res = await fetch(url, { method, headers, body: JSON.stringify(dealerForm) });
     if (!res.ok) return toast.error((await res.json()).detail || "Dealer save failed");
@@ -451,7 +499,7 @@ export default function UsersPage() {
   };
 
   const performDeleteDealer = async (name) => {
-    const res = await fetch(`${API}/api/masters/dealers/${encodeURIComponent(name)}`, { method: "DELETE", headers });
+    const res = await fetch(`${API}/masters/dealers/${encodeURIComponent(name)}`, { method: "DELETE", headers });
     if (!res.ok) return toast.error((await res.json()).detail || "Dealer delete failed");
     loadData();
   };
@@ -471,8 +519,8 @@ export default function UsersPage() {
 
     const method = editingBranch ? "PUT" : "POST";
     const url = editingBranch
-      ? `${API}/api/masters/branches/${encodeURIComponent(editingBranch.name)}`
-      : `${API}/api/masters/branches`;
+      ? `${API}/masters/branches/${encodeURIComponent(editingBranch.name)}`
+      : `${API}/masters/branches`;
 
     const res = await fetch(url, { method, headers, body: JSON.stringify(branchForm) });
     if (!res.ok) return toast.error((await res.json()).detail || "Branch save failed");
@@ -483,7 +531,7 @@ export default function UsersPage() {
   };
 
   const performDeleteBranch = async (name) => {
-    const res = await fetch(`${API}/api/masters/branches/${encodeURIComponent(name)}`, { method: "DELETE", headers });
+    const res = await fetch(`${API}/masters/branches/${encodeURIComponent(name)}`, { method: "DELETE", headers });
     if (!res.ok) return toast.error((await res.json()).detail || "Branch delete failed");
     loadData();
   };
@@ -519,7 +567,7 @@ export default function UsersPage() {
     if (!payload.dealer) return toast.warning("Please select Dealer");
     if (!payload.branch) return toast.warning("Please select Branch");
 
-    const res = await fetch(`${API}/api/users/create`, {
+    const res = await fetch(`${API}/users/create`, {
       method: "POST",
       headers,
       body: JSON.stringify(payload),
@@ -537,7 +585,7 @@ export default function UsersPage() {
     const id = item.id;
     if (!id) return toast.error("User ID not found");
 
-    const res = await fetch(`${API}/api/profile/${id}/status`, {
+    const res = await fetch(`${API}/profile/${id}/status`, {
       method: "PUT",
       headers,
     });
@@ -547,7 +595,7 @@ export default function UsersPage() {
   };
 
   const performDeleteUser = async (item) => {
-    const res = await fetch(`${API}/api/users/${item.id}`, {
+    const res = await fetch(`${API}/users/${item.id}`, {
       method: "DELETE",
       headers,
     });
@@ -594,7 +642,7 @@ export default function UsersPage() {
 
     setResetSubmitting(true);
     try {
-      const res = await fetch(`${API}/api/users/${resetTarget.id}/reset-password`, {
+      const res = await fetch(`${API}/users/${resetTarget.id}/reset-password`, {
         method: "PUT",
         headers,
         body: JSON.stringify({
@@ -625,7 +673,7 @@ export default function UsersPage() {
     form.append("template_type", templateForm.templateType);
     form.append("file", templateForm.file);
 
-    const res = await fetch(`${API}/api/templates/upload`, {
+    const res = await fetch(`${API}/templates/upload`, {
       method: "POST",
       headers: authHeaders,
       body: form,
@@ -642,7 +690,7 @@ export default function UsersPage() {
     const id = item.id || item.templateId || item.template_id;
     if (!id) return toast.error("Template ID not found");
     try {
-      const res = await fetch(`${API}/api/templates/download/${id}`, { headers: authHeaders });
+      const res = await fetch(`${API}/templates/download/${id}`, { headers: authHeaders });
       if (!res.ok) {
         let detail = "Template download failed";
         try { detail = (await res.json()).detail || detail; } catch {}
@@ -669,7 +717,7 @@ export default function UsersPage() {
     const id = item.id || item.templateId || item.template_id;
     if (!id) return toast.error("Template ID not found");
 
-    const res = await fetch(`${API}/api/templates/${id}`, {
+    const res = await fetch(`${API}/templates/${id}`, {
       method: "DELETE",
       headers,
     });
@@ -862,7 +910,7 @@ export default function UsersPage() {
               label="State"
               value={newUser.state}
               onChange={handleStateChange}
-              options={isMaster ? states.map((st) => st.name) : [user?.state || "Tamil Nadu"]}
+              options={isMaster ? states.map((st) => st.name) : [user?.state].filter(Boolean)}
               disabled={isAdmin}
             />
 
@@ -1179,8 +1227,8 @@ function MasterSection({ title, fields, onSave, editing, rows, columns, onEdit, 
             </tr>
           </thead>
           <tbody>
-            {rows.map((r, i) => (
-              <tr key={i} className="border-b">
+            {rows.map((r) => (
+              <tr key={r.id || r.code || r.name} className="border-b">
                 {columns.map((c) => <td key={c} className="p-3">{r[c] || "-"}</td>)}
                 <td className="p-3 flex gap-3">
                   <Edit size={17} onClick={() => onEdit(r)} style={{ cursor: "pointer" }} />

@@ -2036,35 +2036,11 @@ def _exact_ci(value: str) -> dict:
     return {"$regex": f"^{re.escape((value or '').strip())}$", "$options": "i"}
 
 
-DEFAULT_MASTER_RECORDS = {
-    "states": [
-        {"code": "TN", "name": "Tamil Nadu", "status": "active"},
-        {"code": "KL", "name": "Kerala", "status": "active"},
-    ],
-    "brands": [
-        {"code": "HY", "name": "Hyundai", "status": "active"},
-    ],
-}
-
-
-def _master_record_matches(record: dict, raw_value: str) -> bool:
-    raw = (raw_value or "").strip()
-    if not raw:
-        return False
-    code = str(record.get("code") or "").strip()
-    name = str(record.get("name") or "").strip()
-    return raw.upper() == code.upper() or raw.lower() == name.lower()
-
-
-async def _resolve_master_record(collection_name: str, value: str, label: str) -> dict:
-    """Resolve selected master value to the exact saved master record.
-
-    This never guesses from the first two letters. Kerala must resolve to the
-    State Master code KL, not KE, KERALA, or default TN.
-    """
+async def _lookup_master_record(collection_name: str, value: str) -> Optional[dict]:
+    """Find an exact master record in MongoDB. Never invents default rows."""
     raw_value = (value or "").strip()
     if not raw_value:
-        raise HTTPException(status_code=400, detail=f"{label} is required")
+        return None
 
     code_value = raw_value.upper()
     collection = getattr(db, collection_name)
@@ -2076,23 +2052,31 @@ async def _resolve_master_record(collection_name: str, value: str, label: str) -
             {"name": {"$regex": f"^{re.escape(raw_value)}$", "$options": "i"}},
         ]
     }, {"_id": 0})
-
-    # First-time setup may show default masters in the UI before they are saved
-    # in MongoDB. Resolve those exact defaults too, without guessing.
     if not record:
-        for default_record in DEFAULT_MASTER_RECORDS.get(collection_name, []):
-            if _master_record_matches(default_record, raw_value):
-                record = default_record
-                break
-
-    if not record or not (record.get("code") or "").strip():
-        raise HTTPException(status_code=400, detail=f"Invalid {label} selected. Please check {label} master code.")
-
+        return None
     return {
         **record,
         "code": _clean_master_code(record.get("code")),
         "name": _clean_master_name(record.get("name")) or raw_value,
     }
+
+
+async def _resolve_master_record(collection_name: str, value: str, label: str) -> dict:
+    """Resolve selected master value to the exact saved master record.
+
+    This never guesses from the first two letters and never invents
+    Tamil Nadu / Kerala / Hyundai when those rows are absent from MongoDB.
+    Kerala must resolve to the State Master code KL, not KE, KERALA, or TN.
+    """
+    raw_value = (value or "").strip()
+    if not raw_value:
+        raise HTTPException(status_code=400, detail=f"{label} is required")
+
+    record = await _lookup_master_record(collection_name, raw_value)
+    if not record or not (record.get("code") or "").strip():
+        raise HTTPException(status_code=400, detail=f"Invalid {label} selected. Please check {label} master code.")
+
+    return record
 
 
 async def _resolve_master_code(collection_name: str, value: str, label: str) -> str:
@@ -2104,34 +2088,7 @@ async def _resolve_master_code(collection_name: str, value: str, label: str) -> 
 async def get_master_states(
     current_user: UserResponse = Depends(get_current_user)
 ):
-    states = await db.states.find(
-        {},
-        {"_id": 0}
-    ).sort("name", 1).to_list(1000)
-
-    if states:
-        return states
-
-    for default_state in DEFAULT_MASTER_RECORDS["states"]:
-        state_code = _clean_master_code(default_state.get("code"))
-
-        await db.states.update_one(
-            {"code": state_code},
-            {
-                "$setOnInsert": {
-                    **default_state,
-                    "code": state_code
-                }
-            },
-            upsert=True
-        )
-
-    states = await db.states.find(
-        {},
-        {"_id": 0}
-    ).sort("name", 1).to_list(1000)
-
-    return states
+    return await db.states.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
 
 @api_router.post("/masters/states")
 async def add_master_state(data: MasterStateCreate, current_user: UserResponse = Depends(get_current_user)):
@@ -2212,8 +2169,7 @@ async def delete_master_state(code: str, current_user: UserResponse = Depends(ge
 
 @api_router.get("/masters/brands")
 async def get_master_brands(current_user: UserResponse = Depends(get_current_user)):
-    brands = await db.brands.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
-    return brands or DEFAULT_MASTER_RECORDS["brands"]
+    return await db.brands.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
 
 
 @api_router.post("/masters/brands")
@@ -2512,7 +2468,7 @@ async def _build_next_user_id(state_code: str, brand_code: str) -> str:
 @api_router.get("/users/generate-id")
 async def generate_user_id(
     brand_code: str,
-    state_code: str = "TN",
+    state_code: str,
     current_user: UserResponse = Depends(get_current_user)
 ):
     await _ensure_master_or_admin(current_user)
@@ -2679,8 +2635,6 @@ async def delete_hub_user(user_id: str, current_user: UserResponse = Depends(get
 async def get_scope_options(current_user: UserResponse = Depends(get_current_user)):
     if current_user.role == "master":
         states = await db.states.find({"status": "active"}, {"_id": 0, "code": 1, "name": 1}).sort("name", 1).to_list(1000)
-        if not states:
-            states = [{"code": "TN", "name": "Tamil Nadu"}, {"code": "KL", "name": "Kerala"}]
         brands = await db.brands.find({"status": "active"}, {"_id": 0, "code": 1, "name": 1}).sort("name", 1).to_list(1000)
         dealers = await db.dealers.find({"status": "active"}, {"_id": 0, "name": 1, "brand": 1, "brand_name": 1}).sort("name", 1).to_list(1000)
         branches = await db.branches.find({"status": "active"}, {"_id": 0, "code": 1, "name": 1, "dealer": 1, "dealer_name": 1, "brand": 1, "brand_name": 1}).sort("name", 1).to_list(1000)
@@ -2713,20 +2667,20 @@ async def get_scope_options(current_user: UserResponse = Depends(get_current_use
             branch_query,
             {"_id": 0, "code": 1, "name": 1, "dealer": 1, "dealer_name": 1, "brand": 1, "brand_name": 1}
         ).sort("name", 1).to_list(1000)
-        state_code = await _resolve_master_code("states", current_user.state or "Tamil Nadu", "State")
-        brand_code = await _resolve_master_code("brands", current_user.brand or "Hyundai", "Brand")
+        state_record = await _lookup_master_record("states", current_user.state)
+        brand_record = await _lookup_master_record("brands", current_user.brand)
         return {
-            "states": [{"name": current_user.state or "Tamil Nadu", "code": state_code}],
-            "brands": [{"name": current_user.brand, "code": brand_code}],
+            "states": ([{"name": current_user.state, "code": (state_record or {}).get("code") or ""}] if current_user.state else []),
+            "brands": ([{"name": current_user.brand, "code": (brand_record or {}).get("code") or ""}] if current_user.brand else []),
             "dealers": [{"name": current_user.group, "brand": current_user.brand, "brand_name": current_user.brand}],
             "branches": branches or [{"name": current_user.location, "dealer": current_user.group, "dealer_name": current_user.group, "brand": current_user.brand, "brand_name": current_user.brand}]
         }
 
-    state_code = await _resolve_master_code("states", current_user.state or "Tamil Nadu", "State")
-    brand_code = await _resolve_master_code("brands", current_user.brand or "Hyundai", "Brand")
+    state_record = await _lookup_master_record("states", current_user.state)
+    brand_record = await _lookup_master_record("brands", current_user.brand)
     return {
-        "states": [{"name": current_user.state or "Tamil Nadu", "code": state_code}],
-        "brands": [{"name": current_user.brand, "code": brand_code}],
+        "states": ([{"name": current_user.state, "code": (state_record or {}).get("code") or ""}] if current_user.state else []),
+        "brands": ([{"name": current_user.brand, "code": (brand_record or {}).get("code") or ""}] if current_user.brand else []),
         "dealers": [{"name": current_user.group, "brand": current_user.brand, "brand_name": current_user.brand}],
         "branches": [{"name": current_user.location, "dealer": current_user.group, "dealer_name": current_user.group, "brand": current_user.brand, "brand_name": current_user.brand}]
     }
