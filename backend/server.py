@@ -2265,6 +2265,8 @@ async def add_master_dealer(data: MasterDealerCreate, current_user: UserResponse
     brand = (data.brand or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Dealer name required")
+    if not brand:
+        raise HTTPException(status_code=400, detail="Brand is required")
 
     if await db.dealers.find_one({"name": _exact_ci(name), **({"brand": brand} if brand else {})}):
         raise HTTPException(status_code=400, detail="Dealer already exists")
@@ -2292,6 +2294,8 @@ async def update_master_dealer(name: str, data: MasterDealerCreate, current_user
 
     if not new_name:
         raise HTTPException(status_code=400, detail="Dealer name required")
+    if not brand:
+        raise HTTPException(status_code=400, detail="Brand is required")
 
     existing = await db.dealers.find_one({"name": _exact_ci(new_name), **({"brand": brand} if brand else {})})
     if existing and existing.get("name") != old_name:
@@ -2635,9 +2639,9 @@ async def delete_hub_user(user_id: str, current_user: UserResponse = Depends(get
 async def get_scope_options(current_user: UserResponse = Depends(get_current_user)):
     if current_user.role == "master":
         states = await db.states.find({"status": "active"}, {"_id": 0, "code": 1, "name": 1}).sort("name", 1).to_list(1000)
-        brands = await db.brands.find({"status": "active"}, {"_id": 0, "code": 1, "name": 1}).sort("name", 1).to_list(1000)
-        dealers = await db.dealers.find({"status": "active"}, {"_id": 0, "name": 1, "brand": 1, "brand_name": 1}).sort("name", 1).to_list(1000)
-        branches = await db.branches.find({"status": "active"}, {"_id": 0, "code": 1, "name": 1, "dealer": 1, "dealer_name": 1, "brand": 1, "brand_name": 1}).sort("name", 1).to_list(1000)
+        brands = await db.brands.find({}, {"_id": 0, "code": 1, "name": 1, "status": 1}).sort("name", 1).to_list(1000)
+        dealers = await db.dealers.find({}, {"_id": 0, "name": 1, "brand": 1, "brand_name": 1, "status": 1}).sort("name", 1).to_list(1000)
+        branches = await db.branches.find({}, {"_id": 0, "code": 1, "name": 1, "dealer": 1, "dealer_name": 1, "brand": 1, "brand_name": 1, "status": 1}).sort("name", 1).to_list(1000)
         return {"states": states, "brands": brands, "dealers": dealers, "branches": branches}
 
     if current_user.role == "admin":

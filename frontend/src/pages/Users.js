@@ -95,7 +95,7 @@ export default function UsersPage() {
 
   const [stateForm, setStateForm] = useState({ code: "", name: "" });
   const [brandForm, setBrandForm] = useState({ code: "", name: "" });
-  const [dealerForm, setDealerForm] = useState({ name: "" });
+  const [dealerForm, setDealerForm] = useState({ name: "", brand: "" });
   const [branchForm, setBranchForm] = useState({ dealer: "", name: "" });
 
   const [editingState, setEditingState] = useState(null);
@@ -186,6 +186,7 @@ export default function UsersPage() {
       setDealers(Array.isArray(d) ? d : []);
       setBranches(Array.isArray(br) ? br : []);
       setUsers(Array.isArray(u) ? u : []);
+      window.dispatchEvent(new Event("nmts-masters-changed"));
     } catch (error) {
       console.error("User Hub data load failed", error);
       toast.error(networkErrorMessage(error));
@@ -483,19 +484,24 @@ export default function UsersPage() {
   };
 
   const addOrUpdateDealer = async () => {
+    if (!dealerForm.brand) return toast.warning("Brand is required");
     if (!dealerForm.name) return toast.warning("Dealer Name required");
 
-    const method = editingDealer ? "PUT" : "POST";
-    const url = editingDealer
-      ? `${API}/masters/dealers/${encodeURIComponent(editingDealer.name)}`
-      : `${API}/masters/dealers`;
+    try {
+      const method = editingDealer ? "PUT" : "POST";
+      const url = editingDealer
+        ? `${API}/masters/dealers/${encodeURIComponent(editingDealer.name)}`
+        : `${API}/masters/dealers`;
 
-    const res = await fetch(url, { method, headers, body: JSON.stringify(dealerForm) });
-    if (!res.ok) return toast.error((await res.json()).detail || "Dealer save failed");
+      const res = await fetch(url, { method, headers, body: JSON.stringify(dealerForm) });
+      if (!res.ok) return toast.error(await apiErrorMessage(res, "Dealer save failed"));
 
-    setDealerForm({ name: "" });
-    setEditingDealer(null);
-    loadData();
+      setDealerForm({ name: "", brand: "" });
+      setEditingDealer(null);
+      await loadData();
+    } catch (error) {
+      toast.error(networkErrorMessage(error));
+    }
   };
 
   const performDeleteDealer = async (name) => {
@@ -1006,12 +1012,22 @@ export default function UsersPage() {
           {settingsTab === "dealer" && (
             <MasterSection
               title="Dealer Master"
-              fields={<Input label="Dealer Name" value={dealerForm.name} onChange={(v) => setDealerForm({ name: v })} />}
+              fields={
+                <>
+                  <Select
+                    label="Brand"
+                    value={dealerForm.brand}
+                    onChange={(v) => setDealerForm({ ...dealerForm, brand: v })}
+                    options={brands.map((b) => b.name)}
+                  />
+                  <Input label="Dealer Name" value={dealerForm.name} onChange={(v) => setDealerForm({ ...dealerForm, name: v })} />
+                </>
+              }
               onSave={addOrUpdateDealer}
               editing={editingDealer}
               rows={dealers}
-              columns={["name"]}
-              onEdit={(d) => { setEditingDealer(d); setDealerForm({ name: d.name }); }}
+              columns={["brand", "name"]}
+              onEdit={(d) => { setEditingDealer(d); setDealerForm({ name: d.name, brand: d.brand || d.brand_name || "" }); }}
               onDelete={(d) => deleteDealer(d.name)}
             />
           )}
