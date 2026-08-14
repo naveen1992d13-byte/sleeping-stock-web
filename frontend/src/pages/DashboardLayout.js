@@ -176,6 +176,7 @@ export function DashboardLayout() {
     const nextBranchNames = uniqueNames(branchesForDealer, (b) => b.name);
     setBranchOptions(nextBranchNames);
     if (scopeBranch && !nextBranchNames.includes(scopeBranch)) setScopeBranch("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isMaster, scopeMasters, scopeBrand, scopeDealer, scopeBranch]);
 
   useEffect(() => {
