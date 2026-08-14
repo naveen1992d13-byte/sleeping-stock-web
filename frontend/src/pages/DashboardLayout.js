@@ -172,7 +172,9 @@ export function DashboardLayout() {
       return;
     }
 
-    const branchesForDealer = (scopeMasters.branches || []).filter((branch) => recordDealer(branch) === scopeDealer);
+    const branchesForDealer = (scopeMasters.branches || []).filter((branch) => (
+      recordDealer(branch) === scopeDealer && recordBrand(branch) === scopeBrand
+    ));
     const nextBranchNames = uniqueNames(branchesForDealer, (b) => b.name);
     setBranchOptions(nextBranchNames);
     if (scopeBranch && !nextBranchNames.includes(scopeBranch)) setScopeBranch("");
@@ -187,7 +189,7 @@ export function DashboardLayout() {
       const branchDealer = normalizeScopeValue(branch.dealer || branch.dealer_name);
       const branchBrand = normalizeScopeValue(branch.brand || branch.brand_name);
       const dealerMatches = branchDealer === adminDealer;
-      const brandMatches = !branchBrand || branchBrand === adminBrand;
+      const brandMatches = Boolean(branchBrand) && branchBrand === adminBrand;
       return dealerMatches && brandMatches;
     });
     setBranchOptions(uniqueNames(adminBranches, (b) => b.name));

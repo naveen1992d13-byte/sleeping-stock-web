@@ -74,6 +74,21 @@ export default function UsersPage() {
   const scopeDealer = outletScope.scopeDealer || "All Dealers";
   const scopeBranch = outletScope.scopeBranch || "All Branches";
   const isAllValue = (value) => !value || String(value).startsWith("All ") || value === "N/A";
+  const recordBrand = (row) => String(row?.brand || row?.brand_name || "").trim();
+  const recordDealer = (row) => String(row?.dealer || row?.dealer_name || "").trim();
+  const dealerQuery = (name, brand) => {
+    const params = new URLSearchParams();
+    if (brand) params.set("brand", brand);
+    const qs = params.toString();
+    return `${API}/masters/dealers/${encodeURIComponent(name)}${qs ? `?${qs}` : ""}`;
+  };
+  const branchQuery = (name, dealer, brand) => {
+    const params = new URLSearchParams();
+    if (dealer) params.set("dealer", dealer);
+    if (brand) params.set("brand", brand);
+    const qs = params.toString();
+    return `${API}/masters/branches/${encodeURIComponent(name)}${qs ? `?${qs}` : ""}`;
+  };
 
   const [activeTab, setActiveTab] = useState("list");
   const [settingsTab, setSettingsTab] = useState("brand");
@@ -96,7 +111,7 @@ export default function UsersPage() {
   const [stateForm, setStateForm] = useState({ code: "", name: "" });
   const [brandForm, setBrandForm] = useState({ code: "", name: "" });
   const [dealerForm, setDealerForm] = useState({ name: "", brand: "" });
-  const [branchForm, setBranchForm] = useState({ dealer: "", name: "" });
+  const [branchForm, setBranchForm] = useState({ brand: "", dealer: "", name: "" });
 
   const [editingState, setEditingState] = useState(null);
   const [editingBrand, setEditingBrand] = useState(null);
@@ -120,6 +135,7 @@ export default function UsersPage() {
   };
 
   const [newUser, setNewUser] = useState(blankUser);
+  const [editingUser, setEditingUser] = useState(null);
 
   const [confirmDlg, setConfirmDlg] = useState(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
@@ -260,8 +276,12 @@ export default function UsersPage() {
   }), [visibleUsers, scopeBrand, scopeDealer, scopeBranch]);
 
   const stats = useMemo(() => {
-    const scopedDealers = dealers.filter(d => (isAllValue(scopeBrand) || d.brand === scopeBrand) && (isAllValue(scopeDealer) || d.name === scopeDealer));
-    const scopedBranches = branches.filter(b => (isAllValue(scopeBrand) || !b.brand || b.brand === scopeBrand) && (isAllValue(scopeDealer) || b.dealer === scopeDealer) && (isAllValue(scopeBranch) || b.name === scopeBranch));
+    const scopedDealers = dealers.filter((d) => (isAllValue(scopeBrand) || recordBrand(d) === scopeBrand) && (isAllValue(scopeDealer) || d.name === scopeDealer));
+    const scopedBranches = branches.filter((b) => (
+      (isAllValue(scopeBrand) || recordBrand(b) === scopeBrand) &&
+      (isAllValue(scopeDealer) || recordDealer(b) === scopeDealer) &&
+      (isAllValue(scopeBranch) || b.name === scopeBranch)
+    ));
     const scopedBrands = brands.filter(b => isAllValue(scopeBrand) || b.name === scopeBrand);
     const scopedStates = states.filter(st => isAllValue(scopeBrand) || scopedUsers.some(u => u.state === st.name || u.state === st.code));
     return {
@@ -300,21 +320,27 @@ export default function UsersPage() {
     );
   });
 
+  const availableDealersForUser = useMemo(() => {
+    const selectedBrand = newUser.brand || user?.brand || "";
+    if (!selectedBrand) return [];
+    return dealers
+      .filter((d) => recordBrand(d) === selectedBrand)
+      .map((d) => d.name);
+  }, [dealers, newUser.brand, user]);
+
   const availableBranchesForNewUser = useMemo(() => {
-  const selectedDealer = newUser.dealer || user?.dealer || user?.group || "";
+    const selectedDealer = newUser.dealer || user?.dealer || user?.group || "";
+    const selectedBrand = newUser.brand || user?.brand || "";
+    if (!selectedDealer || !selectedBrand) return [];
+    return branches
+      .filter((b) => recordDealer(b) === selectedDealer && recordBrand(b) === selectedBrand)
+      .map((b) => b.name);
+  }, [branches, newUser.dealer, newUser.brand, user]);
 
-  if (!selectedDealer) {
-    return [];
-  }
-
-  return branches
-    .filter((b) => {
-      const branchDealer = String(b.dealer || "").trim().toLowerCase();
-      const dealerName = String(selectedDealer || "").trim().toLowerCase();
-      return branchDealer === dealerName;
-    })
-    .map((b) => b.name);
-}, [branches, newUser.dealer, user]);
+  const availableDealersForBranchForm = useMemo(() => {
+    if (!branchForm.brand) return [];
+    return dealers.filter((d) => recordBrand(d) === branchForm.brand).map((d) => d.name);
+  }, [dealers, branchForm.brand]);
 
   const getStateCode = (stateName) => {
     const value = String(stateName || "").trim();
@@ -353,13 +379,17 @@ export default function UsersPage() {
   };
 
   const handleStateChange = async (stateName) => {
+    if (editingUser) {
+      setNewUser({ ...newUser, state: stateName });
+      return;
+    }
     const id = newUser.brand ? await generateUserId(stateName, newUser.brand) : "";
     setNewUser({ ...newUser, state: stateName, userId: id });
   };
 
   const handleBrandChange = async (brandName) => {
-    const id = newUser.state ? await generateUserId(newUser.state, brandName) : "";
-    setNewUser({ ...newUser, brand: brandName, userId: id });
+    const id = (!editingUser && newUser.state) ? await generateUserId(newUser.state, brandName) : (editingUser ? newUser.userId : "");
+    setNewUser({ ...newUser, brand: brandName, dealer: "", branch: "", userId: id || newUser.userId });
   };
 
   const togglePermission = (menu) => {
@@ -372,6 +402,7 @@ export default function UsersPage() {
   };
 
   const resetUserForm = () => {
+    setEditingUser(null);
     if (isAdmin) {
       setNewUser({
         ...blankUser,
@@ -490,7 +521,7 @@ export default function UsersPage() {
     try {
       const method = editingDealer ? "PUT" : "POST";
       const url = editingDealer
-        ? `${API}/masters/dealers/${encodeURIComponent(editingDealer.name)}`
+        ? dealerQuery(editingDealer.name, editingDealer.brand || editingDealer.brand_name || "")
         : `${API}/masters/dealers`;
 
       const res = await fetch(url, { method, headers, body: JSON.stringify(dealerForm) });
@@ -504,58 +535,86 @@ export default function UsersPage() {
     }
   };
 
-  const performDeleteDealer = async (name) => {
-    const res = await fetch(`${API}/masters/dealers/${encodeURIComponent(name)}`, { method: "DELETE", headers });
+  const performDeleteDealer = async (row) => {
+    const name = typeof row === "string" ? row : row?.name;
+    const brand = typeof row === "string" ? "" : (row?.brand || row?.brand_name || "");
+    const res = await fetch(dealerQuery(name, brand), { method: "DELETE", headers });
     if (!res.ok) return toast.error((await res.json()).detail || "Dealer delete failed");
     loadData();
   };
 
-  const deleteDealer = (name) => {
+  const deleteDealer = (row) => {
     openConfirm({
       title: "Delete Dealer",
       message: "Delete this Dealer?",
       confirmLabel: "Delete",
       variant: "danger",
-      onConfirm: () => performDeleteDealer(name),
+      onConfirm: () => performDeleteDealer(row),
     });
   };
 
   const addOrUpdateBranch = async () => {
+    if (!branchForm.brand) return toast.warning("Please select Brand");
     if (!branchForm.dealer || !branchForm.name) return toast.warning("Dealer and Branch required");
 
     const method = editingBranch ? "PUT" : "POST";
     const url = editingBranch
-      ? `${API}/masters/branches/${encodeURIComponent(editingBranch.name)}`
+      ? branchQuery(editingBranch.name, editingBranch.dealer || editingBranch.dealer_name, editingBranch.brand || editingBranch.brand_name || branchForm.brand)
       : `${API}/masters/branches`;
 
     const res = await fetch(url, { method, headers, body: JSON.stringify(branchForm) });
     if (!res.ok) return toast.error((await res.json()).detail || "Branch save failed");
 
-    setBranchForm({ dealer: "", name: "" });
+    setBranchForm({ brand: "", dealer: "", name: "" });
     setEditingBranch(null);
     loadData();
   };
 
-  const performDeleteBranch = async (name) => {
-    const res = await fetch(`${API}/masters/branches/${encodeURIComponent(name)}`, { method: "DELETE", headers });
+  const performDeleteBranch = async (row) => {
+    const name = typeof row === "string" ? row : row?.name;
+    const dealer = typeof row === "string" ? "" : (row?.dealer || row?.dealer_name || "");
+    const brand = typeof row === "string" ? "" : (row?.brand || row?.brand_name || "");
+    const res = await fetch(branchQuery(name, dealer, brand), { method: "DELETE", headers });
     if (!res.ok) return toast.error((await res.json()).detail || "Branch delete failed");
     loadData();
   };
 
-  const deleteBranch = (name) => {
+  const deleteBranch = (row) => {
     openConfirm({
       title: "Delete Branch",
       message: "Delete this Branch?",
       confirmLabel: "Delete",
       variant: "danger",
-      onConfirm: () => performDeleteBranch(name),
+      onConfirm: () => performDeleteBranch(row),
     });
+  };
+
+  const openEditUser = (item) => {
+    if (isNormalUser) return toast.warning("You are not allowed to edit users");
+    if (isAdmin && item.role !== "user") return toast.warning("Admin can edit only User role");
+    setEditingUser(item);
+    setNewUser({
+      userId: item.userId || item.user_id || "",
+      name: item.name || item.username || "",
+      mobile: item.mobile || item.phone || "",
+      email: item.email || "",
+      role: item.role || "user",
+      state: item.state || "",
+      brand: item.brand || "",
+      dealer: item.dealer || item.group || "",
+      branch: item.branch || item.location || "",
+      password: "",
+      confirmPassword: "",
+      status: item.status || "active",
+      permissions: Array.isArray(item.permissions) ? item.permissions : [],
+    });
+    setActiveTab("add");
   };
 
   const saveUser = async () => {
     if (isNormalUser) return toast.warning("You are not allowed to create users");
     if (isAdmin && newUser.role !== "user") return toast.warning("Admin can create only User role");
-    if (newUser.password !== newUser.confirmPassword) return toast.warning("Password not matching");
+    if (!editingUser && newUser.password !== newUser.confirmPassword) return toast.warning("Password not matching");
 
     const payload = isAdmin
       ? {
@@ -572,6 +631,32 @@ export default function UsersPage() {
     if (!payload.brand) return toast.warning("Please select Brand");
     if (!payload.dealer) return toast.warning("Please select Dealer");
     if (!payload.branch) return toast.warning("Please select Branch");
+
+    if (editingUser) {
+      const updateBody = {
+        name: payload.name,
+        mobile: payload.mobile,
+        email: payload.email,
+        role: payload.role,
+        state: payload.state,
+        brand: payload.brand,
+        dealer: payload.dealer,
+        branch: payload.branch,
+        status: payload.status,
+        permissions: payload.permissions,
+      };
+      const res = await fetch(`${API}/users/hub/${editingUser.id}`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify(updateBody),
+      });
+      if (!res.ok) return toast.error((await res.json()).detail || "User update failed");
+      toast.success("User updated successfully");
+      resetUserForm();
+      setActiveTab("list");
+      loadData();
+      return;
+    }
 
     const res = await fetch(`${API}/users/create`, {
       method: "POST",
@@ -760,7 +845,7 @@ export default function UsersPage() {
       <div className="flex flex-wrap gap-3 mb-5">
         <Tab active={activeTab === "list"} onClick={() => setActiveTab("list")} icon={Users} label="User List" />
         {(isMaster || isAdmin) && (
-          <Tab active={activeTab === "add"} onClick={() => setActiveTab("add")} icon={UserPlus} label="Add New User" />
+          <Tab active={activeTab === "add"} onClick={() => setActiveTab("add")} icon={UserPlus} label={editingUser ? "Edit User" : "Add New User"} />
         )}
         {isMaster && (
           <Tab active={activeTab === "settings"} onClick={() => setActiveTab("settings")} icon={Settings} label="Settings" />
@@ -856,6 +941,13 @@ export default function UsersPage() {
 
                     {(isMaster || isAdmin) && (
                       <>
+                        <Edit
+                          size={16}
+                          title="Edit User"
+                          style={{ cursor: "pointer", color: "#0F766E" }}
+                          onClick={() => openEditUser(u)}
+                        />
+
                         <KeyRound
                           size={16}
                           title="Reset Password"
@@ -896,7 +988,7 @@ export default function UsersPage() {
 
       {activeTab === "add" && (isMaster || isAdmin) && (
         <Panel>
-          <h2 className="text-xl font-bold mb-4">Add New User</h2>
+          <h2 className="text-xl font-bold mb-4">{editingUser ? "Edit User" : "Add New User"}</h2>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <Input label="User ID Auto" value={newUser.userId} disabled />
@@ -932,7 +1024,7 @@ export default function UsersPage() {
               label="Dealer"
               value={newUser.dealer}
               onChange={(v) => setNewUser({ ...newUser, dealer: v, branch: "" })}
-              options={isMaster ? dealers.map((d) => d.name) : [user?.dealer || user?.group || ""]}
+              options={isMaster ? availableDealersForUser : [user?.dealer || user?.group || ""]}
               disabled={isAdmin}
             />
 
@@ -943,8 +1035,12 @@ export default function UsersPage() {
               options={availableBranchesForNewUser}
             />
 
+            {!editingUser && (
+              <>
             <Input label="Password" type="password" value={newUser.password} onChange={(v) => setNewUser({ ...newUser, password: v })} />
             <Input label="Confirm Password" type="password" value={newUser.confirmPassword} onChange={(v) => setNewUser({ ...newUser, confirmPassword: v })} />
+              </>
+            )}
           </div>
 
           <h3 className="font-bold mt-5 mb-3 flex gap-2"><ShieldCheck /> Permissions</h3>
@@ -957,7 +1053,7 @@ export default function UsersPage() {
           </div>
 
           <Button className="mt-5" onClick={saveUser} style={{ backgroundColor: COLORS.button }}>
-            <Save className="h-4 w-4 mr-2" /> Save User
+            <Save className="h-4 w-4 mr-2" /> {editingUser ? "Update User" : "Save User"}
           </Button>
         </Panel>
       )}
@@ -1028,7 +1124,7 @@ export default function UsersPage() {
               rows={dealers}
               columns={["brand", "name"]}
               onEdit={(d) => { setEditingDealer(d); setDealerForm({ name: d.name, brand: d.brand || d.brand_name || "" }); }}
-              onDelete={(d) => deleteDealer(d.name)}
+              onDelete={(d) => deleteDealer(d)}
             />
           )}
 
@@ -1037,16 +1133,27 @@ export default function UsersPage() {
               title="Branch Master"
               fields={
                 <>
-                  <Select label="Dealer" value={branchForm.dealer} onChange={(v) => setBranchForm({ ...branchForm, dealer: v })} options={dealers.map((d) => d.name)} />
+                  <Select
+                    label="Brand"
+                    value={branchForm.brand}
+                    onChange={(v) => setBranchForm({ ...branchForm, brand: v, dealer: "" })}
+                    options={brands.map((b) => b.name)}
+                  />
+                  <Select
+                    label="Dealer"
+                    value={branchForm.dealer}
+                    onChange={(v) => setBranchForm({ ...branchForm, dealer: v })}
+                    options={availableDealersForBranchForm}
+                  />
                   <Input label="Branch Name" value={branchForm.name} onChange={(v) => setBranchForm({ ...branchForm, name: v })} />
                 </>
               }
               onSave={addOrUpdateBranch}
               editing={editingBranch}
               rows={branches}
-              columns={["dealer", "name"]}
-              onEdit={(b) => { setEditingBranch(b); setBranchForm({ dealer: b.dealer, name: b.name }); }}
-              onDelete={(b) => deleteBranch(b.name)}
+              columns={["brand", "dealer", "name"]}
+              onEdit={(b) => { setEditingBranch(b); setBranchForm({ brand: b.brand || b.brand_name || "", dealer: b.dealer || b.dealer_name || "", name: b.name }); }}
+              onDelete={(b) => deleteBranch(b)}
             />
           )}
 
@@ -1244,7 +1351,7 @@ function MasterSection({ title, fields, onSave, editing, rows, columns, onEdit, 
           </thead>
           <tbody>
             {rows.map((r) => (
-              <tr key={r.id || r.code || r.name} className="border-b">
+              <tr key={r.id || r.code || `${r.brand || ""}-${r.dealer || ""}-${r.name}`} className="border-b">
                 {columns.map((c) => <td key={c} className="p-3">{r[c] || "-"}</td>)}
                 <td className="p-3 flex gap-3">
                   <Edit size={17} onClick={() => onEdit(r)} style={{ cursor: "pointer" }} />

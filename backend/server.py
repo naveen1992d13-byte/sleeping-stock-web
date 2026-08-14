@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -2036,6 +2036,79 @@ def _exact_ci(value: str) -> dict:
     return {"$regex": f"^{re.escape((value or '').strip())}$", "$options": "i"}
 
 
+def _master_brand_value(row: Optional[dict]) -> str:
+    return str((row or {}).get("brand") or (row or {}).get("brand_name") or "").strip()
+
+
+def _master_dealer_value(row: Optional[dict]) -> str:
+    return str((row or {}).get("dealer") or (row or {}).get("dealer_name") or (row or {}).get("name") or "").strip()
+
+
+def _brand_field_query(brand: str) -> dict:
+    """Match denormalized brand / brand_name. Blank brand never matches a selected brand."""
+    brand = (brand or "").strip()
+    if not brand:
+        return {"brand": {"$in": ["__never_match_blank_brand__"]}}
+    rx = _exact_ci(brand)
+    return {"$or": [{"brand": rx}, {"brand_name": rx}]}
+
+
+def _dealer_field_query(dealer: str) -> dict:
+    dealer = (dealer or "").strip()
+    rx = _exact_ci(dealer)
+    return {"$or": [{"dealer": rx}, {"dealer_name": rx}]}
+
+
+async def _find_dealers_by_name(name: str, brand: Optional[str] = None) -> list:
+    name = (name or "").strip()
+    if not name:
+        return []
+    query = {"name": _exact_ci(name)}
+    brand = (brand or "").strip()
+    if brand:
+        query = {"$and": [query, _brand_field_query(brand)]}
+    return await db.dealers.find(query, {"_id": 0}).to_list(50)
+
+
+async def _require_dealer_doc(name: str, brand: Optional[str] = None) -> dict:
+    matches = await _find_dealers_by_name(name, brand)
+    if not matches:
+        raise HTTPException(status_code=400, detail="Invalid dealer selected")
+    if not (brand or "").strip() and len(matches) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Brand is required because this dealer name exists under multiple brands",
+        )
+    return matches[0]
+
+
+async def _find_branches_by_identity(name: str, dealer: Optional[str] = None, brand: Optional[str] = None) -> list:
+    name = (name or "").strip()
+    if not name:
+        return []
+    query = {"name": _exact_ci(name)}
+    clauses = [query]
+    if (dealer or "").strip():
+        clauses.append(_dealer_field_query(dealer))
+    if (brand or "").strip():
+        clauses.append(_brand_field_query(brand))
+    if len(clauses) > 1:
+        query = {"$and": clauses}
+    return await db.branches.find(query, {"_id": 0}).to_list(50)
+
+
+async def _require_branch_doc(name: str, dealer: Optional[str] = None, brand: Optional[str] = None) -> dict:
+    matches = await _find_branches_by_identity(name, dealer, brand)
+    if not matches:
+        raise HTTPException(status_code=404, detail="Branch not found")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Dealer and Brand are required because this branch name is not unique",
+        )
+    return matches[0]
+
+
 async def _lookup_master_record(collection_name: str, value: str) -> Optional[dict]:
     """Find an exact master record in MongoDB. Never invents default rows."""
     raw_value = (value or "").strip()
@@ -2211,10 +2284,15 @@ async def update_master_brand(code: str, data: MasterBrandCreate, current_user: 
     if not new_code or not name:
         raise HTTPException(status_code=400, detail="Brand code and name required")
 
+    current = await db.brands.find_one({"code": old_code}, {"_id": 0})
+    if not current:
+        raise HTTPException(status_code=404, detail="Brand not found")
+
     existing = await db.brands.find_one({"code": new_code})
     if existing and existing.get("code") != old_code:
         raise HTTPException(status_code=400, detail="Brand code already exists")
 
+    old_name = (current.get("name") or "").strip()
     result = await db.brands.update_one(
         {"code": old_code},
         {"$set": {
@@ -2229,7 +2307,11 @@ async def update_master_brand(code: str, data: MasterBrandCreate, current_user: 
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Brand not found")
 
-    await db.users.update_many({"brand": old_code}, {"$set": {"brand": name}})
+    if old_name and old_name != name:
+        brand_docs = _brand_field_query(old_name)
+        await db.dealers.update_many(brand_docs, {"$set": {"brand": name, "brand_name": name}})
+        await db.branches.update_many(brand_docs, {"$set": {"brand": name, "brand_name": name}})
+        await db.users.update_many({"brand": _exact_ci(old_name)}, {"$set": {"brand": name}})
     return {"message": "Brand updated successfully"}
 
 
@@ -2253,7 +2335,7 @@ async def delete_master_brand(code: str, current_user: UserResponse = Depends(ge
 async def get_master_dealers(current_user: UserResponse = Depends(get_current_user)):
     query = {}
     if current_user.role in ["admin", "user"]:
-        query = {"$or": [{"brand": {"$exists": False}}, {"brand": current_user.brand}, {"brand_name": current_user.brand}]}
+        query = _brand_field_query(current_user.brand)
     return await db.dealers.find(query, {"_id": 0}).sort("name", 1).to_list(1000)
 
 
@@ -2268,7 +2350,7 @@ async def add_master_dealer(data: MasterDealerCreate, current_user: UserResponse
     if not brand:
         raise HTTPException(status_code=400, detail="Brand is required")
 
-    if await db.dealers.find_one({"name": _exact_ci(name), **({"brand": brand} if brand else {})}):
+    if await _find_dealers_by_name(name, brand):
         raise HTTPException(status_code=400, detail="Dealer already exists")
 
     await db.dealers.insert_one({
@@ -2285,28 +2367,38 @@ async def add_master_dealer(data: MasterDealerCreate, current_user: UserResponse
 
 
 @api_router.put("/masters/dealers/{name}")
-async def update_master_dealer(name: str, data: MasterDealerCreate, current_user: UserResponse = Depends(get_current_user)):
+async def update_master_dealer(
+    name: str,
+    data: MasterDealerCreate,
+    current_user: UserResponse = Depends(get_current_user),
+    brand: Optional[str] = Query(None),
+):
     await _ensure_master(current_user)
 
     old_name = name.strip()
     new_name = data.name.strip()
-    brand = (data.brand or "").strip()
+    new_brand = (data.brand or "").strip()
+    current_brand = (brand or new_brand).strip()
 
     if not new_name:
         raise HTTPException(status_code=400, detail="Dealer name required")
-    if not brand:
+    if not new_brand:
         raise HTTPException(status_code=400, detail="Brand is required")
 
-    existing = await db.dealers.find_one({"name": _exact_ci(new_name), **({"brand": brand} if brand else {})})
-    if existing and existing.get("name") != old_name:
+    current = await _require_dealer_doc(old_name, current_brand)
+    old_brand = _master_brand_value(current)
+
+    conflict = await _find_dealers_by_name(new_name, new_brand)
+    if any(row.get("id") != current.get("id") for row in conflict):
         raise HTTPException(status_code=400, detail="Dealer already exists")
 
+    dealer_filter = {"id": current["id"]} if current.get("id") else {"name": old_name}
     result = await db.dealers.update_one(
-        {"name": old_name},
+        dealer_filter,
         {"$set": {
             "name": new_name,
-            "brand": brand,
-            "brand_name": brand,
+            "brand": new_brand,
+            "brand_name": new_brand,
             "status": "active",
             "updatedAt": _now_iso(),
             "updatedBy": current_user.id
@@ -2316,23 +2408,52 @@ async def update_master_dealer(name: str, data: MasterDealerCreate, current_user
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Dealer not found")
 
-    await db.branches.update_many({"dealer": old_name}, {"$set": {"dealer": new_name}})
-    await db.users.update_many({"group": old_name}, {"$set": {"group": new_name, "dealer": new_name}})
+    branch_query = _dealer_field_query(old_name)
+    user_query = {"$or": [{"group": old_name}, {"dealer": old_name}]}
+    if old_brand:
+        branch_query = {"$and": [branch_query, _brand_field_query(old_brand)]}
+        user_query = {"$and": [user_query, {"brand": _exact_ci(old_brand)}]}
+    await db.branches.update_many(branch_query, {"$set": {
+        "dealer": new_name,
+        "dealer_name": new_name,
+        "brand": new_brand,
+        "brand_name": new_brand,
+    }})
+    user_set = {"group": new_name, "dealer": new_name}
+    if old_brand != new_brand:
+        user_set["brand"] = new_brand
+    await db.users.update_many(user_query, {"$set": user_set})
     return {"message": "Dealer updated successfully"}
 
 
 @api_router.delete("/masters/dealers/{name}")
-async def delete_master_dealer(name: str, current_user: UserResponse = Depends(get_current_user)):
+async def delete_master_dealer(
+    name: str,
+    current_user: UserResponse = Depends(get_current_user),
+    brand: Optional[str] = Query(None),
+):
     await _ensure_master(current_user)
 
-    dealer_name = name.strip()
-    used_user = await db.users.find_one({"$or": [{"group": dealer_name}, {"dealer": dealer_name}]})
-    used_branch = await db.branches.find_one({"dealer": dealer_name})
+    dealer_doc = await _require_dealer_doc(name.strip(), brand)
+    dealer_name = dealer_doc.get("name") or name.strip()
+    dealer_brand = _master_brand_value(dealer_doc)
+
+    user_query = {"$or": [{"group": dealer_name}, {"dealer": dealer_name}]}
+    branch_query = _dealer_field_query(dealer_name)
+    if dealer_brand:
+        user_query = {"$and": [user_query, {"brand": _exact_ci(dealer_brand)}]}
+        branch_query = {"$and": [branch_query, _brand_field_query(dealer_brand)]}
+
+    used_user = await db.users.find_one(user_query)
+    used_branch = await db.branches.find_one(branch_query)
 
     if used_user or used_branch:
         raise HTTPException(status_code=400, detail="Dealer is already used")
 
-    result = await db.dealers.delete_one({"name": dealer_name})
+    if dealer_doc.get("id"):
+        result = await db.dealers.delete_one({"id": dealer_doc["id"]})
+    else:
+        result = await db.dealers.delete_one({"name": dealer_name})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Dealer not found")
 
@@ -2343,9 +2464,15 @@ async def delete_master_dealer(name: str, current_user: UserResponse = Depends(g
 async def get_master_branches(current_user: UserResponse = Depends(get_current_user)):
     query = {}
     if current_user.role == "admin":
-        query = {"dealer": current_user.group}
+        query = {"$and": [_dealer_field_query(current_user.group), _brand_field_query(current_user.brand)]}
     elif current_user.role == "user":
-        query = {"dealer": current_user.group, "name": current_user.location}
+        query = {
+            "$and": [
+                _dealer_field_query(current_user.group),
+                _brand_field_query(current_user.brand),
+                {"name": _exact_ci(current_user.location)},
+            ]
+        }
 
     return await db.branches.find(query, {"_id": 0}).sort("name", 1).to_list(1000)
 
@@ -2361,13 +2488,13 @@ async def add_master_branch(data: MasterBranchCreate, current_user: UserResponse
     if not dealer or not name:
         raise HTTPException(status_code=400, detail="Dealer and branch name required")
 
-    dealer_doc = await db.dealers.find_one({"name": _exact_ci(dealer)}, {"_id": 0})
-    if not dealer_doc:
-        raise HTTPException(status_code=400, detail="Invalid dealer selected")
+    dealer_doc = await _require_dealer_doc(dealer, brand)
     if not brand:
-        brand = dealer_doc.get("brand") or dealer_doc.get("brand_name") or ""
+        brand = _master_brand_value(dealer_doc)
+    if not brand:
+        raise HTTPException(status_code=400, detail="Brand is required")
 
-    if await db.branches.find_one({"dealer": dealer, "name": _exact_ci(name), **({"brand": brand} if brand else {})}):
+    if await _find_branches_by_identity(name, dealer, brand):
         raise HTTPException(status_code=400, detail="Branch already exists")
 
     await db.branches.insert_one({
@@ -2386,34 +2513,47 @@ async def add_master_branch(data: MasterBranchCreate, current_user: UserResponse
 
 
 @api_router.put("/masters/branches/{name}")
-async def update_master_branch(name: str, data: MasterBranchCreate, current_user: UserResponse = Depends(get_current_user)):
+async def update_master_branch(
+    name: str,
+    data: MasterBranchCreate,
+    current_user: UserResponse = Depends(get_current_user),
+    dealer: Optional[str] = Query(None),
+    brand: Optional[str] = Query(None),
+):
     await _ensure_master(current_user)
 
     old_name = name.strip()
-    dealer = data.dealer.strip()
+    new_dealer = data.dealer.strip()
     new_name = data.name.strip()
-    brand = (data.brand or "").strip()
+    new_brand = (data.brand or "").strip()
+    current_dealer = (dealer or new_dealer).strip()
+    current_brand = (brand or new_brand).strip()
 
-    if not dealer or not new_name:
+    if not new_dealer or not new_name:
         raise HTTPException(status_code=400, detail="Dealer and branch name required")
 
-    dealer_doc = await db.dealers.find_one({"name": _exact_ci(dealer)}, {"_id": 0})
-    if not dealer_doc:
-        raise HTTPException(status_code=400, detail="Invalid dealer selected")
-    if not brand:
-        brand = dealer_doc.get("brand") or dealer_doc.get("brand_name") or ""
+    current = await _require_branch_doc(old_name, current_dealer, current_brand)
+    old_dealer = _master_dealer_value(current)
+    old_brand = _master_brand_value(current)
 
-    existing = await db.branches.find_one({"dealer": dealer, "name": _exact_ci(new_name), **({"brand": brand} if brand else {})})
-    if existing and existing.get("name") != old_name:
+    dealer_doc = await _require_dealer_doc(new_dealer, new_brand or current_brand)
+    if not new_brand:
+        new_brand = _master_brand_value(dealer_doc)
+    if not new_brand:
+        raise HTTPException(status_code=400, detail="Brand is required")
+
+    conflict = await _find_branches_by_identity(new_name, new_dealer, new_brand)
+    if any(row.get("id") != current.get("id") for row in conflict):
         raise HTTPException(status_code=400, detail="Branch already exists")
 
+    branch_filter = {"id": current["id"]} if current.get("id") else {"name": old_name}
     result = await db.branches.update_one(
-        {"name": old_name},
+        branch_filter,
         {"$set": {
-            "brand": brand,
-            "brand_name": brand,
-            "dealer": dealer,
-            "dealer_name": dealer,
+            "brand": new_brand,
+            "brand_name": new_brand,
+            "dealer": new_dealer,
+            "dealer_name": new_dealer,
             "name": new_name,
             "status": "active",
             "updatedAt": _now_iso(),
@@ -2424,20 +2564,47 @@ async def update_master_branch(name: str, data: MasterBranchCreate, current_user
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Branch not found")
 
-    await db.users.update_many({"location": old_name}, {"$set": {"location": new_name, "branch": new_name}})
+    user_clauses = [{"$or": [{"location": old_name}, {"branch": old_name}]}]
+    if old_dealer:
+        user_clauses.append({"$or": [{"group": old_dealer}, {"dealer": old_dealer}]})
+    if old_brand:
+        user_clauses.append({"brand": _exact_ci(old_brand)})
+    user_query = {"$and": user_clauses} if len(user_clauses) > 1 else user_clauses[0]
+    await db.users.update_many(user_query, {"$set": {"location": new_name, "branch": new_name}})
     return {"message": "Branch updated successfully"}
 
 
 @api_router.delete("/masters/branches/{name}")
-async def delete_master_branch(name: str, current_user: UserResponse = Depends(get_current_user)):
+async def delete_master_branch(
+    name: str,
+    current_user: UserResponse = Depends(get_current_user),
+    dealer: Optional[str] = Query(None),
+    brand: Optional[str] = Query(None),
+):
     await _ensure_master(current_user)
 
-    branch_name = name.strip()
-    used = await db.users.find_one({"$or": [{"location": branch_name}, {"branch": branch_name}]})
+    current = await _require_branch_doc(name.strip(), dealer, brand)
+    branch_name = current.get("name") or name.strip()
+    branch_dealer = _master_dealer_value(current)
+    branch_brand = _master_brand_value(current)
+
+    user_query = {"$or": [{"location": branch_name}, {"branch": branch_name}]}
+    if branch_dealer or branch_brand:
+        clauses = [user_query]
+        if branch_dealer:
+            clauses.append({"$or": [{"group": branch_dealer}, {"dealer": branch_dealer}]})
+        if branch_brand:
+            clauses.append({"brand": _exact_ci(branch_brand)})
+        user_query = {"$and": clauses}
+
+    used = await db.users.find_one(user_query)
     if used:
         raise HTTPException(status_code=400, detail="Branch is already used by users")
 
-    result = await db.branches.delete_one({"name": branch_name})
+    if current.get("id"):
+        result = await db.branches.delete_one({"id": current["id"]})
+    else:
+        result = await db.branches.delete_one({"name": branch_name})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Branch not found")
 
@@ -2596,14 +2763,16 @@ async def update_hub_user(user_id: str, data: UserHubUpdate, current_user: UserR
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
+    raw = data.model_dump()
     if current_user.role == "admin":
         if target.get("role") != "user":
             raise HTTPException(status_code=403, detail="Admin can update only users")
         if target.get("brand") != current_user.brand or target.get("group") != current_user.group:
             raise HTTPException(status_code=403, detail="Not authorized for this user")
+        for locked in ("brand", "dealer", "group", "role", "state"):
+            raw.pop(locked, None)
 
     update_data = {}
-    raw = data.model_dump()
     for key, value in raw.items():
         if value is not None:
             update_data[key] = value
@@ -2658,13 +2827,7 @@ async def get_scope_options(current_user: UserResponse = Depends(get_current_use
             "status": "active",
             "$and": [
                 {"$or": [{"dealer": dealer_rx}, {"dealer_name": dealer_rx}]},
-                {"$or": [
-                    {"brand": {"$exists": False}},
-                    {"brand": None},
-                    {"brand": ""},
-                    {"brand": brand_rx},
-                    {"brand_name": brand_rx},
-                ]},
+                {"$or": [{"brand": brand_rx}, {"brand_name": brand_rx}]},
             ],
         }
         branches = await db.branches.find(

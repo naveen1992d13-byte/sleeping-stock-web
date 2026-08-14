@@ -130,19 +130,20 @@ async def _resolve_query_scope(current_user, brand: Optional[str], dealer: Optio
     # Users always use assigned profile scope.
 
     brand_id = await _lookup_master_id("brands", brand_name)
-    dealer_id = await _lookup_master_id("dealers", dealer_name, {"brand": {"$regex": f"^{re.escape(brand_name)}$", "$options": "i"}} if brand_name else None)
-    branch_id = await _lookup_master_id(
-        "branches",
-        branch_name,
-        {
-            "$or": [
-                {"dealer": {"$regex": f"^{re.escape(dealer_name)}$", "$options": "i"}},
-                {"dealer_name": {"$regex": f"^{re.escape(dealer_name)}$", "$options": "i"}},
-            ]
-        }
-        if dealer_name
-        else None,
+    brand_rx = {"$regex": f"^{re.escape(brand_name)}$", "$options": "i"} if brand_name else None
+    dealer_id = await _lookup_master_id(
+        "dealers",
+        dealer_name,
+        {"$or": [{"brand": brand_rx}, {"brand_name": brand_rx}]} if brand_rx else None,
     )
+    branch_extra = None
+    if dealer_name:
+        dealer_rx = {"$regex": f"^{re.escape(dealer_name)}$", "$options": "i"}
+        clauses = [{"$or": [{"dealer": dealer_rx}, {"dealer_name": dealer_rx}]}]
+        if brand_rx:
+            clauses.append({"$or": [{"brand": brand_rx}, {"brand_name": brand_rx}]})
+        branch_extra = {"$and": clauses} if len(clauses) > 1 else clauses[0]
+    branch_id = await _lookup_master_id("branches", branch_name, branch_extra)
 
     return {
         "brand_id": brand_id,

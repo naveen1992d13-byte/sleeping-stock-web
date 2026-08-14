@@ -208,24 +208,30 @@ async def _resolve_canonical_pairing_scope(brand: str, dealer: str, branch: str)
     if not brand_doc:
         raise HTTPException(400, f"Invalid brand selected: {brand}")
 
-    dealer_doc = await db.dealers.find_one({"name": _scope_ci(dealer)}, {"_id": 0, "name": 1, "brand": 1, "brand_name": 1})
+    dealer_doc = await db.dealers.find_one(
+        {
+            "name": _scope_ci(dealer),
+            "$or": [{"brand": _scope_ci(brand)}, {"brand_name": _scope_ci(brand)}],
+        },
+        {"_id": 0, "name": 1, "brand": 1, "brand_name": 1},
+    )
     if not dealer_doc:
-        dealer_doc = await db.groups.find_one({"name": _scope_ci(dealer)}, {"_id": 0, "name": 1})
-    if not dealer_doc:
-        raise HTTPException(400, f"Invalid dealer selected: {dealer}")
+        raise HTTPException(400, f"Invalid dealer '{dealer}' for brand '{brand}'")
 
     canonical_dealer = (dealer_doc.get("name") or dealer).strip()
+    canonical_brand = (brand_doc.get("name") or brand).strip()
     branch_doc = await db.branches.find_one(
-        {"dealer": _scope_ci(canonical_dealer), "name": _scope_ci(branch)},
+        {
+            "$and": [
+                {"name": _scope_ci(branch)},
+                {"$or": [{"dealer": _scope_ci(canonical_dealer)}, {"dealer_name": _scope_ci(canonical_dealer)}]},
+                {"$or": [{"brand": _scope_ci(canonical_brand)}, {"brand_name": _scope_ci(canonical_brand)}]},
+            ]
+        },
         {"_id": 0, "name": 1, "brand": 1, "brand_name": 1, "dealer": 1},
     )
     if not branch_doc:
-        branch_doc = await db.branches.find_one(
-            {"dealer": canonical_dealer, "name": _scope_ci(branch)},
-            {"_id": 0, "name": 1, "brand": 1, "brand_name": 1, "dealer": 1},
-        )
-    if not branch_doc:
-        raise HTTPException(400, f"Invalid branch '{branch}' for dealer '{canonical_dealer}'")
+        raise HTTPException(400, f"Invalid branch '{branch}' for brand '{canonical_brand}' and dealer '{canonical_dealer}'")
 
     canonical_brand = (brand_doc.get("name") or brand).strip()
     branch_brand = (branch_doc.get("brand") or branch_doc.get("brand_name") or "").strip()

@@ -72,16 +72,16 @@ function ScopeFilters({user, value, onChange, minDate, historical=false}) {
 
   const dealers = uniqueNames(masterOptions.dealers.filter(item => {
     if (!selectedBrand) return true;
-    if (typeof item === 'string') return true;
+    if (typeof item === 'string') return false;
     const itemBrand = item.brand_name || item.brand || item.brandName;
-    return !itemBrand || same(itemBrand, selectedBrand);
+    return itemBrand && same(itemBrand, selectedBrand);
   }));
   const branches = uniqueNames(masterOptions.branches.filter(item => {
-    if (typeof item === 'string') return true;
+    if (typeof item === 'string') return !selectedBrand && !selectedDealer;
     const itemBrand = item.brand_name || item.brand || item.brandName;
     const itemDealer = item.dealer_name || item.dealer || item.dealerName;
-    if (selectedBrand && itemBrand && !same(itemBrand, selectedBrand)) return false;
-    if (selectedDealer && itemDealer && !same(itemDealer, selectedDealer)) return false;
+    if (selectedBrand && (!itemBrand || !same(itemBrand, selectedBrand))) return false;
+    if (selectedDealer && (!itemDealer || !same(itemDealer, selectedDealer))) return false;
     return true;
   }));
   const brands = uniqueNames(masterOptions.brands);

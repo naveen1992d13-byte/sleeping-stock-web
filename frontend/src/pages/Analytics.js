@@ -266,12 +266,6 @@ export function Analytics() {
     scopeBrand,
     scopeDealer,
     scopeBranch,
-    setScopeBrand,
-    setScopeDealer,
-    setScopeBranch,
-    brandOptions = [],
-    dealerOptions = [],
-    branchOptions = [],
   } = ctx;
 
   const [month, setMonth] = useState(monthValue());
@@ -554,50 +548,13 @@ export function Analytics() {
           })}
         </select>
 
-        <select
-          className={selectClass}
-          value={scopeBrand || ''}
-          onChange={(e) => setScopeBrand?.(e.target.value)}
-          data-testid="analytics-brand"
-          aria-label="Brand"
-          disabled={!setScopeBrand}
+        <span
+          className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-[11px] font-medium text-gray-700"
+          data-testid="analytics-scope"
+          title="Scope is controlled by the header Brand → Dealer → Branch filter"
         >
-          {(brandOptions.length ? brandOptions : [scopeBrand || 'All Brands']).map((b) => (
-            <option key={b} value={b}>
-              {b}
-            </option>
-          ))}
-        </select>
-
-        <select
-          className={selectClass}
-          value={scopeDealer || ''}
-          onChange={(e) => setScopeDealer?.(e.target.value)}
-          data-testid="analytics-dealer"
-          aria-label="Dealer"
-          disabled={!setScopeDealer}
-        >
-          {(dealerOptions.length ? dealerOptions : [scopeDealer || 'All Dealers']).map((d) => (
-            <option key={d} value={d}>
-              {d}
-            </option>
-          ))}
-        </select>
-
-        <select
-          className={selectClass}
-          value={scopeBranch || ''}
-          onChange={(e) => setScopeBranch?.(e.target.value)}
-          data-testid="analytics-branch"
-          aria-label="Branch"
-          disabled={!setScopeBranch}
-        >
-          {(branchOptions.length ? branchOptions : [scopeBranch || 'All Branches']).map((b) => (
-            <option key={b} value={b}>
-              {b}
-            </option>
-          ))}
-        </select>
+          {[scopeBrand || 'Select Brand', scopeDealer || 'Select Dealer', scopeBranch || 'Select Branch'].join(' / ')}
+        </span>
 
         <select
           className={selectClass}
