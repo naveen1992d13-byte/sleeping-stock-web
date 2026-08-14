@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth, API, canAccessPermission, canAccessMenuItem } from '../App';
 import axios from 'axios';
@@ -47,9 +47,9 @@ export function DashboardLayout() {
   const [tabs, setTabs] = useState([]);
   const [activeTabId, setActiveTabId] = useState(null);
 
-  const [brandOptions, setBrandOptions] = useState(["All Brands"]);
-  const [dealerOptions, setDealerOptions] = useState(["All Dealers"]);
-  const [branchOptions, setBranchOptions] = useState(["All Branches"]);
+  const [brandOptions, setBrandOptions] = useState([]);
+  const [dealerOptions, setDealerOptions] = useState([]);
+  const [branchOptions, setBranchOptions] = useState([]);
 
   const isMaster = user?.role === "master";
   const isAdmin = user?.role === "admin";
@@ -67,8 +67,11 @@ export function DashboardLayout() {
   const [scopeMasters, setScopeMasters] = useState({ brands: [], dealers: [], branches: [] });
 
   const isAllScope = (value) => !value || String(value).startsWith("All ") || value === "N/A";
+  const isSpecificScope = (value) => Boolean(value) && !isAllScope(value);
   const normalizeScopeValue = (value) => String(value || "").trim().toLowerCase();
   const uniqueNames = (items, selector) => Array.from(new Set((items || []).map(selector).filter(Boolean))).sort((a, b) => String(a).localeCompare(String(b)));
+  const recordBrand = (row) => String(row?.brand || row?.brand_name || "").trim();
+  const recordDealer = (row) => String(row?.dealer || row?.dealer_name || "").trim();
 
   const navItems = APPLICATION_MENU_ITEMS;
 
@@ -78,91 +81,101 @@ export function DashboardLayout() {
     if (!user) return;
 
     if (isMaster) {
-      setScopeBrand("All Brands");
-      setScopeDealer("All Dealers");
-      setScopeBranch("All Branches");
+      setScopeBrand("");
+      setScopeDealer("");
+      setScopeBranch("");
     } else {
       setScopeBrand(getUserBrand());
       setScopeDealer(getUserDealer());
       // Admin can switch between every branch under the assigned dealer.
       // Normal users stay locked to their assigned branch.
-      setScopeBranch(isAdmin ? "All Branches" : getUserBranch());
+      setScopeBranch(isAdmin ? "" : getUserBranch());
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.role, user?.brand, user?.dealer, user?.group, user?.branch, user?.location]);
 
-  useEffect(() => {
-    const loadScopeOptions = async () => {
-      if (!user) return;
+  const loadScopeOptions = useCallback(async () => {
+    if (!user) return;
 
-      try {
-        const res = await axios.get(`${API}/scope/options`);
-        const data = res.data || {};
+    try {
+      const res = await axios.get(`${API}/scope/options`);
+      const data = res.data || {};
 
-        const dbBrands = Array.isArray(data.brands) ? data.brands : [];
-        const dbDealers = Array.isArray(data.dealers) ? data.dealers : [];
-        const dbBranches = Array.isArray(data.branches) ? data.branches : [];
-        setScopeMasters({ brands: dbBrands, dealers: dbDealers, branches: dbBranches });
+      const dbBrands = Array.isArray(data.brands) ? data.brands : [];
+      const dbDealers = Array.isArray(data.dealers) ? data.dealers : [];
+      const dbBranches = Array.isArray(data.branches) ? data.branches : [];
+      setScopeMasters({ brands: dbBrands, dealers: dbDealers, branches: dbBranches });
 
-        if (isMaster) {
-          setBrandOptions(["All Brands", ...uniqueNames(dbBrands, (b) => b.name)]);
-          setDealerOptions(["All Dealers", ...uniqueNames(dbDealers, (d) => d.name)]);
-          setBranchOptions(["All Branches", ...uniqueNames(dbBranches, (b) => b.name)]);
-        } else if (isAdmin) {
-          const adminBranches = uniqueNames(dbBranches, (b) => b.name);
-          setBrandOptions([getUserBrand()]);
-          setDealerOptions([getUserDealer()]);
-          setBranchOptions(["All Branches", ...(adminBranches.length ? adminBranches : [getUserBranch()])]);
-        } else {
-          setBrandOptions([getUserBrand()]);
-          setDealerOptions([getUserDealer()]);
-          setBranchOptions([getUserBranch()]);
-        }
-      } catch (error) {
-        console.error("Scope options load failed", error);
-        setScopeMasters({ brands: [], dealers: [], branches: [] });
+      const brandNames = uniqueNames(dbBrands, (b) => b.name);
 
-        if (isMaster) {
-          setBrandOptions(["All Brands"]);
-          setDealerOptions(["All Dealers"]);
-          setBranchOptions(["All Branches"]);
-        } else {
-          setBrandOptions([getUserBrand()]);
-          setDealerOptions([getUserDealer()]);
-          setBranchOptions([getUserBranch()]);
-        }
+      if (isMaster) {
+        setBrandOptions(brandNames);
+        setScopeBrand((current) => (brandNames.includes(current) ? current : ""));
+      } else if (isAdmin) {
+        const adminBranches = uniqueNames(dbBranches, (b) => b.name);
+        setBrandOptions([getUserBrand()].filter((name) => name && name !== "N/A"));
+        setDealerOptions([getUserDealer()].filter((name) => name && name !== "N/A"));
+        setBranchOptions(adminBranches);
+      } else {
+        setBrandOptions([getUserBrand()].filter((name) => name && name !== "N/A"));
+        setDealerOptions([getUserDealer()].filter((name) => name && name !== "N/A"));
+        setBranchOptions([getUserBranch()].filter((name) => name && name !== "N/A"));
       }
-    };
+    } catch (error) {
+      console.error("Scope options load failed", error);
+      setScopeMasters({ brands: [], dealers: [], branches: [] });
 
-    loadScopeOptions();
+      if (isMaster) {
+        setBrandOptions([]);
+        setDealerOptions([]);
+        setBranchOptions([]);
+      } else {
+        setBrandOptions([getUserBrand()].filter((name) => name && name !== "N/A"));
+        setDealerOptions([getUserDealer()].filter((name) => name && name !== "N/A"));
+        setBranchOptions([getUserBranch()].filter((name) => name && name !== "N/A"));
+      }
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.role, user?.brand, user?.dealer, user?.group, user?.branch, user?.location]);
+  }, [user?.role, user?.brand, user?.dealer, user?.group, user?.branch, user?.location, isMaster, isAdmin]);
+
+  useEffect(() => {
+    loadScopeOptions();
+    const reload = () => loadScopeOptions();
+    window.addEventListener("nmts-masters-changed", reload);
+    window.addEventListener("focus", reload);
+    return () => {
+      window.removeEventListener("nmts-masters-changed", reload);
+      window.removeEventListener("focus", reload);
+    };
+  }, [loadScopeOptions]);
 
   useEffect(() => {
     if (!isMaster) return;
 
-    const dealersForBrand = (scopeMasters.dealers || []).filter((dealer) => {
-      const dealerBrand = dealer.brand || dealer.brand_name;
-      return isAllScope(scopeBrand) || !dealerBrand || dealerBrand === scopeBrand;
-    });
-    const nextDealerOptions = ["All Dealers", ...uniqueNames(dealersForBrand, (d) => d.name)];
-    setDealerOptions(nextDealerOptions);
-    if (!nextDealerOptions.includes(scopeDealer)) {
-      setScopeDealer("All Dealers");
-      setScopeBranch("All Branches");
+    if (!isSpecificScope(scopeBrand)) {
+      setDealerOptions([]);
+      setBranchOptions([]);
+      if (scopeDealer) setScopeDealer("");
+      if (scopeBranch) setScopeBranch("");
       return;
     }
 
-    const branchesForScope = (scopeMasters.branches || []).filter((branch) => {
-      const branchBrand = branch.brand || branch.brand_name;
-      const branchDealer = branch.dealer || branch.dealer_name;
-      const brandOk = isAllScope(scopeBrand) || !branchBrand || branchBrand === scopeBrand;
-      const dealerOk = isAllScope(scopeDealer) || branchDealer === scopeDealer;
-      return brandOk && dealerOk;
-    });
-    const nextBranchOptions = ["All Branches", ...uniqueNames(branchesForScope, (b) => b.name)];
-    setBranchOptions(nextBranchOptions);
-    if (!nextBranchOptions.includes(scopeBranch)) setScopeBranch("All Branches");
+    const dealersForBrand = (scopeMasters.dealers || []).filter((dealer) => recordBrand(dealer) === scopeBrand);
+    const nextDealerNames = uniqueNames(dealersForBrand, (d) => d.name);
+    setDealerOptions(nextDealerNames);
+
+    const dealerSelected = isSpecificScope(scopeDealer) && nextDealerNames.includes(scopeDealer);
+    if (!dealerSelected) {
+      if (scopeDealer) setScopeDealer("");
+      if (scopeBranch) setScopeBranch("");
+      setBranchOptions([]);
+      return;
+    }
+
+    const branchesForDealer = (scopeMasters.branches || []).filter((branch) => recordDealer(branch) === scopeDealer);
+    const nextBranchNames = uniqueNames(branchesForDealer, (b) => b.name);
+    setBranchOptions(nextBranchNames);
+    if (scopeBranch && !nextBranchNames.includes(scopeBranch)) setScopeBranch("");
   }, [isMaster, scopeMasters, scopeBrand, scopeDealer, scopeBranch]);
 
   useEffect(() => {
@@ -172,12 +185,11 @@ export function DashboardLayout() {
     const adminBranches = (scopeMasters.branches || []).filter((branch) => {
       const branchDealer = normalizeScopeValue(branch.dealer || branch.dealer_name);
       const branchBrand = normalizeScopeValue(branch.brand || branch.brand_name);
-      const dealerMatches = !branchDealer || branchDealer === adminDealer;
+      const dealerMatches = branchDealer === adminDealer;
       const brandMatches = !branchBrand || branchBrand === adminBrand;
       return dealerMatches && brandMatches;
     });
-    const nextBranchOptions = ["All Branches", ...uniqueNames(adminBranches, (b) => b.name)];
-    setBranchOptions(nextBranchOptions.length > 1 ? nextBranchOptions : ["All Branches", getUserBranch()]);
+    setBranchOptions(uniqueNames(adminBranches, (b) => b.name));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAdmin, scopeMasters, user?.group, user?.dealer, user?.location, user?.branch]);
 
@@ -516,34 +528,37 @@ export function DashboardLayout() {
                 <HeaderScopeSelect
                   label="Brand"
                   value={scopeBrand}
+                  placeholder="Select Brand"
                   onChange={(value) => {
                     setScopeBrand(value);
                     if (isMaster) {
-                      setScopeDealer('All Dealers');
-                      setScopeBranch('All Branches');
+                      setScopeDealer("");
+                      setScopeBranch("");
                     }
                   }}
-                  options={isMaster ? brandOptions : [scopeBrand]}
+                  options={isMaster ? brandOptions : [scopeBrand].filter(Boolean)}
                   disabled={!isMaster}
                 />
                 <HeaderScopeSelect
                   label="Dealer"
                   value={scopeDealer}
+                  placeholder="Select Dealer"
                   onChange={(value) => {
                     setScopeDealer(value);
                     if (isMaster || isAdmin) {
-                      setScopeBranch('All Branches');
+                      setScopeBranch("");
                     }
                   }}
-                  options={isMaster ? dealerOptions : [scopeDealer]}
-                  disabled={!isMaster}
+                  options={isMaster ? dealerOptions : [scopeDealer].filter(Boolean)}
+                  disabled={isMaster ? !isSpecificScope(scopeBrand) : !isMaster}
                 />
                 <HeaderScopeSelect
                   label="Branch"
                   value={scopeBranch}
+                  placeholder="Select Branch"
                   onChange={setScopeBranch}
-                  options={isMaster || isAdmin ? branchOptions : [scopeBranch]}
-                  disabled={!isMaster && !isAdmin}
+                  options={isMaster || isAdmin ? branchOptions : [scopeBranch].filter(Boolean)}
+                  disabled={isMaster ? !isSpecificScope(scopeDealer) : (!isMaster && !isAdmin)}
                 />
               </div>
 
@@ -679,18 +694,21 @@ export function DashboardLayout() {
   );
 }
 
-function HeaderScopeSelect({ label, value, onChange, options, disabled }) {
+function HeaderScopeSelect({ label, value, onChange, options, disabled, placeholder }) {
+  const safeOptions = (options || []).filter(Boolean);
+  const selectValue = safeOptions.includes(value) ? value : "";
   return (
     <label className="nmts-header-scope-field">
       <span className="nmts-header-scope-label">{label}</span>
       <select
-        value={value}
+        value={selectValue}
         disabled={disabled}
         onChange={(e) => onChange(e.target.value)}
         className="nmts-header-scope-select"
         title={label}
       >
-        {options.map((item) => (
+        <option value="">{placeholder || `Select ${label}`}</option>
+        {safeOptions.map((item) => (
           <option key={item} value={item}>
             {item}
           </option>
