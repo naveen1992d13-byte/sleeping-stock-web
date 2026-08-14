@@ -54,9 +54,17 @@ def headers(token):
 
 
 def _cleanup(headers):
+    """Mongo-first wipe of AUDITSI rows so a failed setup cannot leave orphans."""
     db = _mongo()
     db.users.delete_many({"email": {"$regex": r"^auditsi\."}})
     db.users.delete_many({"name": {"$regex": rf"^{PREFIX}"}})
+    db.branches.delete_many({"name": {"$regex": rf"^{PREFIX}"}})
+    db.dealers.delete_many({"name": {"$regex": rf"^{PREFIX}"}})
+    db.dealers.delete_many({"name": DEALER, "brand": {"$regex": rf"^{PREFIX}"}})
+    db.brands.delete_many({"name": {"$regex": rf"^{PREFIX}"}})
+    db.brands.delete_many({"code": {"$in": ["SA", "SB"]}})
+    db.states.delete_many({"code": "SX"})
+    # Best-effort API deletes in case any row was recreated concurrently.
     for row in list(db.branches.find({"name": {"$regex": rf"^{PREFIX}"}})):
         requests.delete(
             _api(f"/masters/branches/{quote(row['name'])}"),
@@ -64,7 +72,6 @@ def _cleanup(headers):
             params={"dealer": row.get("dealer"), "brand": row.get("brand")},
             timeout=30,
         )
-    db.branches.delete_many({"name": {"$regex": rf"^{PREFIX}"}})
     for row in list(db.dealers.find({"$or": [{"name": {"$regex": rf"^{PREFIX}"}}, {"name": DEALER, "brand": {"$regex": rf"^{PREFIX}"}}]})):
         requests.delete(
             _api(f"/masters/dealers/{quote(row['name'])}"),
@@ -72,28 +79,34 @@ def _cleanup(headers):
             params={"brand": row.get("brand")},
             timeout=30,
         )
-    db.dealers.delete_many({"name": {"$regex": rf"^{PREFIX}"}})
-    db.dealers.delete_many({"name": DEALER, "brand": {"$regex": rf"^{PREFIX}"}})
     for row in list(db.brands.find({"name": {"$regex": rf"^{PREFIX}"}})):
         requests.delete(_api(f"/masters/brands/{quote(row.get('code') or '')}"), headers=headers, timeout=30)
+    db.branches.delete_many({"name": {"$regex": rf"^{PREFIX}"}})
+    db.dealers.delete_many({"name": {"$regex": rf"^{PREFIX}"}})
+    db.dealers.delete_many({"name": DEALER, "brand": {"$regex": rf"^{PREFIX}"}})
     db.brands.delete_many({"name": {"$regex": rf"^{PREFIX}"}})
     db.brands.delete_many({"code": {"$in": ["SA", "SB"]}})
-    db.states.delete_many({"code": "SX"})
+
+
+def _assert_ok(response, label):
+    assert response.status_code == 200, f"{label}: {response.status_code} {response.text}"
 
 
 @pytest.fixture(scope="module")
 def masters(headers):
     _cleanup(headers)
-    assert requests.post(_api("/masters/brands"), headers=headers, json={"code": "SA", "name": BRAND_A}, timeout=30).status_code == 200
-    assert requests.post(_api("/masters/brands"), headers=headers, json={"code": "SB", "name": BRAND_B}, timeout=30).status_code == 200
-    assert requests.post(_api("/masters/dealers"), headers=headers, json={"name": DEALER, "brand": BRAND_A}, timeout=30).status_code == 200
-    assert requests.post(_api("/masters/dealers"), headers=headers, json={"name": DEALER, "brand": BRAND_B}, timeout=30).status_code == 200
-    for name in ("AUDITSI A-Chennai", "AUDITSI A-Coimbatore"):
-        assert requests.post(_api("/masters/branches"), headers=headers, json={"name": name, "dealer": DEALER, "brand": BRAND_A}, timeout=30).status_code == 200
-    for name in ("AUDITSI B-Mumbai", "AUDITSI B-Pune"):
-        assert requests.post(_api("/masters/branches"), headers=headers, json={"name": name, "dealer": DEALER, "brand": BRAND_B}, timeout=30).status_code == 200
-    yield
-    _cleanup(headers)
+    try:
+        _assert_ok(requests.post(_api("/masters/brands"), headers=headers, json={"code": "SA", "name": BRAND_A}, timeout=30), "create brand A")
+        _assert_ok(requests.post(_api("/masters/brands"), headers=headers, json={"code": "SB", "name": BRAND_B}, timeout=30), "create brand B")
+        _assert_ok(requests.post(_api("/masters/dealers"), headers=headers, json={"name": DEALER, "brand": BRAND_A}, timeout=30), "create dealer A")
+        _assert_ok(requests.post(_api("/masters/dealers"), headers=headers, json={"name": DEALER, "brand": BRAND_B}, timeout=30), "create dealer B")
+        for name in ("AUDITSI A-Chennai", "AUDITSI A-Coimbatore"):
+            _assert_ok(requests.post(_api("/masters/branches"), headers=headers, json={"name": name, "dealer": DEALER, "brand": BRAND_A}, timeout=30), f"create {name}")
+        for name in ("AUDITSI B-Mumbai", "AUDITSI B-Pune"):
+            _assert_ok(requests.post(_api("/masters/branches"), headers=headers, json={"name": name, "dealer": DEALER, "brand": BRAND_B}, timeout=30), f"create {name}")
+        yield
+    finally:
+        _cleanup(headers)
 
 
 def test_same_dealer_name_two_brands(headers, masters):
@@ -171,8 +184,10 @@ def test_delete_branch_is_brand_scoped(headers, masters):
         timeout=30,
     )
     assert deleted.status_code == 200, deleted.text
-    remaining = list(db.branches.find({"name": shared}, {"_id": 0, "brand": 1, "dealer": 1}))
-    assert remaining == [{"brand": BRAND_B, "dealer": DEALER}] or remaining[0]["brand"] == BRAND_B
+    remaining = list(db.branches.find({"name": shared}, {"_id": 0, "brand": 1, "dealer": 1, "brand_name": 1, "dealer_name": 1}))
+    assert len(remaining) == 1
+    assert remaining[0].get("brand") == BRAND_B or remaining[0].get("brand_name") == BRAND_B
+    assert remaining[0].get("dealer") == DEALER or remaining[0].get("dealer_name") == DEALER
     requests.delete(
         _api(f"/masters/branches/{quote(shared)}"),
         headers=headers,
