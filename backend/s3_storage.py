@@ -120,6 +120,17 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _aws_error_code(exc: BaseException) -> str:
+    """Best-effort AWS error code only — never log secret values or full messages."""
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, dict):
+        err = resp.get("Error") if isinstance(resp.get("Error"), dict) else {}
+        code = err.get("Code") if err else None
+        if code:
+            return str(code)[:64]
+    return ""
+
+
 def guess_content_type(filename: str, fallback: str = "application/octet-stream") -> str:
     ctype, _ = mimetypes.guess_type(filename or "")
     return ctype or fallback
@@ -243,6 +254,7 @@ class S3StorageService:
         self._local = _LocalObjectStore(local_root)
         self._client = None
         self._mode = "local"
+        self._ensure_attempted = False
         self._init_client()
 
     def _credentials_look_valid(self) -> bool:
@@ -281,7 +293,28 @@ class S3StorageService:
         except Exception as exc:
             self._client = None
             self._mode = "local"
-            logger.warning("S3 init failed (%s); using local object store", type(exc).__name__)
+            err_code = _aws_error_code(exc)
+            logger.warning(
+                "S3 init failed (%s%s); using local object store",
+                type(exc).__name__,
+                f" code={err_code}" if err_code else "",
+            )
+
+    def ensure_s3(self) -> bool:
+        """One-time re-init after a failed first probe. Does not bypass the REAL S3 gate."""
+        if self.is_s3():
+            return True
+        if getattr(self, "_ensure_attempted", False):
+            return False
+        self._ensure_attempted = True
+        self.region = (os.getenv(ENV_AWS_REGION) or "").strip() or self.region or "us-east-1"
+        self.bucket = resolve_bucket()
+        self.env = storage_env()
+        self.access_key = (os.getenv(ENV_AWS_ACCESS_KEY_ID) or "").strip()
+        self.secret_key = (os.getenv(ENV_AWS_SECRET_ACCESS_KEY) or "").strip()
+        logger.info("Retrying S3 initialization once")
+        self._init_client()
+        return self.is_s3()
 
     @property
     def mode(self) -> str:
@@ -500,6 +533,11 @@ def get_storage() -> S3StorageService:
             if _SERVICE is None:
                 _SERVICE = S3StorageService()
     return _SERVICE
+
+
+def ensure_s3() -> bool:
+    """Refresh env and retry S3 init once if the singleton is still local."""
+    return get_storage().ensure_s3()
 
 
 def reset_storage_for_tests() -> S3StorageService:

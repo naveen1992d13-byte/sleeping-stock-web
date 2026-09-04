@@ -1,13 +1,19 @@
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Load secrets before importing s3_storage so the singleton can see AWS keys.
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / '.env.s3.local', override=True)
+
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError, OperationFailure
 import os
 import logging
-from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import List, Optional
 import uuid
@@ -39,6 +45,7 @@ try:
     from . import archive_runs
     from . import maintenance as maint
     from . import excel_permissions
+    from . import upload_center_summary as ucs
 except ImportError:
     import s3_storage
     import file_objects
@@ -49,11 +56,7 @@ except ImportError:
     import archive_runs
     import maintenance as maint
     import excel_permissions
-
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
-# Optional local overlay for corrected AWS/S3 secret mapping (gitignored; never commit).
-load_dotenv(ROOT_DIR / '.env.s3.local', override=True)
+    import upload_center_summary as ucs
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -2913,6 +2916,33 @@ async def get_dashboard_summary(
     }
 
 
+def _branch_master_query(current_user: UserResponse, brand=None, dealer=None, branch=None) -> dict:
+    """Same Brand/Dealer/Branch scope as upload cards, applied to db.branches."""
+    query: dict = {}
+    if current_user.role == "master":
+        if not _is_all_scope(brand):
+            query["$or"] = [{"brand": brand}, {"brand_name": brand}]
+        if not _is_all_scope(dealer):
+            query["dealer"] = dealer
+        if not _is_all_scope(branch):
+            query["name"] = branch
+    elif current_user.role == "admin":
+        query["$or"] = [{"brand": current_user.brand}, {"brand_name": current_user.brand}]
+        query["dealer"] = current_user.group
+        if not _is_all_scope(branch):
+            query["name"] = branch
+    else:
+        query["$or"] = [{"brand": current_user.brand}, {"brand_name": current_user.brand}]
+        query["dealer"] = current_user.group
+        query["name"] = current_user.location
+    return query
+
+
+async def _today_expected_pairs(current_user: UserResponse, brand=None, dealer=None, branch=None):
+    branch_docs = await db.branches.find(_branch_master_query(current_user, brand, dealer, branch), {"_id": 0}).to_list(10000)
+    return ucs.expected_identities_from_branches(branch_docs)
+
+
 @api_router.get("/uploads/master-summary")
 async def get_master_upload_summary(
     brand: Optional[str] = None,
@@ -2921,92 +2951,39 @@ async def get_master_upload_summary(
     current_user: UserResponse = Depends(get_current_user)
 ):
     """Master Admin / Admin summary cards for Upload Center / Dashboard.
-    Refreshes automatically whenever the global header filters (Brand/Dealer/Branch) change,
-    since the frontend passes the active scope values as query params. Admin is
-    automatically scoped to their own Brand/Dealer by _apply_role_scope_v2 below —
-    they can never see another Admin's data.
+
+    Completed Uploaders = unique Brand+Dealer+Branch with a Published upload today.
+    Waiting is never Completed. Item/qty/value use the latest valid upload per branch.
     """
     await _ensure_master_or_admin(current_user)
 
     date_key = _nmts_date_key()
-    upload_query = {"date_key": date_key}
+    upload_query = {"date_key": date_key, "upload_type": "product"}
     _apply_role_scope_v2(upload_query, current_user, brand, dealer, branch)
 
     uploads_today = await db.uploads.find(upload_query, {"_id": 0, "raw_file_bytes": 0}).to_list(200000)
-
-    active_uploads = [u for u in uploads_today if u.get("status") != "Cancelled"]
-    brands_uploaded = len({u.get("brand_name") for u in active_uploads if u.get("brand_name")})
-    dealers_uploaded = len({u.get("dealer_name") for u in active_uploads if u.get("dealer_name")})
-    branches_uploaded = len({u.get("branch") for u in active_uploads if u.get("branch")})
-
-    published = sum(1 for u in uploads_today if u.get("publish_status") == "Published")
-    cancelled = sum(1 for u in uploads_today if u.get("status") == "Cancelled")
-    pending = sum(1 for u in uploads_today if u.get("status") != "Cancelled" and u.get("publish_status") != "Published")
-
-    # Quantity totals (not just counts) for the Published Quantity / Pending Quantity
-    # / Cancelled Quantity summary cards. Additive fields — existing "published" /
-    # "pending" / "cancelled" count fields above are left untouched.
-    def _qty_of(u):
-        return float(u.get("total_available_qty", 0) or 0)
-
-    def _items_of(u):
-        return int(u.get("item_count", u.get("rows_imported", 0)) or 0)
-
-    def _value_of(u):
-        return float(u.get("total_value", 0) or 0)
-
-    uploaded_items = sum(_items_of(u) for u in active_uploads)
-    uploaded_qty = sum(_qty_of(u) for u in active_uploads)
-    uploaded_value = sum(_value_of(u) for u in active_uploads)
-
-    published_items = sum(_items_of(u) for u in uploads_today if u.get("status") != "Cancelled" and u.get("publish_status") == "Published")
-    published_qty = sum(_qty_of(u) for u in uploads_today if u.get("status") != "Cancelled" and u.get("publish_status") == "Published")
-    published_value = sum(_value_of(u) for u in uploads_today if u.get("status") != "Cancelled" and u.get("publish_status") == "Published")
-
-    cancelled_qty = sum(_qty_of(u) for u in uploads_today if u.get("status") == "Cancelled")
-    pending_items = sum(_items_of(u) for u in uploads_today if u.get("status") != "Cancelled" and u.get("publish_status") != "Published")
-    pending_qty = sum(_qty_of(u) for u in uploads_today if u.get("status") != "Cancelled" and u.get("publish_status") != "Published")
-    pending_value = sum(_value_of(u) for u in uploads_today if u.get("status") != "Cancelled" and u.get("publish_status") != "Published")
-
-    completed_pairs = {
-        (u.get("dealer_name"), u.get("branch"))
-        for u in active_uploads if u.get("dealer_name") and u.get("branch")
-    }
-    completed_uploads = len(completed_pairs)
-
-    branch_query = {}
-    if not _is_all_scope(dealer):
-        branch_query["dealer"] = dealer
-    elif current_user.role != "master":
-        branch_query["dealer"] = current_user.group
-
-    branch_docs = await db.branches.find(branch_query, {"_id": 0}).to_list(10000)
-    expected_pairs = {(b.get("dealer"), b.get("name")) for b in branch_docs if b.get("dealer") and b.get("name")}
-    if not _is_all_scope(branch):
-        expected_pairs = {p for p in expected_pairs if p[1] == branch}
-    expected_uploads = len(expected_pairs)
-    balance_uploads = max(expected_uploads - completed_uploads, 0)
-
+    expected_pairs = await _today_expected_pairs(current_user, brand, dealer, branch)
+    summary = ucs.summarize_today(uploads_today, expected_pairs)
     return {
-        "brandsUploaded": brands_uploaded,
-        "dealersUploaded": dealers_uploaded,
-        "branchesUploaded": branches_uploaded,
-        "expectedUploads": expected_uploads,
-        "completedUploads": completed_uploads,
-        "balanceUploads": balance_uploads,
-        "published": published,
-        "pending": pending,
-        "cancelled": cancelled,
-        "uploadedItems": uploaded_items,
-        "uploadedQty": uploaded_qty,
-        "uploadedValue": uploaded_value,
-        "publishedItems": published_items,
-        "publishedQty": published_qty,
-        "publishedValue": published_value,
-        "pendingItems": pending_items,
-        "pendingQty": pending_qty,
-        "pendingValue": pending_value,
-        "cancelledQty": cancelled_qty,
+        "brandsUploaded": summary["brandsUploaded"],
+        "dealersUploaded": summary["dealersUploaded"],
+        "branchesUploaded": summary["branchesUploaded"],
+        "expectedUploads": summary["expectedUploads"],
+        "completedUploads": summary["completedUploads"],
+        "balanceUploads": summary["balanceUploads"],
+        "published": summary["published"],
+        "pending": summary["pending"],
+        "cancelled": summary["cancelled"],
+        "uploadedItems": summary["uploadedItems"],
+        "uploadedQty": summary["uploadedQty"],
+        "uploadedValue": summary["uploadedValue"],
+        "publishedItems": summary["publishedItems"],
+        "publishedQty": summary["publishedQty"],
+        "publishedValue": summary["publishedValue"],
+        "pendingItems": summary["pendingItems"],
+        "pendingQty": summary["pendingQty"],
+        "pendingValue": summary["pendingValue"],
+        "cancelledQty": 0,
     }
 
 
@@ -3017,46 +2994,22 @@ async def get_upload_balance_details(
     branch: Optional[str] = None,
     current_user: UserResponse = Depends(get_current_user),
 ):
-    """Dealer/branch pairs that have not uploaded today (scoped)."""
+    """Expected branches today: Completed = Published; Pending = not Published."""
     await _ensure_master_or_admin(current_user)
     date_key = _nmts_date_key()
-    upload_query = {"date_key": date_key}
+    upload_query = {"date_key": date_key, "upload_type": "product"}
     _apply_role_scope_v2(upload_query, current_user, brand, dealer, branch)
     uploads_today = await db.uploads.find(upload_query, {"_id": 0, "raw_file_bytes": 0}).to_list(200000)
-    active_uploads = [u for u in uploads_today if u.get("status") != "Cancelled"]
-    completed_pairs = {
-        (u.get("dealer_name"), u.get("branch"))
-        for u in active_uploads if u.get("dealer_name") and u.get("branch")
-    }
-    branch_query = {}
-    if not _is_all_scope(dealer):
-        branch_query["dealer"] = dealer
-    elif current_user.role != "master":
-        branch_query["dealer"] = current_user.group
-    branch_docs = await db.branches.find(branch_query, {"_id": 0}).to_list(10000)
-    expected_pairs = {(b.get("dealer"), b.get("name")) for b in branch_docs if b.get("dealer") and b.get("name")}
-    if not _is_all_scope(branch):
-        expected_pairs = {p for p in expected_pairs if p[1] == branch}
-    pending = []
-    completed = []
-    for dealer_name, branch_name in sorted(expected_pairs):
-        row = {
-            "dealer": dealer_name,
-            "branch": branch_name,
-            "brand": brand if brand and not str(brand).startswith("All") else (current_user.brand if current_user.role != "master" else ""),
-            "upload_status": "Completed" if (dealer_name, branch_name) in completed_pairs else "Pending",
-        }
-        if row["upload_status"] == "Completed":
-            completed.append(row)
-        else:
-            pending.append(row)
+    expected_pairs = await _today_expected_pairs(current_user, brand, dealer, branch)
+    summary = ucs.summarize_today(uploads_today, expected_pairs)
+    rows = ucs.balance_rows(expected_pairs, summary["completed_keys"])
     return {
         "date_key": date_key,
-        "expected_uploads": len(expected_pairs),
-        "completed_uploads": len(completed_pairs),
-        "balance_uploads": max(len(expected_pairs) - len(completed_pairs), 0),
-        "completed": completed,
-        "pending": pending,
+        "expected_uploads": summary["expectedUploads"],
+        "completed_uploads": summary["completedUploads"],
+        "balance_uploads": summary["balanceUploads"],
+        "completed": rows["completed"],
+        "pending": rows["pending"],
     }
 
 
@@ -3067,52 +3020,65 @@ async def get_today_upload_summary(
     branch: Optional[str] = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    """Today's own Upload Center summary. For role 'user' this is always scoped to
-    that user's own uploads only, regardless of any filter passed in — a User must
-    never see another user's uploaded data. For Master/Admin it follows the normal
-    Brand/Dealer/Branch role scope (same as /uploads/master-summary) so the same
-    endpoint can back a personal 'my today upload' card anywhere it's needed.
-    Reads db.upload_items (the per-row upload records) directly so Available Items
-    reflects actual rows with available quantity > 0, not just upload batch counts.
+    """Today's Upload Center metrics using the latest valid upload per branch.
+
+    Role 'user' is always scoped to that user's own uploads.
+    Available Items are rows with available quantity > 0 on the selected uploads.
     """
     date_key = _nmts_date_key()
-    item_query = {"upload_type": "product", "active_date_key": date_key, "publish_status": {"$ne": "Cancelled"}}
-
+    upload_query = {"date_key": date_key, "upload_type": "product"}
     if current_user.role == "user":
-        item_query["uploaded_user_id"] = current_user.id
+        upload_query["uploaded_user_id"] = current_user.id
+        upload_query["brand_name"] = current_user.brand
+        upload_query["dealer_name"] = current_user.group
+        upload_query["branch"] = current_user.location
     else:
-        _apply_role_scope_v2(item_query, current_user, brand, dealer, branch)
+        _apply_role_scope_v2(upload_query, current_user, brand, dealer, branch)
 
-    pipeline = [
-        {"$match": item_query},
-        {"$group": {
-            "_id": None,
-            "total_items": {"$sum": 1},
-            "available_items": {"$sum": {"$cond": [{"$gt": [{"$toDouble": {"$ifNull": ["$available_qty_number", 0]}}, 0]}, 1, 0]}},
-            "available_qty": {"$sum": {"$toDouble": {"$ifNull": ["$available_qty_number", 0]}}},
-            "total_value": {"$sum": {"$toDouble": {"$ifNull": ["$total_value_number", 0]}}},
-            "published_items": {"$sum": {"$cond": [{"$eq": ["$publish_status", "Published"]}, 1, 0]}},
-            "published_qty": {"$sum": {"$cond": [{"$eq": ["$publish_status", "Published"]}, {"$toDouble": {"$ifNull": ["$available_qty_number", 0]}}, 0]}},
-            "published_value": {"$sum": {"$cond": [{"$eq": ["$publish_status", "Published"]}, {"$toDouble": {"$ifNull": ["$total_value_number", 0]}}, 0]}},
-            "pending_items": {"$sum": {"$cond": [{"$ne": ["$publish_status", "Published"]}, 1, 0]}},
-            "pending_qty": {"$sum": {"$cond": [{"$ne": ["$publish_status", "Published"]}, {"$toDouble": {"$ifNull": ["$available_qty_number", 0]}}, 0]}},
-            "pending_value": {"$sum": {"$cond": [{"$ne": ["$publish_status", "Published"]}, {"$toDouble": {"$ifNull": ["$total_value_number", 0]}}, 0]}},
-        }},
-    ]
-    result = await db.upload_items.aggregate(pipeline).to_list(1)
-    row = result[0] if result else {}
+    uploads_today = await db.uploads.find(upload_query, {"_id": 0, "raw_file_bytes": 0}).to_list(200000)
+    expected_pairs = await _today_expected_pairs(current_user, brand, dealer, branch) if current_user.role != "user" else set()
+    if current_user.role == "user":
+        expected_pairs = {(current_user.brand or "", current_user.group or "", current_user.location or "")}
+        expected_pairs = {k for k in expected_pairs if ucs.identity_complete(k)}
+    summary = ucs.summarize_today(uploads_today, expected_pairs)
+
+    async def _item_metrics(upload_ids: list) -> dict:
+        if not upload_ids:
+            return {"items": 0, "available_items": 0, "qty": 0.0, "value": 0.0}
+        pipeline = [
+            {"$match": {"upload_id": {"$in": upload_ids}, "publish_status": {"$ne": "Cancelled"}}},
+            {"$group": {
+                "_id": None,
+                "items": {"$sum": 1},
+                "available_items": {"$sum": {"$cond": [{"$gt": [{"$toDouble": {"$ifNull": ["$available_qty_number", 0]}}, 0]}, 1, 0]}},
+                "qty": {"$sum": {"$toDouble": {"$ifNull": ["$available_qty_number", 0]}}},
+                "value": {"$sum": {"$toDouble": {"$ifNull": ["$total_value_number", 0]}}},
+            }},
+        ]
+        result = await db.upload_items.aggregate(pipeline).to_list(1)
+        row = result[0] if result else {}
+        return {
+            "items": int(row.get("items") or 0),
+            "available_items": int(row.get("available_items") or 0),
+            "qty": float(row.get("qty") or 0),
+            "value": float(row.get("value") or 0),
+        }
+
+    uploaded = await _item_metrics(summary["latest_valid_ids"])
+    published = await _item_metrics(summary["latest_published_ids"])
+    pending = await _item_metrics(summary["pending_waiting_ids"])
 
     return {
-        "todayUploadedItems": row.get("total_items", 0),
-        "todayUploadedAvailableItems": row.get("available_items", 0),
-        "todayUploadedAvailableQty": row.get("available_qty", 0.0),
-        "todayUploadedValue": row.get("total_value", 0.0),
-        "publishedItems": row.get("published_items", 0),
-        "publishedQty": row.get("published_qty", 0.0),
-        "publishedValue": row.get("published_value", 0.0),
-        "pendingItems": row.get("pending_items", 0),
-        "pendingQty": row.get("pending_qty", 0.0),
-        "pendingValue": row.get("pending_value", 0.0),
+        "todayUploadedItems": uploaded["items"],
+        "todayUploadedAvailableItems": uploaded["available_items"],
+        "todayUploadedAvailableQty": uploaded["qty"],
+        "todayUploadedValue": uploaded["value"],
+        "publishedItems": published["items"],
+        "publishedQty": published["qty"],
+        "publishedValue": published["value"],
+        "pendingItems": pending["items"],
+        "pendingQty": pending["qty"],
+        "pendingValue": pending["value"],
     }
 
 
@@ -3358,6 +3324,9 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
 
     # HARD REQUIRE: original Excel must land in private REAL S3 before upload succeeds.
     storage = s3_storage.get_storage()
+    if not storage.is_s3():
+        s3_storage.ensure_s3()
+        storage = s3_storage.get_storage()
     if not storage.is_s3():
         raise HTTPException(
             status_code=503,
@@ -7284,6 +7253,7 @@ async def maintenance_status_public():
 @api_router.get("/storage/status")
 async def storage_status(current_user: UserResponse = Depends(get_current_user)):
     await _ensure_master(current_user)
+    s3_storage.ensure_s3()
     status_payload = s3_storage.get_storage().status()
     status_payload["maintenance"] = maint.maintenance_status()
     run = await archive_runs.latest_run(db)
