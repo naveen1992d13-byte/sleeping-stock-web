@@ -133,6 +133,7 @@ async def list_cleanup_archives(
             {"archive_month": {"$gte": cutoff[:7]}},
         ],
     }
+    prune_on = bool(get_storage().status().get("archive_prune_enabled"))
     rows = await db.archive_manifests.find(q, {"_id": 0}).sort("created_at", -1).to_list(5000)
     out = []
     for m in rows:
@@ -171,18 +172,22 @@ async def list_cleanup_archives(
             live=live,
         )
         physically_ok = bool(live.get("ok") and live.get("real_s3"))
-        delete_locked = not (
+        counts_ok = mongo_count == s3_count if m.get("module") == ha.MODULE_PRODUCT_HISTORY else True
+        delete_locked = (not prune_on) or not (
             physically_ok
             and m.get("module") == ha.MODULE_PRODUCT_HISTORY
             and m.get("status") == am.STATUS_VERIFIED
             and m.get("eligible_for_prune")
             and mongo_count > 0
+            and counts_ok
         )
-        if physically_ok and m.get("status") == am.STATUS_VERIFIED and m.get("eligible_for_prune"):
-            lock_reason = None if m.get("module") == ha.MODULE_PRODUCT_HISTORY and mongo_count > 0 else (
+        if not prune_on:
+            lock_reason = "Locked — Mongo cleanup disabled (ARCHIVE_PRUNE_ENABLED=false)"
+        elif physically_ok and m.get("status") == am.STATUS_VERIFIED and m.get("eligible_for_prune"):
+            lock_reason = None if m.get("module") == ha.MODULE_PRODUCT_HISTORY and mongo_count > 0 and counts_ok else (
                 "Locked — only Product History archives support Mongo delete"
                 if m.get("module") != ha.MODULE_PRODUCT_HISTORY
-                else "Locked — no Mongo rows to delete"
+                else ("Locked — row count mismatch" if not counts_ok else "Locked — no Mongo rows to delete")
             )
         else:
             code = live.get("failure_code") or ""
@@ -259,6 +264,16 @@ async def list_cleanup_archives(
                     if m.get("status") == am.STATUS_PRUNED
                     else ("PRESENT" if mongo_count > 0 else "ABSENT")
                 ),
+                "cleanup_status": (
+                    "PRUNED"
+                    if m.get("status") == am.STATUS_PRUNED
+                    else (
+                        "DISABLED"
+                        if not prune_on
+                        else ("MONGO PRESENT" if mongo_count > 0 else "MONGO ABSENT")
+                    )
+                ),
+                "archive_prune_enabled": prune_on,
                 "transferred_at": m.get("verified_at") or m.get("created_at"),
                 "verified_at": m.get("verified_at"),
                 "created_at": m.get("created_at"),
@@ -270,7 +285,10 @@ async def list_cleanup_archives(
                     av.DISPLAY_PENDING,
                     av.DISPLAY_RUNNING,
                 }
-                or m.get("status") in {am.STATUS_FAILED, am.STATUS_CREATING, am.STATUS_UPLOADED},
+                or (
+                    m.get("status") in {am.STATUS_FAILED, am.STATUS_CREATING, am.STATUS_UPLOADED}
+                    and display != av.DISPLAY_NO_ELIGIBLE
+                ),
             }
         )
     return out
@@ -356,9 +374,14 @@ async def verify_archive(
         "archive_prune_enabled": bool(status.get("archive_prune_enabled")),
         "physical_ok": bool(live.get("ok")),
         "storage_backend_real": str(manifest.get("storage_backend") or "").lower() in {"s3", "real s3"},
+        "counts_match": False,
     }
     reasons = []
     lock_reason = None
+
+    if not checks["archive_prune_enabled"]:
+        reasons.append("ARCHIVE_PRUNE_ENABLED=false")
+        lock_reason = lock_reason or "Locked — Mongo cleanup disabled (ARCHIVE_PRUNE_ENABLED=false)"
 
     if not live.get("real_s3"):
         reasons.append("REAL S3 is not active")
@@ -421,6 +444,10 @@ async def verify_archive(
     if not archived_fp and mongo_count != expected_count:
         source_changed = True
     checks["source_unchanged"] = (mongo_count == 0) or (not source_changed and mongo_count == expected_count)
+    checks["counts_match"] = mongo_count == expected_count and checks["record_count_match"] is not False
+    if mongo_count != expected_count:
+        reasons.append(f"Mongo source count {mongo_count} != S3 archived count {expected_count}")
+        lock_reason = lock_reason or "Locked — row count mismatch"
 
     source_status = (
         "NO_MONGO_ROWS"
@@ -439,9 +466,11 @@ async def verify_archive(
         and checks["object_readable"]
         and checks["sha256_match"]
         and checks["record_count_match"]
+        and checks["counts_match"]
         and checks["date_scope_match"]
         and checks["source_unchanged"]
         and checks["storage_backend_real"]
+        and checks["archive_prune_enabled"]
         and mongo_count > 0
         and manifest.get("status") == am.STATUS_VERIFIED
         and bool(manifest.get("eligible_for_prune"))
@@ -509,6 +538,83 @@ async def verify_archive(
     }
 
 
+async def reverify_archive(db, *, archive_id: str) -> Dict[str, Any]:
+    """Read-only physical Re-Verify. Never deletes Mongo or S3 objects."""
+    import archive_verify as av
+
+    manifest = await db.archive_manifests.find_one({"archive_id": archive_id}, {"_id": 0})
+    if not manifest:
+        return {
+            "ok": False,
+            "action": "Re-Verify",
+            "read_only": True,
+            "archive_id": archive_id,
+            "reason": "Archive not found",
+            "display_status": av.DISPLAY_NOT_TRANSFERRED,
+            "safe_to_delete": False,
+            "delete_locked": True,
+        }
+
+    live = await av.live_verify_manifest(manifest)
+    status = get_storage().status()
+    prune_on = bool(status.get("archive_prune_enabled"))
+    expected_count = int(manifest.get("record_count") or 0)
+    observed = live.get("observed_record_count")
+    mongo_count = None
+    date_iso = manifest.get("archive_date")
+    if manifest.get("module") == ha.MODULE_PRODUCT_HISTORY and date_iso:
+        mongo_count = await db.products.count_documents(_product_query(date_iso))
+    s3_count = int(observed) if observed is not None else expected_count
+    counts_match = live.get("record_count_match") is not False
+    if mongo_count is not None:
+        counts_match = counts_match and int(mongo_count) == int(expected_count)
+        if observed is not None:
+            counts_match = counts_match and int(mongo_count) == int(observed)
+
+    ok = bool(live.get("ok") and live.get("real_s3") and live.get("object_exists") and live.get("object_readable") and counts_match)
+    return {
+        "ok": ok,
+        "action": "Re-Verify",
+        "read_only": True,
+        "archive_id": archive_id,
+        "archive_date": date_iso or manifest.get("archive_month"),
+        "dataset": manifest.get("module"),
+        "collection": manifest.get("source_collection"),
+        "storage_key": manifest.get("storage_key"),
+        "manifest_status": manifest.get("status"),
+        "display_status": live.get("display_status"),
+        "s3_object_status": "EXISTS" if live.get("object_exists") else "MISSING",
+        "s3_readable": bool(live.get("object_readable")),
+        "sha256_status": (
+            "MATCH"
+            if live.get("sha256_match") is True
+            else ("MISMATCH" if live.get("sha256_match") is False else "Not Checked")
+        ),
+        "mongo_count": mongo_count,
+        "s3_count": s3_count,
+        "source_record_count": mongo_count if mongo_count is not None else expected_count,
+        "archived_record_count": expected_count,
+        "record_count_match": counts_match,
+        "size_match": live.get("size_match"),
+        "file_size": manifest.get("file_size"),
+        "observed_size": live.get("observed_size"),
+        "verified_at": manifest.get("verified_at"),
+        "archive_timestamp": manifest.get("verified_at") or manifest.get("created_at"),
+        "reason": live.get("reason") if not ok else "TRANSFERRED & VERIFIED",
+        "live_verification": live,
+        "real_s3": status.get("real_s3"),
+        "archive_prune_enabled": prune_on,
+        "safe_to_delete": False,
+        "delete_locked": True,
+        "lock_reason": (
+            None
+            if ok
+            else (live.get("reason") or "Re-Verify failed")
+        ),
+        "cleanup_status": "DISABLED" if not prune_on else ("MONGO PRESENT" if (mongo_count or 0) > 0 else "MONGO ABSENT"),
+    }
+
+
 async def dry_run_delete(
     db,
     *,
@@ -554,6 +660,13 @@ async def delete_mongo_for_archive(
     role = getattr(current_user, "role", None) or (current_user or {}).get("role")
     if role != "master":
         return {"status": "blocked", "deleted": 0, "reason": "Only Master Admin can delete Mongo archive source rows"}
+
+    if not get_storage().status().get("archive_prune_enabled"):
+        return {
+            "status": "blocked",
+            "deleted": 0,
+            "reason": "Locked — Mongo cleanup disabled (ARCHIVE_PRUNE_ENABLED=false)",
+        }
 
     report = await verify_archive(db, archive_id=archive_id, brand=brand, dealer=dealer, branch=branch)
     if not report.get("safe_to_delete"):
