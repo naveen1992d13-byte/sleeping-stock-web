@@ -147,7 +147,7 @@ export function UploadCenter() {
     setUploading(true);
     try {
       const endpoint = activeType === 'product' ? `${API}/upload/v2` : `${API}/orders/upload`;
-      const res = await axios.post(endpoint, form, { headers: { 'Content-Type': 'multipart/form-data' } });
+      const res = await axios.post(endpoint, form);
       toast.success(`Uploaded. No: ${res.data?.upload_no || ''}`);
       setFile(activeType, null);
       fetchUploads();
@@ -394,7 +394,7 @@ export function UploadCenter() {
                 <thead className="bg-gray-50"><tr><th className="p-2 text-left">Dealer</th><th className="p-2 text-left">Branch</th><th className="p-2 text-left">Status</th></tr></thead>
                 <tbody>
                   {(balanceDetails.pending || []).map((r) => (
-                    <tr key={`${r.dealer}-${r.branch}`} className="border-t"><td className="p-2">{r.dealer}</td><td className="p-2">{r.branch}</td><td className="p-2 text-amber-700">{r.upload_status}</td></tr>
+                    <tr key={`${r.brand}-${r.dealer}-${r.branch}`} className="border-t"><td className="p-2">{r.dealer}</td><td className="p-2">{r.branch}</td><td className="p-2 text-amber-700">{r.upload_status}</td></tr>
                   ))}
                 </tbody>
               </table>
@@ -407,7 +407,7 @@ export function UploadCenter() {
                 <thead className="bg-gray-50"><tr><th className="p-2 text-left">Dealer</th><th className="p-2 text-left">Branch</th></tr></thead>
                 <tbody>
                   {(balanceDetails.completed || []).map((r) => (
-                    <tr key={`c-${r.dealer}-${r.branch}`} className="border-t"><td className="p-2">{r.dealer}</td><td className="p-2">{r.branch}</td></tr>
+                    <tr key={`c-${r.brand}-${r.dealer}-${r.branch}`} className="border-t"><td className="p-2">{r.dealer}</td><td className="p-2">{r.branch}</td></tr>
                   ))}
                 </tbody>
               </table>
@@ -467,5 +467,13 @@ function Stat({ title, value, color = COLORS.primary }) {
 }
 
 function SummaryCard({title,value,color=COLORS.primary,prefix='',onClick,loading=false,clickable=false,currency=false}){return <button type="button" disabled={!clickable||loading} onClick={onClick} className="rounded-xl p-2 text-center w-full min-w-0" style={{backgroundColor:'#F9FAFB', border:`1px solid ${COLORS.border}`, cursor: clickable?'pointer':'default'}}><p className="text-[10px] font-bold leading-tight" style={{color:COLORS.muted}}>{title}</p><h3 className="text-sm sm:text-base md:text-lg font-bold truncate tabular-nums max-w-full" style={{color, fontSize: 'clamp(0.75rem, 2.5vw, 1.125rem)'}}>{prefix}{currency ? formatDisplayNumber(value, { currency: true }) : formatDisplayNumber(value)}</h3></button>}
-function StatusBadge({u}){const s=u.status||'Uploaded'; const cancelled=s==='Cancelled'; const published=u.publish_status==='Published'; const color=cancelled?COLORS.danger:published?COLORS.dark:COLORS.warning; return <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full font-bold" style={{color, backgroundColor:cancelled?'#FEE2E2':published?'#DCFCE7':'#FEF3C7'}}>{published?<CheckCircle2 className="h-3 w-3"/>:<Eye className="h-3 w-3"/>}{cancelled?'Cancelled':published?'Published':s}</span>}
+function StatusBadge({u}){
+  const cancelled = u.status==='Cancelled' || u.publish_status==='Cancelled';
+  const failed = u.status==='Failed' || u.publish_status==='Failed';
+  const published = u.publish_status==='Published';
+  const label = cancelled ? 'Cancelled' : failed ? 'Failed' : published ? 'Published' : 'Waiting';
+  const color = cancelled || failed ? COLORS.danger : published ? COLORS.dark : COLORS.warning;
+  const bg = cancelled || failed ? '#FEE2E2' : published ? '#DCFCE7' : '#FEF3C7';
+  return <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full font-bold" style={{color, backgroundColor:bg}}>{published?<CheckCircle2 className="h-3 w-3"/>:<Eye className="h-3 w-3"/>}{label}</span>;
+}
 export default UploadCenter;
