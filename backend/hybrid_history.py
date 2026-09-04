@@ -572,15 +572,75 @@ async def summarize_product_history(
     buckets: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
 
     for dk in keys:
-        # Always use filtered read for scoped summaries (streams when cold+single)
+        date_iso = date_key_to_iso(dk)
+        query: Dict[str, Any] = {
+            "publish_status": "Published",
+            "active_date_key": {"$in": [dk, date_iso]},
+        }
+        if brand:
+            query["brand_name"] = brand
+        if dealer:
+            query["dealer_name"] = dealer
+        if branch:
+            query["branch"] = branch
+        used_mongo = False
+        try:
+            mongo_n = await db.products.count_documents(query)
+        except Exception:
+            mongo_n = 0
+        if mongo_n:
+            pipeline = [
+                {"$match": query},
+                {
+                    "$group": {
+                        "_id": {
+                            "brand": {"$ifNull": ["$brand_name", ""]},
+                            "dealer": {"$ifNull": ["$dealer_name", ""]},
+                            "branch": {"$ifNull": ["$branch", ""]},
+                        },
+                        "records": {"$sum": 1},
+                        "total_available_qty": {
+                            "$sum": {"$ifNull": ["$available_qty_number", {"$ifNull": ["$quantity", 0]}]}
+                        },
+                        "total_value": {
+                            "$sum": {"$ifNull": ["$total_value_number", {"$ifNull": ["$total_value", 0]}]}
+                        },
+                        "last_published_at": {"$max": "$published_at"},
+                    }
+                },
+            ]
+            try:
+                grouped = await db.products.aggregate(pipeline).to_list(10000)
+                used_mongo = True
+                for r in grouped:
+                    ident = r.get("_id") or {}
+                    key = (
+                        dk,
+                        str(ident.get("brand") or ""),
+                        str(ident.get("dealer") or ""),
+                        str(ident.get("branch") or ""),
+                    )
+                    buckets[key] = {
+                        "date_key": dk,
+                        "brand": key[1],
+                        "dealer": key[2],
+                        "branch": key[3],
+                        "records": int(r.get("records") or 0),
+                        "total_available_qty": float(r.get("total_available_qty") or 0),
+                        "total_value": float(r.get("total_value") or 0),
+                        "last_published_at": r.get("last_published_at"),
+                    }
+            except Exception:
+                used_mongo = False
+        if used_mongo:
+            continue
         result = await read_product_history(
             db,
             date_key=dk,
             brand=brand,
             dealer=dealer,
             branch=branch,
-            # No page → full day for summary aggregation of one day at a time
-            # but we process one date_key per loop to bound peak memory to one day.
+            record_usage=False,
         )
         for r in result["rows"]:
             b = r.get("brand_name") or ""
