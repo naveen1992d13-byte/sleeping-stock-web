@@ -1,13 +1,21 @@
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Load secrets before importing storage modules so the singleton can see AWS keys.
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+# AWS overlay is applied in s3_storage.load_storage_dotenv() so empty .env.s3.local
+# values cannot override Codespaces/process secrets.
+
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError, OperationFailure
 import os
+import sys
 import logging
-from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import List, Optional
 import uuid
@@ -50,10 +58,7 @@ except ImportError:
     import maintenance as maint
     import excel_permissions
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
-# Optional local overlay for corrected AWS/S3 secret mapping (gitignored; never commit).
-load_dotenv(ROOT_DIR / '.env.s3.local', override=True)
+s3_storage.load_storage_dotenv()
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -3359,6 +3364,14 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
     # HARD REQUIRE: original Excel must land in private REAL S3 before upload succeeds.
     storage = s3_storage.get_storage()
     if not storage.is_s3():
+        s3_storage.ensure_s3()
+        storage = s3_storage.get_storage()
+    if not storage.is_s3():
+        logger.error(
+            "Upload blocked: REAL S3 unavailable (interpreter=%s mode=%s)",
+            sys.executable,
+            storage.mode,
+        )
         raise HTTPException(
             status_code=503,
             detail="Upload failed: private REAL S3 is unavailable. Product Excel cannot be stored safely.",
@@ -7284,6 +7297,7 @@ async def maintenance_status_public():
 @api_router.get("/storage/status")
 async def storage_status(current_user: UserResponse = Depends(get_current_user)):
     await _ensure_master(current_user)
+    s3_storage.ensure_s3()
     status_payload = s3_storage.get_storage().status()
     status_payload["maintenance"] = maint.maintenance_status()
     run = await archive_runs.latest_run(db)
@@ -7822,6 +7836,22 @@ async def seed_master_user_on_startup():
             logger.warning("Storage usage index creation failed: %s", exc)
         archive_scheduler.start_archive_scheduler(db)
         logger.info("Archive scheduler started (ARCHIVE_PRUNE_ENABLED=%s)", s3_storage.archive_prune_enabled())
+        exe = str(sys.executable or "").replace("\\", "/")
+        if "/backend/venv/" not in exe:
+            logger.warning(
+                "Backend is not running from backend/venv (%s). "
+                "Codespaces browser uploads will 503. Start with: "
+                "cd backend && ./venv/bin/python -m uvicorn server:socket_app --host 0.0.0.0 --port 8000",
+                sys.executable,
+            )
+        s3_storage.ensure_s3()
+        st = s3_storage.get_storage().status()
+        logger.info(
+            "Object storage: backend=%s real_s3=%s interpreter=%s",
+            st.get("storage_backend"),
+            st.get("real_s3"),
+            sys.executable,
+        )
     except Exception as e:
         logger.error(f"Product Hub index creation failed: {e}")
 
