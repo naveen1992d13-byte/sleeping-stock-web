@@ -12,11 +12,24 @@ This bootstrap always creates/uses **`backend/venv`** and installs
 ## Start the backend (required pattern)
 
 ```bash
+bash backend/run_api.sh
+```
+
+equivalent:
+
+```bash
 cd backend
 ./venv/bin/python -m uvicorn server:socket_app --host 0.0.0.0 --port 8000
 ```
 
-Do **not** use system `python` / system `uvicorn` for this app.
+Do **not** use system `python` / `python3` / system `uvicorn`. A Codespaces browser at
+`https://<name>-3000.app.github.dev` posts to `https://<name>-8000.app.github.dev`.
+If that process is system Python, Upload Center returns:
+
+`Upload failed: private REAL S3 is unavailable. Product Excel cannot be stored safely.`
+(`POST /api/upload/v2` → 503)
+
+On a good start you must see: `Object storage: backend=REAL S3 real_s3=True`.
 
 ## S3 secrets (Codespaces)
 

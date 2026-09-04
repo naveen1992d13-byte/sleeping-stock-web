@@ -13,6 +13,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError, OperationFailure
 import os
+import sys
 import logging
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import List, Optional
@@ -3328,6 +3329,11 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
         s3_storage.ensure_s3()
         storage = s3_storage.get_storage()
     if not storage.is_s3():
+        logger.error(
+            "Upload blocked: REAL S3 unavailable (interpreter=%s mode=%s)",
+            sys.executable,
+            storage.mode,
+        )
         raise HTTPException(
             status_code=503,
             detail="Upload failed: private REAL S3 is unavailable. Product Excel cannot be stored safely.",
@@ -7804,6 +7810,22 @@ async def seed_master_user_on_startup():
             logger.warning("Storage usage index creation failed: %s", exc)
         archive_scheduler.start_archive_scheduler(db)
         logger.info("Archive scheduler started (ARCHIVE_PRUNE_ENABLED=%s)", s3_storage.archive_prune_enabled())
+        exe = str(sys.executable or "").replace("\\", "/")
+        if "/backend/venv/" not in exe:
+            logger.warning(
+                "Backend is not running from backend/venv (%s). "
+                "Codespaces browser uploads will 503. Start with: "
+                "cd backend && ./venv/bin/python -m uvicorn server:socket_app --host 0.0.0.0 --port 8000",
+                sys.executable,
+            )
+        s3_storage.ensure_s3()
+        st = s3_storage.get_storage().status()
+        logger.info(
+            "Object storage: backend=%s real_s3=%s interpreter=%s",
+            st.get("storage_backend"),
+            st.get("real_s3"),
+            sys.executable,
+        )
     except Exception as e:
         logger.error(f"Product Hub index creation failed: {e}")
 
