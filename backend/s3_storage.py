@@ -113,11 +113,64 @@ def archive_scheduler_enabled() -> bool:
 
 
 def resolve_bucket() -> str:
-    return (os.getenv(ENV_NMTS_S3_BUCKET) or os.getenv(ENV_AWS_S3_BUCKET) or "").strip()
+    return (_clean_env(os.getenv(ENV_NMTS_S3_BUCKET)) or _clean_env(os.getenv(ENV_AWS_S3_BUCKET)))
+
+
+def _clean_env(value: Optional[str]) -> str:
+    return str(value or "").strip().strip('"').strip("'").strip()
+
+
+def _apply_dotenv_file(path: Path, *, allow_override: bool) -> None:
+    """Apply dotenv keys. Never write empty values. Never clobber a non-empty env unless allowed."""
+    if not path.is_file():
+        return
+    try:
+        from dotenv import dotenv_values
+    except Exception:
+        return
+    for key, raw in (dotenv_values(path) or {}).items():
+        if raw is None:
+            continue
+        val = _clean_env(str(raw))
+        if not val:
+            continue
+        current = _clean_env(os.getenv(str(key)))
+        if current and not allow_override:
+            continue
+        os.environ[str(key)] = val
+
+
+_DOTENV_LOADED = False
+
+
+def load_storage_dotenv(*, force: bool = False) -> None:
+    """Load AWS/S3 settings from backend/.env then .env.s3.local before any S3 client init.
+
+    Process/Codespaces secrets win over files. Overlay file may fill missing keys only
+    (empty overlay values are ignored so they cannot wipe working secrets).
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED and not force:
+        return
+    root = Path(__file__).resolve().parent
+    _apply_dotenv_file(root / ".env", allow_override=False)
+    _apply_dotenv_file(root / ".env.s3.local", allow_override=False)
+    _DOTENV_LOADED = True
 
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _aws_error_code(exc: BaseException) -> str:
+    """Best-effort AWS error code only — never log secret values or full messages."""
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, dict):
+        err = resp.get("Error") if isinstance(resp.get("Error"), dict) else {}
+        code = err.get("Code") if err else None
+        if code:
+            return str(code)[:64]
+    return ""
 
 
 def guess_content_type(filename: str, fallback: str = "application/octet-stream") -> str:
@@ -231,19 +284,25 @@ class S3StorageService:
     """Upload / download / head / integrity helpers for NMTS archives and files."""
 
     def __init__(self):
-        self.region = (os.getenv(ENV_AWS_REGION) or "").strip() or "us-east-1"  # pragma: allowlist secret
-        self.bucket = resolve_bucket()
-        self.env = storage_env()
-        self.access_key = (os.getenv(ENV_AWS_ACCESS_KEY_ID) or "").strip()
-        self.secret_key = (os.getenv(ENV_AWS_SECRET_ACCESS_KEY) or "").strip()
-        local_root = Path(
-            os.getenv(ENV_LOCAL_OBJECT_STORE)
-            or (Path(__file__).resolve().parent / ".local_object_store")
+        load_storage_dotenv()
+        self._local = _LocalObjectStore(
+            Path(
+                os.getenv(ENV_LOCAL_OBJECT_STORE)
+                or (Path(__file__).resolve().parent / ".local_object_store")
+            )
         )
-        self._local = _LocalObjectStore(local_root)
         self._client = None
         self._mode = "local"
+        self._refresh_from_env()
         self._init_client()
+
+    def _refresh_from_env(self) -> None:
+        self.region = _clean_env(os.getenv(ENV_AWS_REGION)) or _clean_env(os.getenv("AWS_DEFAULT_REGION")) or "us-east-1"
+        self.bucket = resolve_bucket()
+        self.env = storage_env()
+        self.access_key = _clean_env(os.getenv(ENV_AWS_ACCESS_KEY_ID))
+        self.secret_key = _clean_env(os.getenv(ENV_AWS_SECRET_ACCESS_KEY))
+        self.session_token = _clean_env(os.getenv("AWS_SESSION_TOKEN"))
 
     def _credentials_look_valid(self) -> bool:
         # IAM access keys are typically 16–24 chars starting with AKIA/ASIA.
@@ -255,8 +314,95 @@ class S3StorageService:
             return False
         return True
 
+    def _make_client(self, region: str):
+        import boto3
+        from botocore.config import Config
+
+        kwargs: Dict[str, Any] = {
+            "region_name": region,
+            "aws_access_key_id": self.access_key,
+            "aws_secret_access_key": self.secret_key,
+            "config": Config(signature_version="s3v4"),
+        }
+        if self.session_token:
+            kwargs["aws_session_token"] = self.session_token
+        return boto3.client("s3", **kwargs)
+
+    def _lookup_bucket_region(self) -> str:
+        try:
+            loc = self._client.get_bucket_location(Bucket=self.bucket) if self._client else {}
+            constraint = (loc or {}).get("LocationConstraint")
+            return _clean_env(constraint) or "us-east-1"
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _http_status(exc: BaseException) -> int:
+        resp = getattr(exc, "response", None) or {}
+        if isinstance(resp, dict):
+            try:
+                return int((resp.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    @staticmethod
+    def _is_region_mismatch(exc: BaseException) -> bool:
+        code = _aws_error_code(exc)
+        http = S3StorageService._http_status(exc)
+        return code in {
+            "301",
+            "PermanentRedirect",
+            "AuthorizationHeaderMalformed",
+            "IllegalLocationConstraintException",
+        } or http == 301
+
+    @staticmethod
+    def _is_head_bucket_iam_deny(exc: BaseException) -> bool:
+        # AccessDenied on HeadBucket means credentials authenticated but s3:ListBucket
+        # is not granted. InvalidAccessKeyId / SignatureDoesNotMatch are also HTTP 403
+        # and must NOT be treated as REAL S3.
+        return _aws_error_code(exc) in {"AccessDenied", "Forbidden", "AllAccessDisabled"}
+
+    def _probe_bucket(self) -> None:
+        """Confirm the client can talk to the bucket.
+
+        HeadBucket IAM deny does not force local mode: least-privilege keys often
+        allow PutObject on uploads/* without s3:ListBucket. Invalid credentials
+        and missing buckets still fall through to local.
+        """
+        try:
+            self._client.head_bucket(Bucket=self.bucket)
+            return
+        except Exception as exc:
+            if self._is_region_mismatch(exc):
+                new_region = self._lookup_bucket_region()
+                if new_region and new_region != self.region:
+                    self.region = new_region
+                    self._client = self._make_client(self.region)
+                    try:
+                        self._client.head_bucket(Bucket=self.bucket)
+                        return
+                    except Exception as retry_exc:
+                        if self._is_head_bucket_iam_deny(retry_exc):
+                            logger.warning(
+                                "S3 HeadBucket not permitted (%s); keeping REAL S3 client for object PUT",
+                                _aws_error_code(retry_exc),
+                            )
+                            return
+                        raise
+            if self._is_head_bucket_iam_deny(exc):
+                logger.warning(
+                    "S3 HeadBucket not permitted (%s); keeping REAL S3 client for object PUT",
+                    _aws_error_code(exc),
+                )
+                return
+            raise
+
     def _init_client(self) -> None:
+        self._refresh_from_env()
         if not self._credentials_look_valid():
+            self._client = None
             self._mode = "local"
             logger.warning(
                 "S3 credentials/bucket unavailable or malformed; using local object store at %s",
@@ -264,24 +410,34 @@ class S3StorageService:
             )
             return
         try:
-            import boto3
-            from botocore.config import Config
-
-            self._client = boto3.client(
-                "s3",
-                region_name=self.region,
-                aws_access_key_id=self.access_key,
-                aws_secret_access_key=self.secret_key,
-                config=Config(signature_version="s3v4"),
-            )
-            # Lightweight probe — do not raise into callers at import time.
-            self._client.head_bucket(Bucket=self.bucket)
+            self._client = self._make_client(self.region)
+            self._probe_bucket()
             self._mode = "s3"
             logger.info("S3 storage ready (bucket=%s region=%s env=%s)", self.bucket, self.region, self.env)
         except Exception as exc:
             self._client = None
             self._mode = "local"
-            logger.warning("S3 init failed (%s); using local object store", type(exc).__name__)
+            err_code = _aws_error_code(exc)
+            logger.warning(
+                "S3 init failed (%s%s); using local object store",
+                type(exc).__name__,
+                f" code={err_code}" if err_code else "",
+            )
+
+    def ensure_s3(self) -> bool:
+        """Reload env and re-init if still local.
+
+        Constructor already probed once. Callers (startup, POST /upload/v2,
+        GET /storage/status) get one additional init after re-reading dotenv.
+        This is not a lifetime lock: a later request can recover from a
+        temporary AWS/network failure. Does not bypass the REAL S3 hard gate.
+        """
+        if self.is_s3():
+            return True
+        load_storage_dotenv(force=True)
+        logger.info("Retrying S3 initialization")
+        self._init_client()
+        return self.is_s3()
 
     @property
     def mode(self) -> str:
@@ -498,13 +654,20 @@ def get_storage() -> S3StorageService:
     if _SERVICE is None:
         with _SERVICE_LOCK:
             if _SERVICE is None:
+                load_storage_dotenv()
                 _SERVICE = S3StorageService()
     return _SERVICE
 
 
+def ensure_s3() -> bool:
+    """Refresh env and retry S3 init if the singleton is still local."""
+    return get_storage().ensure_s3()
+
+
 def reset_storage_for_tests() -> S3StorageService:
     """Force re-init (tests only)."""
-    global _SERVICE
+    global _SERVICE, _DOTENV_LOADED
     with _SERVICE_LOCK:
+        _DOTENV_LOADED = False
         _SERVICE = S3StorageService()
         return _SERVICE
