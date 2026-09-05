@@ -362,7 +362,10 @@ class S3StorageService:
         # AccessDenied on HeadBucket means credentials authenticated but s3:ListBucket
         # is not granted. InvalidAccessKeyId / SignatureDoesNotMatch are also HTTP 403
         # and must NOT be treated as REAL S3.
-        return _aws_error_code(exc) in {"AccessDenied", "Forbidden", "AllAccessDisabled"}
+        # HeadBucket often returns Error.Code "403" (not AccessDenied) when
+        # s3:ListBucket is denied. InvalidAccessKeyId / SignatureDoesNotMatch
+        # keep their named codes and must stay local.
+        return _aws_error_code(exc) in {"403", "AccessDenied", "Forbidden", "AllAccessDisabled"}
 
     def _probe_bucket(self) -> None:
         """Confirm the client can talk to the bucket.
