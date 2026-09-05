@@ -87,10 +87,35 @@ def test_head_bucket_access_denied_keeps_real_s3(monkeypatch, tmp_path):
     assert list(tmp_path.rglob("*.xlsx")) == []
 
 
+def test_head_bucket_numeric_403_keeps_real_s3(monkeypatch, tmp_path):
+    class FakeClient:
+        def head_bucket(self, Bucket):
+            raise _client_error("403", 403)
+
+        def put_object(self, **kwargs):
+            return {"ETag": '"abc"'}
+
+    svc = _service_with_fake_client(monkeypatch, tmp_path, FakeClient())
+    assert svc.is_s3() is True
+    stored = svc.upload_bytes("dev/uploads/probe.xlsx", b"excel-bytes")
+    assert stored.storage_provider == "s3"
+    assert list(tmp_path.rglob("*.xlsx")) == []
+
+
 def test_invalid_access_key_does_not_claim_real_s3(monkeypatch, tmp_path):
     class FakeClient:
         def head_bucket(self, Bucket):
             raise _client_error("InvalidAccessKeyId", 403)
+
+    svc = _service_with_fake_client(monkeypatch, tmp_path, FakeClient())
+    assert svc.is_s3() is False
+    assert svc.mode == "local"
+
+
+def test_signature_mismatch_does_not_claim_real_s3(monkeypatch, tmp_path):
+    class FakeClient:
+        def head_bucket(self, Bucket):
+            raise _client_error("SignatureDoesNotMatch", 403)
 
     svc = _service_with_fake_client(monkeypatch, tmp_path, FakeClient())
     assert svc.is_s3() is False
