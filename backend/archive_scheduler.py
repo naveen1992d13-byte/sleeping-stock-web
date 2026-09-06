@@ -18,7 +18,9 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 import archive_manifest as am
+import archive_outbox as ao
 import archive_runs as ar
+import event_archive as ea
 import history_archive as ha
 import maintenance as maint
 from s3_storage import archive_scheduler_enabled, verification_mongo_hot_days
@@ -91,9 +93,16 @@ async def run_daily_coordinated_archive(
     run_id: Optional[str] = None,
     freeze_date: bool = True,
 ) -> dict:
-    """Coordinated daily batch for the frozen same-business-day archive_date.
+    """Coordinated nightly verify / retry / catch-up for the frozen archive_date.
 
-    Idempotent per dataset: already VERIFIED / NO_ELIGIBLE rows are not re-uploaded.
+    Event-driven outbox is the primary archive writer (publish, terminal order/request,
+    upload cancel). This nightly pass:
+      1. enqueues any missed events
+      2. drains / retries the outbox
+      3. physically verifies manifests
+      4. runs legacy daily dumps only as a catch-up safety net (idempotent)
+      5. never prunes unless ARCHIVE_PRUNE_ENABLED (default false)
+
     Cycle status is COMPLETE only when uploads, product-history, orders, and requests
     are each VERIFIED (or genuine NO ELIGIBLE). Partial failure does not stamp success.
     """
@@ -117,8 +126,21 @@ async def run_daily_coordinated_archive(
         "archive_date": archive_date,
         "run_id": run_id,
         "datasets": {},
+        "outbox": {},
+        "catch_up": {},
     }
     try:
+        try:
+            results["catch_up"] = await ea.catch_up_missed_events(db, archive_date)
+        except Exception as exc:
+            logger.warning("Archive catch-up enqueue failed for %s: %s", archive_date, exc)
+            results["catch_up"] = {"status": "error", "error": str(exc)[:500]}
+        try:
+            results["outbox"] = await ao.drain_until_idle(db)
+        except Exception as exc:
+            logger.warning("Archive outbox drain failed for %s: %s", archive_date, exc)
+            results["outbox"] = {"status": "error", "error": str(exc)[:500]}
+
         async def _run_module(name: str, coro):
             try:
                 outcome = await coro
@@ -254,7 +276,13 @@ async def _scheduler_loop(db) -> None:
             now = _ist_now()
             monthly_stamp = now.strftime("%Y-%m")
 
-            # Nightly same-business-day archive + catch-up inside maintenance window.
+            # Daytime + night: drain pending/failed archive outbox jobs.
+            try:
+                await ao.drain_once(db)
+            except Exception as exc:
+                logger.warning("Outbox drain skipped: %s", exc)
+
+            # Nightly verify / retry / catch-up inside maintenance window.
             if in_nightly_archive_window(now):
                 # Freeze date at first entry into tonight's window (23:00–23:59).
                 # After midnight (00:00–03:59), continue the SAME frozen date.

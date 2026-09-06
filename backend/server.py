@@ -48,6 +48,10 @@ try:
     from . import maintenance as maint
     from . import excel_permissions
     from . import upload_center_summary as ucs
+    from . import event_archive
+    from . import hybrid_order_history
+    from . import hybrid_request_history
+    from . import archive_keys as archive_keys
 except ImportError:
     import s3_storage
     import file_objects
@@ -59,6 +63,10 @@ except ImportError:
     import maintenance as maint
     import excel_permissions
     import upload_center_summary as ucs
+    import event_archive
+    import hybrid_order_history
+    import hybrid_request_history
+    import archive_keys
 
 s3_storage.load_storage_dotenv()
 
@@ -3345,10 +3353,19 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
         date_iso = now.astimezone(NMTS_TIMEZONE).date().isoformat()
     except Exception:
         date_iso = datetime.now(NMTS_TIMEZONE).date().isoformat()
+    upload_id = str(uuid.uuid4())
+    upload_filename = archive_keys.archive_filename(
+        context.get("brand_name") or context.get("brand"),
+        context.get("dealer_name"),
+        context.get("branch"),
+        upload_no,
+        archive_keys.MODULE_LABEL_UPLOAD,
+        "xlsx",
+    )
     try:
         stored_excel = await file_objects.store_bytes(
             module="uploads",
-            relative_key=f"{date_iso}/product-hub/{upload_no}_{file.filename}",
+            relative_key=f"{date_iso}/current/{upload_filename}",
             data=raw_bytes,
             original_filename=file.filename or "product_upload.xlsx",
             content_type=file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -3384,7 +3401,6 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
     rejected = []
     total_available_qty = 0.0
     total_value = 0.0
-    upload_id = str(uuid.uuid4())
     item_docs = []
 
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
@@ -3479,6 +3495,10 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
         **context,
     }
     await db.uploads.insert_one(upload_doc)
+    try:
+        await event_archive.maybe_enqueue_upload_stored(db, upload_doc)
+    except Exception as exc:
+        logger.warning("upload archive enqueue failed: %s", exc)
 
     return {
         "message": "Upload completed",
@@ -3582,6 +3602,15 @@ async def _finalize_product_publish(
         # Drop embedded Excel blob after successful publish to protect Atlas free-tier quota.
         "raw_file_cleared_reason": "cleared_after_publish",
     }, "$unset": {"raw_file_bytes": ""}})
+    try:
+        await event_archive.maybe_enqueue_publish(
+            db,
+            {**upload, "id": upload_id, "date_key": date_key},
+            actor_id=current_user.id,
+            now_iso=now.isoformat() if hasattr(now, "isoformat") else str(now),
+        )
+    except Exception as exc:
+        logger.warning("publish archive enqueue failed: %s", exc)
     return {
         "message": (
             "Already published — Product Hub/status reconciled successfully"
@@ -3781,6 +3810,7 @@ async def cancel_upload_v2(upload_id: str, data: CancelUploadRequest, current_us
     await db.uploads.update_one({"id": upload_id}, {"$set": {
         "upload_no": cancel_no,
         "cancelled_upload_no": cancel_no,
+        "original_upload_no": upload.get("original_upload_no") or old_no,
         "status": "Cancelled",
         "publish_status": "Cancelled",
         "cancel_reason": reason,
@@ -3791,6 +3821,21 @@ async def cancel_upload_v2(upload_id: str, data: CancelUploadRequest, current_us
     await db.upload_items.update_many({"upload_id": upload_id}, {"$set": {"publish_status": "Cancelled", "upload_no": cancel_no, "cancel_reason": reason}})
     await db.products.update_many({"upload_id": upload_id}, {"$set": {"is_active_today": False, "publish_status": "Cancelled", "cancel_reason": reason}})
     await db.batch_summaries.delete_one({"upload_id": upload_id})
+    try:
+        await event_archive.maybe_enqueue_upload_cancelled(
+            db,
+            {
+                **upload,
+                "upload_no": cancel_no,
+                "cancelled_upload_no": cancel_no,
+                "original_upload_no": upload.get("original_upload_no") or old_no,
+            },
+            actor_id=current_user.id,
+            reason=reason,
+            now_iso=now.isoformat() if hasattr(now, "isoformat") else str(now),
+        )
+    except Exception as exc:
+        logger.warning("cancel archive enqueue failed: %s", exc)
     return {"message": "Upload cancelled", "upload_no": cancel_no}
 
 
@@ -4823,6 +4868,19 @@ async def order_desk_orders(brand: Optional[str] = None, dealer: Optional[str] =
             })
         row['fulfillment_lines'] = fulfillment
         row['overall_status'] = row.get('overall_status') or row.get('status')
+    try:
+        archived = await hybrid_order_history.list_archived_order_headers(
+            db,
+            exclude_ids=set(order_ids),
+            brand=query.get('brand_name'),
+            dealer=query.get('dealer_name') if role != 'user' else None,
+            branch=query.get('branch') if role == 'user' or (branch and not str(branch).startswith('All ')) else None,
+            limit=1000,
+        )
+        if archived:
+            rows.extend(archived)
+    except Exception as exc:
+        logger.warning("order history S3 merge skipped: %s", exc)
     return rows
 
 
@@ -4837,6 +4895,17 @@ async def order_desk_order_detail(
 ):
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
+        try:
+            packed = await hybrid_order_history.read_order_package(db, order_id)
+        except Exception:
+            packed = None
+        if packed and packed.get("order"):
+            return {
+                "order": packed["order"],
+                "items": packed.get("items") or [],
+                "stage": {"archive_source": "s3"},
+                "archive_source": "s3",
+            }
         raise HTTPException(status_code=404, detail='Order not found')
     role = (current_user.role or '').lower()
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
@@ -5808,6 +5877,13 @@ async def order_desk_request_cancellation(order_id: str, item_id: str, payload: 
         current_user,
         {'reason': reason, 'remarks': remarks, 'item_id': item_id, 'auto': safe_auto, 'purchased_outside': reason == 'Purchased Outside'},
     )
+    if safe_auto:
+        try:
+            await event_archive.maybe_enqueue_order_terminal(
+                db, order_id, status='Cancelled', actor_id=current_user.id, reason=reason
+            )
+        except Exception as exc:
+            logger.warning("cancelled order archive enqueue failed: %s", exc)
     return {
         'message': 'Item cancelled automatically (safe — no request/reservation).' if safe_auto
             else 'Cancellation requested — awaiting Admin/Master approval.',
@@ -5872,6 +5948,13 @@ async def order_desk_decide_cancellation(cancellation_id: str, payload: dict, cu
         current_user,
         {'cancellation_id': cancellation_id, 'reason': doc.get('reason')},
     )
+    if approved:
+        try:
+            await event_archive.maybe_enqueue_order_terminal(
+                db, doc.get('order_id'), status='Cancelled', actor_id=current_user.id, reason=doc.get('reason') or ''
+            )
+        except Exception as exc:
+            logger.warning("cancelled order archive enqueue failed: %s", exc)
     updated = await db.order_cancellation_requests.find_one({'id': cancellation_id}, {'_id': 0})
     return {'message': f'Cancellation {updated.get("approval_status")}', 'cancellation': updated}
 
@@ -6112,6 +6195,10 @@ async def save_factory_system_order(
             {'id': item.get('order_id')},
             {'$set': {'status': 'Completed', 'overall_status': 'Completed', 'sourcing_completed_at': now, 'updated_at': now}},
         )
+        try:
+            await event_archive.maybe_enqueue_order_terminal(db, item.get('order_id'), status='Completed')
+        except Exception as exc:
+            logger.warning("order terminal archive enqueue failed: %s", exc)
     return {
         'message': 'System Order Number saved',
         'item': refreshed,
@@ -6235,6 +6322,13 @@ async def request_center_list(
         )
         row['requested_user_id'] = row.get('requested_by') or ''
         row['receiver_users'] = receiver_map.get(scope, [])
+    try:
+        existing_ids = {r.get('id') for r in rows if r.get('id')}
+        archived = await hybrid_request_history.list_archived_requests(db, exclude_ids=existing_ids, limit=2000)
+        if archived:
+            rows.extend(archived)
+    except Exception as exc:
+        logger.warning("request history S3 merge skipped: %s", exc)
     return rows
 
 
@@ -6242,7 +6336,21 @@ async def request_center_list(
 async def request_center_detail(request_id: str, current_user: UserResponse = Depends(get_current_user)):
     req = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
     if not req:
-        raise HTTPException(status_code=404, detail='Request not found')
+        try:
+            packed = await hybrid_request_history.read_request_package(db, request_id)
+        except Exception:
+            packed = None
+        if packed:
+            for candidate in packed.get("requests") or []:
+                if str(candidate.get("id") or "") == str(request_id):
+                    req = candidate
+                    break
+            if not req and packed.get("requests"):
+                req = packed["requests"][0]
+        if not req:
+            raise HTTPException(status_code=404, detail='Request not found')
+        req = dict(req)
+        req["archive_source"] = "s3"
     role = (current_user.role or '').lower()
     is_supplier = role == 'master' or req.get('supplying_dealer') == current_user.group
     is_requester = req.get('requested_by') == current_user.id or (role != 'user' and req.get('requesting_dealer') == current_user.group)
@@ -6378,6 +6486,10 @@ async def _request_center_transition(request_id: str, new_status: str, remarks: 
     })
     updated = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
     await _sync_request_header_after_item_decision(updated, now)
+    try:
+        await event_archive.maybe_enqueue_request_terminal(db, updated or {}, actor_id=current_user.id)
+    except Exception as exc:
+        logger.warning("request terminal archive enqueue failed: %s", exc)
     return updated, True
 
 def sanitize_text_safe(value):
@@ -6488,6 +6600,10 @@ async def _request_logistics_transition(request_id: str, new_status: str, remark
     })
     updated = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
     await _sync_request_header_after_item_decision(updated, now)
+    try:
+        await event_archive.maybe_enqueue_request_terminal(db, updated or {}, actor_id=current_user.id)
+    except Exception as exc:
+        logger.warning("request logistics archive enqueue failed: %s", exc)
     return updated, True
 
 

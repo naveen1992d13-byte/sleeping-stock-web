@@ -60,15 +60,36 @@ class _FakeS3Mode:
             "download_bytes": s.download_bytes,
             "verify_object": s.verify_object,
             "exists": s.exists,
+            "delete": s.delete,
+            "copy_object": s.copy_object,
+            "move_object": s.move_object,
+            "object_present": getattr(s, "_object_present_on_primary", None),
             "mode": s._mode,
             "client": s._client,
         }
         original_download = s.download_bytes
         original_verify = s.verify_object
 
-        def fake_upload(key, data, content_type=None, metadata=None):
+        def fake_upload(key, data, content_type=None, metadata=None, allow_replace=False):
             # Write to local store but report provider=s3 (no real boto client in unit tests)
-            stored = s._local.put(key, bytes(data), content_type or "application/octet-stream")
+            data = bytes(data)
+            digest = s3_storage.sha256_bytes(data)
+            existing = s._local.head(key)
+            if existing:
+                old = existing.get("sha256")
+                if old == digest:
+                    return s3_storage.StoredObject(
+                        storage_provider="s3",
+                        storage_key=key,
+                        content_type=existing.get("content_type") or content_type or "application/octet-stream",
+                        file_size=int(existing.get("file_size") or 0),
+                        sha256=old,
+                    )
+                if ("/cancelled/" in str(key)) or not allow_replace:
+                    raise s3_storage.ImmutableObjectError(
+                        f"Refusing overwrite of immutable object {key}"
+                    )
+            stored = s._local.put(key, data, content_type or "application/octet-stream")
             return s3_storage.StoredObject(
                 storage_provider="s3",
                 storage_key=stored.storage_key,
@@ -98,6 +119,34 @@ class _FakeS3Mode:
         def fake_exists(key):
             return fake_head(key) is not None
 
+        def fake_delete(key):
+            return s._local.delete(key)
+
+        def fake_copy(src_key, dest_key, allow_replace=False):
+            data, ctype = fake_download(src_key)
+            return fake_upload(dest_key, data, content_type=ctype, allow_replace=allow_replace)
+
+        def fake_move(src_key, dest_key, expected_sha256=None, expected_size=None):
+            dest = fake_head(dest_key)
+            src = fake_head(src_key)
+            if not src and dest:
+                return s3_storage.StoredObject(
+                    storage_provider="s3",
+                    storage_key=dest_key,
+                    content_type=dest.get("content_type") or "application/octet-stream",
+                    file_size=int(dest.get("file_size") or 0),
+                    sha256=dest.get("sha256") or "",
+                )
+            copied = fake_copy(src_key, dest_key)
+            digest = expected_sha256 or copied.sha256
+            size = int(expected_size if expected_size is not None else copied.file_size)
+            if not fake_verify(dest_key, digest, size):
+                raise s3_storage.S3StorageError("fake move dest verify failed")
+            fake_delete(src_key)
+            if fake_exists(src_key):
+                raise s3_storage.S3StorageError("fake move source still present")
+            return copied
+
         s.is_s3 = lambda: True  # type: ignore
         s._mode = "s3"
         s.upload_bytes = fake_upload  # type: ignore
@@ -105,6 +154,10 @@ class _FakeS3Mode:
         s.download_bytes = fake_download  # type: ignore
         s.verify_object = fake_verify  # type: ignore
         s.exists = fake_exists  # type: ignore
+        s.delete = fake_delete  # type: ignore
+        s.copy_object = fake_copy  # type: ignore
+        s.move_object = fake_move  # type: ignore
+        s._object_present_on_primary = fake_exists  # type: ignore
         return s
 
     def __exit__(self, *exc):
@@ -115,6 +168,14 @@ class _FakeS3Mode:
         s.download_bytes = self._orig["download_bytes"]  # type: ignore
         s.verify_object = self._orig["verify_object"]  # type: ignore
         s.exists = self._orig["exists"]  # type: ignore
+        if "delete" in self._orig:
+            s.delete = self._orig["delete"]  # type: ignore
+        if "copy_object" in self._orig:
+            s.copy_object = self._orig["copy_object"]  # type: ignore
+        if "move_object" in self._orig:
+            s.move_object = self._orig["move_object"]  # type: ignore
+        if self._orig.get("object_present") is not None:
+            s._object_present_on_primary = self._orig["object_present"]  # type: ignore
         s._mode = self._orig["mode"]
         s._client = self._orig["client"]
         return False
@@ -178,12 +239,21 @@ class FakeCollection:
         matches = [dict(d) for d in self.docs if self._match(d, query or {})]
         return FakeCursor(matches)
 
-    async def find_one_and_update(self, query, update, return_document=None, projection=None, upsert=False):
-        result = await self.update_one(query, update, upsert=upsert)
-        if result.matched_count or result.upserted_id:
-            # Return updated doc matching the simple equality keys (not $or filters)
-            simple = {k: v for k, v in (query or {}).items() if not str(k).startswith("$") and not isinstance(v, dict)}
-            return await self.find_one(simple or query)
+    async def find_one_and_update(self, query, update, return_document=None, projection=None, upsert=False, sort=None):
+        matches = [(i, d) for i, d in enumerate(self.docs) if self._match(d, query)]
+        if sort:
+            for field, direction in reversed(list(sort)):
+                matches.sort(key=lambda pair: str(pair[1].get(field) or ""), reverse=direction < 0)
+        for i, d in matches:
+            applied = self._apply({**d, "_existing": True}, update)
+            applied.pop("_existing", None)
+            self.docs[i] = applied
+            return dict(applied)
+        if upsert:
+            result = await self.update_one(query, update, upsert=True)
+            if result.upserted_id:
+                simple = {k: v for k, v in (query or {}).items() if not str(k).startswith("$") and not isinstance(v, dict)}
+                return await self.find_one(simple or query)
         return None
 
     async def delete_one(self, query):
@@ -226,10 +296,20 @@ class FakeCollection:
                 if not any(self._match(doc, clause) for clause in v):
                     return False
                 continue
+            if k == "$and":
+                if not all(self._match(doc, clause) for clause in v):
+                    return False
+                continue
             dv = doc.get(k)
             if isinstance(v, dict):
                 if "$in" in v and dv not in v["$in"]:
                     return False
+                if "$nin" in v and dv in v["$nin"]:
+                    return False
+                if "$exists" in v:
+                    present = k in doc
+                    if bool(v["$exists"]) != present:
+                        return False
                 if "$gte" in v and not (dv is not None and dv >= v["$gte"]):
                     return False
                 if "$lte" in v and not (dv is not None and dv <= v["$lte"]):
@@ -285,6 +365,7 @@ class FakeDB:
     def __init__(self):
         self._cols = {
             "archive_job_locks": FakeCollection(unique_keys=[["lock_key"]]),
+            "archive_outbox": FakeCollection(unique_keys=[["idempotency_key"], ["job_id"]]),
         }
 
     def __getattr__(self, name):
@@ -1599,7 +1680,7 @@ def test_scheduler_partial_failure_no_last_daily_stamp():
         # Integration: orders fail mid-batch → cycle incomplete; retry completes without
         # re-duplicating already verified uploads/product-history/requests.
         db = FakeDB()
-        date_iso = "2026-08-08"
+        date_iso = "2026-07-22"
         db.products.docs = [
             {
                 "part_number": "P1",
@@ -1609,7 +1690,7 @@ def test_scheduler_partial_failure_no_last_daily_stamp():
                 "dealer_name": "DealerA",
                 "branch": "B1",
                 "publish_status": "Published",
-                "active_date_key": "20260808",
+                "active_date_key": "20260722",
             }
         ]
         db.order_headers.docs = []
@@ -1645,8 +1726,8 @@ def test_scheduler_partial_failure_no_last_daily_stamp():
                     "brand_name": "Hyundai",
                     "dealer_name": "DealerA",
                     "branch": "B1",
-                    "created_at": "2026-08-01T10:00:00+05:30",
-                    "updated_at": "2026-08-08T22:00:00+05:30",
+                    "created_at": "2026-07-01T10:00:00+05:30",
+                    "updated_at": "2026-07-22T22:00:00+05:30",
                 }
             ]
             db.order_items.docs = [
@@ -1655,8 +1736,8 @@ def test_scheduler_partial_failure_no_last_daily_stamp():
                     "order_id": "h-retry",
                     "status": "Cancelled",
                     "part_number": "PR",
-                    "updated_at": "2026-08-08T22:00:00+05:30",
-                    "completed_at": "2026-08-08T22:00:00+05:30",
+                    "updated_at": "2026-07-22T22:00:00+05:30",
+                    "completed_at": "2026-07-22T22:00:00+05:30",
                 }
             ]
             second = await sched.run_daily_coordinated_archive(db, date_iso)

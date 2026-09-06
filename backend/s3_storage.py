@@ -15,6 +15,7 @@ import logging
 import mimetypes
 import os
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -112,8 +113,38 @@ def archive_scheduler_enabled() -> bool:
     return _env_bool(ENV_ARCHIVE_SCHEDULER_ENABLED, True)
 
 
+def _looks_like_access_key_id(value: str) -> bool:
+    text = _clean_env(value)
+    return bool(text) and len(text) <= 24 and (text.startswith("AKIA") or text.startswith("ASIA"))
+
+
+def _looks_like_secret_access_key(value: str) -> bool:
+    text = _clean_env(value)
+    if not text:
+        return False
+    if "/" in text or "+" in text:
+        return True
+    return len(text) >= 36 and not _looks_like_access_key_id(text)
+
+
+def maybe_unswap_aws_keys(access_key: str, secret_key: str) -> Tuple[str, str, bool]:
+    """If env slots are reversed (secret in ACCESS, AKIA in SECRET), unswap in-memory only."""
+    access = _clean_env(access_key)
+    secret = _clean_env(secret_key)
+    if _looks_like_secret_access_key(access) and _looks_like_access_key_id(secret):
+        return secret, access, True
+    return access, secret, False
+
+
 def resolve_bucket() -> str:
-    return (_clean_env(os.getenv(ENV_NMTS_S3_BUCKET)) or _clean_env(os.getenv(ENV_AWS_S3_BUCKET)))
+    """Prefer NMTS_S3_BUCKET. Ignore AWS_S3_BUCKET when it is actually an access-key id."""
+    nmts = _clean_env(os.getenv(ENV_NMTS_S3_BUCKET))
+    if nmts and not _looks_like_access_key_id(nmts):
+        return nmts
+    alias = _clean_env(os.getenv(ENV_AWS_S3_BUCKET))
+    if alias and not _looks_like_access_key_id(alias):
+        return alias
+    return nmts if nmts and not _looks_like_access_key_id(nmts) else ""
 
 
 def _clean_env(value: Optional[str]) -> str:
@@ -201,6 +232,10 @@ class StoredObject:
 
 class S3StorageError(RuntimeError):
     pass
+
+
+class ImmutableObjectError(S3StorageError):
+    """Raised when a write would replace an existing object with different bytes."""
 
 
 class _LocalObjectStore:
@@ -293,6 +328,8 @@ class S3StorageService:
         )
         self._client = None
         self._mode = "local"
+        self._keys_unswapped = False
+        self._init_error_code = ""
         self._refresh_from_env()
         self._init_client()
 
@@ -300,8 +337,12 @@ class S3StorageService:
         self.region = _clean_env(os.getenv(ENV_AWS_REGION)) or _clean_env(os.getenv("AWS_DEFAULT_REGION")) or "us-east-1"
         self.bucket = resolve_bucket()
         self.env = storage_env()
-        self.access_key = _clean_env(os.getenv(ENV_AWS_ACCESS_KEY_ID))
-        self.secret_key = _clean_env(os.getenv(ENV_AWS_SECRET_ACCESS_KEY))
+        access = _clean_env(os.getenv(ENV_AWS_ACCESS_KEY_ID))
+        secret = _clean_env(os.getenv(ENV_AWS_SECRET_ACCESS_KEY))
+        access, secret, swapped = maybe_unswap_aws_keys(access, secret)
+        self.access_key = access
+        self.secret_key = secret
+        self._keys_unswapped = swapped
         self.session_token = _clean_env(os.getenv("AWS_SESSION_TOKEN"))
 
     def _credentials_look_valid(self) -> bool:
@@ -373,6 +414,10 @@ class S3StorageService:
         HeadBucket IAM deny does not force local mode: least-privilege keys often
         allow PutObject on uploads/* without s3:ListBucket. Invalid credentials
         and missing buckets still fall through to local.
+
+        HeadBucket Error.Code "403" / Message "Forbidden" is ambiguous: valid
+        keys without s3:ListBucket AND unknown access-key ids both look like
+        that. Confirm the access key id with STS before claiming REAL S3.
         """
         try:
             self._client.head_bucket(Bucket=self.bucket)
@@ -388,6 +433,7 @@ class S3StorageService:
                         return
                     except Exception as retry_exc:
                         if self._is_head_bucket_iam_deny(retry_exc):
+                            self._require_recognized_access_key()
                             logger.warning(
                                 "S3 HeadBucket not permitted (%s); keeping REAL S3 client for object PUT",
                                 _aws_error_code(retry_exc),
@@ -395,6 +441,7 @@ class S3StorageService:
                             return
                         raise
             if self._is_head_bucket_iam_deny(exc):
+                self._require_recognized_access_key()
                 logger.warning(
                     "S3 HeadBucket not permitted (%s); keeping REAL S3 client for object PUT",
                     _aws_error_code(exc),
@@ -402,8 +449,22 @@ class S3StorageService:
                 return
             raise
 
+    def _require_recognized_access_key(self) -> None:
+        """Reject unknown/revoked access key ids. Does not log identity values."""
+        import boto3
+
+        kwargs: Dict[str, Any] = {
+            "region_name": self.region or "us-east-1",
+            "aws_access_key_id": self.access_key,
+            "aws_secret_access_key": self.secret_key,
+        }
+        if self.session_token:
+            kwargs["aws_session_token"] = self.session_token
+        boto3.client("sts", **kwargs).get_caller_identity()
+
     def _init_client(self) -> None:
         self._refresh_from_env()
+        self._init_error_code = ""
         if not self._credentials_look_valid():
             self._client = None
             self._mode = "local"
@@ -421,6 +482,7 @@ class S3StorageService:
             self._client = None
             self._mode = "local"
             err_code = _aws_error_code(exc)
+            self._init_error_code = err_code or type(exc).__name__
             logger.warning(
                 "S3 init failed (%s%s); using local object store",
                 type(exc).__name__,
@@ -452,18 +514,62 @@ class S3StorageService:
     def key(self, *parts: str) -> str:
         return build_key(self.env, *parts)
 
+    def _existing_digest(self, key: str) -> Optional[Tuple[str, int, str]]:
+        """Return (sha256, size, provider) when the object already exists."""
+        info = self.head(key)
+        if not info:
+            return None
+        digest = info.get("sha256")
+        size = int(info.get("file_size") or 0)
+        provider = str(info.get("storage_provider") or "")
+        if not digest:
+            try:
+                body, _ = self.download_bytes(key)
+                digest = sha256_bytes(body)
+                size = len(body)
+            except Exception:
+                return None
+        return digest, size, provider
+
+    def _refuse_different_overwrite(self, key: str, digest: str, *, allow_replace: bool) -> Optional[StoredObject]:
+        existing = self._existing_digest(key)
+        if not existing:
+            return None
+        existing_sha, existing_size, provider = existing
+        if existing_sha == digest:
+            info = self.head(key) or {}
+            return StoredObject(
+                storage_provider=str(info.get("storage_provider") or provider or self._mode),
+                storage_key=key,
+                content_type=str(info.get("content_type") or "application/octet-stream"),
+                file_size=int(info.get("file_size") or existing_size),
+                sha256=existing_sha,
+                etag=info.get("etag"),
+            )
+        cancelled = "/cancelled/" in str(key)
+        if cancelled or not allow_replace:
+            raise ImmutableObjectError(
+                f"Refusing overwrite of immutable object {key} (existing sha256 differs)"
+            )
+        return None
+
     def upload_bytes(
         self,
         key: str,
         data: bytes,
         content_type: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
+        *,
+        allow_replace: bool = False,
     ) -> StoredObject:
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("data must be bytes")
         data = bytes(data)
         ctype = content_type or "application/octet-stream"
         digest = sha256_bytes(data)
+        reconciled = self._refuse_different_overwrite(key, digest, allow_replace=allow_replace)
+        if reconciled is not None:
+            return reconciled
         if self.is_s3():
             try:
                 extra: Dict[str, Any] = {"ContentType": ctype}
@@ -483,6 +589,157 @@ class S3StorageService:
             except Exception as exc:
                 raise S3StorageError(f"S3 upload failed: {exc}") from exc
         return self._local.put(key, data, ctype)
+
+    def copy_object(self, src_key: str, dest_key: str, *, allow_replace: bool = False) -> StoredObject:
+        """Copy src → dest without deleting src. Write-once on dest unless bytes match."""
+        data, ctype = self.download_bytes(src_key)
+        return self.upload_bytes(dest_key, data, content_type=ctype, allow_replace=allow_replace)
+
+    def move_object(
+        self,
+        src_key: str,
+        dest_key: str,
+        *,
+        expected_sha256: Optional[str] = None,
+        expected_size: Optional[int] = None,
+    ) -> StoredObject:
+        """SAFE MOVE: copy → physically verify dest → delete source.
+
+        If copy/verify fails, source is left untouched. Retry is idempotent:
+        dest already matching the source bytes skips the copy and continues
+        to source delete. Final success: object exists only at dest_key.
+        """
+        src_key = str(src_key or "")
+        dest_key = str(dest_key or "")
+        if not src_key or not dest_key:
+            raise S3StorageError("move_object requires src and dest keys")
+        if src_key == dest_key:
+            info = self.head(src_key) or {}
+            return StoredObject(
+                storage_provider=str(info.get("storage_provider") or self._mode),
+                storage_key=src_key,
+                content_type=str(info.get("content_type") or "application/octet-stream"),
+                file_size=int(info.get("file_size") or 0),
+                sha256=str(info.get("sha256") or ""),
+                etag=info.get("etag"),
+            )
+
+        src_head = self.head(src_key)
+        dest_head = self.head(dest_key)
+        if not src_head and dest_head:
+            digest = expected_sha256 or dest_head.get("sha256") or ""
+            size = int(expected_size if expected_size is not None else dest_head.get("file_size") or 0)
+            if digest and not self.verify_object(dest_key, digest, size):
+                raise S3StorageError(f"Cancelled dest {dest_key} failed verification on retry")
+            return StoredObject(
+                storage_provider=str(dest_head.get("storage_provider") or self._mode),
+                storage_key=dest_key,
+                content_type=str(dest_head.get("content_type") or "application/octet-stream"),
+                file_size=size,
+                sha256=digest,
+                etag=dest_head.get("etag"),
+            )
+        if not src_head:
+            raise FileNotFoundError(src_key)
+
+        copied = None
+        if dest_head:
+            src_sha = expected_sha256 or src_head.get("sha256")
+            if not src_sha:
+                body, _ = self.download_bytes(src_key)
+                src_sha = sha256_bytes(body)
+            dest_sha = dest_head.get("sha256")
+            if not dest_sha:
+                body, _ = self.download_bytes(dest_key)
+                dest_sha = sha256_bytes(body)
+            if dest_sha != src_sha:
+                raise ImmutableObjectError(
+                    f"Refusing move onto dest {dest_key} whose bytes differ from source"
+                )
+            copied = StoredObject(
+                storage_provider=str(dest_head.get("storage_provider") or self._mode),
+                storage_key=dest_key,
+                content_type=str(dest_head.get("content_type") or "application/octet-stream"),
+                file_size=int(dest_head.get("file_size") or 0),
+                sha256=dest_sha,
+                etag=dest_head.get("etag"),
+            )
+        else:
+            copied = self.copy_object(src_key, dest_key)
+
+        digest = expected_sha256 or copied.sha256
+        size = int(expected_size if expected_size is not None else copied.file_size)
+        if not digest:
+            body, _ = self.download_bytes(dest_key)
+            digest = sha256_bytes(body)
+            size = len(body)
+        if not self.verify_object(dest_key, digest, size):
+            raise S3StorageError(
+                f"Move verification failed for dest {dest_key} — source {src_key} left untouched"
+            )
+
+        self._delete_source_after_verified_dest(src_key)
+        if self._object_present_on_primary(src_key):
+            raise S3StorageError(
+                f"Source {src_key} still present after dest verified — retry will delete source only"
+            )
+        if not self.exists(dest_key):
+            raise S3StorageError(f"Dest {dest_key} missing after move")
+        return copied
+
+    def _s3_head(self, key: str) -> Optional[Dict[str, Any]]:
+        """REAL S3 head only — never treat local leftovers as the live object."""
+        if not self.is_s3() or not self._client:
+            return None
+        try:
+            resp = self._client.head_object(Bucket=self.bucket, Key=key)
+            meta = resp.get("Metadata") or {}
+            return {
+                "storage_key": key,
+                "content_type": resp.get("ContentType") or "application/octet-stream",
+                "file_size": int(resp.get("ContentLength") or 0),
+                "sha256": meta.get("sha256"),
+                "etag": resp.get("ETag"),
+                "exists": True,
+                "storage_provider": "s3",
+            }
+        except Exception as exc:
+            code = _aws_error_code(exc)
+            http = self._http_status(exc)
+            if code in {"404", "NoSuchKey", "NotFound"} or http == 404:
+                return None
+            name = type(exc).__name__
+            if "NoSuchKey" in name or "404" in str(exc):
+                return None
+            raise
+
+    def _object_present_on_primary(self, key: str) -> bool:
+        if self.is_s3():
+            return self._s3_head(key) is not None
+        return self._local.head(key) is not None
+
+    def _delete_source_after_verified_dest(self, key: str) -> None:
+        """Delete source only after dest verify. Retry; do not swallow S3 delete errors."""
+        last_err: Optional[BaseException] = None
+        for _ in range(5):
+            if self.is_s3() and self._client:
+                try:
+                    self._client.delete_object(Bucket=self.bucket, Key=key)
+                    last_err = None
+                except Exception as exc:
+                    last_err = exc
+                    logger.warning("S3 delete_object failed for %s: %s", key, type(exc).__name__)
+            self._local.delete(key)
+            if not self._object_present_on_primary(key):
+                return
+            time.sleep(0.15)
+        if last_err:
+            raise S3StorageError(
+                f"S3 delete failed for source {key} after dest verified ({type(last_err).__name__})"
+            ) from last_err
+        raise S3StorageError(
+            f"Source {key} still present after dest verified — retry will delete source only"
+        )
 
     def download_bytes(self, key: str) -> Tuple[bytes, str]:
         if self.is_s3():
@@ -633,6 +890,7 @@ class S3StorageService:
             "env": self.env,
             "access_key_present": bool(self.access_key),
             "access_key_looks_valid": self._credentials_look_valid(),
+            "aws_key_slots_unswapped": bool(getattr(self, "_keys_unswapped", False)),
             "archive_prune_enabled": archive_prune_enabled(),
             "archive_scheduler_enabled": archive_scheduler_enabled(),
             "product_mongo_hot_days": product_mongo_hot_days(),
@@ -643,7 +901,13 @@ class S3StorageService:
             "warning": (
                 None
                 if real_s3
-                else "Cloud archive not active — MongoDB pruning disabled."
+                else (
+                    "AWS access key id was rejected (not a live IAM key). "
+                    "Cloud archive not active — MongoDB pruning disabled."
+                    if str(getattr(self, "_init_error_code", "") or "")
+                    in {"InvalidAccessKeyId", "InvalidClientTokenId"}
+                    else "Cloud archive not active — MongoDB pruning disabled."
+                )
             ),
         }
 
