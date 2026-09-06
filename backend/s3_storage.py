@@ -203,6 +203,10 @@ class S3StorageError(RuntimeError):
     pass
 
 
+class ImmutableObjectError(S3StorageError):
+    """Raised when a write would replace an existing object with different bytes."""
+
+
 class _LocalObjectStore:
     """Filesystem-backed object store used when AWS is unavailable."""
 
@@ -452,18 +456,62 @@ class S3StorageService:
     def key(self, *parts: str) -> str:
         return build_key(self.env, *parts)
 
+    def _existing_digest(self, key: str) -> Optional[Tuple[str, int, str]]:
+        """Return (sha256, size, provider) when the object already exists."""
+        info = self.head(key)
+        if not info:
+            return None
+        digest = info.get("sha256")
+        size = int(info.get("file_size") or 0)
+        provider = str(info.get("storage_provider") or "")
+        if not digest:
+            try:
+                body, _ = self.download_bytes(key)
+                digest = sha256_bytes(body)
+                size = len(body)
+            except Exception:
+                return None
+        return digest, size, provider
+
+    def _refuse_different_overwrite(self, key: str, digest: str, *, allow_replace: bool) -> Optional[StoredObject]:
+        existing = self._existing_digest(key)
+        if not existing:
+            return None
+        existing_sha, existing_size, provider = existing
+        if existing_sha == digest:
+            info = self.head(key) or {}
+            return StoredObject(
+                storage_provider=str(info.get("storage_provider") or provider or self._mode),
+                storage_key=key,
+                content_type=str(info.get("content_type") or "application/octet-stream"),
+                file_size=int(info.get("file_size") or existing_size),
+                sha256=existing_sha,
+                etag=info.get("etag"),
+            )
+        cancelled = "/cancelled/" in str(key)
+        if cancelled or not allow_replace:
+            raise ImmutableObjectError(
+                f"Refusing overwrite of immutable object {key} (existing sha256 differs)"
+            )
+        return None
+
     def upload_bytes(
         self,
         key: str,
         data: bytes,
         content_type: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
+        *,
+        allow_replace: bool = False,
     ) -> StoredObject:
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("data must be bytes")
         data = bytes(data)
         ctype = content_type or "application/octet-stream"
         digest = sha256_bytes(data)
+        reconciled = self._refuse_different_overwrite(key, digest, allow_replace=allow_replace)
+        if reconciled is not None:
+            return reconciled
         if self.is_s3():
             try:
                 extra: Dict[str, Any] = {"ContentType": ctype}
@@ -483,6 +531,11 @@ class S3StorageService:
             except Exception as exc:
                 raise S3StorageError(f"S3 upload failed: {exc}") from exc
         return self._local.put(key, data, ctype)
+
+    def copy_object(self, src_key: str, dest_key: str, *, allow_replace: bool = False) -> StoredObject:
+        """Copy src → dest without deleting src. Write-once on dest unless bytes match."""
+        data, ctype = self.download_bytes(src_key)
+        return self.upload_bytes(dest_key, data, content_type=ctype, allow_replace=allow_replace)
 
     def download_bytes(self, key: str) -> Tuple[bytes, str]:
         if self.is_s3():

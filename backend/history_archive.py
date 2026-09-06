@@ -244,6 +244,9 @@ async def _upload_verified(
 ) -> Dict[str, Any]:
     storage = get_storage()
     digest = sha256_bytes(data)
+    if existing and str(existing.get("status") or "") in {am.STATUS_VERIFIED, am.STATUS_PRUNED}:
+        # Never clobber a trusted archive (same or different bytes).
+        return existing
     manifest = existing or am.base_manifest(
         module=module,
         archive_date=archive_date,
@@ -277,9 +280,19 @@ async def _upload_verified(
     manifest = await am.upsert_manifest(db, manifest)
 
     import archive_verify as av
+    from s3_storage import ImmutableObjectError
 
     # Idempotent retry: if the expected object already exists and passes physical
     # verification, reconcile the manifest instead of blindly re-uploading.
+    allow_replace = bool(
+        existing
+        and str(existing.get("status") or "") in {am.STATUS_FAILED, am.STATUS_CREATING, am.STATUS_UPLOADED}
+    )
+    if existing and str(existing.get("status") or "") in {am.STATUS_VERIFIED, am.STATUS_PRUNED}:
+        if existing.get("sha256") == digest and existing.get("storage_key") == storage_key:
+            return existing
+        allow_replace = False
+
     if storage.is_s3() and storage.exists(storage_key):
         pre = av.physical_s3_verify(
             storage_key=storage_key,
@@ -299,12 +312,23 @@ async def _upload_verified(
                 error=None,
                 reconciled=True,
             )
+        if not allow_replace:
+            await am.mark_status(
+                db,
+                manifest["archive_id"],
+                existing.get("status") if existing and existing.get("status") in {am.STATUS_VERIFIED, am.STATUS_PRUNED} else am.STATUS_FAILED,
+                error="Refusing overwrite of existing archive object with different bytes",
+                eligible_for_prune=bool(existing and existing.get("status") == am.STATUS_VERIFIED),
+            )
+            if existing and existing.get("status") in {am.STATUS_VERIFIED, am.STATUS_PRUNED}:
+                return existing
+            raise RuntimeError("Refusing overwrite of existing archive object with different bytes")
 
     try:
         if not storage.is_s3():
             # Still write local for diagnostics, but never claim REAL S3 success.
             try:
-                storage.upload_bytes(storage_key, data, content_type="application/gzip")
+                storage.upload_bytes(storage_key, data, content_type="application/gzip", allow_replace=allow_replace)
             except Exception:
                 pass
             await am.mark_status(
@@ -317,7 +341,9 @@ async def _upload_verified(
             )
             raise RuntimeError("REAL S3 unavailable — archive not TRANSFERRED & VERIFIED")
 
-        stored = storage.upload_bytes(storage_key, data, content_type="application/gzip")
+        stored = storage.upload_bytes(
+            storage_key, data, content_type="application/gzip", allow_replace=allow_replace
+        )
         await am.mark_status(db, manifest["archive_id"], am.STATUS_UPLOADED)
         provider = str(getattr(stored, "storage_provider", None) or storage.mode or "").lower()
         if provider == "local":
@@ -330,6 +356,17 @@ async def _upload_verified(
                 storage_backend="local",
             )
             raise RuntimeError("Upload failed — local fallback masquerading as S3 success blocked")
+    except ImmutableObjectError as exc:
+        await am.mark_status(
+            db,
+            manifest["archive_id"],
+            existing.get("status") if existing and existing.get("status") in {am.STATUS_VERIFIED, am.STATUS_PRUNED} else am.STATUS_FAILED,
+            error=str(exc)[:1000],
+            eligible_for_prune=bool(existing and existing.get("status") == am.STATUS_VERIFIED),
+        )
+        if existing and existing.get("status") in {am.STATUS_VERIFIED, am.STATUS_PRUNED}:
+            return existing
+        raise
     except RuntimeError:
         raise
     except Exception as exc:
@@ -434,8 +471,8 @@ async def archive_product_history_for_date(db, archive_date: str, force: bool = 
 
     # Upload companion objects (best-effort; main products archive is authoritative)
     try:
-        storage.upload_bytes(summary_key, summary_bytes, content_type="application/json")
-        storage.upload_bytes(snap_key, snap_bytes, content_type="application/json")
+        storage.upload_bytes(summary_key, summary_bytes, content_type="application/json", allow_replace=True)
+        storage.upload_bytes(snap_key, snap_bytes, content_type="application/json", allow_replace=True)
     except Exception as exc:
         logger.warning("Companion archive upload failed for %s: %s", date_iso, exc)
 
@@ -1240,8 +1277,30 @@ async def archive_verifications_for_date(db, archive_date: str, force: bool = Fa
         brands=brands,
         dealers=dealers,
         branches=branches,
+        extra_fields={
+            "reader_ready": False,
+            "prune_blocked_reason": "no_history_reader",
+            "retention_policy": "mongo_hot_days",
+        },
     )
-    return {"status": "verified", "manifest": manifest, "record_count": len(rows)}
+    # Do not claim cleanup-ready: there is no verification-history S3 reader.
+    if manifest and manifest.get("status") == am.STATUS_VERIFIED:
+        manifest = await am.mark_status(
+            db,
+            manifest["archive_id"],
+            am.STATUS_VERIFIED,
+            eligible_for_prune=False,
+            reader_ready=False,
+            prune_blocked_reason="no_history_reader",
+            retention_policy="mongo_hot_days",
+        )
+    return {
+        "status": "verified",
+        "manifest": manifest,
+        "record_count": len(rows),
+        "prune_blocked": True,
+        "reader_ready": False,
+    }
 
 
 # -------------------- Prune (disabled by default; REAL S3 required) --------------------

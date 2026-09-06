@@ -13,6 +13,10 @@ STATUS_FAILED = "FAILED"
 STATUS_PRUNED = "PRUNED"
 STATUS_NO_ELIGIBLE = "NO_ELIGIBLE"
 
+LIFECYCLE_ACTIVE = "active"
+LIFECYCLE_SUPERSEDED = "superseded"
+LIFECYCLE_CANCELLED = "cancelled"
+
 VALID_STATUSES = {
     STATUS_CREATING,
     STATUS_UPLOADED,
@@ -67,6 +71,13 @@ def base_manifest(
         "branch_count": 0,
         "error": None,
         "eligible_for_prune": False,
+        "entity_id": None,
+        "lifecycle_status": LIFECYCLE_ACTIVE,
+        "cancelled_storage_key": None,
+        "original_storage_key": None,
+        "cancelled_by": None,
+        "cancelled_at": None,
+        "cancel_reason": None,
     }
 
 
@@ -81,7 +92,18 @@ async def ensure_archive_indexes(db) -> None:
         name="idx_archive_module_month_status",
     )
     await db.archive_manifests.create_index("storage_key")
+    await db.archive_manifests.create_index(
+        [("module", 1), ("entity_id", 1), ("status", 1)],
+        name="idx_archive_module_entity_status",
+    )
+    await db.archive_manifests.create_index(
+        [("module", 1), ("archive_date", 1), ("lifecycle_status", 1)],
+        name="idx_archive_module_date_lifecycle",
+    )
     await db.archive_job_locks.create_index("lock_key", unique=True)
+    await db.archive_outbox.create_index("job_id", unique=True)
+    await db.archive_outbox.create_index("idempotency_key", unique=True)
+    await db.archive_outbox.create_index([("status", 1), ("next_retry_at", 1)])
     await db.order_archive_index.create_index([("archive_month", 1), ("number", 1)])
     await db.request_archive_index.create_index([("archive_month", 1), ("number", 1)])
 
@@ -128,6 +150,71 @@ async def find_s3_readable(db, module: str, archive_date: Optional[str] = None, 
         return verified[0]
     pruned = [r for r in rows if r.get("status") == STATUS_PRUNED]
     return pruned[0] if pruned else None
+
+
+def _real_s3_q(module: str) -> Dict[str, Any]:
+    return {
+        "module": module,
+        "status": {"$in": [STATUS_VERIFIED, STATUS_PRUNED]},
+        "storage_backend": {"$in": ["s3", "REAL S3"]},
+    }
+
+
+async def find_verified_entity(db, module: str, entity_id: str):
+    """Return the latest REAL-S3 VERIFIED row for one entity (upload/order/request)."""
+    if not entity_id:
+        return None
+    q: Dict[str, Any] = {
+        "module": module,
+        "entity_id": str(entity_id),
+        "status": STATUS_VERIFIED,
+        "eligible_for_prune": True,
+        "storage_backend": {"$in": ["s3", "REAL S3"]},
+    }
+    return await db.archive_manifests.find_one(q, {"_id": 0}, sort=[("created_at", -1)])
+
+
+async def find_s3_readable_entity(db, module: str, entity_id: str):
+    if not entity_id:
+        return None
+    q = _real_s3_q(module)
+    q["entity_id"] = str(entity_id)
+    rows = await db.archive_manifests.find(q, {"_id": 0}).sort("created_at", -1).to_list(20)
+    if not rows:
+        return None
+    verified = [r for r in rows if r.get("status") == STATUS_VERIFIED]
+    if verified:
+        return verified[0]
+    return rows[0]
+
+
+async def list_s3_readable_entities(
+    db,
+    module: str,
+    *,
+    archive_date: Optional[str] = None,
+    lifecycle_in: Optional[list] = None,
+    lifecycle_nin: Optional[list] = None,
+    limit: int = 500,
+):
+    q = _real_s3_q(module)
+    if archive_date:
+        q["archive_date"] = archive_date
+    if lifecycle_in:
+        q["lifecycle_status"] = {"$in": list(lifecycle_in)}
+    elif lifecycle_nin:
+        q["lifecycle_status"] = {"$nin": list(lifecycle_nin)}
+    return await db.archive_manifests.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
+
+
+async def find_any_entity(db, module: str, entity_id: str):
+    if not entity_id:
+        return None
+    return await db.archive_manifests.find_one(
+        {"module": module, "entity_id": str(entity_id)},
+        {"_id": 0},
+        sort=[("created_at", -1)],
+    )
 
 
 async def find_acceptable_daily(db, module: str, archive_date: str):

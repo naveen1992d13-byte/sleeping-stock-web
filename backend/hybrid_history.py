@@ -14,6 +14,7 @@ from io import BytesIO
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+import archive_keys as ak
 import archive_manifest as am
 from history_archive import MODULE_PRODUCT_HISTORY, date_key_to_iso, iso_to_date_key
 from s3_storage import get_storage, product_mongo_hot_days
@@ -89,6 +90,157 @@ def _load_jsonl_gz(data: bytes) -> List[Dict[str, Any]]:
     return list(_iter_jsonl_gz(data))
 
 
+def _s3_bytes(storage_key: str) -> Optional[bytes]:
+    storage = get_storage()
+    if not storage.is_s3() or not storage_key:
+        return None
+    try:
+        data, _ctype = storage.download_bytes(storage_key)
+        head = storage.head(storage_key)
+        if head and str(head.get("storage_provider") or "").lower() == "local":
+            return None
+        return data
+    except Exception as exc:
+        logger.warning("Failed reading archive %s: %s", storage_key, exc)
+        return None
+
+
+async def _active_product_hub_manifests(
+    db,
+    date_iso: str,
+    *,
+    brand=None,
+    dealer=None,
+    branch=None,
+) -> List[Dict[str, Any]]:
+    """Latest non-cancelled, non-superseded product-hub publish per Brand/Dealer/Branch."""
+    rows = await am.list_s3_readable_entities(
+        db,
+        ak.MODULE_PRODUCT_HUB,
+        archive_date=date_iso,
+        lifecycle_nin=[am.LIFECYCLE_CANCELLED, am.LIFECYCLE_SUPERSEDED],
+        limit=500,
+    )
+    chosen: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for man in rows:
+        life = str(man.get("lifecycle_status") or am.LIFECYCLE_ACTIVE)
+        if life in {am.LIFECYCLE_CANCELLED, am.LIFECYCLE_SUPERSEDED}:
+            continue
+        b = str(man.get("brand_name") or "")
+        d = str(man.get("dealer_name") or "")
+        br = str(man.get("branch") or "")
+        if brand and b and b != str(brand):
+            continue
+        if dealer and d and d != str(dealer):
+            continue
+        if branch and br and br != str(branch):
+            continue
+        slot_key = (b, d, br)
+        prev = chosen.get(slot_key)
+        if not prev or str(man.get("created_at") or "") > str(prev.get("created_at") or ""):
+            chosen[slot_key] = man
+    return list(chosen.values())
+
+
+def _unavailable_s3(date_iso: str, manifest_status=None) -> Dict[str, Any]:
+    return {
+        "rows": [],
+        "count": 0,
+        "total": 0,
+        "source": "s3_unavailable",
+        "archive_unavailable": True,
+        "message": "Archive temporarily unavailable. Please retry.",
+        "manifest_status": manifest_status,
+    }
+
+
+async def _stream_product_hub_day_page(
+    db,
+    date_key: str,
+    *,
+    brand=None,
+    dealer=None,
+    branch=None,
+    part_number=None,
+    search=None,
+    page: int = 1,
+    page_size: int = 50,
+) -> Optional[Dict[str, Any]]:
+    date_iso = date_key_to_iso(date_key)
+    manifests = await _active_product_hub_manifests(db, date_iso, brand=brand, dealer=dealer, branch=branch)
+    if not manifests:
+        return None
+    storage = get_storage()
+    if not storage.is_s3():
+        logger.warning("Refusing historical S3 read for product-hub %s — not REAL S3", date_iso)
+        return _unavailable_s3(date_iso, manifests[0].get("status"))
+
+    blobs: List[bytes] = []
+    for man in manifests:
+        backend = str(man.get("storage_backend") or "").lower()
+        if backend not in {"s3", "real s3"}:
+            return _unavailable_s3(date_iso, man.get("status"))
+        data = _s3_bytes(man.get("storage_key") or "")
+        if data is None:
+            return _unavailable_s3(date_iso, man.get("status"))
+        blobs.append(data)
+
+    ps = max(1, min(int(page_size or 50), 500))
+    pg = max(1, int(page or 1))
+    start = (pg - 1) * ps
+    end = start + ps
+    matched = 0
+    page_rows: List[Dict[str, Any]] = []
+    has_more = False
+    for data in blobs:
+        for row in _iter_jsonl_gz(data):
+            if not _match_scope(row, brand, dealer, branch):
+                continue
+            if not _match_search(row, part_number, search):
+                continue
+            if start <= matched < end:
+                page_rows.append(row)
+            elif matched >= end:
+                has_more = True
+            matched += 1
+    total = matched
+    return {
+        "rows": page_rows,
+        "count": len(page_rows),
+        "total": total,
+        "source": "s3",
+        "archive_unavailable": False,
+        "manifest_status": manifests[0].get("status"),
+        "manifest_record_count": sum(int(m.get("record_count") or 0) for m in manifests),
+        "page": {
+            "page": pg,
+            "page_size": ps,
+            "total": total,
+            "total_pages": (total + ps - 1) // ps if ps else 0,
+            "has_more": pg * ps < total or has_more,
+        },
+    }
+
+
+async def _read_product_hub_day(db, date_key: str, brand=None, dealer=None, branch=None) -> List[Dict[str, Any]]:
+    date_iso = date_key_to_iso(date_key)
+    manifests = await _active_product_hub_manifests(db, date_iso, brand=brand, dealer=dealer, branch=branch)
+    if not manifests:
+        return []
+    storage = get_storage()
+    if not storage.is_s3():
+        return []
+    rows: List[Dict[str, Any]] = []
+    for man in manifests:
+        data = _s3_bytes(man.get("storage_key") or "")
+        if not data:
+            continue
+        for row in _iter_jsonl_gz(data):
+            if _match_scope(row, brand, dealer, branch):
+                rows.append(row)
+    return rows
+
+
 def stream_filter_page_from_archive_bytes(
     data: bytes,
     *,
@@ -157,6 +309,19 @@ async def _stream_s3_product_day_page(
     page: int = 1,
     page_size: int = 50,
 ) -> Optional[Dict[str, Any]]:
+    hub = await _stream_product_hub_day_page(
+        db,
+        date_key,
+        brand=brand,
+        dealer=dealer,
+        branch=branch,
+        part_number=part_number,
+        search=search,
+        page=page,
+        page_size=page_size,
+    )
+    if hub is not None:
+        return hub
     date_iso = date_key_to_iso(date_key)
     manifest = await am.find_s3_readable(db, MODULE_PRODUCT_HISTORY, archive_date=date_iso)
     if not manifest:
@@ -235,6 +400,9 @@ async def _stream_s3_product_day_page(
 
 async def _read_s3_product_day(db, date_key: str) -> List[Dict[str, Any]]:
     """Full-day load — used only for non-paginated callers (exports/summaries)."""
+    hub_rows = await _read_product_hub_day(db, date_key)
+    if hub_rows:
+        return hub_rows
     date_iso = date_key_to_iso(date_key)
     manifest = await am.find_s3_readable(db, MODULE_PRODUCT_HISTORY, archive_date=date_iso)
     if not manifest:
