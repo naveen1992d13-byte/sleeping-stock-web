@@ -130,19 +130,23 @@ def response_time_minutes_for_lines(line_item_count: int) -> int:
     return 60
 
 
-def reminder_offsets_minutes(sla_minutes: int) -> Tuple[int, int]:
-    """Return (first_reminder, urgent_reminder) offsets from send time."""
-    if sla_minutes <= 30:
-        return 15, 25
-    if sla_minutes <= 45:
-        return 20, 35
-    return 30, 50
+def reminder_offsets_minutes(sla_minutes: int) -> Tuple[int, int, int]:
+    """Return reminder offsets from send time within the existing SLA window.
+
+    Reminder 1 = first third, Reminder 2 = second third,
+    Reminder 3 = one minute before the unchanged deadline.
+    """
+    minutes = max(3, int(sla_minutes or 0))
+    first = max(1, minutes // 3)
+    second = max(first + 1, (2 * minutes) // 3)
+    third = max(second + 1, minutes - 1)
+    return first, second, third
 
 
 def compute_response_schedule(line_item_count: int, sent_at: datetime = None) -> dict:
     sent = sent_at or _now_utc()
     minutes = response_time_minutes_for_lines(line_item_count)
-    r1, r2 = reminder_offsets_minutes(minutes)
+    r1, r2, r3 = reminder_offsets_minutes(minutes)
     deadline = sent + timedelta(minutes=minutes)
     return {
         'line_item_count': int(line_item_count or 0),
@@ -151,6 +155,7 @@ def compute_response_schedule(line_item_count: int, sent_at: datetime = None) ->
         'response_deadline': deadline.isoformat(),
         'reminder_at': (sent + timedelta(minutes=r1)).isoformat(),
         'urgent_reminder_at': (sent + timedelta(minutes=r2)).isoformat(),
+        'reminder_3_at': (sent + timedelta(minutes=r3)).isoformat(),
         'response_status': 'awaiting',
     }
 
@@ -358,7 +363,24 @@ def evaluate_group_timer(header: dict, now: datetime = None) -> dict:
         'cancel_allowed': cancel_allowed,
         'reminder_at': header.get('reminder_at'),
         'urgent_reminder_at': header.get('urgent_reminder_at'),
+        'reminder_3_at': header.get('reminder_3_at'),
     }
+
+
+def is_own_ordering_branch(source: dict, order: dict) -> bool:
+    """True when the source branch is the exact ordering branch."""
+    return _clean(source.get('branch')).lower() == _clean(order.get('branch')).lower() and bool(_clean(order.get('branch')))
+
+
+def partition_own_branch_first(pool: List[dict], order: dict) -> List[dict]:
+    """Eligible own-branch rows first; remaining sources keep their relative order."""
+    own, others = [], []
+    for source in pool or []:
+        if is_own_ordering_branch(source, order):
+            own.append(source)
+        else:
+            others.append(source)
+    return own + others
 
 
 def eligible_pool(item: dict, order: dict, level: str, freezes: Set[str], aging_type: str, min_aging_days: float) -> List[dict]:
@@ -481,6 +503,10 @@ def compute_stage_flags(item: dict, order: dict, freezes: Set[str],
         active_stage = 'factory'
         next_source_allowed = False
 
+    expected_next_outcome = None
+    if remaining > 0 and factory_stage_status == 'open' and not branch_pool and not dealer_pool:
+        expected_next_outcome = 'Factory Order'
+
     return {
         'branch_stage_status': branch_stage_status,
         'dealer_stage_status': dealer_stage_status,
@@ -489,6 +515,132 @@ def compute_stage_flags(item: dict, order: dict, freezes: Set[str],
         'next_source_allowed': next_source_allowed,
         'eligible_branch_count': len(branch_pool),
         'eligible_dealer_count': len(dealer_pool),
+        'expected_next_outcome': expected_next_outcome,
+    }
+
+
+def evaluate_finish_readiness(order: Dict[str, Any], items: List[Dict[str, Any]], requests_by_item: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Order-level Finish is allowed only when no request is still open,
+    remaining qty is zero, and every factory-required row has a Factory Order No.
+    """
+    unresolved = []
+    missing_factory_order_no = []
+    remaining_open = []
+    for item in items or []:
+        item_id = item.get('id')
+        remaining = max(0, int(_f(item.get('remaining_qty'))))
+        if remaining > 0:
+            remaining_open.append(item_id)
+        for req in requests_by_item.get(item_id, []) if requests_by_item else []:
+            if _clean(req.get('status')) == 'Requested':
+                unresolved.append({
+                    'item_id': item_id,
+                    'request_number': req.get('request_number'),
+                    'level': req.get('level') or req.get('source_type'),
+                })
+        factory_qty = max(0, int(_f(item.get('factory_fulfilled_qty') or item.get('factory_order_qty') or item.get('factory_qty'))))
+        factory_required = remaining > 0 or factory_qty > 0
+        if factory_required and not _clean(item.get('system_order_number')):
+            missing_factory_order_no.append(item_id)
+    return {
+        'can_finish': not unresolved and not missing_factory_order_no and not remaining_open,
+        'unresolved_requests': unresolved,
+        'missing_factory_order_no': missing_factory_order_no,
+        'remaining_open_items': remaining_open,
+    }
+
+
+_ACCEPTED_REQUEST_STATUSES = {
+    'Approved', 'Partially Approved', 'Dispatched', 'Received', 'Completed',
+}
+
+
+def build_fulfillment_line(order: Dict[str, Any], item: Dict[str, Any], reqs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Final Order History fulfillment view for one part, with source breakup."""
+    ordering_branch = _clean(order.get('branch')).lower()
+    sources: List[Dict[str, Any]] = []
+    own_branch_fulfilled_qty = 0.0
+    accepted_qty = 0.0
+    source_dealer = ''
+    source_branch = ''
+    for req in reqs or []:
+        status = _clean(req.get('status'))
+        qty = _f(req.get('accepted_qty', req.get('approved_qty')))
+        if qty <= 0 or status not in _ACCEPTED_REQUEST_STATUSES:
+            continue
+        accepted_qty += qty
+        dealer = _clean(req.get('supplying_dealer'))
+        branch = _clean(req.get('supplying_branch'))
+        if branch.lower() == ordering_branch and ordering_branch:
+            own_branch_fulfilled_qty += qty
+        level = allocation_level(
+            {'dealer_name': dealer, 'branch': branch, 'level': req.get('source_type') or req.get('level')},
+            order,
+        )
+        sources.append({
+            'source_type': (level or 'branch').title(),
+            'source_dealer': dealer,
+            'source_branch': branch,
+            'accepted_qty': qty,
+            'request_number': req.get('request_number'),
+            'accepted_by': req.get('approved_by') or req.get('accepted_by') or req.get('decided_user_name'),
+            'accepted_at': req.get('approved_at') or req.get('accepted_at') or req.get('decided_at'),
+            'status': 'Accepted' if status == 'Approved' else status,
+            'level': level,
+        })
+        if not source_dealer:
+            source_dealer = dealer
+            source_branch = branch
+        elif dealer != source_dealer or branch != source_branch:
+            source_dealer = 'Multiple'
+            source_branch = 'Multiple'
+
+    factory_qty = _f(item.get('factory_fulfilled_qty') or item.get('factory_order_qty') or item.get('factory_qty'))
+    factory_order_no = _clean(item.get('system_order_number'))
+    remaining = _f(item.get('remaining_qty'))
+    required = _f(item.get('required_qty') or item.get('requested_qty'))
+    if remaining > 0:
+        final_status = 'Open'
+    elif factory_qty > 0 and factory_order_no:
+        final_status = 'Factory Completed'
+    elif factory_qty > 0:
+        final_status = 'Factory Order'
+    elif accepted_qty > 0:
+        final_status = 'Accepted'
+    else:
+        final_status = _clean(item.get('status') or item.get('request_status')) or 'Closed'
+
+    if factory_qty > 0 or factory_order_no:
+        sources.append({
+            'source_type': 'Factory',
+            'source_dealer': '',
+            'source_branch': '',
+            'accepted_qty': factory_qty,
+            'system_order_number': factory_order_no,
+            'factory_order_no': factory_order_no,
+            'accepted_by': item.get('factory_system_order_saved_by_name'),
+            'accepted_at': item.get('factory_system_order_saved_at'),
+            'status': 'Factory Completed' if factory_order_no else 'Factory Order',
+            'level': 'factory',
+        })
+
+    return {
+        'part_number': item.get('part_number') or '',
+        'part_name': item.get('description') or item.get('part_name') or '',
+        'requested_qty': required,
+        'ordered_qty': required,
+        'own_branch_fulfilled_qty': own_branch_fulfilled_qty,
+        'accepted_qty': accepted_qty,
+        'source_dealer': source_dealer,
+        'source_branch': source_branch,
+        'factory_qty': factory_qty,
+        'factory_order_no': factory_order_no,
+        'system_order_number': factory_order_no,
+        'final_status': final_status,
+        'fulfilled_qty': accepted_qty + factory_qty,
+        'remaining_qty': max(0.0, required - accepted_qty - factory_qty),
+        'request_status': item.get('request_status') or item.get('status') or final_status,
+        'sources': sources,
     }
 
 
@@ -967,5 +1119,8 @@ async def ensure_order_desk_indexes(db):
         ])
         await db.request_headers.create_index([('response_deadline', 1), ('response_status', 1)])
         await db.request_headers.create_index([('status', 1), ('response_deadline', 1)])
+        await db.mobile_request_push_claims.create_index(
+            [('request_group_key', 1), ('kind', 1)], unique=True,
+        )
     except Exception:
         pass
