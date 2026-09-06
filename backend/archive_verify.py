@@ -6,11 +6,32 @@ REAL S3 with matching size, checksum, and readable record count.
 
 from __future__ import annotations
 
+import contextvars
 import gzip
 from io import BytesIO
 from typing import Any, Dict, Optional
 
 from s3_storage import get_storage, sha256_bytes
+
+# Request-scoped HEAD cache so Storage page builders share one S3 HEAD per archive.
+_head_s3_cache: contextvars.ContextVar[Optional[Dict[str, Dict[str, Any]]]] = contextvars.ContextVar(
+    "nmts_head_s3_cache", default=None
+)
+
+
+def begin_head_cache() -> contextvars.Token:
+    return _head_s3_cache.set({})
+
+
+def end_head_cache(token: contextvars.Token) -> None:
+    _head_s3_cache.reset(token)
+
+
+def _remember_head(cid: str, report: Dict[str, Any]) -> Dict[str, Any]:
+    cache = _head_s3_cache.get()
+    if cache is not None and cid:
+        cache[cid] = report
+    return report
 
 # UI / API display states (map from manifest + live checks)
 DISPLAY_VERIFIED = "TRANSFERRED & VERIFIED"
@@ -53,6 +74,11 @@ def head_s3_status(manifest: Dict[str, Any]) -> Dict[str, Any]:
     Green requires: REAL S3 + object exists (s3 provider) + size match +
     manifest VERIFIED/PRUNED with eligible_for_prune and storage_backend s3.
     """
+    cache = _head_s3_cache.get()
+    cid = str(manifest.get("archive_id") or manifest.get("storage_key") or "")
+    if cache is not None and cid and cid in cache:
+        return cache[cid]
+
     storage = get_storage()
     status = storage.status()
     key = str(manifest.get("storage_key") or "")
@@ -77,18 +103,18 @@ def head_s3_status(manifest: Dict[str, Any]) -> Dict[str, Any]:
         report["reason"] = manifest.get("error") or "NO ELIGIBLE DATA"
         report["display_status"] = DISPLAY_NO_ELIGIBLE
         report["failure_code"] = ""
-        return report
+        return _remember_head(cid, report)
 
     if not key:
         report["failure_code"] = "missing_key"
         report["reason"] = "Wrong archive key/path"
         report["display_status"] = DISPLAY_NOT_TRANSFERRED
-        return report
+        return _remember_head(cid, report)
     if not storage.is_s3():
         report["failure_code"] = "s3_unavailable"
         report["reason"] = "S3 credentials/config unavailable — local fallback is not REAL S3"
         report["display_status"] = DISPLAY_NOT_TRANSFERRED
-        return report
+        return _remember_head(cid, report)
 
     head = storage.head(key)
     if head and str(head.get("storage_provider") or "").lower() == "local":
@@ -96,13 +122,13 @@ def head_s3_status(manifest: Dict[str, Any]) -> Dict[str, Any]:
         report["reason"] = "Object resolved to local fallback, not REAL S3"
         report["object_exists"] = True
         report["display_status"] = DISPLAY_VERIFICATION_FAILED
-        return report
+        return _remember_head(cid, report)
     report["object_exists"] = bool(head)
     if not head:
         report["failure_code"] = "object_missing"
         report["reason"] = "S3 object missing"
         report["display_status"] = DISPLAY_NOT_TRANSFERRED
-        return report
+        return _remember_head(cid, report)
 
     observed_size = int(head.get("file_size") or 0)
     report["observed_size"] = observed_size
@@ -112,7 +138,7 @@ def head_s3_status(manifest: Dict[str, Any]) -> Dict[str, Any]:
         report["failure_code"] = "size_mismatch"
         report["reason"] = f"file size mismatch expected={expected_size} got={observed_size}"
         report["display_status"] = DISPLAY_VERIFICATION_FAILED
-        return report
+        return _remember_head(cid, report)
 
     backend = str(manifest.get("storage_backend") or "").lower()
     status_ok = manifest.get("status") in {"VERIFIED", "PRUNED"}
@@ -127,19 +153,19 @@ def head_s3_status(manifest: Dict[str, Any]) -> Dict[str, Any]:
         report["display_status"] = (
             DISPLAY_PRUNED if manifest.get("status") == "PRUNED" else DISPLAY_VERIFIED
         )
-        return report
+        return _remember_head(cid, report)
 
     mstatus = str(manifest.get("status") or "")
     if mstatus in {"CREATING", "UPLOADED"}:
         report["display_status"] = DISPLAY_PENDING if mstatus == "CREATING" else DISPLAY_RUNNING
         report["reason"] = mstatus
-        return report
+        return _remember_head(cid, report)
     report["failure_code"] = "manifest_not_verified"
     report["reason"] = manifest.get("error") or "Archive not TRANSFERRED & VERIFIED"
     report["display_status"] = (
         DISPLAY_VERIFICATION_FAILED if mstatus == "VERIFIED" else DISPLAY_NOT_TRANSFERRED
     )
-    return report
+    return _remember_head(cid, report)
 
 
 def physical_s3_verify(

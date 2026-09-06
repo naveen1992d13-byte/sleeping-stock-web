@@ -1865,6 +1865,104 @@ def test_delete_locked_until_physical_verify():
     asyncio.get_event_loop().run_until_complete(_run())
 
 
+def test_history_prefers_mongo_while_unpruned_and_s3_after_prune():
+    async def _run():
+        db = FakeDB()
+        date_iso = "2026-04-01"
+        date_key = "20260401"
+        db.products.docs = [
+            {
+                "part_number": "KEEP1",
+                "item_name": "Keep",
+                "quantity": 2,
+                "total_value": 8,
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "B1",
+                "publish_status": "Published",
+                "active_date_key": date_key,
+            }
+        ]
+        with _FakeS3Mode():
+            archived = await ha.archive_product_history_for_date(db, date_iso)
+            assert archived["status"] == "verified"
+            still_mongo = await hh.read_product_history(
+                db, date_key=date_iso, brand="Hyundai", hot_days=1, page=1, page_size=50, record_usage=False
+            )
+            assert still_mongo["sources"].get(date_key) == "mongo"
+            assert still_mongo["mongo_count"] >= 1
+            assert any(r["part_number"] == "KEEP1" for r in still_mongo["rows"])
+
+            man = archived["manifest"]
+            await am.mark_status(
+                db,
+                man["archive_id"],
+                am.STATUS_PRUNED,
+                pruned_at="2026-04-02T00:00:00+00:00",
+                eligible_for_prune=False,
+                storage_backend="s3",
+            )
+            db.products.docs = []
+            from_s3 = await hh.read_product_history(
+                db, date_key=date_iso, brand="Hyundai", hot_days=1, page=1, page_size=50, record_usage=False
+            )
+            assert from_s3["sources"].get(date_key) == "s3"
+            assert from_s3["s3_count"] >= 1
+            assert any(r["part_number"] == "KEEP1" for r in from_s3["rows"])
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_mongo_delete_blocked_when_prune_flag_false():
+    import archive_cleanup as ac
+
+    async def _run():
+        db = FakeDB()
+        date_iso = "2026-04-03"
+        db.products.docs = [
+            {
+                "part_number": "PKEEP",
+                "item_name": "Keep",
+                "quantity": 1,
+                "total_value": 1,
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "B1",
+                "publish_status": "Published",
+                "active_date_key": "20260403",
+            }
+        ]
+        with _FakeS3Mode():
+            archived = await ha.archive_product_history_for_date(db, date_iso)
+            aid = archived["manifest"]["archive_id"]
+            report = await ac.verify_archive(db, archive_id=aid)
+            assert report["safe_to_delete"] is False
+            assert report.get("archive_prune_enabled") is False
+            assert "ARCHIVE_PRUNE_ENABLED" in str(report.get("lock_reason") or report.get("reason") or "")
+            rev = await ac.reverify_archive(db, archive_id=aid)
+            assert rev["read_only"] is True
+            assert rev["safe_to_delete"] is False
+            assert rev.get("action") == "Re-Verify"
+            blocked = await ac.delete_mongo_for_archive(
+                db,
+                archive_id=aid,
+                current_user=SimpleNamespace(role="master", id="m1", username="Master", email="a@b.c"),
+                confirm_text="DELETE",
+            )
+            assert blocked["status"] == "blocked"
+            assert len(db.products.docs) == 1
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_storage_ui_reverify_and_prune_gate_contract():
+    src = Path(ROOT.parent, "frontend/src/pages/StorageCostMonitor.js").read_text(encoding="utf-8")
+    assert "Re-Verify" in src
+    assert "/re-verify" in src
+    assert "archive_prune_enabled" in src
+    assert "Retry Archive" in src
+
+
 def test_menu_analytics_label_and_storage_nav_contract():
     src = Path(ROOT.parent, "frontend/src/config/menuConfig.js").read_text(encoding="utf-8")
     assert "label: 'Analytics'" in src

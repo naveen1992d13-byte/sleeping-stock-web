@@ -7688,6 +7688,14 @@ async def storage_archive_verify(
     return await ac.verify_archive(db, archive_id=archive_id, brand=brand, dealer=dealer, branch=branch)
 
 
+@api_router.post("/storage/archives/{archive_id}/re-verify")
+async def storage_archive_reverify(archive_id: str, current_user: UserResponse = Depends(get_current_user)):
+    """Master-only read-only physical Re-Verify. Never deletes Mongo or S3."""
+    await _ensure_master(current_user)
+    import archive_cleanup as ac
+    return await ac.reverify_archive(db, archive_id=archive_id)
+
+
 @api_router.post("/storage/archives/{archive_id}/dry-run-delete")
 async def storage_archive_dry_run_delete(
     archive_id: str,
@@ -7778,7 +7786,11 @@ async def maintenance_guard(request: Request, call_next):
         if maint.is_mutating_method(method) and not maint.is_master_readonly_path(api_path):
             # Allow archive retry / storage read helpers that are monitoring-critical
             if api_path.startswith("/storage/archives") and method == "POST" and (
-                api_path.endswith("/retry") or "/daily/run" in api_path or "/product-history/run" in api_path
+                api_path.endswith("/retry")
+                or api_path.endswith("/re-verify")
+                or api_path.endswith("/verify")
+                or "/daily/run" in api_path
+                or "/product-history/run" in api_path
             ):
                 return await call_next(request)
             from starlette.responses import JSONResponse
