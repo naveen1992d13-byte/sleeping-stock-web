@@ -340,6 +340,23 @@ async def _scheduler_loop(db) -> None:
                                 )
                         except Exception as exc:
                             logger.error("Daily coordinated archive failed: %s", exc)
+
+                # Historical Mongo cleanup: prune ONLY past dates whose S3 archive
+                # is VERIFIED (S3 = historical, Mongo = live). Fully gated by
+                # ARCHIVE_PRUNE_ENABLED (default false) and delegated per-date to
+                # prune_product_history_date, which refuses today/live data, honors
+                # the Mongo hot window, re-verifies the object before deleting, and
+                # leaves Mongo untouched if verification fails.
+                try:
+                    prune_sweep = await ha.prune_eligible_mongo_history(db)
+                    if prune_sweep.get("status") == "ok" and prune_sweep.get("deleted"):
+                        logger.info(
+                            "Nightly historical Mongo prune: dates=%s deleted=%s",
+                            prune_sweep.get("dates"),
+                            prune_sweep.get("deleted"),
+                        )
+                except Exception as exc:
+                    logger.warning("Nightly historical Mongo prune skipped: %s", exc)
             else:
                 # Outside window — clear in-memory freeze so next night starts fresh.
                 active_archive_date = None
