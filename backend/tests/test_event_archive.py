@@ -46,11 +46,12 @@ def _reset_storage():
     s3_storage.reset_storage_for_tests()
 
 
-def _seed_upload(db, upload_id="up-1", date_iso="2026-09-04", status="Published"):
+def _seed_upload(db, upload_id="up-1", date_iso="2026-09-04", status="Published", upload_no=None):
+    upload_no = upload_no or ("PU26090401" if upload_id == "up-1" else f"PU-{upload_id}")
     db.uploads.docs.append(
         {
             "id": upload_id,
-            "upload_no": "PU26090401",
+            "upload_no": upload_no,
             "upload_type": "product",
             "date_key": date_iso.replace("-", ""),
             "created_at": f"{date_iso}T10:00:00+05:30",
@@ -102,16 +103,17 @@ def test_archive_keys_current_vs_cancelled():
     can = ak.product_history_products_key(
         "2026-09-04", "up-1", cancelled=True, brand="Hyundai", dealer="DealerA", branch="B1", upload_no="PU26090401"
     )
-    assert "/product-history/2026-09-04/current/up-1/" in cur
-    assert cur.endswith("Hyundai_DealerA_B1_PU26090401_ProductHistory.jsonl.gz")
-    assert "/product-history/2026-09-04/cancelled/up-1/" in can
+    assert cur == "test/product-history/2026-09-04/current/Hyundai_DealerA_B1_PU26090401_ProductHistory.jsonl.gz"
+    assert "up-1" not in cur
+    assert can == "test/product-history/2026-09-04/cancelled/Hyundai_DealerA_B1_PU26090401_ProductHistory.jsonl.gz"
     assert can.endswith("Hyundai_DealerA_B1_PU26090401_ProductHistory.jsonl.gz")
     assert cur != can
     assert ak.cancelled_key_from_current(cur) == can
     up = ak.upload_original_key(
         "2026-09-04", "up-1", brand="Hyundai", dealer="DealerA", branch="B1", upload_no="PU26090401"
     )
-    assert up.endswith("/current/up-1/Hyundai_DealerA_B1_PU26090401_UploadCenter.xlsx")
+    assert up.endswith("/current/Hyundai_DealerA_B1_PU26090401_UploadCenter.xlsx")
+    assert "/current/up-1/" not in up
     assert "test/orders/" in ak.order_package_key("2026-09-04", "ord-1", order_number="ORDER123")
     assert ak.order_package_key("2026-09-04", "ord-1", brand="Hyundai", dealer="DealerA", branch="B1", order_number="ORDER123").endswith(
         "Hyundai_DealerA_B1_ORDER123_Order.jsonl.gz"
@@ -130,7 +132,8 @@ def test_publish_event_archive_and_history_reads_s3():
             assert man["status"] == am.STATUS_VERIFIED
             assert man["entity_id"] == "up-1"
             assert man["lifecycle_status"] == am.LIFECYCLE_ACTIVE
-            assert "/product-history/2026-09-04/current/up-1/" in man["storage_key"]
+            assert man["storage_key"] == "test/product-history/2026-09-04/current/Hyundai_DealerA_B1_PU26090401_ProductHistory.jsonl.gz"
+            assert "up-1" not in man["storage_key"]
             assert man["storage_key"].endswith("_ProductHistory.jsonl.gz")
             hist = await hh.read_product_history(db, date_key="20260904", brand="Hyundai", hot_days=1)
             # Today-ish hot window may prefer Mongo; force cold read by hot_days=1 with past date
@@ -152,8 +155,8 @@ def test_publish_event_archive_and_history_reads_s3():
 def test_same_day_republish_new_immutable_and_supersede():
     async def _go():
         db = FakeDB()
-        _seed_upload(db, "up-old")
-        _seed_upload(db, "up-new")
+        _seed_upload(db, "up-old", upload_no="PU-OLD")
+        _seed_upload(db, "up-new", upload_no="PU-NEW")
         db.products.docs[-1]["part_number"] = "PN-NEW"
         with _FakeS3Mode():
             first = await ea.handle_publish_completed(db, {"upload_id": "up-old"})
@@ -211,7 +214,8 @@ def test_cancelled_upload_moves_to_cancelled_storage():
             cancelled = await ea.handle_upload_cancelled(db, {"upload_id": "up-c", "reason": "Wrong file", "cancelled_by": "admin"})
             assert cancelled["status"] == "verified"
             dest = cancelled["cancelled_storage_key"]
-            assert "/cancelled/up-c/" in dest
+            assert dest.endswith("/cancelled/Hyundai_DealerA_B1_PUC1_UploadCenter.xlsx")
+            assert "/cancelled/up-c/" not in dest
             assert dest.endswith("_UploadCenter.xlsx")
             storage = s3_storage.get_storage()
             assert not storage.exists(key)  # SAFE MOVE: current gone
@@ -420,6 +424,25 @@ def test_night_verify_catch_up_and_prune_stays_off():
     _run(_go())
 
 
+def test_publish_of_cancelled_upload_lands_in_cancelled_not_current():
+    async def _go():
+        db = FakeDB()
+        _seed_upload(db, upload_id="up-late", status="Cancelled", upload_no="PU-LATE")
+        db.uploads.docs[0]["publish_status"] = "Cancelled"
+        db.uploads.docs[0]["status"] = "Cancelled"
+        with _FakeS3Mode():
+            result = await ea.handle_publish_completed(db, {"upload_id": "up-late"})
+            key = result["manifest"]["storage_key"]
+            assert "/cancelled/" in key
+            assert "/current/" not in key
+            assert "up-late" not in key.split("/")
+            storage = s3_storage.get_storage()
+            assert storage.exists(key)
+            assert not storage.exists(key.replace("/cancelled/", "/current/"))
+
+    _run(_go())
+
+
 def test_latest_live_product_hub_not_deleted_by_event_path():
     async def _go():
         db = FakeDB()
@@ -434,7 +457,7 @@ def test_latest_live_product_hub_not_deleted_by_event_path():
 
 def test_safe_move_keeps_source_when_dest_verify_fails():
     storage = s3_storage.get_storage()
-    src = storage.key("uploads", "2026-09-04", "current", "x", "Hyundai_FPL_Vanagaram_PU1_UploadCenter.xlsx")
+    src = storage.key("uploads", "2026-09-04", "current", "Hyundai_FPL_Vanagaram_PU1_UploadCenter.xlsx")
     dest = src.replace("/current/", "/cancelled/")
     storage.upload_bytes(src, b"keep-me")
     orig = storage.verify_object

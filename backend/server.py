@@ -3365,7 +3365,7 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
     try:
         stored_excel = await file_objects.store_bytes(
             module="uploads",
-            relative_key=f"{date_iso}/current/{upload_id}/{upload_filename}",
+            relative_key=f"{date_iso}/current/{upload_filename}",
             data=raw_bytes,
             original_filename=file.filename or "product_upload.xlsx",
             content_type=file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

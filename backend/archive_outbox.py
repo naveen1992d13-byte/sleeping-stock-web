@@ -130,6 +130,7 @@ async def claim_next(db, owner: str = _OWNER) -> Optional[Dict[str, Any]]:
                 "updated_at": now,
             }
         },
+        sort=[("created_at", 1)],
         return_document=True,
     )
     if claimed:
@@ -221,3 +222,19 @@ async def drain_until_idle(db, *, max_batches: int = 50) -> Dict[str, Any]:
         if batch["processed"] == 0:
             break
     return totals
+
+
+async def _drain_guarded(db) -> None:
+    try:
+        await drain_once(db)
+    except Exception as exc:
+        logger.warning("archive outbox kick drain failed: %s", type(exc).__name__)
+
+
+def schedule_drain(db) -> None:
+    """Background drain so publish/cancel archive immediately without waiting on the scheduler."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_drain_guarded(db))

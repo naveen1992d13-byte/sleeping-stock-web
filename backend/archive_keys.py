@@ -1,11 +1,14 @@
 """Write-once S3 key layout for event-driven archive.
 
-Visible current vs cancelled separation, unique per entity id:
+Upload Center and Product History have no UUID folder. Filename is unique:
 
-  {env}/uploads/{date}/current|{cancelled}/{upload_id}/Brand_Dealer_Branch_Ref_UploadCenter.xlsx
-  {env}/product-history/{date}/current|{cancelled}/{upload_id}/Brand_Dealer_Branch_Ref_ProductHistory.jsonl.gz
-  {env}/orders/{date}/current|{cancelled}/{order_id}/Brand_Dealer_Branch_Ref_Order.jsonl.gz
-  {env}/requests/{date}/current|{cancelled}/{request_id}/Brand_Dealer_Branch_Ref_Request.jsonl.gz
+  {env}/uploads/{date}/current|cancelled/Brand_Dealer_Branch_Ref_UploadCenter.xlsx
+  {env}/product-history/{date}/current|cancelled/Brand_Dealer_Branch_Ref_ProductHistory.jsonl.gz
+
+Orders/Requests keep an entity folder (workflow unchanged):
+
+  {env}/orders/{date}/current|cancelled/{order_id}/Brand_Dealer_Branch_Ref_Order.jsonl.gz
+  {env}/requests/{date}/current|cancelled/{request_id}/Brand_Dealer_Branch_Ref_Request.jsonl.gz
 
 Date lives only in the folder path — never in the filename.
 
@@ -132,6 +135,15 @@ def _entity_folder(module: str, archive_date, lifecycle: str, entity_id: str, fi
     return f"{env}/{module}/{day}/{life}/{eid}/{fname}"
 
 
+def _lifecycle_file_key(module: str, archive_date, lifecycle: str, filename: str) -> str:
+    """{env}/{module}/{date}/{current|cancelled}/{filename} — no UUID folder."""
+    env = _prefix()
+    day = _ymd(archive_date)
+    life = LIFECYCLE_CANCELLED if lifecycle == LIFECYCLE_CANCELLED else LIFECYCLE_CURRENT
+    fname = str(filename or "archive.bin").split("/")[-1]
+    return f"{env}/{module}/{day}/{life}/{fname}"
+
+
 def cancelled_key_from_current(storage_key: str) -> str:
     """Same filename/entity folder, lifecycle current → cancelled. No-op if already cancelled."""
     key = str(storage_key or "")
@@ -165,11 +177,10 @@ def upload_original_key(
     fname = filename or archive_filename(
         brand, dealer, branch, upload_no or upload_id, MODULE_LABEL_UPLOAD, "xlsx"
     )
-    return _entity_folder(
+    return _lifecycle_file_key(
         MODULE_UPLOADS,
         archive_date,
         LIFECYCLE_CANCELLED if cancelled else LIFECYCLE_CURRENT,
-        upload_id,
         fname,
     )
 
@@ -188,11 +199,10 @@ def product_history_products_key(
     fname = filename or archive_filename(
         brand, dealer, branch, upload_no or upload_id, MODULE_LABEL_PRODUCT_HISTORY, "jsonl.gz"
     )
-    return _entity_folder(
+    return _lifecycle_file_key(
         MODULE_PRODUCT_HISTORY,
         archive_date,
         LIFECYCLE_CANCELLED if cancelled else LIFECYCLE_CURRENT,
-        upload_id,
         fname,
     )
 
@@ -219,11 +229,10 @@ def product_history_companion_key(
     if stem.endswith(".jsonl.gz"):
         stem = stem[: -len(".jsonl.gz")]
     companion = str(name or "companion").split("/")[-1]
-    return _entity_folder(
+    return _lifecycle_file_key(
         MODULE_PRODUCT_HISTORY,
         archive_date,
         LIFECYCLE_CANCELLED if cancelled else LIFECYCLE_CURRENT,
-        upload_id,
         f"{stem}_{companion}",
     )
 

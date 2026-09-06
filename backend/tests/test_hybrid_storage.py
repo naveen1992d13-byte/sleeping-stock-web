@@ -235,13 +235,16 @@ class FakeCollection:
         matches = [dict(d) for d in self.docs if self._match(d, query or {})]
         return FakeCursor(matches)
 
-    async def find_one_and_update(self, query, update, return_document=None, projection=None, upsert=False):
-        for i, d in enumerate(self.docs):
-            if self._match(d, query):
-                applied = self._apply({**d, "_existing": True}, update)
-                applied.pop("_existing", None)
-                self.docs[i] = applied
-                return dict(applied)
+    async def find_one_and_update(self, query, update, return_document=None, projection=None, upsert=False, sort=None):
+        matches = [(i, d) for i, d in enumerate(self.docs) if self._match(d, query)]
+        if sort:
+            for field, direction in reversed(list(sort)):
+                matches.sort(key=lambda pair: str(pair[1].get(field) or ""), reverse=direction < 0)
+        for i, d in matches:
+            applied = self._apply({**d, "_existing": True}, update)
+            applied.pop("_existing", None)
+            self.docs[i] = applied
+            return dict(applied)
         if upsert:
             result = await self.update_one(query, update, upsert=True)
             if result.upserted_id:

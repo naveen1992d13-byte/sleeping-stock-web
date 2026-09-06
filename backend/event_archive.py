@@ -434,13 +434,14 @@ async def handle_upload_cancelled(db, payload: Dict[str, Any]) -> Dict[str, Any]
 
 
 async def handle_publish_completed(db, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Archive one published upload batch to product-history/{date}/current/{upload_id}/."""
+    """Archive one published upload batch to product-history/{date}/current/ (or cancelled/ if already cancelled)."""
     upload_id = _text(payload.get("upload_id"))
     if not upload_id:
         return {"status": "error", "error": "upload_id required"}
     upload = await db.uploads.find_one({"id": upload_id}, {"_id": 0}) or {}
     archive_date = _upload_archive_date(upload) or payload.get("archive_date")
     date_key = ha.iso_to_date_key(archive_date)
+    already_cancelled = _text(upload.get("status") or "") == "Cancelled" or _text(upload.get("publish_status") or "") == "Cancelled"
 
     rows = await db.products.find({"upload_id": upload_id, "publish_status": "Published"}, {"_id": 0}).to_list(500000)
     if not rows:
@@ -456,12 +457,14 @@ async def handle_publish_completed(db, payload: Dict[str, Any]) -> Dict[str, Any
         "branch": upload.get("branch"),
         "upload_no": upload.get("upload_no"),
     }
-    products_key = ak.product_history_products_key(archive_date, upload_id, cancelled=False, **key_kwargs)
+    products_key = ak.product_history_products_key(
+        archive_date, upload_id, cancelled=already_cancelled, **key_kwargs
+    )
     summary_key = ak.product_history_companion_key(
-        archive_date, upload_id, "batch-summaries.json", cancelled=False, **key_kwargs
+        archive_date, upload_id, "batch-summaries.json", cancelled=already_cancelled, **key_kwargs
     )
     snap_key = ak.product_history_companion_key(
-        archive_date, upload_id, "analytics-snapshots.json", cancelled=False, **key_kwargs
+        archive_date, upload_id, "analytics-snapshots.json", cancelled=already_cancelled, **key_kwargs
     )
 
     products_bytes = await asyncio.to_thread(ha._gzip_jsonl, rows)
@@ -506,7 +509,7 @@ async def handle_publish_completed(db, payload: Dict[str, Any]) -> Dict[str, Any
         source_collection="products",
         record_count=len(rows),
         entity_id=upload_id,
-        lifecycle_status=LIFECYCLE_ACTIVE,
+        lifecycle_status=LIFECYCLE_CANCELLED if already_cancelled else LIFECYCLE_ACTIVE,
         extra_fields=extra,
     )
     return result
@@ -819,6 +822,7 @@ async def maybe_enqueue_publish(db, upload: Dict[str, Any], *, actor_id: str = "
                     "reason": "same-day republish",
                 },
             )
+    ao.schedule_drain(db)
 
 
 async def maybe_enqueue_upload_stored(db, upload: Dict[str, Any]) -> None:
@@ -832,6 +836,7 @@ async def maybe_enqueue_upload_stored(db, upload: Dict[str, Any]) -> None:
             "file_size": upload.get("file_size"),
         },
     )
+    ao.schedule_drain(db)
 
 
 async def maybe_enqueue_upload_cancelled(db, upload: Dict[str, Any], *, actor_id: str = "", reason: str = "", now_iso: str = "") -> None:
@@ -846,6 +851,7 @@ async def maybe_enqueue_upload_cancelled(db, upload: Dict[str, Any], *, actor_id
             "reason": reason,
         },
     )
+    ao.schedule_drain(db)
 
 
 async def maybe_enqueue_order_terminal(db, order_id: str, *, status: str = "", actor_id: str = "", reason: str = "") -> None:
