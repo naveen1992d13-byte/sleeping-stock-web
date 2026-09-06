@@ -15,6 +15,7 @@ import logging
 import mimetypes
 import os
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -112,8 +113,38 @@ def archive_scheduler_enabled() -> bool:
     return _env_bool(ENV_ARCHIVE_SCHEDULER_ENABLED, True)
 
 
+def _looks_like_access_key_id(value: str) -> bool:
+    text = _clean_env(value)
+    return bool(text) and len(text) <= 24 and (text.startswith("AKIA") or text.startswith("ASIA"))
+
+
+def _looks_like_secret_access_key(value: str) -> bool:
+    text = _clean_env(value)
+    if not text:
+        return False
+    if "/" in text or "+" in text:
+        return True
+    return len(text) >= 36 and not _looks_like_access_key_id(text)
+
+
+def maybe_unswap_aws_keys(access_key: str, secret_key: str) -> Tuple[str, str, bool]:
+    """If env slots are reversed (secret in ACCESS, AKIA in SECRET), unswap in-memory only."""
+    access = _clean_env(access_key)
+    secret = _clean_env(secret_key)
+    if _looks_like_secret_access_key(access) and _looks_like_access_key_id(secret):
+        return secret, access, True
+    return access, secret, False
+
+
 def resolve_bucket() -> str:
-    return (_clean_env(os.getenv(ENV_NMTS_S3_BUCKET)) or _clean_env(os.getenv(ENV_AWS_S3_BUCKET)))
+    """Prefer NMTS_S3_BUCKET. Ignore AWS_S3_BUCKET when it is actually an access-key id."""
+    nmts = _clean_env(os.getenv(ENV_NMTS_S3_BUCKET))
+    if nmts and not _looks_like_access_key_id(nmts):
+        return nmts
+    alias = _clean_env(os.getenv(ENV_AWS_S3_BUCKET))
+    if alias and not _looks_like_access_key_id(alias):
+        return alias
+    return nmts if nmts and not _looks_like_access_key_id(nmts) else ""
 
 
 def _clean_env(value: Optional[str]) -> str:
@@ -297,6 +328,8 @@ class S3StorageService:
         )
         self._client = None
         self._mode = "local"
+        self._keys_unswapped = False
+        self._init_error_code = ""
         self._refresh_from_env()
         self._init_client()
 
@@ -304,8 +337,12 @@ class S3StorageService:
         self.region = _clean_env(os.getenv(ENV_AWS_REGION)) or _clean_env(os.getenv("AWS_DEFAULT_REGION")) or "us-east-1"
         self.bucket = resolve_bucket()
         self.env = storage_env()
-        self.access_key = _clean_env(os.getenv(ENV_AWS_ACCESS_KEY_ID))
-        self.secret_key = _clean_env(os.getenv(ENV_AWS_SECRET_ACCESS_KEY))
+        access = _clean_env(os.getenv(ENV_AWS_ACCESS_KEY_ID))
+        secret = _clean_env(os.getenv(ENV_AWS_SECRET_ACCESS_KEY))
+        access, secret, swapped = maybe_unswap_aws_keys(access, secret)
+        self.access_key = access
+        self.secret_key = secret
+        self._keys_unswapped = swapped
         self.session_token = _clean_env(os.getenv("AWS_SESSION_TOKEN"))
 
     def _credentials_look_valid(self) -> bool:
@@ -377,6 +414,10 @@ class S3StorageService:
         HeadBucket IAM deny does not force local mode: least-privilege keys often
         allow PutObject on uploads/* without s3:ListBucket. Invalid credentials
         and missing buckets still fall through to local.
+
+        HeadBucket Error.Code "403" / Message "Forbidden" is ambiguous: valid
+        keys without s3:ListBucket AND unknown access-key ids both look like
+        that. Confirm the access key id with STS before claiming REAL S3.
         """
         try:
             self._client.head_bucket(Bucket=self.bucket)
@@ -392,6 +433,7 @@ class S3StorageService:
                         return
                     except Exception as retry_exc:
                         if self._is_head_bucket_iam_deny(retry_exc):
+                            self._require_recognized_access_key()
                             logger.warning(
                                 "S3 HeadBucket not permitted (%s); keeping REAL S3 client for object PUT",
                                 _aws_error_code(retry_exc),
@@ -399,6 +441,7 @@ class S3StorageService:
                             return
                         raise
             if self._is_head_bucket_iam_deny(exc):
+                self._require_recognized_access_key()
                 logger.warning(
                     "S3 HeadBucket not permitted (%s); keeping REAL S3 client for object PUT",
                     _aws_error_code(exc),
@@ -406,8 +449,22 @@ class S3StorageService:
                 return
             raise
 
+    def _require_recognized_access_key(self) -> None:
+        """Reject unknown/revoked access key ids. Does not log identity values."""
+        import boto3
+
+        kwargs: Dict[str, Any] = {
+            "region_name": self.region or "us-east-1",
+            "aws_access_key_id": self.access_key,
+            "aws_secret_access_key": self.secret_key,
+        }
+        if self.session_token:
+            kwargs["aws_session_token"] = self.session_token
+        boto3.client("sts", **kwargs).get_caller_identity()
+
     def _init_client(self) -> None:
         self._refresh_from_env()
+        self._init_error_code = ""
         if not self._credentials_look_valid():
             self._client = None
             self._mode = "local"
@@ -425,6 +482,7 @@ class S3StorageService:
             self._client = None
             self._mode = "local"
             err_code = _aws_error_code(exc)
+            self._init_error_code = err_code or type(exc).__name__
             logger.warning(
                 "S3 init failed (%s%s); using local object store",
                 type(exc).__name__,
@@ -620,14 +678,68 @@ class S3StorageService:
                 f"Move verification failed for dest {dest_key} — source {src_key} left untouched"
             )
 
-        self.delete(src_key)
-        if self.exists(src_key):
+        self._delete_source_after_verified_dest(src_key)
+        if self._object_present_on_primary(src_key):
             raise S3StorageError(
                 f"Source {src_key} still present after dest verified — retry will delete source only"
             )
         if not self.exists(dest_key):
             raise S3StorageError(f"Dest {dest_key} missing after move")
         return copied
+
+    def _s3_head(self, key: str) -> Optional[Dict[str, Any]]:
+        """REAL S3 head only — never treat local leftovers as the live object."""
+        if not self.is_s3() or not self._client:
+            return None
+        try:
+            resp = self._client.head_object(Bucket=self.bucket, Key=key)
+            meta = resp.get("Metadata") or {}
+            return {
+                "storage_key": key,
+                "content_type": resp.get("ContentType") or "application/octet-stream",
+                "file_size": int(resp.get("ContentLength") or 0),
+                "sha256": meta.get("sha256"),
+                "etag": resp.get("ETag"),
+                "exists": True,
+                "storage_provider": "s3",
+            }
+        except Exception as exc:
+            code = _aws_error_code(exc)
+            http = self._http_status(exc)
+            if code in {"404", "NoSuchKey", "NotFound"} or http == 404:
+                return None
+            name = type(exc).__name__
+            if "NoSuchKey" in name or "404" in str(exc):
+                return None
+            raise
+
+    def _object_present_on_primary(self, key: str) -> bool:
+        if self.is_s3():
+            return self._s3_head(key) is not None
+        return self._local.head(key) is not None
+
+    def _delete_source_after_verified_dest(self, key: str) -> None:
+        """Delete source only after dest verify. Retry; do not swallow S3 delete errors."""
+        last_err: Optional[BaseException] = None
+        for _ in range(5):
+            if self.is_s3() and self._client:
+                try:
+                    self._client.delete_object(Bucket=self.bucket, Key=key)
+                    last_err = None
+                except Exception as exc:
+                    last_err = exc
+                    logger.warning("S3 delete_object failed for %s: %s", key, type(exc).__name__)
+            self._local.delete(key)
+            if not self._object_present_on_primary(key):
+                return
+            time.sleep(0.15)
+        if last_err:
+            raise S3StorageError(
+                f"S3 delete failed for source {key} after dest verified ({type(last_err).__name__})"
+            ) from last_err
+        raise S3StorageError(
+            f"Source {key} still present after dest verified — retry will delete source only"
+        )
 
     def download_bytes(self, key: str) -> Tuple[bytes, str]:
         if self.is_s3():
@@ -778,6 +890,7 @@ class S3StorageService:
             "env": self.env,
             "access_key_present": bool(self.access_key),
             "access_key_looks_valid": self._credentials_look_valid(),
+            "aws_key_slots_unswapped": bool(getattr(self, "_keys_unswapped", False)),
             "archive_prune_enabled": archive_prune_enabled(),
             "archive_scheduler_enabled": archive_scheduler_enabled(),
             "product_mongo_hot_days": product_mongo_hot_days(),
@@ -788,7 +901,13 @@ class S3StorageService:
             "warning": (
                 None
                 if real_s3
-                else "Cloud archive not active — MongoDB pruning disabled."
+                else (
+                    "AWS access key id was rejected (not a live IAM key). "
+                    "Cloud archive not active — MongoDB pruning disabled."
+                    if str(getattr(self, "_init_error_code", "") or "")
+                    in {"InvalidAccessKeyId", "InvalidClientTokenId"}
+                    else "Cloud archive not active — MongoDB pruning disabled."
+                )
             ),
         }
 

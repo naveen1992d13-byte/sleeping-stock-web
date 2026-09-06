@@ -63,6 +63,7 @@ class _FakeS3Mode:
             "delete": s.delete,
             "copy_object": s.copy_object,
             "move_object": s.move_object,
+            "object_present": getattr(s, "_object_present_on_primary", None),
             "mode": s._mode,
             "client": s._client,
         }
@@ -156,6 +157,7 @@ class _FakeS3Mode:
         s.delete = fake_delete  # type: ignore
         s.copy_object = fake_copy  # type: ignore
         s.move_object = fake_move  # type: ignore
+        s._object_present_on_primary = fake_exists  # type: ignore
         return s
 
     def __exit__(self, *exc):
@@ -172,6 +174,8 @@ class _FakeS3Mode:
             s.copy_object = self._orig["copy_object"]  # type: ignore
         if "move_object" in self._orig:
             s.move_object = self._orig["move_object"]  # type: ignore
+        if self._orig.get("object_present") is not None:
+            s._object_present_on_primary = self._orig["object_present"]  # type: ignore
         s._mode = self._orig["mode"]
         s._client = self._orig["client"]
         return False

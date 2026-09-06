@@ -3810,6 +3810,7 @@ async def cancel_upload_v2(upload_id: str, data: CancelUploadRequest, current_us
     await db.uploads.update_one({"id": upload_id}, {"$set": {
         "upload_no": cancel_no,
         "cancelled_upload_no": cancel_no,
+        "original_upload_no": upload.get("original_upload_no") or old_no,
         "status": "Cancelled",
         "publish_status": "Cancelled",
         "cancel_reason": reason,
@@ -3823,7 +3824,12 @@ async def cancel_upload_v2(upload_id: str, data: CancelUploadRequest, current_us
     try:
         await event_archive.maybe_enqueue_upload_cancelled(
             db,
-            upload,
+            {
+                **upload,
+                "upload_no": cancel_no,
+                "cancelled_upload_no": cancel_no,
+                "original_upload_no": upload.get("original_upload_no") or old_no,
+            },
             actor_id=current_user.id,
             reason=reason,
             now_iso=now.isoformat() if hasattr(now, "isoformat") else str(now),

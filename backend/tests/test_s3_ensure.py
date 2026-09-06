@@ -66,7 +66,10 @@ def _service_with_fake_client(monkeypatch, tmp_path, client, *, key="AKIATESTKEY
     svc._local = m._LocalObjectStore(Path(tmp_path))
     svc._client = None
     svc._mode = "local"
+    svc._init_error_code = ""
     svc._make_client = lambda region: client
+    # Unit tests do not call live STS; HeadBucket IAM-deny still keeps REAL S3.
+    svc._require_recognized_access_key = lambda: None
     svc._refresh_from_env()
     svc._init_client()
     return svc
@@ -100,6 +103,38 @@ def test_head_bucket_numeric_403_keeps_real_s3(monkeypatch, tmp_path):
     stored = svc.upload_bytes("dev/uploads/probe.xlsx", b"excel-bytes")
     assert stored.storage_provider == "s3"
     assert list(tmp_path.rglob("*.xlsx")) == []
+
+
+def test_head_bucket_403_unrecognized_sts_key_falls_local(monkeypatch, tmp_path):
+    class FakeClient:
+        def head_bucket(self, Bucket):
+            raise _client_error("403", 403, "Forbidden")
+
+        def put_object(self, **kwargs):
+            raise AssertionError("must not put when access key id is unknown")
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIATESTKEYEXAMPLE1")  # pragma: allowlist secret
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testsecret")  # pragma: allowlist secret
+    monkeypatch.setenv("NMTS_S3_BUCKET", "nmts-test-bucket")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("NMTS_LOCAL_OBJECT_STORE", str(tmp_path))
+    monkeypatch.setattr(m, "load_storage_dotenv", lambda force=False: None)
+    svc = m.S3StorageService.__new__(m.S3StorageService)
+    svc._local = m._LocalObjectStore(Path(tmp_path))
+    svc._client = None
+    svc._mode = "local"
+    svc._init_error_code = ""
+    svc._make_client = lambda region: FakeClient()
+
+    def boom():
+        raise _client_error("InvalidClientTokenId", 403)
+
+    svc._require_recognized_access_key = boom
+    svc._refresh_from_env()
+    svc._init_client()
+    assert svc.is_s3() is False
+    assert svc.mode == "local"
+    assert svc._init_error_code == "InvalidClientTokenId"
 
 
 def test_invalid_access_key_does_not_claim_real_s3(monkeypatch, tmp_path):
@@ -176,6 +211,25 @@ def test_ensure_s3_retries_while_local():
     assert svc.ensure_s3() is False
     assert svc.ensure_s3() is False
     assert len(calls) == 2
+
+
+def test_maybe_unswap_aws_keys_when_slots_reversed():
+    access, secret, swapped = m.maybe_unswap_aws_keys("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "AKIAIOSFODNN7EXAMPLE")
+    assert swapped is True
+    assert access == "AKIAIOSFODNN7EXAMPLE"
+    assert secret.startswith("wJalr")
+    a2, s2, swapped2 = m.maybe_unswap_aws_keys("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+    assert swapped2 is False
+    assert a2.startswith("AKIA")
+
+
+def test_resolve_bucket_ignores_access_key_in_aws_s3_bucket(monkeypatch):
+    monkeypatch.setenv("NMTS_S3_BUCKET", "nmts-real-bucket")
+    monkeypatch.setenv("AWS_S3_BUCKET", "AKIAIOSFODNN7EXAMPLE")
+    assert m.resolve_bucket() == "nmts-real-bucket"
+    monkeypatch.delenv("NMTS_S3_BUCKET")
+    monkeypatch.setenv("AWS_S3_BUCKET", "AKIAIOSFODNN7EXAMPLE")
+    assert m.resolve_bucket() == ""
 
 
 def test_ensure_s3_recovers_on_retry():

@@ -233,9 +233,10 @@ async def _safe_move_to_cancelled(
     expected_size: int = 0,
     expected_record_count: Optional[int] = None,
     require_jsonl_count: bool = False,
+    dest_key: str = "",
 ) -> Dict[str, Any]:
     """Copy current → cancelled, verify dest, delete source. Source untouched on failure."""
-    dest_key = ak.cancelled_key_from_current(src_key)
+    dest_key = _text(dest_key) or ak.cancelled_key_from_current(src_key)
     storage = get_storage()
     if not storage.is_s3():
         raise RuntimeError("REAL S3 unavailable — cancelled move not written")
@@ -257,7 +258,7 @@ async def _safe_move_to_cancelled(
     )
     if not live.get("ok"):
         raise RuntimeError(live.get("reason") or "Cancelled dest failed verification after move")
-    if storage.exists(src_key) and src_key != dest_key:
+    if storage._object_present_on_primary(src_key) and src_key != dest_key:
         raise RuntimeError("Source current object still present after move — retry")
 
     extra = {
@@ -372,13 +373,37 @@ async def handle_upload_stored(db, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def handle_upload_cancelled(db, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """SAFE MOVE: copy Excel current → cancelled, verify dest, then delete source."""
+    """SAFE MOVE: copy Excel current → cancelled using the software Cancel No as the filename."""
     upload_id = _text(payload.get("upload_id"))
     upload = await db.uploads.find_one({"id": upload_id}, {"_id": 0}) or {}
     src_key = _text(payload.get("original_storage_key") or upload.get("storage_key"))
     if not upload_id or not src_key:
         return {"status": "error", "error": "upload_id/storage_key required"}
     archive_date = _upload_archive_date(upload) or payload.get("archive_date")
+    original_no = _text(
+        upload.get("original_upload_no") or payload.get("original_upload_no") or ""
+    )
+    cancel_no = _text(
+        payload.get("cancel_no")
+        or upload.get("cancelled_upload_no")
+        or upload.get("upload_no")
+        or original_no
+    )
+    if cancel_no.startswith(("PU", "OU")):
+        cancel_no = "CN" + cancel_no[2:]
+    if not original_no:
+        original_no = _text(payload.get("original_upload_no")) or (
+            "PU" + cancel_no[2:] if cancel_no.startswith("CN") else cancel_no
+        )
+    dest_key = ak.upload_original_key(
+        archive_date,
+        upload_id,
+        cancelled=True,
+        brand=upload.get("brand_name"),
+        dealer=upload.get("dealer_name"),
+        branch=upload.get("branch"),
+        upload_no=cancel_no,
+    )
     extra = {
         "archive_date": archive_date,
         "cancelled_by": payload.get("cancelled_by") or upload.get("cancelled_by"),
@@ -387,12 +412,19 @@ async def handle_upload_cancelled(db, payload: Dict[str, Any]) -> Dict[str, Any]
         "record_count": 1,
         "format": "xlsx",
         "source_collection": "uploads",
+        "original_upload_no": original_no,
+        "cancelled_upload_no": cancel_no,
+        "upload_no": cancel_no,
+        "brand_name": upload.get("brand_name"),
+        "dealer_name": upload.get("dealer_name"),
+        "branch": upload.get("branch"),
     }
     result = await _safe_move_to_cancelled(
         db,
         module=ak.MODULE_UPLOADS,
         entity_id=upload_id,
         src_key=src_key,
+        dest_key=dest_key,
         lifecycle_status=LIFECYCLE_CANCELLED,
         extra_fields=extra,
         expected_sha256=_text(upload.get("sha256")),
@@ -846,6 +878,8 @@ async def maybe_enqueue_upload_cancelled(db, upload: Dict[str, Any], *, actor_id
         {
             "upload_id": upload.get("id"),
             "original_storage_key": upload.get("storage_key"),
+            "cancel_no": upload.get("cancelled_upload_no") or upload.get("upload_no"),
+            "original_upload_no": upload.get("original_upload_no"),
             "cancelled_by": actor_id,
             "cancelled_at": now_iso,
             "reason": reason,

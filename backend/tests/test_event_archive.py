@@ -187,13 +187,17 @@ def test_cancelled_upload_moves_to_cancelled_storage():
     async def _go():
         db = FakeDB()
         excel = b"excel-bytes"
+        original_no = "PUHY260904001"
+        cancel_no = "CNHY260904001"
         key = ak.upload_original_key(
-            "2026-09-04", "up-c", brand="Hyundai", dealer="DealerA", branch="B1", upload_no="PUC1"
+            "2026-09-04", "up-c", brand="Hyundai", dealer="DealerA", branch="B1", upload_no=original_no
         )
         db.uploads.docs.append(
             {
                 "id": "up-c",
-                "upload_no": "PUC1",
+                "upload_no": cancel_no,
+                "original_upload_no": original_no,
+                "cancelled_upload_no": cancel_no,
                 "brand_name": "Hyundai",
                 "dealer_name": "DealerA",
                 "branch": "B1",
@@ -211,12 +215,22 @@ def test_cancelled_upload_moves_to_cancelled_storage():
             s3_storage.get_storage().upload_bytes(key, excel, content_type="application/vnd.ms-excel")
             stored = await ea.handle_upload_stored(db, {"upload_id": "up-c", "storage_key": key, "sha256": s3_storage.sha256_bytes(excel), "file_size": len(excel)})
             assert stored["status"] == "verified"
-            cancelled = await ea.handle_upload_cancelled(db, {"upload_id": "up-c", "reason": "Wrong file", "cancelled_by": "admin"})
+            cancelled = await ea.handle_upload_cancelled(
+                db,
+                {
+                    "upload_id": "up-c",
+                    "reason": "Wrong file",
+                    "cancelled_by": "admin",
+                    "cancel_no": cancel_no,
+                    "original_upload_no": original_no,
+                    "original_storage_key": key,
+                },
+            )
             assert cancelled["status"] == "verified"
             dest = cancelled["cancelled_storage_key"]
-            assert dest.endswith("/cancelled/Hyundai_DealerA_B1_PUC1_UploadCenter.xlsx")
+            assert dest.endswith("/cancelled/Hyundai_DealerA_B1_CNHY260904001_UploadCenter.xlsx")
+            assert original_no not in dest.split("/")[-1]
             assert "/cancelled/up-c/" not in dest
-            assert dest.endswith("_UploadCenter.xlsx")
             storage = s3_storage.get_storage()
             assert not storage.exists(key)  # SAFE MOVE: current gone
             assert storage.exists(dest)
@@ -225,6 +239,8 @@ def test_cancelled_upload_moves_to_cancelled_storage():
             man = cancelled["manifest"]
             assert man["lifecycle_status"] == am.LIFECYCLE_CANCELLED
             assert man.get("storage_key") == dest
+            assert man.get("cancelled_upload_no") == cancel_no
+            assert man.get("original_upload_no") == original_no
             assert man.get("cancelled_by") == "admin"
             assert db.uploads.docs[0]["storage_key"] == dest
 
