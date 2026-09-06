@@ -537,6 +537,98 @@ class S3StorageService:
         data, ctype = self.download_bytes(src_key)
         return self.upload_bytes(dest_key, data, content_type=ctype, allow_replace=allow_replace)
 
+    def move_object(
+        self,
+        src_key: str,
+        dest_key: str,
+        *,
+        expected_sha256: Optional[str] = None,
+        expected_size: Optional[int] = None,
+    ) -> StoredObject:
+        """SAFE MOVE: copy → physically verify dest → delete source.
+
+        If copy/verify fails, source is left untouched. Retry is idempotent:
+        dest already matching the source bytes skips the copy and continues
+        to source delete. Final success: object exists only at dest_key.
+        """
+        src_key = str(src_key or "")
+        dest_key = str(dest_key or "")
+        if not src_key or not dest_key:
+            raise S3StorageError("move_object requires src and dest keys")
+        if src_key == dest_key:
+            info = self.head(src_key) or {}
+            return StoredObject(
+                storage_provider=str(info.get("storage_provider") or self._mode),
+                storage_key=src_key,
+                content_type=str(info.get("content_type") or "application/octet-stream"),
+                file_size=int(info.get("file_size") or 0),
+                sha256=str(info.get("sha256") or ""),
+                etag=info.get("etag"),
+            )
+
+        src_head = self.head(src_key)
+        dest_head = self.head(dest_key)
+        if not src_head and dest_head:
+            digest = expected_sha256 or dest_head.get("sha256") or ""
+            size = int(expected_size if expected_size is not None else dest_head.get("file_size") or 0)
+            if digest and not self.verify_object(dest_key, digest, size):
+                raise S3StorageError(f"Cancelled dest {dest_key} failed verification on retry")
+            return StoredObject(
+                storage_provider=str(dest_head.get("storage_provider") or self._mode),
+                storage_key=dest_key,
+                content_type=str(dest_head.get("content_type") or "application/octet-stream"),
+                file_size=size,
+                sha256=digest,
+                etag=dest_head.get("etag"),
+            )
+        if not src_head:
+            raise FileNotFoundError(src_key)
+
+        copied = None
+        if dest_head:
+            src_sha = expected_sha256 or src_head.get("sha256")
+            if not src_sha:
+                body, _ = self.download_bytes(src_key)
+                src_sha = sha256_bytes(body)
+            dest_sha = dest_head.get("sha256")
+            if not dest_sha:
+                body, _ = self.download_bytes(dest_key)
+                dest_sha = sha256_bytes(body)
+            if dest_sha != src_sha:
+                raise ImmutableObjectError(
+                    f"Refusing move onto dest {dest_key} whose bytes differ from source"
+                )
+            copied = StoredObject(
+                storage_provider=str(dest_head.get("storage_provider") or self._mode),
+                storage_key=dest_key,
+                content_type=str(dest_head.get("content_type") or "application/octet-stream"),
+                file_size=int(dest_head.get("file_size") or 0),
+                sha256=dest_sha,
+                etag=dest_head.get("etag"),
+            )
+        else:
+            copied = self.copy_object(src_key, dest_key)
+
+        digest = expected_sha256 or copied.sha256
+        size = int(expected_size if expected_size is not None else copied.file_size)
+        if not digest:
+            body, _ = self.download_bytes(dest_key)
+            digest = sha256_bytes(body)
+            size = len(body)
+        if not self.verify_object(dest_key, digest, size):
+            raise S3StorageError(
+                f"Move verification failed for dest {dest_key} — source {src_key} left untouched"
+            )
+
+        self.delete(src_key)
+        if self.exists(src_key):
+            raise S3StorageError(
+                f"Source {src_key} still present after dest verified — retry will delete source only"
+            )
+        if not self.exists(dest_key):
+            raise S3StorageError(f"Dest {dest_key} missing after move")
+        return copied
+
     def download_bytes(self, key: str) -> Tuple[bytes, str]:
         if self.is_s3():
             try:

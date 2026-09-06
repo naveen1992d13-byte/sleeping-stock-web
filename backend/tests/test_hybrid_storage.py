@@ -60,6 +60,9 @@ class _FakeS3Mode:
             "download_bytes": s.download_bytes,
             "verify_object": s.verify_object,
             "exists": s.exists,
+            "delete": s.delete,
+            "copy_object": s.copy_object,
+            "move_object": s.move_object,
             "mode": s._mode,
             "client": s._client,
         }
@@ -115,6 +118,34 @@ class _FakeS3Mode:
         def fake_exists(key):
             return fake_head(key) is not None
 
+        def fake_delete(key):
+            return s._local.delete(key)
+
+        def fake_copy(src_key, dest_key, allow_replace=False):
+            data, ctype = fake_download(src_key)
+            return fake_upload(dest_key, data, content_type=ctype, allow_replace=allow_replace)
+
+        def fake_move(src_key, dest_key, expected_sha256=None, expected_size=None):
+            dest = fake_head(dest_key)
+            src = fake_head(src_key)
+            if not src and dest:
+                return s3_storage.StoredObject(
+                    storage_provider="s3",
+                    storage_key=dest_key,
+                    content_type=dest.get("content_type") or "application/octet-stream",
+                    file_size=int(dest.get("file_size") or 0),
+                    sha256=dest.get("sha256") or "",
+                )
+            copied = fake_copy(src_key, dest_key)
+            digest = expected_sha256 or copied.sha256
+            size = int(expected_size if expected_size is not None else copied.file_size)
+            if not fake_verify(dest_key, digest, size):
+                raise s3_storage.S3StorageError("fake move dest verify failed")
+            fake_delete(src_key)
+            if fake_exists(src_key):
+                raise s3_storage.S3StorageError("fake move source still present")
+            return copied
+
         s.is_s3 = lambda: True  # type: ignore
         s._mode = "s3"
         s.upload_bytes = fake_upload  # type: ignore
@@ -122,6 +153,9 @@ class _FakeS3Mode:
         s.download_bytes = fake_download  # type: ignore
         s.verify_object = fake_verify  # type: ignore
         s.exists = fake_exists  # type: ignore
+        s.delete = fake_delete  # type: ignore
+        s.copy_object = fake_copy  # type: ignore
+        s.move_object = fake_move  # type: ignore
         return s
 
     def __exit__(self, *exc):
@@ -132,6 +166,12 @@ class _FakeS3Mode:
         s.download_bytes = self._orig["download_bytes"]  # type: ignore
         s.verify_object = self._orig["verify_object"]  # type: ignore
         s.exists = self._orig["exists"]  # type: ignore
+        if "delete" in self._orig:
+            s.delete = self._orig["delete"]  # type: ignore
+        if "copy_object" in self._orig:
+            s.copy_object = self._orig["copy_object"]  # type: ignore
+        if "move_object" in self._orig:
+            s.move_object = self._orig["move_object"]  # type: ignore
         s._mode = self._orig["mode"]
         s._client = self._orig["client"]
         return False

@@ -116,11 +116,24 @@ async def _active_product_hub_manifests(
     """Latest non-cancelled, non-superseded product-hub publish per Brand/Dealer/Branch."""
     rows = await am.list_s3_readable_entities(
         db,
-        ak.MODULE_PRODUCT_HUB,
+        ak.MODULE_PRODUCT_HISTORY,
         archive_date=date_iso,
         lifecycle_nin=[am.LIFECYCLE_CANCELLED, am.LIFECYCLE_SUPERSEDED],
         limit=500,
     )
+    entity_rows = [r for r in rows if r.get("entity_id")]
+    if entity_rows:
+        rows = entity_rows
+    else:
+        # leftover PR-49 product-hub entity keys
+        legacy = await am.list_s3_readable_entities(
+            db,
+            "product-hub",
+            archive_date=date_iso,
+            lifecycle_nin=[am.LIFECYCLE_CANCELLED, am.LIFECYCLE_SUPERSEDED],
+            limit=500,
+        )
+        rows = [r for r in legacy if r.get("entity_id")]
     chosen: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for man in rows:
         life = str(man.get("lifecycle_status") or am.LIFECYCLE_ACTIVE)

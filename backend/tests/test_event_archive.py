@@ -93,14 +93,30 @@ def _seed_upload(db, upload_id="up-1", date_iso="2026-09-04", status="Published"
 
 
 def test_archive_keys_current_vs_cancelled():
-    cur = ak.product_hub_products_key("2026-09-04", "up-1", cancelled=False)
-    can = ak.product_hub_products_key("2026-09-04", "up-1", cancelled=True)
-    assert "/current/up-1/products.jsonl.gz" in cur
-    assert "/cancelled/up-1/products.jsonl.gz" in can
+    fname = ak.archive_filename("Hyundai", "FPL Hyundai", "Vanagaram", "PUHY260906001", "UploadCenter", "xlsx")
+    assert fname == "Hyundai_FPL_Vanagaram_PUHY260906001_UploadCenter.xlsx"
+    assert "2026" not in fname
+    cur = ak.product_history_products_key(
+        "2026-09-04", "up-1", cancelled=False, brand="Hyundai", dealer="DealerA", branch="B1", upload_no="PU26090401"
+    )
+    can = ak.product_history_products_key(
+        "2026-09-04", "up-1", cancelled=True, brand="Hyundai", dealer="DealerA", branch="B1", upload_no="PU26090401"
+    )
+    assert "/product-history/2026-09-04/current/up-1/" in cur
+    assert cur.endswith("Hyundai_DealerA_B1_PU26090401_ProductHistory.jsonl.gz")
+    assert "/product-history/2026-09-04/cancelled/up-1/" in can
+    assert can.endswith("Hyundai_DealerA_B1_PU26090401_ProductHistory.jsonl.gz")
     assert cur != can
-    assert ak.upload_original_key("2026-09-04", "up-1").endswith("/current/up-1/original.xlsx")
-    assert "test/orders/" in ak.order_package_key("2026-09-04", "ord-1")
-    assert "test/requests/" in ak.request_package_key("2026-09-04", "req-1")
+    assert ak.cancelled_key_from_current(cur) == can
+    up = ak.upload_original_key(
+        "2026-09-04", "up-1", brand="Hyundai", dealer="DealerA", branch="B1", upload_no="PU26090401"
+    )
+    assert up.endswith("/current/up-1/Hyundai_DealerA_B1_PU26090401_UploadCenter.xlsx")
+    assert "test/orders/" in ak.order_package_key("2026-09-04", "ord-1", order_number="ORDER123")
+    assert ak.order_package_key("2026-09-04", "ord-1", brand="Hyundai", dealer="DealerA", branch="B1", order_number="ORDER123").endswith(
+        "Hyundai_DealerA_B1_ORDER123_Order.jsonl.gz"
+    )
+    assert "test/requests/" in ak.request_package_key("2026-09-04", "req-1", request_number="REQ123")
 
 
 def test_publish_event_archive_and_history_reads_s3():
@@ -114,7 +130,8 @@ def test_publish_event_archive_and_history_reads_s3():
             assert man["status"] == am.STATUS_VERIFIED
             assert man["entity_id"] == "up-1"
             assert man["lifecycle_status"] == am.LIFECYCLE_ACTIVE
-            assert "/product-hub/2026-09-04/current/up-1/" in man["storage_key"]
+            assert "/product-history/2026-09-04/current/up-1/" in man["storage_key"]
+            assert man["storage_key"].endswith("_ProductHistory.jsonl.gz")
             hist = await hh.read_product_history(db, date_key="20260904", brand="Hyundai", hot_days=1)
             # Today-ish hot window may prefer Mongo; force cold read by hot_days=1 with past date
             assert any(r.get("part_number") == "PN-1" for r in hist["rows"]) or hist.get("total", 0) >= 1
@@ -146,12 +163,14 @@ def test_same_day_republish_new_immutable_and_supersede():
                 db, {"upload_id": "up-old", "superseded_by": "up-new", "reason": "same-day republish"}
             )
             assert sup["status"] == "verified"
-            old = await am.find_s3_readable_entity(db, ak.MODULE_PRODUCT_HUB, "up-old")
+            old = await am.find_s3_readable_entity(db, ak.MODULE_PRODUCT_HISTORY, "up-old")
             assert old["lifecycle_status"] == am.LIFECYCLE_SUPERSEDED
             assert old.get("cancelled_storage_key")
             storage = s3_storage.get_storage()
-            assert storage.exists(old["storage_key"])
-            assert storage.exists(old["cancelled_storage_key"])
+            current_key = ak.current_key_from_cancelled(old["storage_key"])
+            assert "/cancelled/" in (old.get("cancelled_storage_key") or old["storage_key"])
+            assert storage.exists(old["cancelled_storage_key"] or old["storage_key"])
+            assert not storage.exists(current_key) or current_key == (old.get("cancelled_storage_key") or old["storage_key"])
             db.products.docs = []
             hist = await hh.read_product_history(db, date_key="20260904", brand="Hyundai", hot_days=1)
             parts = {r.get("part_number") for r in hist["rows"]}
@@ -161,14 +180,20 @@ def test_same_day_republish_new_immutable_and_supersede():
     _run(_go())
 
 
-def test_cancelled_upload_copies_to_cancelled_storage():
+def test_cancelled_upload_moves_to_cancelled_storage():
     async def _go():
         db = FakeDB()
         excel = b"excel-bytes"
-        key = ak.upload_original_key("2026-09-04", "up-c")
+        key = ak.upload_original_key(
+            "2026-09-04", "up-c", brand="Hyundai", dealer="DealerA", branch="B1", upload_no="PUC1"
+        )
         db.uploads.docs.append(
             {
                 "id": "up-c",
+                "upload_no": "PUC1",
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "B1",
                 "date_key": "20260904",
                 "created_at": "2026-09-04T10:00:00+05:30",
                 "storage_key": key,
@@ -187,15 +212,17 @@ def test_cancelled_upload_copies_to_cancelled_storage():
             assert cancelled["status"] == "verified"
             dest = cancelled["cancelled_storage_key"]
             assert "/cancelled/up-c/" in dest
+            assert dest.endswith("_UploadCenter.xlsx")
             storage = s3_storage.get_storage()
-            assert storage.exists(key)  # original never deleted
+            assert not storage.exists(key)  # SAFE MOVE: current gone
             assert storage.exists(dest)
-            src, _ = storage.download_bytes(key)
             dst, _ = storage.download_bytes(dest)
-            assert src == dst == excel
+            assert dst == excel
             man = cancelled["manifest"]
             assert man["lifecycle_status"] == am.LIFECYCLE_CANCELLED
+            assert man.get("storage_key") == dest
             assert man.get("cancelled_by") == "admin"
+            assert db.uploads.docs[0]["storage_key"] == dest
 
     _run(_go())
 
@@ -244,8 +271,11 @@ def test_order_and_request_terminal_archive_and_readers():
             o = await ea.handle_order_terminal(db, {"order_id": "ord-1", "status": "Completed"})
             assert o["status"] in {"verified", "already_archived"}
             assert "/orders/2026-09-04/current/ord-1/" in o["manifest"]["storage_key"]
+            assert o["manifest"]["storage_key"].endswith("_Order.jsonl.gz")
+            current_order_key = o["manifest"]["storage_key"]
             r = await ea.handle_request_terminal(db, {"request_id": "req-1", "status": "Completed"})
             assert r["status"] in {"verified", "already_archived"}
+            assert r["manifest"]["storage_key"].endswith("_Request.jsonl.gz")
             packed = await hoh.read_order_package(db, "ord-1")
             assert packed["order"]["order_number"] == "OD-1"
             assert packed["items"]
@@ -285,6 +315,20 @@ def test_order_and_request_terminal_archive_and_readers():
             )
             rc = await ea.handle_request_terminal(db, {"request_id": "req-c", "status": "Cancelled"})
             assert "/cancelled/req-c/" in rc["manifest"]["storage_key"]
+
+            # Completed order later cancelled → SAFE MOVE (current deleted)
+            db.order_headers.docs[0]["status"] = "Cancelled"
+            db.order_headers.docs[0]["overall_status"] = "Cancelled"
+            db.order_items.docs[0]["status"] = "Cancelled"
+            moved = await ea.handle_order_terminal(db, {"order_id": "ord-1", "status": "Cancelled"})
+            assert moved["status"] == "verified"
+            dest = moved["cancelled_storage_key"]
+            assert "/cancelled/ord-1/" in dest
+            storage = s3_storage.get_storage()
+            assert not storage.exists(current_order_key)
+            assert storage.exists(dest)
+            packed_moved = await hoh.read_order_package(db, "ord-1")
+            assert packed_moved["order"]["order_number"] == "OD-1"
 
     _run(_go())
 
@@ -386,6 +430,29 @@ def test_latest_live_product_hub_not_deleted_by_event_path():
         assert len(db.products.docs) == before
 
     _run(_go())
+
+
+def test_safe_move_keeps_source_when_dest_verify_fails():
+    storage = s3_storage.get_storage()
+    src = storage.key("uploads", "2026-09-04", "current", "x", "Hyundai_FPL_Vanagaram_PU1_UploadCenter.xlsx")
+    dest = src.replace("/current/", "/cancelled/")
+    storage.upload_bytes(src, b"keep-me")
+    orig = storage.verify_object
+
+    def fail_verify(key, expected_sha256, expected_size):
+        if key == dest:
+            return False
+        return orig(key, expected_sha256, expected_size)
+
+    storage.verify_object = fail_verify  # type: ignore
+    try:
+        with pytest.raises(s3_storage.S3StorageError):
+            storage.move_object(src, dest)
+        assert storage.exists(src)
+        data, _ = storage.download_bytes(src)
+        assert data == b"keep-me"
+    finally:
+        storage.verify_object = orig  # type: ignore
 
 
 def test_enqueue_never_raises_and_partial_not_terminal():

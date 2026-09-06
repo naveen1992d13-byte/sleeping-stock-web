@@ -221,6 +221,79 @@ async def _put_verified(
     return {"status": "verified", "manifest": marked, "record_count": record_count}
 
 
+async def _safe_move_to_cancelled(
+    db,
+    *,
+    module: str,
+    entity_id: str,
+    src_key: str,
+    lifecycle_status: str,
+    extra_fields: Optional[Dict[str, Any]] = None,
+    expected_sha256: str = "",
+    expected_size: int = 0,
+    expected_record_count: Optional[int] = None,
+    require_jsonl_count: bool = False,
+) -> Dict[str, Any]:
+    """Copy current → cancelled, verify dest, delete source. Source untouched on failure."""
+    dest_key = ak.cancelled_key_from_current(src_key)
+    storage = get_storage()
+    if not storage.is_s3():
+        raise RuntimeError("REAL S3 unavailable — cancelled move not written")
+    if not src_key:
+        return {"status": "error", "error": "source storage_key required"}
+
+    moved = storage.move_object(
+        src_key,
+        dest_key,
+        expected_sha256=expected_sha256 or None,
+        expected_size=expected_size or None,
+    )
+    live = av.physical_s3_verify(
+        storage_key=dest_key,
+        expected_sha256=moved.sha256 or expected_sha256,
+        expected_size=moved.file_size or expected_size,
+        expected_record_count=expected_record_count,
+        require_jsonl_count=require_jsonl_count,
+    )
+    if not live.get("ok"):
+        raise RuntimeError(live.get("reason") or "Cancelled dest failed verification after move")
+    if storage.exists(src_key) and src_key != dest_key:
+        raise RuntimeError("Source current object still present after move — retry")
+
+    extra = {
+        "entity_id": entity_id,
+        "lifecycle_status": lifecycle_status,
+        "original_storage_key": src_key,
+        "cancelled_storage_key": dest_key,
+        "storage_key": dest_key,
+        "file_size": moved.file_size,
+        "sha256": moved.sha256,
+    }
+    if extra_fields:
+        extra.update(extra_fields)
+
+    existing = await am.find_any_entity(db, module, entity_id)
+    manifest = existing or am.base_manifest(
+        module=module,
+        archive_date=(extra_fields or {}).get("archive_date"),
+        storage_key=dest_key,
+        source_collection=(existing or {}).get("source_collection") or "",
+    )
+    manifest.update(extra)
+    manifest = await am.upsert_manifest(db, manifest)
+    marked = await am.mark_status(
+        db,
+        manifest["archive_id"],
+        am.STATUS_VERIFIED,
+        eligible_for_prune=True,
+        storage_backend="s3",
+        error=None,
+        **{k: v for k, v in extra.items() if k != "storage_key"},
+        storage_key=dest_key,
+    )
+    return {"status": "verified", "manifest": marked, "cancelled_storage_key": dest_key, "original_storage_key": src_key}
+
+
 def _upload_archive_date(upload: Dict[str, Any]) -> str:
     dk = _text(upload.get("date_key"))
     if len(dk) == 8 and dk.isdigit():
@@ -299,91 +372,69 @@ async def handle_upload_stored(db, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def handle_upload_cancelled(db, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Copy original Excel to cancelled path first, verify, then update manifest. Never delete source."""
+    """SAFE MOVE: copy Excel current → cancelled, verify dest, then delete source."""
     upload_id = _text(payload.get("upload_id"))
     upload = await db.uploads.find_one({"id": upload_id}, {"_id": 0}) or {}
     src_key = _text(payload.get("original_storage_key") or upload.get("storage_key"))
     if not upload_id or not src_key:
         return {"status": "error", "error": "upload_id/storage_key required"}
     archive_date = _upload_archive_date(upload) or payload.get("archive_date")
-    dest_key = ak.upload_original_key(archive_date, upload_id, cancelled=True)
-    storage = get_storage()
-    if not storage.is_s3():
-        raise RuntimeError("REAL S3 unavailable — cancelled Excel copy not written")
-
-    copied = storage.copy_object(src_key, dest_key)
-    live = av.physical_s3_verify(
-        storage_key=dest_key,
-        expected_sha256=copied.sha256,
-        expected_size=copied.file_size,
-        require_jsonl_count=False,
-    )
-    if not live.get("ok"):
-        raise RuntimeError(live.get("reason") or "Cancelled Excel copy failed verification")
-
-    # Also copy a published product-hub object into cancelled/ if it exists.
-    ph_src = ak.product_hub_products_key(archive_date, upload_id, cancelled=False)
-    ph_dest = ak.product_hub_products_key(archive_date, upload_id, cancelled=True)
-    if storage.exists(ph_src):
-        try:
-            storage.copy_object(ph_src, ph_dest)
-        except ImmutableObjectError:
-            pass
-        except Exception as exc:
-            logger.warning("cancelled product-hub copy skipped: %s", type(exc).__name__)
-
-    existing = await am.find_any_entity(db, ak.MODULE_UPLOADS, upload_id)
-    manifest = existing or am.base_manifest(
-        module=ak.MODULE_UPLOADS,
-        archive_date=archive_date,
-        storage_key=src_key,
-        format="xlsx",
-        source_collection="uploads",
-    )
     extra = {
-        "entity_id": upload_id,
-        "lifecycle_status": LIFECYCLE_CANCELLED,
-        "original_storage_key": src_key,
-        "cancelled_storage_key": dest_key,
+        "archive_date": archive_date,
         "cancelled_by": payload.get("cancelled_by") or upload.get("cancelled_by"),
         "cancelled_at": payload.get("cancelled_at") or upload.get("cancelled_at"),
         "cancel_reason": payload.get("reason") or upload.get("cancel_reason"),
-        "storage_key": src_key,
-        "file_size": copied.file_size,
-        "sha256": copied.sha256,
         "record_count": 1,
         "format": "xlsx",
+        "source_collection": "uploads",
     }
-    manifest.update(extra)
-    manifest = await am.upsert_manifest(db, manifest)
-    marked = await am.mark_status(
+    result = await _safe_move_to_cancelled(
         db,
-        manifest["archive_id"],
-        am.STATUS_VERIFIED,
-        eligible_for_prune=True,
-        storage_backend="s3",
-        error=None,
-        **{k: v for k, v in extra.items() if k != "storage_key"},
+        module=ak.MODULE_UPLOADS,
+        entity_id=upload_id,
+        src_key=src_key,
+        lifecycle_status=LIFECYCLE_CANCELLED,
+        extra_fields=extra,
+        expected_sha256=_text(upload.get("sha256")),
+        expected_size=int(upload.get("file_size") or 0),
+        require_jsonl_count=False,
     )
+    dest_key = result.get("cancelled_storage_key")
+    if dest_key:
+        try:
+            await db.uploads.update_one({"id": upload_id}, {"$set": {"storage_key": dest_key}})
+        except Exception as exc:
+            logger.warning("upload storage_key pointer update skipped: %s", type(exc).__name__)
 
-    ph_existing = await am.find_any_entity(db, ak.MODULE_PRODUCT_HUB, upload_id)
-    if ph_existing:
-        await am.mark_status(
+    ph_existing = await am.find_any_entity(db, ak.MODULE_PRODUCT_HISTORY, upload_id)
+    if not ph_existing:
+        ph_existing = await am.find_any_entity(db, "product-hub", upload_id)
+    storage = get_storage()
+    ph_src = _text((ph_existing or {}).get("storage_key"))
+    if ph_src and "/current/" in ph_src and storage.exists(ph_src):
+        await _safe_move_to_cancelled(
             db,
-            ph_existing["archive_id"],
-            ph_existing.get("status") or am.STATUS_VERIFIED,
+            module=_text((ph_existing or {}).get("module")) or ak.MODULE_PRODUCT_HISTORY,
+            entity_id=upload_id,
+            src_key=ph_src,
             lifecycle_status=LIFECYCLE_CANCELLED,
-            cancelled_storage_key=ph_dest if storage.exists(ph_dest) else ph_existing.get("cancelled_storage_key"),
-            cancelled_by=extra["cancelled_by"],
-            cancelled_at=extra["cancelled_at"],
-            cancel_reason=extra["cancel_reason"],
+            extra_fields={
+                "archive_date": archive_date,
+                "cancelled_by": extra["cancelled_by"],
+                "cancelled_at": extra["cancelled_at"],
+                "cancel_reason": extra["cancel_reason"],
+                "record_count": int((ph_existing or {}).get("record_count") or 0),
+            },
+            expected_sha256=_text((ph_existing or {}).get("sha256")),
+            expected_size=int((ph_existing or {}).get("file_size") or 0),
+            expected_record_count=int((ph_existing or {}).get("record_count") or 0) or None,
+            require_jsonl_count=True,
         )
-
-    return {"status": "verified", "manifest": marked, "cancelled_storage_key": dest_key, "original_storage_key": src_key}
+    return result
 
 
 async def handle_publish_completed(db, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Archive one published upload batch to product-hub/{date}/current/{upload_id}/."""
+    """Archive one published upload batch to product-history/{date}/current/{upload_id}/."""
     upload_id = _text(payload.get("upload_id"))
     if not upload_id:
         return {"status": "error", "error": "upload_id required"}
@@ -399,9 +450,19 @@ async def handle_publish_completed(db, payload: Dict[str, Any]) -> Dict[str, Any
     summaries = await db.batch_summaries.find({"upload_id": upload_id}, {"_id": 0}).to_list(100)
     snap_docs = ha._build_analytics_snapshot_docs(archive_date, rows)
 
-    products_key = ak.product_hub_products_key(archive_date, upload_id, cancelled=False)
-    summary_key = ak.product_hub_companion_key(archive_date, upload_id, "batch-summaries.json", cancelled=False)
-    snap_key = ak.product_hub_companion_key(archive_date, upload_id, "analytics-snapshots.json", cancelled=False)
+    key_kwargs = {
+        "brand": upload.get("brand_name"),
+        "dealer": upload.get("dealer_name"),
+        "branch": upload.get("branch"),
+        "upload_no": upload.get("upload_no"),
+    }
+    products_key = ak.product_history_products_key(archive_date, upload_id, cancelled=False, **key_kwargs)
+    summary_key = ak.product_history_companion_key(
+        archive_date, upload_id, "batch-summaries.json", cancelled=False, **key_kwargs
+    )
+    snap_key = ak.product_history_companion_key(
+        archive_date, upload_id, "analytics-snapshots.json", cancelled=False, **key_kwargs
+    )
 
     products_bytes = await asyncio.to_thread(ha._gzip_jsonl, rows)
     summary_bytes = json.dumps(summaries, ensure_ascii=False, default=str).encode("utf-8")
@@ -438,7 +499,7 @@ async def handle_publish_completed(db, payload: Dict[str, Any]) -> Dict[str, Any
     }
     result = await _put_verified(
         db,
-        module=ak.MODULE_PRODUCT_HUB,
+        module=ak.MODULE_PRODUCT_HISTORY,
         archive_date=archive_date,
         storage_key=products_key,
         data=products_bytes,
@@ -452,51 +513,55 @@ async def handle_publish_completed(db, payload: Dict[str, Any]) -> Dict[str, Any
 
 
 async def handle_publish_superseded(db, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Same-day previous publish: copy current object to cancelled/, mark superseded. Never delete."""
+    """Same-day previous publish: SAFE MOVE current → cancelled, mark superseded."""
     upload_id = _text(payload.get("upload_id"))
     upload = await db.uploads.find_one({"id": upload_id}, {"_id": 0}) or {}
     archive_date = _upload_archive_date(upload) or payload.get("archive_date")
-    src_key = ak.product_hub_products_key(archive_date, upload_id, cancelled=False)
-    dest_key = ak.product_hub_products_key(archive_date, upload_id, cancelled=True)
+    existing = await am.find_any_entity(db, ak.MODULE_PRODUCT_HISTORY, upload_id)
+    if not existing:
+        existing = await am.find_any_entity(db, "product-hub", upload_id)
+    src_key = _text((existing or {}).get("storage_key")) or ak.product_history_products_key(
+        archive_date,
+        upload_id,
+        cancelled=False,
+        brand=upload.get("brand_name"),
+        dealer=upload.get("dealer_name"),
+        branch=upload.get("branch"),
+        upload_no=upload.get("upload_no"),
+    )
     storage = get_storage()
     if not storage.is_s3():
-        raise RuntimeError("REAL S3 unavailable — supersede copy not written")
+        raise RuntimeError("REAL S3 unavailable — supersede move not written")
 
-    existing = await am.find_any_entity(db, ak.MODULE_PRODUCT_HUB, upload_id)
     if not storage.exists(src_key):
-        # Publish may not have archived yet — enqueue publish then retry supersede.
         if not existing or existing.get("status") != am.STATUS_VERIFIED:
             await ao.enqueue_safe(db, ao.EVENT_PUBLISH_COMPLETED, {"upload_id": upload_id})
             raise RuntimeError("supersede waiting for current publish archive")
         src_key = existing.get("storage_key") or src_key
 
-    copied = storage.copy_object(src_key, dest_key)
-    live = av.physical_s3_verify(
-        storage_key=dest_key,
-        expected_sha256=copied.sha256,
-        expected_size=copied.file_size,
+    return await _safe_move_to_cancelled(
+        db,
+        module=_text((existing or {}).get("module")) or ak.MODULE_PRODUCT_HISTORY,
+        entity_id=upload_id,
+        src_key=src_key,
+        lifecycle_status=LIFECYCLE_SUPERSEDED,
+        extra_fields={
+            "archive_date": archive_date,
+            "cancelled_by": payload.get("superseded_by"),
+            "cancelled_at": payload.get("superseded_at"),
+            "cancel_reason": payload.get("reason") or "same-day republish",
+            "record_count": int((existing or {}).get("record_count") or 0),
+            "brand_name": upload.get("brand_name") or (existing or {}).get("brand_name"),
+            "dealer_name": upload.get("dealer_name") or (existing or {}).get("dealer_name"),
+            "branch": upload.get("branch") or (existing or {}).get("branch"),
+            "upload_no": upload.get("upload_no") or (existing or {}).get("upload_no"),
+            "reader_ready": True,
+        },
+        expected_sha256=_text((existing or {}).get("sha256")),
+        expected_size=int((existing or {}).get("file_size") or 0),
         expected_record_count=int((existing or {}).get("record_count") or 0) or None,
         require_jsonl_count=True,
     )
-    if not live.get("ok"):
-        raise RuntimeError(live.get("reason") or "supersede copy failed verification")
-
-    if existing:
-        marked = await am.mark_status(
-            db,
-            existing["archive_id"],
-            existing.get("status") if existing.get("status") in {am.STATUS_VERIFIED, am.STATUS_PRUNED} else am.STATUS_VERIFIED,
-            lifecycle_status=LIFECYCLE_SUPERSEDED,
-            cancelled_storage_key=dest_key,
-            cancelled_by=payload.get("superseded_by"),
-            cancelled_at=payload.get("superseded_at"),
-            cancel_reason=payload.get("reason") or "same-day republish",
-            eligible_for_prune=existing.get("status") == am.STATUS_VERIFIED,
-            storage_backend="s3",
-        )
-        return {"status": "verified", "manifest": marked}
-
-    return {"status": "verified", "cancelled_storage_key": dest_key}
 
 
 def _package_rows(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -558,13 +623,13 @@ async def handle_order_terminal(db, payload: Dict[str, Any]) -> Dict[str, Any]:
     archive_date = (header.get("updated_at") or header.get("completed_at") or header.get("created_at") or "")[:10]
     if len(archive_date) != 10:
         archive_date = ha.date_key_to_iso(_text(header.get("date_key"))) or archive_date
-    key = ak.order_package_key(archive_date, order_id, cancelled=cancelled)
-    data = await asyncio.to_thread(ha._gzip_jsonl, rows)
-    scope = _scope([header, *items])
+    existing = await am.find_any_entity(db, ak.MODULE_ORDERS, order_id)
+    existing_key = _text((existing or {}).get("storage_key"))
+    storage = get_storage()
     extra = {
-        "scope_brands": sorted(scope["brands"])[:200],
-        "scope_dealers": sorted(scope["dealers"])[:200],
-        "scope_branches": sorted(scope["branches"])[:200],
+        "scope_brands": sorted(_scope([header, *items])["brands"])[:200],
+        "scope_dealers": sorted(_scope([header, *items])["dealers"])[:200],
+        "scope_branches": sorted(_scope([header, *items])["branches"])[:200],
         "order_number": header.get("order_number"),
         "terminal_status": status,
         "brand_name": header.get("brand_name"),
@@ -574,7 +639,31 @@ async def handle_order_terminal(db, payload: Dict[str, Any]) -> Dict[str, Any]:
         "cancelled_by": payload.get("cancelled_by") or header.get("cancelled_by"),
         "cancelled_at": payload.get("cancelled_at") or header.get("cancelled_at"),
         "cancel_reason": payload.get("reason") or header.get("cancel_reason"),
+        "archive_date": archive_date,
     }
+    if cancelled and existing_key and "/current/" in existing_key and storage.exists(existing_key):
+        return await _safe_move_to_cancelled(
+            db,
+            module=ak.MODULE_ORDERS,
+            entity_id=order_id,
+            src_key=existing_key,
+            lifecycle_status=LIFECYCLE_CANCELLED,
+            extra_fields=extra,
+            expected_sha256=_text((existing or {}).get("sha256")),
+            expected_size=int((existing or {}).get("file_size") or 0),
+            expected_record_count=int((existing or {}).get("record_count") or 0) or None,
+            require_jsonl_count=True,
+        )
+    key = ak.order_package_key(
+        archive_date,
+        order_id,
+        cancelled=cancelled,
+        brand=header.get("brand_name"),
+        dealer=header.get("dealer_name"),
+        branch=header.get("branch"),
+        order_number=header.get("order_number"),
+    )
+    data = await asyncio.to_thread(ha._gzip_jsonl, rows)
     result = await _put_verified(
         db,
         module=ak.MODULE_ORDERS,
@@ -634,20 +723,47 @@ async def handle_request_terminal(db, payload: Dict[str, Any]) -> Dict[str, Any]
         return {"status": "error", "error": "request package empty"}
     cancelled = ak.lifecycle_from_status(status) == ak.LIFECYCLE_CANCELLED
     archive_date = (req.get("updated_at") or req.get("completed_at") or req.get("decided_at") or req.get("requested_at") or "")[:10]
-    key = ak.request_package_key(archive_date, request_id, cancelled=cancelled)
-    data = await asyncio.to_thread(ha._gzip_jsonl, rows)
-    scope = _scope([req])
+    existing = await am.find_any_entity(db, ak.MODULE_REQUESTS, request_id)
+    existing_key = _text((existing or {}).get("storage_key"))
+    storage = get_storage()
     extra = {
-        "scope_brands": sorted(scope["brands"])[:200],
-        "scope_dealers": sorted(scope["dealers"])[:200],
-        "scope_branches": sorted(scope["branches"])[:200],
+        "scope_brands": sorted(_scope([req])["brands"])[:200],
+        "scope_dealers": sorted(_scope([req])["dealers"])[:200],
+        "scope_branches": sorted(_scope([req])["branches"])[:200],
         "request_number": req.get("request_number"),
         "terminal_status": status,
         "reader_ready": True,
         "cancelled_by": payload.get("cancelled_by") or req.get("decided_by") or req.get("cancelled_by"),
         "cancelled_at": payload.get("cancelled_at") or req.get("decided_at") or req.get("cancelled_at"),
         "cancel_reason": payload.get("reason") or req.get("approval_remarks") or req.get("cancel_reason"),
+        "archive_date": archive_date,
+        "brand_name": req.get("requesting_brand") or req.get("brand_name"),
+        "dealer_name": req.get("requesting_dealer") or req.get("dealer_name"),
+        "branch": req.get("requesting_branch") or req.get("branch"),
     }
+    if cancelled and existing_key and "/current/" in existing_key and storage.exists(existing_key):
+        return await _safe_move_to_cancelled(
+            db,
+            module=ak.MODULE_REQUESTS,
+            entity_id=request_id,
+            src_key=existing_key,
+            lifecycle_status=LIFECYCLE_CANCELLED,
+            extra_fields=extra,
+            expected_sha256=_text((existing or {}).get("sha256")),
+            expected_size=int((existing or {}).get("file_size") or 0),
+            expected_record_count=int((existing or {}).get("record_count") or 0) or None,
+            require_jsonl_count=True,
+        )
+    key = ak.request_package_key(
+        archive_date,
+        request_id,
+        cancelled=cancelled,
+        brand=extra.get("brand_name"),
+        dealer=extra.get("dealer_name"),
+        branch=extra.get("branch"),
+        request_number=req.get("request_number"),
+    )
+    data = await asyncio.to_thread(ha._gzip_jsonl, rows)
     return await _put_verified(
         db,
         module=ak.MODULE_REQUESTS,
@@ -791,7 +907,7 @@ async def catch_up_missed_events(db, archive_date: str) -> Dict[str, Any]:
         if u.get("storage_key") and not await am.find_verified_entity(db, ak.MODULE_UPLOADS, uid):
             await ao.enqueue_safe(db, ao.EVENT_UPLOAD_STORED, {"upload_id": uid, "storage_key": u.get("storage_key"), "sha256": u.get("sha256"), "file_size": u.get("file_size")})
             enqueued["upload_stored"] += 1
-        if _text(u.get("publish_status")) == "Published" and not await am.find_verified_entity(db, ak.MODULE_PRODUCT_HUB, uid):
+        if _text(u.get("publish_status")) == "Published" and not await am.find_verified_entity(db, ak.MODULE_PRODUCT_HISTORY, uid):
             await ao.enqueue_safe(db, ao.EVENT_PUBLISH_COMPLETED, {"upload_id": uid})
             enqueued["publish"] += 1
         if _text(u.get("status") or u.get("publish_status")) == "Cancelled":

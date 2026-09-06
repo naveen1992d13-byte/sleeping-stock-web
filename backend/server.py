@@ -51,6 +51,7 @@ try:
     from . import event_archive
     from . import hybrid_order_history
     from . import hybrid_request_history
+    from . import archive_keys as archive_keys
 except ImportError:
     import s3_storage
     import file_objects
@@ -65,6 +66,7 @@ except ImportError:
     import event_archive
     import hybrid_order_history
     import hybrid_request_history
+    import archive_keys
 
 s3_storage.load_storage_dotenv()
 
@@ -3352,10 +3354,18 @@ async def upload_product_center_v2(file: UploadFile = File(...), current_user: U
     except Exception:
         date_iso = datetime.now(NMTS_TIMEZONE).date().isoformat()
     upload_id = str(uuid.uuid4())
+    upload_filename = archive_keys.archive_filename(
+        context.get("brand_name") or context.get("brand"),
+        context.get("dealer_name"),
+        context.get("branch"),
+        upload_no,
+        archive_keys.MODULE_LABEL_UPLOAD,
+        "xlsx",
+    )
     try:
         stored_excel = await file_objects.store_bytes(
             module="uploads",
-            relative_key=f"{date_iso}/current/{upload_id}/original.xlsx",
+            relative_key=f"{date_iso}/current/{upload_id}/{upload_filename}",
             data=raw_bytes,
             original_filename=file.filename or "product_upload.xlsx",
             content_type=file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
