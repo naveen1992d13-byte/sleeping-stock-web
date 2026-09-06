@@ -1456,10 +1456,20 @@ async def list_branch_notifications(session=Depends(get_device_session)):
     ).to_list(2000)
     action_by_key = {a["request_id"]: a for a in actions}
 
+    request_numbers = [g.get("request_number") for g in groups.values() if g.get("request_number")]
+    header_by_number = {}
+    if request_numbers:
+        async for header in db.request_headers.find(
+            {"request_number": {"$in": request_numbers}},
+            {"_id": 0, "request_number": 1, "response_deadline": 1, "response_status": 1, "request_sent_at": 1},
+        ):
+            header_by_number[header.get("request_number")] = header
+
     results = []
     for key, group in groups.items():
         lock = lock_by_key.get(key)
         action = action_by_key.get(key, {})
+        header = header_by_number.get(group.get("request_number")) or {}
         results.append({
             **group,
             "my_skip_count": action.get("skip_count", 0),
@@ -1470,6 +1480,9 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             "accepted_by_device_name": lock.get("device_name") if lock else None,
             "accepted_by_another": bool(lock) and lock.get("device_id") != session["device"]["device_id"],
             "accepted_by_me": bool(lock) and lock.get("device_id") == session["device"]["device_id"],
+            "response_deadline": header.get("response_deadline"),
+            "response_status": header.get("response_status"),
+            "request_sent_at": header.get("request_sent_at") or group.get("requested_at"),
         })
     results.sort(key=lambda r: r["requested_at"] or "", reverse=True)
     return results
