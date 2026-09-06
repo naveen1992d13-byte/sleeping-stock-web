@@ -51,7 +51,7 @@ class TestTimerAndFreezeHelpers:
         sched = odw.compute_response_schedule(10)
         assert sched['response_time_minutes'] == 30
         assert sched['response_status'] == 'awaiting'
-        assert sched['reminder_at'] < sched['urgent_reminder_at'] < sched['response_deadline']
+        assert sched['reminder_at'] < sched['urgent_reminder_at'] < sched['reminder_3_at'] < sched['response_deadline']
 
     def test_evaluate_timer_cancel_allowed_only_after_expiry(self):
         import order_desk_workflow as odw
