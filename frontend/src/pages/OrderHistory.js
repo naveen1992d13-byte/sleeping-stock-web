@@ -3,7 +3,7 @@ import { useNavigate, useOutletContext } from 'react-router-dom';
 import axios from 'axios';
 import { API } from '../App';
 import { Button } from '../components/ui/button';
-import { ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
+import { ChevronDown, ChevronRight, RefreshCw, FileSpreadsheet, Mail } from 'lucide-react';
 import { toast } from 'sonner';
 
 const formatNumber = (v) => Number(v || 0).toLocaleString('en-IN');
@@ -17,6 +17,9 @@ export function OrderHistory() {
   const [orders, setOrders] = useState([]);
   const [expanded, setExpanded] = useState({});
   const [loading, setLoading] = useState(false);
+  const [emailOrderId, setEmailOrderId] = useState('');
+  const [emailTo, setEmailTo] = useState('');
+  const [emailing, setEmailing] = useState(false);
 
   const loadHistory = async () => {
     setLoading(true);
@@ -41,6 +44,39 @@ export function OrderHistory() {
 
   const openOrder = (orderId) => {
     navigate('/orders', { state: { openOrderId: orderId } });
+  };
+
+  const downloadFulfillmentExcel = async (order) => {
+    try {
+      const res = await axios.get(`${API}/order-desk/orders/${order.id}/fulfillment-export`, { responseType: 'blob' });
+      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `Order_History_${order.order_number || order.id}.xlsx`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Unable to download Order History Excel');
+    }
+  };
+
+  const sendFulfillmentEmail = async (order) => {
+    const to = String(emailTo || '').trim();
+    if (!to) return toast.error('Enter an email address');
+    setEmailing(true);
+    try {
+      const res = await axios.post(`${API}/order-desk/orders/${order.id}/email-fulfillment`, { to_email: to, dry_run: false });
+      if (res.data?.status === 'sent') toast.success(`Order History emailed to ${to}`);
+      else toast.error(res.data?.error || 'Email was not sent');
+      setEmailOrderId('');
+      setEmailTo('');
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Unable to email Order History');
+    } finally {
+      setEmailing(false);
+    }
   };
 
   return (
@@ -108,28 +144,55 @@ export function OrderHistory() {
                     {open && (
                       <tr className="bg-slate-50 border-t">
                         <td colSpan={11} className="p-4">
-                          <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                            Item fulfillment (how each part was sourced)
+                          <div className="mb-3 flex flex-wrap items-center gap-2">
+                            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                              Final fulfillment (source breakup when a part has more than one source)
+                            </div>
+                            <div className="ml-auto flex flex-wrap gap-2">
+                              <Button size="sm" variant="outline" onClick={() => downloadFulfillmentExcel(order)}>
+                                <FileSpreadsheet className="mr-1 h-4 w-4" />Download Excel
+                              </Button>
+                              {String(order.status || order.overall_status || '') === 'Completed' && (
+                                <Button size="sm" variant="outline" onClick={() => { setEmailOrderId(order.id); setEmailTo(''); }}>
+                                  <Mail className="mr-1 h-4 w-4" />Email
+                                </Button>
+                              )}
+                            </div>
                           </div>
+                          {emailOrderId === order.id && (
+                            <div className="mb-3 flex flex-wrap items-end gap-2 rounded-lg border bg-white p-3">
+                              <label className="text-xs text-slate-600">Send Order History to
+                                <input
+                                  type="email"
+                                  value={emailTo}
+                                  onChange={(e) => setEmailTo(e.target.value)}
+                                  className="mt-1 h-9 w-64 rounded border px-2 text-sm"
+                                  placeholder="name@example.com"
+                                />
+                              </label>
+                              <Button size="sm" disabled={emailing} onClick={() => sendFulfillmentEmail(order)}>
+                                {emailing ? 'Sending…' : 'Send Email'}
+                              </Button>
+                              <Button size="sm" variant="outline" onClick={() => setEmailOrderId('')}>Cancel</Button>
+                            </div>
+                          )}
                           {!lines.length ? (
                             <div className="text-sm text-slate-500">No enrichment available for this legacy order.</div>
                           ) : (
                             <div className="overflow-x-auto rounded-lg border bg-white">
-                              <table className="w-full text-xs min-w-[1100px]">
+                              <table className="w-full text-xs min-w-[1200px]">
                                 <thead className="bg-slate-100">
                                   <tr>
                                     {[
-                                      'Part',
+                                      'Part Number',
                                       'Requested Qty',
-                                      'Fulfilled Qty',
-                                      'Remaining Qty',
-                                      'Source Type',
-                                      'Branch / Dealer / Factory',
-                                      'Request Number',
-                                      'System Order Number',
-                                      'Accepted / Fulfilled By',
-                                      'Accepted / Fulfilled At',
-                                      'Final Sourcing Status',
+                                      'Own Branch Fulfilled Qty',
+                                      'Accepted Qty',
+                                      'Source Dealer',
+                                      'Source Branch',
+                                      'Factory Qty',
+                                      'Factory Order No',
+                                      'Final Status',
                                     ].map((h) => (
                                       <th key={h} className="p-2 text-left">{h}</th>
                                     ))}
@@ -137,45 +200,33 @@ export function OrderHistory() {
                                 </thead>
                                 <tbody>
                                   {lines.map((line, idx) => {
-                                    const sources = line.sources || [];
+                                    const sources = (line.sources || []).filter((src) => src.source_type !== 'Factory');
                                     if (!sources.length) {
                                       return (
                                         <tr key={`${line.part_number}-${idx}`} className="border-t">
                                           <td className="p-2 font-medium">{line.part_number || '-'}</td>
-                                          <td className="p-2">{formatNumber(line.ordered_qty)}</td>
-                                          <td className="p-2">{formatNumber(line.fulfilled_qty)}</td>
-                                          <td className="p-2">{formatNumber(line.remaining_qty)}</td>
-                                          <td className="p-2">-</td>
-                                          <td className="p-2">-</td>
-                                          <td className="p-2">-</td>
-                                          <td className="p-2">{line.system_order_number || '-'}</td>
-                                          <td className="p-2">-</td>
-                                          <td className="p-2">-</td>
-                                          <td className="p-2">{line.request_status || '-'}</td>
+                                          <td className="p-2">{formatNumber(line.requested_qty ?? line.ordered_qty)}</td>
+                                          <td className="p-2">{formatNumber(line.own_branch_fulfilled_qty)}</td>
+                                          <td className="p-2">{formatNumber(line.accepted_qty)}</td>
+                                          <td className="p-2">{line.source_dealer || '-'}</td>
+                                          <td className="p-2">{line.source_branch || '-'}</td>
+                                          <td className="p-2">{formatNumber(line.factory_qty)}</td>
+                                          <td className="p-2">{line.factory_order_no || line.system_order_number || '-'}</td>
+                                          <td className="p-2">{line.final_status || line.request_status || '-'}</td>
                                         </tr>
                                       );
                                     }
                                     return sources.map((src, sidx) => (
                                       <tr key={`${line.part_number}-${idx}-${sidx}`} className="border-t">
                                         <td className="p-2 font-medium">{sidx === 0 ? (line.part_number || '-') : ''}</td>
-                                        <td className="p-2">{sidx === 0 ? formatNumber(line.ordered_qty) : ''}</td>
-                                        <td className="p-2">{formatNumber(src.accepted_qty ?? line.fulfilled_qty)}</td>
-                                        <td className="p-2">{sidx === 0 ? formatNumber(line.remaining_qty) : ''}</td>
-                                        <td className="p-2">{src.source_type || '-'}</td>
-                                        <td className="p-2">
-                                          {src.source_type === 'Factory'
-                                            ? 'Factory'
-                                            : [src.source_dealer, src.source_branch].filter(Boolean).join(' / ') || '-'}
-                                        </td>
-                                        <td className="p-2">{src.request_number || '-'}</td>
-                                        <td className="p-2">
-                                          {src.source_type === 'Factory'
-                                            ? (src.system_order_number || line.system_order_number || '-')
-                                            : '-'}
-                                        </td>
-                                        <td className="p-2">{src.accepted_by || '-'}</td>
-                                        <td className="p-2">{dtfmt(src.accepted_at)}</td>
-                                        <td className="p-2">{src.status || line.request_status || '-'}</td>
+                                        <td className="p-2">{sidx === 0 ? formatNumber(line.requested_qty ?? line.ordered_qty) : ''}</td>
+                                        <td className="p-2">{sidx === 0 ? formatNumber(line.own_branch_fulfilled_qty) : ''}</td>
+                                        <td className="p-2">{formatNumber(src.accepted_qty ?? line.accepted_qty)}</td>
+                                        <td className="p-2">{src.source_dealer || '-'}</td>
+                                        <td className="p-2">{src.source_branch || '-'}</td>
+                                        <td className="p-2">{sidx === 0 ? formatNumber(line.factory_qty) : ''}</td>
+                                        <td className="p-2">{sidx === 0 ? (line.factory_order_no || line.system_order_number || '-') : ''}</td>
+                                        <td className="p-2">{sidx === 0 ? (line.final_status || line.request_status || '-') : src.status}</td>
                                       </tr>
                                     ));
                                   })}

@@ -38,6 +38,14 @@ try:
 except ImportError:
     import order_desk_workflow as odw
 try:
+    from . import request_sla_scheduler
+except ImportError:
+    import request_sla_scheduler
+try:
+    from . import mobile_push
+except ImportError:
+    import mobile_push
+try:
     from . import s3_storage
     from . import file_objects
     from . import archive_manifest
@@ -4824,48 +4832,7 @@ async def order_desk_orders(brand: Optional[str] = None, dealer: Optional[str] =
     for row in rows:
         fulfillment = []
         for it in items_by_order.get(row.get('id'), []):
-            reqs = reqs_by_item.get(it.get('id'), [])
-            accepted = float(it.get('accepted_qty') or 0)
-            required = float(it.get('required_qty') or 0)
-            factory_no = it.get('system_order_number')
-            factory_qty = float(it.get('factory_fulfilled_qty') or 0)
-            sources = []
-            for r in reqs:
-                st = r.get('status')
-                if st in ('Approved', 'Partially Approved', 'Dispatched', 'Received', 'Completed') and float(r.get('accepted_qty', r.get('approved_qty', 0)) or 0) > 0:
-                    level = odw.allocation_level(
-                        {'dealer_name': r.get('supplying_dealer'), 'branch': r.get('supplying_branch'), 'level': r.get('source_type') or r.get('level')},
-                        row,
-                    )
-                    sources.append({
-                        'source_type': (level or 'branch').title(),
-                        'source_branch': r.get('supplying_branch'),
-                        'source_dealer': r.get('supplying_dealer'),
-                        'accepted_qty': float(r.get('accepted_qty', r.get('approved_qty', 0)) or 0),
-                        'request_number': r.get('request_number'),
-                        'accepted_by': r.get('approved_by') or r.get('accepted_by'),
-                        'accepted_at': r.get('approved_at') or r.get('accepted_at'),
-                        'status': 'Accepted' if st == 'Approved' else st,
-                    })
-            if factory_no:
-                sources.append({
-                    'source_type': 'Factory',
-                    'system_order_number': factory_no,
-                    'accepted_qty': factory_qty,
-                    'accepted_by': it.get('factory_system_order_saved_by_name'),
-                    'accepted_at': it.get('factory_system_order_saved_at'),
-                    'status': 'Completed',
-                })
-            fulfillment.append({
-                'part_number': it.get('part_number'),
-                'part_name': it.get('description') or it.get('part_name'),
-                'ordered_qty': required,
-                'fulfilled_qty': accepted + factory_qty,
-                'remaining_qty': max(0.0, required - accepted - factory_qty),
-                'request_status': it.get('request_status') or it.get('status'),
-                'system_order_number': factory_no,
-                'sources': sources,
-            })
+            fulfillment.append(odw.build_fulfillment_line(row, it, reqs_by_item.get(it.get('id'), [])))
         row['fulfillment_lines'] = fulfillment
         row['overall_status'] = row.get('overall_status') or row.get('status')
     try:
@@ -4919,10 +4886,16 @@ async def order_desk_order_detail(
         dealer_min_aging=float(dealer_min_aging or 0),
     )
     order_stage = odw.compute_order_stage(items)
+    reqs_by_item = {}
+    all_reqs = await db.order_requests.find({'order_id': order_id}, {'_id': 0}).to_list(20000)
+    for req in all_reqs:
+        reqs_by_item.setdefault(req.get('order_item_id'), []).append(req)
+    finish_readiness = odw.evaluate_finish_readiness(order, items, reqs_by_item)
     return {
         'order': {**order, **order_stage},
         'items': items,
         'stage': order_stage,
+        'finish_readiness': finish_readiness,
     }
 
 
@@ -5275,6 +5248,8 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
         pool = [_with_reservation_adjustment(s, reserved_map) for s in pool]
         pool = [s for s in pool if s.get('net_available_qty', 0) > 0]
         pool.sort(key=lambda s: _auto_suggest_sort_key(s, aging_type))
+        if level == 'branch':
+            pool = odw.partition_own_branch_first(pool, order)
 
         picked = []
         left = pending_qty
@@ -5500,7 +5475,23 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
     # Email is best-effort only: the request/request number/items above are
     # already saved and must never be rolled back by a PDF or SMTP failure.
     await _send_request_group_email(group_doc)
+    try:
+        asyncio.create_task(_notify_new_request_push(group_doc))
+    except Exception as exc:
+        logging.getLogger('nmts.mobile_push').warning('new request push schedule failed: %s', exc)
     return await db.request_headers.find_one({'id': group_id}, {'_id': 0})
+
+
+async def _notify_new_request_push(group_doc: dict):
+    try:
+        if await request_sla_scheduler.claim_push(db, group_doc, 'new'):
+            await mobile_push.notify_branch_request_push(db, group_doc, kind='new')
+            await db.request_headers.update_one(
+                {'id': group_doc.get('id')},
+                {'$set': {'mobile_push_sent.new': datetime.now(timezone.utc).isoformat()}},
+            )
+    except Exception as exc:
+        logging.getLogger('nmts.mobile_push').warning('new request push failed: %s', exc)
 
 
 @api_router.post('/order-desk/orders/{order_id}/send-requests')
@@ -5993,34 +5984,35 @@ async def resend_request_group_email(request_number: str, current_user: UserResp
     }
 
 
-@api_router.post('/requests/group/{request_number}/cancel-timeout')
-async def cancel_request_group_timeout(request_number: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
-    """Cancel unanswered items after response deadline. Does not unlock Accepted qty.
-    Cancellation reason: Cancelled – No Response. Does NOT create a Rejected-Today freeze.
+def _sla_system_actor() -> UserResponse:
+    return UserResponse(
+        id='system-sla',
+        user_id='system-sla',
+        username='SLA Timer',
+        email='sla@sleepingstock.in',
+        role='master',
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+async def _apply_request_group_timeout(group_doc: dict, actor: UserResponse):
+    """Reuse the existing no-response timeout transition.
+
+    Releases only unanswered reserved qty. Accepted qty stays. Remaining
+    qty is marked retry_required so the existing next-source flow continues.
     """
-    group_doc = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
-    if not group_doc:
-        raise HTTPException(status_code=404, detail='Request not found')
-    role = (current_user.role or '').lower()
-    is_requester = group_doc.get('requested_by') == current_user.id or (role != 'user' and group_doc.get('requesting_dealer') == current_user.group)
-    if role != 'master' and not is_requester:
-        raise HTTPException(status_code=403, detail='Not authorized to cancel this request')
-
-    timer = odw.evaluate_group_timer(group_doc)
-    if not timer.get('cancel_allowed'):
-        raise HTTPException(status_code=400, detail='Cancel is only allowed after the response deadline expires')
-
+    request_number = group_doc.get('request_number')
     now = datetime.now(timezone.utc).isoformat()
     pending = await db.order_requests.find(
         {'request_number': request_number, 'status': 'Requested'}, {'_id': 0},
     ).to_list(10000)
     if not pending:
-        return {'message': 'No unanswered items to cancel', 'cancelled': 0, 'cancel_allowed': False}
+        return {'message': 'No unanswered items to cancel', 'cancelled': 0, 'cancel_allowed': False, 'request_number': request_number}
 
     cancelled = 0
     for req in pending:
         updated, changed = await _request_center_transition(
-            req['id'], 'Cancelled', 'Cancelled – No Response', current_user,
+            req['id'], 'Cancelled', 'Cancelled – No Response', actor,
         )
         if changed:
             cancelled += 1
@@ -6047,7 +6039,7 @@ async def cancel_request_group_timeout(request_number: str, payload: dict = None
         'updated_at': now,
     }})
     order = await db.order_headers.find_one({'id': group_doc.get('order_id')}, {'_id': 0}) or {}
-    await odw.append_order_audit(db, order, 'Cancelled – No Response', current_user, {
+    await odw.append_order_audit(db, order, 'Cancelled – No Response', actor, {
         'request_number': request_number, 'cancelled': cancelled,
     })
     return {
@@ -6056,6 +6048,26 @@ async def cancel_request_group_timeout(request_number: str, payload: dict = None
         'cancel_allowed': False,
         'request_number': request_number,
     }
+
+
+@api_router.post('/requests/group/{request_number}/cancel-timeout')
+async def cancel_request_group_timeout(request_number: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    """Cancel unanswered items after response deadline. Does not unlock Accepted qty.
+    Cancellation reason: Cancelled – No Response. Does NOT create a Rejected-Today freeze.
+    """
+    group_doc = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
+    if not group_doc:
+        raise HTTPException(status_code=404, detail='Request not found')
+    role = (current_user.role or '').lower()
+    is_requester = group_doc.get('requested_by') == current_user.id or (role != 'user' and group_doc.get('requesting_dealer') == current_user.group)
+    if role != 'master' and not is_requester:
+        raise HTTPException(status_code=403, detail='Not authorized to cancel this request')
+
+    timer = odw.evaluate_group_timer(group_doc)
+    if not timer.get('cancel_allowed'):
+        raise HTTPException(status_code=400, detail='Cancel is only allowed after the response deadline expires')
+
+    return await _apply_request_group_timeout(group_doc, current_user)
 
 
 @api_router.get('/requests/group/{request_number}')
@@ -6208,6 +6220,224 @@ async def save_factory_system_order(
     }
 
 
+class FactorySystemOrderBulkBody(BaseModel):
+    item_ids: List[str]
+    system_order_number: str
+    remarks: str = ""
+    correction_reason: str = ""
+
+
+@api_router.post('/order-desk/orders/{order_id}/factory-system-order-bulk')
+async def save_factory_system_order_bulk(
+    order_id: str,
+    body: FactorySystemOrderBulkBody,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Apply one Factory Order No to multiple factory-required rows."""
+    number = (body.system_order_number or '').strip()
+    if not number:
+        raise HTTPException(status_code=400, detail='Factory Order No is required')
+    item_ids = [str(x) for x in (body.item_ids or []) if x]
+    if not item_ids:
+        raise HTTPException(status_code=400, detail='Select at least one factory row')
+    saved = []
+    errors = []
+    last = None
+    for item_id in item_ids:
+        item = await db.order_items.find_one({'id': item_id, 'order_id': order_id}, {'_id': 0, 'id': 1})
+        if not item:
+            errors.append({'item_id': item_id, 'detail': 'Item not found on this order'})
+            continue
+        try:
+            last = await save_factory_system_order(
+                item_id,
+                FactorySystemOrderBody(
+                    system_order_number=number,
+                    remarks=body.remarks,
+                    correction_reason=body.correction_reason,
+                ),
+                current_user,
+            )
+            saved.append(item_id)
+        except HTTPException as exc:
+            errors.append({'item_id': item_id, 'detail': exc.detail})
+    return {
+        'message': f'Factory Order No applied to {len(saved)} part(s)',
+        'saved_item_ids': saved,
+        'errors': errors,
+        'system_order_number': number,
+        'order_closed': bool((last or {}).get('order_closed')),
+    }
+
+
+@api_router.post('/order-desk/orders/{order_id}/finish')
+async def finish_order_desk_order(order_id: str, current_user: UserResponse = Depends(get_current_user)):
+    """Close the order when no request is open, remaining qty is zero, and
+    every factory-required row has a Factory Order No. Does not wipe accepted
+    qty, source dealer/branch, factory qty, or Factory Order No.
+    """
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
+    role = (current_user.role or '').lower()
+    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not authorized for this order')
+    items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    reqs_by_item = {}
+    for req in await db.order_requests.find({'order_id': order_id}, {'_id': 0}).to_list(20000):
+        reqs_by_item.setdefault(req.get('order_item_id'), []).append(req)
+    readiness = odw.evaluate_finish_readiness(order, items, reqs_by_item)
+    if not readiness.get('can_finish'):
+        raise HTTPException(status_code=400, detail={
+            'message': 'Order cannot be finished yet',
+            **readiness,
+        })
+    now = datetime.now(timezone.utc).isoformat()
+    await db.order_headers.update_one({'id': order_id}, {'$set': {
+        'status': 'Completed',
+        'overall_status': 'Completed',
+        'finished_at': now,
+        'finished_by': current_user.id,
+        'finished_by_name': current_user.username,
+        'sourcing_completed_at': now,
+        'updated_at': now,
+    }})
+    await odw.append_order_audit(db, order, 'Order finished', current_user)
+    try:
+        await event_archive.maybe_enqueue_order_terminal(db, order_id, status='Completed')
+    except Exception as exc:
+        logging.getLogger(__name__).warning("order terminal archive enqueue failed: %s", exc)
+    updated = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    return {'message': 'Order finished', 'order': updated, 'finish_readiness': readiness}
+
+
+def _fulfillment_lines_for_order(order: dict, items: list, reqs_by_item: dict) -> list:
+    return [odw.build_fulfillment_line(order, item, reqs_by_item.get(item.get('id'), [])) for item in items]
+
+
+async def _load_order_fulfillment(order_id: str, current_user: UserResponse):
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
+    role = (current_user.role or '').lower()
+    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not authorized for this order')
+    items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    reqs_by_item = {}
+    for req in await db.order_requests.find({'order_id': order_id}, {'_id': 0}).to_list(20000):
+        reqs_by_item.setdefault(req.get('order_item_id'), []).append(req)
+    return order, _fulfillment_lines_for_order(order, items, reqs_by_item)
+
+
+@api_router.get('/order-desk/orders/{order_id}/fulfillment-export')
+async def order_desk_fulfillment_export(order_id: str, current_user: UserResponse = Depends(get_current_user)):
+    from fastapi.responses import StreamingResponse
+    excel_permissions.require_excel_export(current_user)
+    order, lines = await _load_order_fulfillment(order_id, current_user)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Order History'
+    headers = [
+        'Order Number', 'Part Number', 'Requested Qty', 'Own Branch Fulfilled Qty',
+        'Accepted Qty', 'Source Dealer', 'Source Branch', 'Factory Qty',
+        'Factory Order No', 'Final Status',
+    ]
+    ws.append(headers)
+    order_number = order.get('order_number') or ''
+    for line in lines:
+        sources = [s for s in (line.get('sources') or []) if s.get('source_type') != 'Factory']
+        factory_sources = [s for s in (line.get('sources') or []) if s.get('source_type') == 'Factory']
+        if sources:
+            for idx, src in enumerate(sources):
+                ws.append([
+                    order_number,
+                    line.get('part_number') if idx == 0 else '',
+                    line.get('requested_qty') if idx == 0 else '',
+                    line.get('own_branch_fulfilled_qty') if idx == 0 else '',
+                    src.get('accepted_qty') or 0,
+                    src.get('source_dealer') or '',
+                    src.get('source_branch') or '',
+                    line.get('factory_qty') if idx == 0 else '',
+                    line.get('factory_order_no') if idx == 0 else '',
+                    line.get('final_status') if idx == 0 else '',
+                ])
+        elif factory_sources or line.get('factory_qty') or line.get('requested_qty'):
+            ws.append([
+                order_number,
+                line.get('part_number'),
+                line.get('requested_qty'),
+                line.get('own_branch_fulfilled_qty'),
+                line.get('accepted_qty'),
+                line.get('source_dealer') or ('Factory' if line.get('factory_qty') else ''),
+                line.get('source_branch') or '',
+                line.get('factory_qty'),
+                line.get('factory_order_no'),
+                line.get('final_status'),
+            ])
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f"Order_History_{order.get('order_number') or order_id}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={'Content-Disposition': f'attachment; filename={fname}'},
+    )
+
+
+class OrderFulfillmentEmailBody(BaseModel):
+    to_email: str
+    dry_run: bool = False
+
+
+@api_router.post('/order-desk/orders/{order_id}/email-fulfillment')
+async def order_desk_email_fulfillment(
+    order_id: str,
+    body: OrderFulfillmentEmailBody,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Email completed-order fulfillment using the existing Gmail HTML helper.
+
+    Automated tests must pass dry_run=true so no real SMTP send occurs.
+    """
+    order, lines = await _load_order_fulfillment(order_id, current_user)
+    to_email = (body.to_email or '').strip()
+    if not to_email:
+        raise HTTPException(status_code=400, detail='to_email is required')
+    fields = [
+        ('Order Number', order.get('order_number') or ''),
+        ('Dealer', order.get('dealer_name') or ''),
+        ('Branch', order.get('branch') or ''),
+        ('Status', order.get('overall_status') or order.get('status') or ''),
+    ]
+    for line in lines:
+        fields.append((
+            line.get('part_number') or 'Part',
+            (
+                f"Req {line.get('requested_qty') or 0} · Own {line.get('own_branch_fulfilled_qty') or 0} · "
+                f"Accepted {line.get('accepted_qty') or 0} · {line.get('source_dealer') or '-'} / "
+                f"{line.get('source_branch') or '-'} · Factory {line.get('factory_qty') or 0} "
+                f"{line.get('factory_order_no') or ''} · {line.get('final_status') or ''}"
+            ).strip(),
+        ))
+    context = {
+        'headline': f"Order History · {order.get('order_number') or order_id}",
+        'fields': fields,
+        'footer': 'NMTS Sleeping Stock — fulfillment summary. This is not a new request.',
+    }
+    subject = f"NMTS Order History {order.get('order_number') or order_id}"
+    if body.dry_run:
+        return {
+            'status': 'dry_run',
+            'to_email': to_email,
+            'subject': subject,
+            'context': context,
+            'line_count': len(lines),
+        }
+    result = notifications.send_gmail_email(to_email, subject, context)
+    return {'status': result.get('status'), 'to_email': to_email, 'error': result.get('error'), 'line_count': len(lines)}
+
+
 @api_router.get('/requests')
 async def request_center_list(
     view: str = 'all', status_filter: Optional[str] = None, search: Optional[str] = None,
@@ -6314,6 +6544,16 @@ async def request_center_list(
             'name': u.get('name') or u.get('username') or '',
         } for u in users]
 
+    request_numbers = {r.get('request_number') for r in rows if r.get('request_number')}
+    header_by_number = {}
+    if request_numbers:
+        async for header in db.request_headers.find(
+            {'request_number': {'$in': list(request_numbers)}},
+            {'_id': 0, 'request_number': 1, 'response_deadline': 1, 'response_status': 1,
+             'request_sent_at': 1, 'response_time_minutes': 1, 'status': 1},
+        ):
+            header_by_number[header.get('request_number')] = header
+
     for row in rows:
         scope = (
             str(row.get('supplying_brand') or row.get('requesting_brand') or '').strip(),
@@ -6322,6 +6562,13 @@ async def request_center_list(
         )
         row['requested_user_id'] = row.get('requested_by') or ''
         row['receiver_users'] = receiver_map.get(scope, [])
+        header = header_by_number.get(row.get('request_number')) or {}
+        if header:
+            timer = odw.evaluate_group_timer(header)
+            row['response_deadline'] = timer.get('response_deadline') or header.get('response_deadline')
+            row['response_status'] = timer.get('response_status') or header.get('response_status')
+            row['request_sent_at'] = timer.get('request_sent_at') or header.get('request_sent_at')
+            row['response_time_minutes'] = timer.get('response_time_minutes') or header.get('response_time_minutes')
     try:
         existing_ids = {r.get('id') for r in rows if r.get('id')}
         archived = await hybrid_request_history.list_archived_requests(db, exclude_ids=existing_ids, limit=2000)
@@ -7917,6 +8164,15 @@ async def seed_master_user_on_startup():
             logger.warning("Storage usage index creation failed: %s", exc)
         archive_scheduler.start_archive_scheduler(db)
         logger.info("Archive scheduler started (ARCHIVE_PRUNE_ENABLED=%s)", s3_storage.archive_prune_enabled())
+
+        async def _sla_apply_timeout(header):
+            await _apply_request_group_timeout(header, _sla_system_actor())
+
+        async def _sla_send_reminder(header, kind):
+            await mobile_push.notify_branch_request_push(db, header, kind=kind)
+
+        request_sla_scheduler.start_request_sla_scheduler(db, _sla_apply_timeout, _sla_send_reminder)
+        logger.info("Request SLA scheduler started")
         exe = str(sys.executable or "").replace("\\", "/")
         if "/backend/venv/" not in exe:
             logger.warning(

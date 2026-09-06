@@ -112,3 +112,101 @@ async def notify_auto_perpetual_assignments(db, *, assignments_by_user: Dict[str
                 status=status,
                 detail=detail,
             )
+
+
+_REQUEST_PUSH_COPY = {
+    "new": (
+        "New Parts Transfer Request",
+        "New request {request_number} from {requesting_branch}. Open Request Center to respond.",
+    ),
+    "reminder_1": (
+        "Request reminder",
+        "Request {request_number} is still awaiting your response.",
+    ),
+    "reminder_2": (
+        "Request reminder",
+        "Request {request_number} still needs a response.",
+    ),
+    "reminder_3": (
+        "Request deadline approaching",
+        "Request {request_number} is near its response deadline.",
+    ),
+}
+
+
+async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
+    """High-priority request push to supplying-branch mobile devices. Never raises."""
+    try:
+        dealer = (group_doc or {}).get("supplying_dealer") or ""
+        branch = (group_doc or {}).get("supplying_branch") or ""
+        request_number = (group_doc or {}).get("request_number") or ""
+        request_group_key = (group_doc or {}).get("id") or request_number
+        if not dealer or not branch or not request_number:
+            return {"ok": False, "error": "missing_scope"}
+        title_tpl, body_tpl = _REQUEST_PUSH_COPY.get(kind, _REQUEST_PUSH_COPY["new"])
+        title = title_tpl
+        body = body_tpl.format(
+            request_number=request_number,
+            requesting_branch=(group_doc or {}).get("requesting_branch") or "",
+        )
+        data = {
+            "type": "branch_request",
+            "screen": "request",
+            "kind": kind,
+            "request_group_key": request_group_key,
+            "request_number": request_number,
+        }
+        devices = await db.mobile_devices.find(
+            {
+                "dealer_name": dealer,
+                "branch": branch,
+                "status": "active",
+                "push_token": {"$exists": True, "$ne": ""},
+            },
+            {"_id": 0, "device_id": 1, "push_token": 1, "mobile_user_id": 1},
+        ).to_list(100)
+        if not devices:
+            await log_push_attempt(
+                db,
+                mobile_user_id="",
+                device_id="",
+                push_token="",
+                title=title,
+                body=body,
+                data=data,
+                status="skipped",
+                detail="no_active_push_token",
+            )
+            return {"ok": True, "sent": 0, "skipped": True}
+        batch = [
+            {
+                "to": dev.get("push_token"),
+                "title": title,
+                "body": body,
+                "sound": "default",
+                "priority": "high",
+                "channelId": "sleeping-stock-requests",
+                "data": data,
+            }
+            for dev in devices
+            if dev.get("push_token")
+        ]
+        result = send_expo_push_messages(batch)
+        status = "sent" if result.get("ok") else "failed"
+        detail = str(result.get("error") or result.get("body") or "")[:500]
+        for dev in devices:
+            await log_push_attempt(
+                db,
+                mobile_user_id=dev.get("mobile_user_id", ""),
+                device_id=dev.get("device_id", ""),
+                push_token=dev.get("push_token", ""),
+                title=title,
+                body=body,
+                data=data,
+                status=status,
+                detail=detail,
+            )
+        return {"ok": result.get("ok"), "sent": len(batch), "kind": kind}
+    except Exception as exc:
+        logger.warning("branch request push failed: %s", exc)
+        return {"ok": False, "error": str(exc)[:300]}
