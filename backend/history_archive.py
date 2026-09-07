@@ -1310,15 +1310,44 @@ def _today_ist_keys() -> Tuple[str, str]:
     return today.strftime("%Y%m%d"), today.isoformat()
 
 
+async def clear_stale_is_active_today(db) -> Dict[str, Any]:
+    """Clear previous-day is_active_today flags so old rows are not treated as live.
+
+    Live Product Hub / Order Desk already key off IST today's active_date_key.
+    Stale True flags only blocked historical Mongo prune.
+    """
+    today_key, today_iso = _today_ist_keys()
+    query = {
+        "is_active_today": True,
+        "active_date_key": {"$nin": [today_key, today_iso]},
+    }
+    result = await db.products.update_many(query, {"$set": {"is_active_today": False}})
+    cleared = int(getattr(result, "modified_count", 0) or getattr(result, "matched_count", 0) or 0)
+    logger.info("Cleared stale is_active_today flags: %s (today=%s)", cleared, today_iso)
+    return {"status": "ok", "cleared": cleared, "today_key": today_key, "today_iso": today_iso}
+
+
+def _manifest_is_real_s3_verified(manifest: Dict[str, Any]) -> bool:
+    backend = str((manifest or {}).get("storage_backend") or "").lower()
+    return (
+        (manifest or {}).get("status") == am.STATUS_VERIFIED
+        and bool((manifest or {}).get("eligible_for_prune"))
+        and backend in {"s3", "real s3"}
+    )
+
+
 async def prune_product_history_date(db, archive_date: str, *, force: bool = False) -> Dict[str, Any]:
     """Delete Mongo product rows for one VERIFIED historical date only.
 
     Safety gates (all required unless force is used for tests with real S3):
     1. ARCHIVE_PRUNE_ENABLED=true
     2. Storage backend is REAL S3 (local fallback never prunes)
-    3. Manifest status VERIFIED with matching checksum/size
-    4. Date is NOT today (never touch live/current Product Hub set)
-    5. Re-verify object exists before delete
+    3. Every related product-history manifest for the date is VERIFIED
+       (or already PRUNED) on REAL S3 — never delete on a boolean alone
+    4. Re-verify each S3 object exists with matching checksum/size
+    5. Date is NOT today (never touch live/current Product Hub set)
+    6. Date is outside PRODUCT_MONGO_HOT_DAYS
+    Does not delete S3 archive data.
     """
     from s3_storage import archive_prune_enabled, get_storage, product_mongo_hot_days
 
@@ -1326,6 +1355,8 @@ async def prune_product_history_date(db, archive_date: str, *, force: bool = Fal
     date_iso = date_key_to_iso(archive_date)
     date_key = iso_to_date_key(date_iso)
     today_key, today_iso = _today_ist_keys()
+
+    await clear_stale_is_active_today(db)
 
     if date_key == today_key or date_iso == today_iso:
         return {
@@ -1363,45 +1394,70 @@ async def prune_product_history_date(db, archive_date: str, *, force: bool = Fal
             "deleted": 0,
         }
 
-    manifest = await am.find_verified(db, MODULE_PRODUCT_HISTORY, archive_date=date_iso)
-    if not manifest:
+    manifests = await db.archive_manifests.find(
+        {"module": MODULE_PRODUCT_HISTORY, "archive_date": date_iso},
+        {"_id": 0},
+    ).to_list(500)
+    if not manifests:
         return {
             "status": "blocked",
             "reason": "no VERIFIED archive manifest for date",
             "archive_date": date_iso,
             "deleted": 0,
         }
-    if not manifest.get("eligible_for_prune") and not force:
+
+    pending = [
+        m for m in manifests
+        if m.get("status") not in {am.STATUS_VERIFIED, am.STATUS_PRUNED}
+    ]
+    if pending and not force:
         return {
             "status": "blocked",
-            "reason": "manifest not eligible_for_prune (requires REAL S3 verification)",
+            "reason": "incomplete product-history archive for date — Mongo untouched",
             "archive_date": date_iso,
+            "pending_count": len(pending),
             "deleted": 0,
         }
 
-    # Re-verify object before any delete
-    key = manifest.get("storage_key") or ""
-    if not storage.verify_object(key, manifest.get("sha256") or "", int(manifest.get("file_size") or 0)):
-        await am.mark_status(
-            db,
-            manifest["archive_id"],
-            am.STATUS_FAILED,
-            error="Pre-prune re-verification failed",
-            eligible_for_prune=False,
-        )
+    verified = [m for m in manifests if _manifest_is_real_s3_verified(m)]
+    if not verified:
         return {
-            "status": "failed",
-            "reason": "pre-prune re-verification failed — Mongo untouched",
+            "status": "blocked",
+            "reason": "no VERIFIED archive manifest for date",
             "archive_date": date_iso,
             "deleted": 0,
         }
 
+    # Re-verify every related S3 object before any delete
+    for manifest in verified:
+        if not manifest.get("eligible_for_prune") and not force:
+            return {
+                "status": "blocked",
+                "reason": "manifest not eligible_for_prune (requires REAL S3 verification)",
+                "archive_date": date_iso,
+                "deleted": 0,
+            }
+        key = manifest.get("storage_key") or ""
+        if not storage.verify_object(key, manifest.get("sha256") or "", int(manifest.get("file_size") or 0)):
+            await am.mark_status(
+                db,
+                manifest["archive_id"],
+                am.STATUS_FAILED,
+                error="Pre-prune re-verification failed",
+                eligible_for_prune=False,
+            )
+            return {
+                "status": "failed",
+                "reason": "pre-prune re-verification failed — Mongo untouched",
+                "archive_date": date_iso,
+                "deleted": 0,
+            }
+
+    # Historical date only — ignore stale is_active_today flags
     query = {
         "publish_status": "Published",
         "active_date_key": {"$in": [date_key, date_iso]},
     }
-    # Never delete rows still marked as today's active set
-    query["is_active_today"] = {"$ne": True}
 
     before = await db.products.count_documents(query)
     result = await db.products.delete_many(query)
@@ -1412,22 +1468,24 @@ async def prune_product_history_date(db, archive_date: str, *, force: bool = Fal
     sum_res = await db.batch_summaries.delete_many(sum_q)
     summaries_deleted = int(getattr(sum_res, "deleted_count", 0) or 0)
 
-    await am.mark_status(
-        db,
-        manifest["archive_id"],
-        am.STATUS_PRUNED,
-        pruned_at=_ist_now().astimezone(timezone.utc).isoformat(),
-        pruned_product_count=deleted,
-        pruned_summary_count=summaries_deleted,
-        eligible_for_prune=False,
-    )
+    for manifest in verified:
+        await am.mark_status(
+            db,
+            manifest["archive_id"],
+            am.STATUS_PRUNED,
+            pruned_at=_ist_now().astimezone(timezone.utc).isoformat(),
+            pruned_product_count=deleted,
+            pruned_summary_count=summaries_deleted,
+            eligible_for_prune=False,
+        )
     return {
         "status": "pruned",
         "archive_date": date_iso,
         "deleted": deleted,
         "summaries_deleted": summaries_deleted,
         "counted_before": before,
-        "manifest_id": manifest.get("archive_id"),
+        "manifest_id": verified[0].get("archive_id"),
+        "manifests_pruned": len(verified),
     }
 
 

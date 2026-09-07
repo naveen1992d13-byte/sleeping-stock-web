@@ -4514,20 +4514,34 @@ def _send_requests_fingerprint(order_id: str, items: list) -> str:
 
 
 async def _resolve_request_receiver_email(brand: str, dealer: str, branch: str) -> str:
-    """Best single receiver for a Requested-To destination: an active Admin
-    scoped to the exact supplying dealer+branch, else an active Master for
-    the supplying brand. Never guesses — returns '' if nothing matches."""
-    query = {
-        'status': {'$regex': '^active$', '$options': 'i'},
-        'group': dealer, 'location': branch, 'role': 'admin',
-    }
-    user = await db.users.find_one(query, {'_id': 0, 'email': 1, 'id': 1})
-    if not user or not (user.get('email') or '').strip():
-        master_query = {'status': {'$regex': '^active$', '$options': 'i'}, 'role': 'master'}
-        if brand:
-            master_query['brand'] = brand
-        user = await db.users.find_one(master_query, {'_id': 0, 'email': 1, 'id': 1})
-    return ((user or {}).get('email') or '').strip()
+    """Best single receiver for a Requested-To destination.
+
+    Order: supplying branch user email → dealer/admin fallback → master
+    fallback. Group/location/brand matches are case-insensitive. Master
+    brand is preferred when present but never required.
+    """
+    dealer = (dealer or '').strip()
+    branch = (branch or '').strip()
+    brand = (brand or '').strip()
+    active = {'status': {'$regex': '^active$', '$options': 'i'}}
+    clauses = [{'role': 'master'}]
+    if dealer and branch:
+        clauses.append({
+            'group': {'$regex': f'^{re.escape(dealer)}$', '$options': 'i'},
+            'location': {'$regex': f'^{re.escape(branch)}$', '$options': 'i'},
+        })
+    if dealer:
+        clauses.append({
+            'group': {'$regex': f'^{re.escape(dealer)}$', '$options': 'i'},
+            'role': {'$in': ['admin', 'master']},
+        })
+    candidates = await db.users.find(
+        {'$and': [active, {'$or': clauses}]},
+        {'_id': 0, 'email': 1, 'role': 1, 'group': 1, 'location': 1, 'brand': 1, 'status': 1},
+    ).to_list(500)
+    return notifications.select_request_receiver_email(
+        candidates, brand=brand, dealer=dealer, branch=branch,
+    )
 
 
 async def _send_request_group_email(group_doc: dict):
@@ -5138,15 +5152,15 @@ async def order_desk_allocate(order_id: str, payload: dict, current_user: UserRe
 async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: UserResponse = Depends(get_current_user)):
     """Smart Auto Suggest Allocation Engine.
 
-    level='branch': suggests only from same_dealer_sources (Branch
-    Availability), sorted by the chosen aging type (Purchase/Sales), highest
-    aging first, ties broken by highest available qty, then oldest uploaded
-    stock, then alphabetical branch. Allocates from a single branch if it can
-    cover the full requirement, otherwise splits across branches — never
-    exceeding the requested quantity.
+    level='own': suggests only from the ordering branch (Own Branch).
+    Allocates eligible own-branch qty first; leftover remaining qty stays
+    for the Branches stage.
+
+    level='branch': suggests only from other same-dealer branches, and is
+    refused until Own Branch is completed/exhausted for remaining qty.
 
     level='dealer': same ranking, but pulls only from other_dealer_sources,
-    is refused until at least one request has been sent for this order, and
+    is refused until Own Branch and Branches are completed/exhausted, and
     only ever targets the Pending Qty = Requested Qty - Already Requested
     Branch Qty (computed live from non-Rejected/Cancelled order_requests).
 
@@ -5154,13 +5168,15 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
     and both skip any item the user has manually overridden.
     """
     level = str((payload or {}).get('level') or '').strip().lower()
+    if level in ('own_branch',):
+        level = 'own'
     aging_type = str((payload or {}).get('aging_type') or 'purchase').strip().lower()
     try:
         min_aging_days = float((payload or {}).get('min_aging_days') or (payload or {}).get('aging_min_days') or 0)
     except (TypeError, ValueError):
         min_aging_days = 0.0
-    if level not in ('branch', 'dealer'):
-        raise HTTPException(status_code=400, detail="level must be 'branch' or 'dealer'")
+    if level not in ('own', 'branch', 'dealer'):
+        raise HTTPException(status_code=400, detail="level must be 'own', 'branch' or 'dealer'")
     if aging_type not in ('purchase', 'sales'):
         aging_type = 'purchase'
 
@@ -5177,28 +5193,32 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
     if not any(item.get('availability_checked_at') for item in items):
         raise HTTPException(status_code=400, detail='Run Check Availability before using Auto Suggest')
 
-    # Stage gate: Dealer Auto Suggest only after Branch stage exhausted for remaining items
-    if level == 'dealer':
+    # Stage gates: Branches after Own Branch; Dealers after Own Branch + Branches
+    if level in ('branch', 'dealer'):
         freezes_gate = await odw.load_today_freezes(db, [i.get('part_number') for i in items], order.get('brand_name') or '')
+        still_own = False
         still_branch = False
         for item in items:
             rem = float(item.get('remaining_qty') if item.get('remaining_qty') is not None else item.get('required_qty') or 0)
-            # subtract accepted/pending roughly via enrichment later; use flag + pool
-            if item.get('branch_stage_exhausted'):
+            if rem <= 0:
                 continue
-            pool = odw.eligible_pool(item, order, 'branch', freezes_gate, 'purchase', 0)
-            if pool and rem > 0 and not item.get('branch_stage_exhausted'):
-                # If any active branch request pending, also block
-                still_branch = True
-                break
-        sent_already = await db.request_headers.find_one({'order_id': order_id}, {'_id': 0, 'id': 1})
-        if not sent_already and still_branch:
-            raise HTTPException(status_code=400, detail='Dealer Auto Suggest opens only after Branch stage is exhausted for remaining quantity')
-        if still_branch:
-            raise HTTPException(status_code=400, detail='Complete or exhaust Branch stage before Dealer Auto Suggest')
+            if not item.get('own_stage_exhausted'):
+                own_left = odw.eligible_pool(item, order, 'own', freezes_gate, 'purchase', 0)
+                if own_left:
+                    still_own = True
+            if not item.get('branch_stage_exhausted'):
+                branch_left = odw.eligible_pool(item, order, 'branch', freezes_gate, 'purchase', 0)
+                if branch_left:
+                    still_branch = True
+        if level == 'branch' and still_own:
+            raise HTTPException(status_code=400, detail='Complete or exhaust Own Branch before Branches Auto Suggest')
+        if level == 'dealer' and still_own:
+            raise HTTPException(status_code=400, detail='Complete or exhaust Own Branch before Dealer Auto Suggest')
+        if level == 'dealer' and still_branch:
+            raise HTTPException(status_code=400, detail='Complete or exhaust Branches before Dealer Auto Suggest')
 
     selected_item_ids = {str(x) for x in ((payload or {}).get('item_ids') or []) if x}
-    pool_field = 'same_dealer_sources' if level == 'branch' else 'other_dealer_sources'
+    pool_field = 'other_dealer_sources' if level == 'dealer' else 'same_dealer_sources'
 
     all_stock_ids = [s.get('stock_id') for item in items for s in (item.get(pool_field) or [])]
     reserved_map = await _reservation_qty_map(all_stock_ids)
@@ -5238,9 +5258,18 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
             result_items.append({**item, 'auto_suggest_skipped': 'fully_locked'})
             continue
 
-        if level == 'dealer' and not item.get('branch_stage_exhausted'):
+        if level == 'branch' and not item.get('own_stage_exhausted'):
+            own_left = odw.eligible_pool(item, order, 'own', freezes, aging_type, min_aging_days)
+            if own_left:
+                result_items.append({**item, 'auto_suggest_skipped': 'own_stage_open'})
+                continue
+        if level == 'dealer' and (not item.get('own_stage_exhausted') or not item.get('branch_stage_exhausted')):
+            own_left = odw.eligible_pool(item, order, 'own', freezes, aging_type, min_aging_days)
             branch_left = odw.eligible_pool(item, order, 'branch', freezes, aging_type, min_aging_days)
-            if branch_left:
+            if own_left and not item.get('own_stage_exhausted'):
+                result_items.append({**item, 'auto_suggest_skipped': 'own_stage_open'})
+                continue
+            if branch_left and not item.get('branch_stage_exhausted'):
                 result_items.append({**item, 'auto_suggest_skipped': 'branch_stage_open'})
                 continue
 
@@ -5248,7 +5277,7 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
         pool = [_with_reservation_adjustment(s, reserved_map) for s in pool]
         pool = [s for s in pool if s.get('net_available_qty', 0) > 0]
         pool.sort(key=lambda s: _auto_suggest_sort_key(s, aging_type))
-        if level == 'branch':
+        if level == 'own':
             pool = odw.partition_own_branch_first(pool, order)
 
         picked = []
@@ -5276,24 +5305,15 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
             left -= take
             reserved_map[source.get('stock_id')] = reserved_map.get(source.get('stock_id'), 0) + take
 
-        preserved = [
-            a for a in (item.get('allocations') or [])
-            if a.get('request_no') or a.get('request_number')
-            or str(a.get('status') or '').lower() in (
+        kept = []
+        for alloc in (item.get('allocations') or []):
+            sent = bool(alloc.get('request_no') or alloc.get('request_number')) or str(alloc.get('status') or '').lower() in (
                 'request sent', 'awaiting response', 'requested', 'accepted', 'partially accepted',
                 'rejected', 'cancelled', 'completed', 'dispatched', 'received', 'response time expired',
             )
-        ]
-        if level == 'branch':
-            new_allocations = preserved + picked
-        else:
-            existing = [
-                a for a in preserved
-                if not (a.get('level') == 'dealer' and a.get('origin') == 'auto' and not (a.get('request_no') or a.get('request_number')))
-            ]
-            # drop unsent dealer drafts then add new
-            existing = [a for a in (item.get('allocations') or []) if a.get('request_no') or a.get('request_number') or a.get('level') != 'dealer']
-            new_allocations = existing + picked
+            if sent or odw.allocation_level(alloc, order) != level:
+                kept.append(alloc)
+        new_allocations = kept + picked
 
         total_allocated = sum(float(a.get('request_qty') or 0) for a in new_allocations)
         await db.order_items.update_one({'id': item['id']}, {'$set': {
@@ -5499,9 +5519,9 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
     """Send requests for selected allocations.
 
     Body (optional):
-      level: 'branch' | 'dealer'  — send only that stage's unsent allocations.
+      level: 'own' | 'branch' | 'dealer'  — send only that stage's unsent allocations.
       If omitted, defaults to sending all unsent allocations (legacy behaviour),
-      but the UI always passes an explicit level so Branch and Dealer stay separate.
+      but the UI always passes an explicit level so Own Branch, Branches and Dealers stay separate.
     Auto Suggest never calls this endpoint.
     """
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
@@ -5513,8 +5533,10 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
         raise HTTPException(status_code=403, detail='Not authorized to send requests for this order')
 
     level = str(((payload or {}).get('level') or '')).strip().lower()
-    if level and level not in ('branch', 'dealer'):
-        raise HTTPException(status_code=400, detail="level must be 'branch' or 'dealer'")
+    if level in ('own_branch',):
+        level = 'own'
+    if level and level not in ('own', 'branch', 'dealer'):
+        raise HTTPException(status_code=400, detail="level must be 'own', 'branch' or 'dealer'")
 
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
     now = datetime.now(timezone.utc).isoformat()
@@ -5534,7 +5556,7 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
             sources = odw.filter_unsent_allocations(item, order, level, item_reqs)
         else:
             sources = []
-            for lvl in ('branch', 'dealer'):
+            for lvl in ('own', 'branch', 'dealer'):
                 sources.extend(odw.filter_unsent_allocations(item, order, lvl, item_reqs))
         for source in sources:
             key = (_order_clean_text(source.get('dealer_name')), _order_clean_text(source.get('branch')))
@@ -5543,7 +5565,9 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
     if not groups:
         raise HTTPException(
             status_code=400,
-            detail=f"No unsent {'branch' if level == 'branch' else 'dealer' if level == 'dealer' else ''} source selections to send".strip()
+            detail=(
+                f"No unsent {'own-branch' if level == 'own' else 'branch' if level == 'branch' else 'dealer' if level == 'dealer' else ''} source selections to send"
+            ).strip()
             or 'Select at least one source before sending requests',
         )
 

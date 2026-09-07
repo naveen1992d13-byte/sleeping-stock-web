@@ -99,6 +99,89 @@ class TestFulfillmentLine:
         assert len(line['sources']) == 3
 
 
+class TestOwnThenBranchesThenDealers:
+    def test_allocation_level_splits_own_and_other_branches(self):
+        order = {'dealer_name': 'KUN Hyundai', 'branch': 'Ambattur'}
+        assert odw.allocation_level({'dealer_name': 'KUN Hyundai', 'branch': 'Ambattur'}, order) == 'own'
+        assert odw.allocation_level({'dealer_name': 'KUN Hyundai', 'branch': 'Vanagaram'}, order) == 'branch'
+        assert odw.allocation_level({'dealer_name': 'Other Dealer', 'branch': 'X'}, order) == 'dealer'
+
+    def test_eligible_pool_own_excludes_other_same_dealer_branches(self):
+        order = {'dealer_name': 'KUN', 'branch': 'Ambattur', 'brand_name': 'Hyundai'}
+        item = {
+            'part_number': 'P1',
+            'same_dealer_sources': [
+                {'dealer_name': 'KUN', 'branch': 'Ambattur', 'available_qty': 3, 'net_available_qty': 3, 'purchase_aging_days': 100},
+                {'dealer_name': 'KUN', 'branch': 'Vanagaram', 'available_qty': 8, 'net_available_qty': 8, 'purchase_aging_days': 100},
+            ],
+            'other_dealer_sources': [
+                {'dealer_name': 'Other', 'branch': 'X', 'available_qty': 5, 'net_available_qty': 5, 'purchase_aging_days': 100},
+            ],
+        }
+        own = [s['branch'] for s in odw.eligible_pool(item, order, 'own', set(), 'purchase', 0)]
+        branches = [s['branch'] for s in odw.eligible_pool(item, order, 'branch', set(), 'purchase', 0)]
+        dealers = [s['dealer_name'] for s in odw.eligible_pool(item, order, 'dealer', set(), 'purchase', 0)]
+        assert own == ['Ambattur']
+        assert branches == ['Vanagaram']
+        assert dealers == ['Other']
+
+    def test_dealers_and_factory_stay_locked_until_prior_stages_exhaust(self):
+        order = {'dealer_name': 'KUN', 'branch': 'Ambattur', 'brand_name': 'Hyundai'}
+        item = {
+            'remaining_qty': 10,
+            'accepted_qty': 0,
+            'same_dealer_sources': [
+                {'dealer_name': 'KUN', 'branch': 'Ambattur', 'available_qty': 3, 'net_available_qty': 3, 'purchase_aging_days': 100},
+                {'dealer_name': 'KUN', 'branch': 'Vanagaram', 'available_qty': 8, 'net_available_qty': 8, 'purchase_aging_days': 100},
+            ],
+            'other_dealer_sources': [
+                {'dealer_name': 'Other', 'branch': 'X', 'available_qty': 5, 'net_available_qty': 5, 'purchase_aging_days': 100},
+            ],
+        }
+        flags = odw.compute_stage_flags(item, order, set())
+        assert flags['active_stage'] == 'own'
+        assert flags['own_stage_status'] == 'open'
+        assert flags['branch_stage_status'] == 'locked'
+        assert flags['dealer_stage_status'] == 'locked'
+        assert flags['factory_stage_status'] == 'locked'
+
+        after_own = odw.compute_stage_flags({**item, 'own_stage_exhausted': True}, order, set())
+        assert after_own['active_stage'] == 'branch'
+        assert after_own['own_stage_status'] == 'exhausted'
+        assert after_own['branch_stage_status'] == 'open'
+        assert after_own['dealer_stage_status'] == 'locked'
+        assert after_own['factory_stage_status'] == 'locked'
+
+        after_branches = odw.compute_stage_flags(
+            {**item, 'own_stage_exhausted': True, 'branch_stage_exhausted': True},
+            order,
+            set(),
+        )
+        assert after_branches['active_stage'] == 'dealer'
+        assert after_branches['branch_stage_status'] == 'exhausted'
+        assert after_branches['dealer_stage_status'] == 'open'
+        assert after_branches['factory_stage_status'] == 'locked'
+
+        after_dealers = odw.compute_stage_flags(
+            {**item, 'own_stage_exhausted': True, 'branch_stage_exhausted': True, 'dealer_stage_exhausted': True},
+            order,
+            set(),
+        )
+        assert after_dealers['active_stage'] == 'factory'
+        assert after_dealers['dealer_stage_status'] == 'exhausted'
+        assert after_dealers['factory_stage_status'] == 'open'
+
+    def test_order_stage_prefers_own_over_later_tabs(self):
+        items = [
+            {'own_stage_status': 'open', 'branch_stage_status': 'locked', 'dealer_stage_status': 'locked', 'factory_stage_status': 'locked'},
+            {'own_stage_status': 'exhausted', 'branch_stage_status': 'open', 'dealer_stage_status': 'locked', 'factory_stage_status': 'locked'},
+        ]
+        stage = odw.compute_order_stage(items)
+        assert stage['active_stage'] == 'own'
+        assert stage['branch_stage_status'] == 'locked'
+        assert stage['dealer_stage_status'] == 'locked'
+
+
 class TestSlaHelpers:
     def test_timeout_due_only_after_deadline(self):
         sent = datetime.now(timezone.utc) - timedelta(minutes=5)

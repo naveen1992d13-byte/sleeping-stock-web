@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,18 @@ import requests
 logger = logging.getLogger("nmts.mobile_push")
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+_EXPO_TOKEN_RE = re.compile(r"^ExponentPushToken\[.+\]$")
+
+
+def _ci_exact(field: str, value: str) -> dict:
+    value = (value or "").strip()
+    if not value:
+        return {field: value}
+    return {field: {"$regex": f"^{re.escape(value)}$", "$options": "i"}}
+
+
+def is_expo_push_token(token: str) -> bool:
+    return bool(_EXPO_TOKEN_RE.match((token or "").strip()))
 
 
 def _now():
@@ -158,13 +171,14 @@ async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
         }
         devices = await db.mobile_devices.find(
             {
-                "dealer_name": dealer,
-                "branch": branch,
+                **_ci_exact("dealer_name", dealer),
+                **_ci_exact("branch", branch),
                 "status": "active",
                 "push_token": {"$exists": True, "$ne": ""},
             },
             {"_id": 0, "device_id": 1, "push_token": 1, "mobile_user_id": 1},
         ).to_list(100)
+        devices = [dev for dev in devices if is_expo_push_token(dev.get("push_token") or "")]
         if not devices:
             await log_push_attempt(
                 db,

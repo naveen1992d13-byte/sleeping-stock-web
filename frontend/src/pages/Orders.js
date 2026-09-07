@@ -11,7 +11,7 @@ import { toast } from 'sonner';
 
 const emptyRows = [];
 const PRIMARY_STATUS = ['All', 'To Process', 'Request Sent', 'Accepted', 'Rejected', 'Completed'];
-const STAGES = ['branch', 'dealer', 'factory', 'finish'];
+const STAGES = ['own', 'branch', 'dealer', 'factory', 'finish'];
 const CANCELLATION_REASONS = [
   'Wrong Part', 'Wrong Qty', 'Duplicate Entry', 'Purchased Outside', 'No Longer Required', 'Other',
 ];
@@ -68,7 +68,18 @@ function rowTintClass(item) {
 function acceptedSourceLabel(item) {
   const accepted = (item.request_history || []).filter((row) => Number(row.accepted_qty || 0) > 0);
   if (!accepted.length) return '';
-  return accepted.map((row) => row.branch_name || row.source_name || row.source_branch || '').filter(Boolean).join(', ');
+  return accepted.map((row) => {
+    const dealer = row.dealer_name || row.source_dealer || '';
+    const branch = row.branch_name || row.source_name || row.source_branch || '';
+    if (dealer && branch) return `${dealer} / ${branch}`;
+    return branch || dealer;
+  }).filter(Boolean).join(', ');
+}
+
+function isOwnOrderingBranch(source, order) {
+  const orderBranch = String(order?.branch || '').trim().toLowerCase();
+  const sourceBranch = String(source?.branch || source?.source_branch || '').trim().toLowerCase();
+  return Boolean(orderBranch) && orderBranch === sourceBranch;
 }
 
 function formatNumber(value) {
@@ -193,8 +204,8 @@ export function Orders() {
   const [allocations, setAllocations] = useState({});
   const [loading, setLoading] = useState(false);
   const [expandedItem, setExpandedItem] = useState('');
-  const [activeStage, setActiveStage] = useState('branch'); // branch | dealer | factory
-  const [orderStage, setOrderStage] = useState({ active_stage: 'branch', dealer_stage_status: 'locked', factory_stage_status: 'locked' });
+  const [activeStage, setActiveStage] = useState('own'); // own | branch | dealer | factory | finish
+  const [orderStage, setOrderStage] = useState({ active_stage: 'own', own_stage_status: 'open', dealer_stage_status: 'locked', factory_stage_status: 'locked' });
 
   // Per-stage aging
   const [branchAgingType, setBranchAgingType] = useState('purchase');
@@ -255,6 +266,7 @@ export function Orders() {
     } else if (!preserveStage && nextItems?.[0]?.order_active_stage) {
       const meta = {
         active_stage: nextItems[0].order_active_stage,
+        own_stage_status: nextItems[0].order_own_stage_status,
         branch_stage_status: nextItems[0].order_branch_stage_status,
         dealer_stage_status: nextItems[0].order_dealer_stage_status,
         factory_stage_status: nextItems[0].order_factory_stage_status,
@@ -348,7 +360,7 @@ export function Orders() {
       const res = await axios.post(`${API}/order-desk/upload`, form, { headers: { 'Content-Type': 'multipart/form-data' } });
       setCurrentOrder(res.data.order);
       applyItems(res.data.items || []);
-      setActiveStage('branch');
+      setActiveStage('own');
       toast.success(res.data?.duplicate ? `Order already created: ${res.data.order.order_number}` : `Order created: ${res.data.order.order_number}`);
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Order upload failed');
@@ -372,7 +384,7 @@ export function Orders() {
       });
       setCurrentOrder(res.data.order);
       applyItems(res.data.items || []);
-      setPasteText(''); setPasteOpen(false); setActiveStage('branch');
+      setPasteText(''); setPasteOpen(false); setActiveStage('own');
       toast.success(`Order created: ${res.data.order.order_number}`);
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Unable to create order');
@@ -404,7 +416,7 @@ export function Orders() {
       const params = new URLSearchParams({ brand: scopeBrand, dealer: scopeDealer, branch: scopeBranch });
       await axios.post(`${API}/order-desk/orders/${currentOrder.id}/check-availability?${params}`);
       await loadOrder(currentOrder.id, false);
-      toast.success(`${activeStage === 'dealer' ? 'Dealer' : 'Branch'} availability checked`);
+      toast.success(`${activeStage === 'dealer' ? 'Dealer' : activeStage === 'own' ? 'Own Branch' : 'Branches'} availability checked`);
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Availability check failed');
     } finally { setLoading(false); }
@@ -431,7 +443,8 @@ export function Orders() {
       dirtyAllocRef.current = false;
       applyItems(res.data.items || []);
       const suggestedCount = (res.data.items || []).filter(i => Number(i.auto_suggest_new_qty || 0) > 0).length;
-      toast.success(`${level === 'branch' ? 'Branch' : 'Dealer'} Auto Suggest applied to ${suggestedCount} item(s). Review, then Send Request.`);
+      const label = level === 'own' ? 'Own Branch' : (level === 'branch' ? 'Branches' : 'Dealer');
+      toast.success(`${label} Auto Suggest applied to ${suggestedCount} item(s). Review, then Send Request.`);
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Auto Suggest failed');
     } finally { setAutoSuggestLoading(''); }
@@ -550,6 +563,7 @@ export function Orders() {
         // already handled
       }
     }
+    if (stageFilter === 'Own Branch' && item.active_stage !== 'own' && item.own_stage_status !== 'open') return false;
     if (stageFilter === 'Branch' && item.active_stage !== 'branch' && item.branch_stage_status !== 'open') return false;
     if (stageFilter === 'Dealer' && item.active_stage !== 'dealer' && item.dealer_stage_status !== 'open') return false;
     if (stageFilter === 'Factory' && item.active_stage !== 'factory' && item.factory_stage_status !== 'open') return false;
@@ -563,7 +577,8 @@ export function Orders() {
     remaining: items.reduce((s, i) => s + Number(i.remaining_qty != null ? i.remaining_qty : Math.max(0, Number(i.required_qty || 0) - Number(i.accepted_qty || 0))), 0),
   }), [items]);
 
-  const dealerUnlocked = orderStage.dealer_stage_status === 'open' || orderStage.active_stage === 'dealer' || orderStage.active_stage === 'factory' || orderStage.active_stage === 'complete';
+  const branchUnlocked = ['exhausted', 'complete'].includes(orderStage.own_stage_status) || ['branch', 'dealer', 'factory', 'complete'].includes(orderStage.active_stage);
+  const dealerUnlocked = ['exhausted', 'complete'].includes(orderStage.branch_stage_status) || orderStage.dealer_stage_status === 'open' || orderStage.active_stage === 'dealer' || orderStage.active_stage === 'factory' || orderStage.active_stage === 'complete';
   const factoryUnlocked = orderStage.factory_stage_status === 'open' || orderStage.active_stage === 'factory' || orderStage.active_stage === 'complete';
   const factoryRequiredItems = items.filter((item) => {
     const remaining = Number(item.remaining_qty != null ? item.remaining_qty : Math.max(0, Number(item.required_qty || 0) - Number(item.accepted_qty || 0)));
@@ -571,8 +586,9 @@ export function Orders() {
   });
 
   const trySetStage = (stage) => {
-    if (stage === 'dealer' && !dealerUnlocked) return toast.error('Dealer stage opens only after Branch sources are exhausted');
-    if (stage === 'factory' && !factoryUnlocked) return toast.error('Factory stage opens only after Branch + Dealer are exhausted');
+    if (stage === 'branch' && !branchUnlocked) return toast.error('Branches open only after Own Branch is completed or exhausted');
+    if (stage === 'dealer' && !dealerUnlocked) return toast.error('Dealers open only after Branches are completed or exhausted');
+    if (stage === 'factory' && !factoryUnlocked) return toast.error('Factory opens only after Dealers are completed or exhausted');
     setActiveStage(stage);
   };
 
@@ -630,13 +646,19 @@ export function Orders() {
   const clearCurrentWorkspace = () => {
     setCurrentOrder(null); setItems([]); setAllocations({}); setExpandedItem('');
     setSendRequestResult(null); setPartSearch(''); setStatusFilter('All'); setStageFilter('All');
-    setActiveStage('branch');
+    setActiveStage('own');
     if (fileRef.current) fileRef.current.value = '';
     toast.success('Workspace cleared');
   };
 
   const stageSources = (item) => {
-    const list = activeStage === 'dealer' ? (item.other_dealer_sources || []) : (item.same_dealer_sources || []);
+    let list;
+    if (activeStage === 'dealer') list = item.other_dealer_sources || [];
+    else if (activeStage === 'own') {
+      list = (item.same_dealer_sources || []).filter((s) => s.is_own_ordering_branch || s.level === 'own' || isOwnOrderingBranch(s, currentOrder));
+    } else if (activeStage === 'branch') {
+      list = (item.same_dealer_sources || []).filter((s) => !(s.is_own_ordering_branch || s.level === 'own' || isOwnOrderingBranch(s, currentOrder)));
+    } else list = [];
     const minDays = Number(activeStage === 'dealer' ? dealerAgingMin : branchAgingMin) || 0;
     const agingType = activeStage === 'dealer' ? dealerAgingType : branchAgingType;
     return list.filter(s => {
@@ -686,8 +708,9 @@ export function Orders() {
           <label className="min-w-[120px] text-xs font-medium text-slate-600">Stage
             <select value={stageFilter} onChange={e => setStageFilter(e.target.value)} className="mt-1 h-9 w-full rounded-md border px-2 text-sm">
               <option value="All">All</option>
-              <option value="Branch">Branch</option>
-              <option value="Dealer">Dealer</option>
+              <option value="Own Branch">Own Branch</option>
+              <option value="Branch">Branches</option>
+              <option value="Dealer">Dealers</option>
               <option value="Factory">Factory</option>
             </select>
           </label>
@@ -713,10 +736,11 @@ export function Orders() {
       <div className="rounded-xl border bg-white overflow-hidden">
         <div className="flex flex-wrap gap-2 p-3 border-b bg-slate-50">
           {[
-            ['branch', 'STEP 1: OWN BRANCH', true],
-            ['dealer', 'STEP 2: OTHER BRANCH / DEALER', dealerUnlocked],
-            ['factory', 'STEP 3: FACTORY', factoryUnlocked],
-            ['finish', 'STEP 4: FINISH', true],
+            ['own', 'STEP 1: OWN BRANCH', true],
+            ['branch', 'STEP 2: BRANCHES', branchUnlocked],
+            ['dealer', 'STEP 3: DEALERS', dealerUnlocked],
+            ['factory', 'STEP 4: FACTORY', factoryUnlocked],
+            ['finish', 'STEP 5: FINISH', true],
           ].map(([key, label, unlocked]) => (
             <button
               key={key}
@@ -731,15 +755,15 @@ export function Orders() {
         </div>
 
         {/* Stage-specific controls */}
-        {activeStage === 'branch' && (
+        {activeStage === 'own' && (
           <div className="flex flex-wrap items-end gap-2 p-3 border-b">
-            <label className="min-w-[130px] text-xs font-medium text-slate-600">Branch Aging Type
+            <label className="min-w-[130px] text-xs font-medium text-slate-600">Own Branch Aging Type
               <select value={branchAgingType} onChange={e => setBranchAgingType(e.target.value)} className="mt-1 h-9 w-full rounded-md border px-2 text-sm">
                 <option value="purchase">Purchase Aging</option>
                 <option value="sales">Sales Aging</option>
               </select>
             </label>
-            <label className="min-w-[130px] text-xs font-medium text-slate-600">Branch Aging Cutoff
+            <label className="min-w-[130px] text-xs font-medium text-slate-600">Own Branch Aging Cutoff
               <select value={branchAgingMin} onChange={e => setBranchAgingMin(e.target.value)} className="mt-1 h-9 w-full rounded-md border px-2 text-sm">
                 <option value="0">All Aging</option>
                 <option value="30">30+ Days</option>
@@ -750,12 +774,41 @@ export function Orders() {
                 <option value="365">365+ Days</option>
               </select>
             </label>
-            <Button onClick={checkAvailability} disabled={!currentOrder || loading || !scopeReady}><Search className="mr-2 h-4 w-4" />Check Branch Availability</Button>
-            <Button variant="outline" onClick={() => runAutoSuggest('branch')} disabled={!currentOrder || !currentOrder?.availability_checked || loading || !!autoSuggestLoading}>
-              {autoSuggestLoading === 'branch' ? 'Suggesting…' : 'Auto Suggest Branch'}
+            <Button onClick={checkAvailability} disabled={!currentOrder || loading || !scopeReady}><Search className="mr-2 h-4 w-4" />Check Own Branch Availability</Button>
+            <Button variant="outline" onClick={() => runAutoSuggest('own')} disabled={!currentOrder || !currentOrder?.availability_checked || loading || !!autoSuggestLoading}>
+              {autoSuggestLoading === 'own' ? 'Suggesting…' : 'Auto Suggest Own Branch'}
             </Button>
-            <Button onClick={() => sendRequests('branch')} disabled={!currentOrder || loading || !!sendingRequest}>
-              <Send className="mr-2 h-4 w-4" />{sendingRequest === 'branch' ? 'Sending…' : 'Send Branch Request'}
+            <Button onClick={() => sendRequests('own')} disabled={!currentOrder || loading || !!sendingRequest}>
+              <Send className="mr-2 h-4 w-4" />{sendingRequest === 'own' ? 'Sending…' : 'Send Own Branch Request'}
+            </Button>
+          </div>
+        )}
+
+        {activeStage === 'branch' && (
+          <div className="flex flex-wrap items-end gap-2 p-3 border-b">
+            <label className="min-w-[130px] text-xs font-medium text-slate-600">Branches Aging Type
+              <select value={branchAgingType} onChange={e => setBranchAgingType(e.target.value)} className="mt-1 h-9 w-full rounded-md border px-2 text-sm">
+                <option value="purchase">Purchase Aging</option>
+                <option value="sales">Sales Aging</option>
+              </select>
+            </label>
+            <label className="min-w-[130px] text-xs font-medium text-slate-600">Branches Aging Cutoff
+              <select value={branchAgingMin} onChange={e => setBranchAgingMin(e.target.value)} className="mt-1 h-9 w-full rounded-md border px-2 text-sm">
+                <option value="0">All Aging</option>
+                <option value="30">30+ Days</option>
+                <option value="60">60+ Days</option>
+                <option value="90">90+ Days</option>
+                <option value="120">120+ Days</option>
+                <option value="180">180+ Days</option>
+                <option value="365">365+ Days</option>
+              </select>
+            </label>
+            <Button onClick={checkAvailability} disabled={!currentOrder || loading || !scopeReady}><Search className="mr-2 h-4 w-4" />Check Branches Availability</Button>
+            <Button variant="outline" onClick={() => runAutoSuggest('branch')} disabled={!currentOrder || !currentOrder?.availability_checked || loading || !!autoSuggestLoading || !branchUnlocked}>
+              {autoSuggestLoading === 'branch' ? 'Suggesting…' : 'Auto Suggest Branches'}
+            </Button>
+            <Button onClick={() => sendRequests('branch')} disabled={!currentOrder || loading || !!sendingRequest || !branchUnlocked}>
+              <Send className="mr-2 h-4 w-4" />{sendingRequest === 'branch' ? 'Sending…' : 'Send Branches Request'}
             </Button>
           </div>
         )}
@@ -779,11 +832,11 @@ export function Orders() {
                 <option value="365">365+ Days</option>
               </select>
             </label>
-            <Button onClick={checkAvailability} disabled={!currentOrder || loading || !scopeReady}><Search className="mr-2 h-4 w-4" />Check Dealer Availability</Button>
-            <Button variant="outline" onClick={() => runAutoSuggest('dealer')} disabled={!currentOrder || !currentOrder?.availability_checked || loading || !!autoSuggestLoading}>
+            <Button onClick={checkAvailability} disabled={!currentOrder || loading || !scopeReady || !dealerUnlocked}><Search className="mr-2 h-4 w-4" />Check Dealer Availability</Button>
+            <Button variant="outline" onClick={() => runAutoSuggest('dealer')} disabled={!currentOrder || !currentOrder?.availability_checked || loading || !!autoSuggestLoading || !dealerUnlocked}>
               {autoSuggestLoading === 'dealer' ? 'Suggesting…' : 'Auto Suggest Dealer'}
             </Button>
-            <Button onClick={() => sendRequests('dealer')} disabled={!currentOrder || loading || !!sendingRequest}>
+            <Button onClick={() => sendRequests('dealer')} disabled={!currentOrder || loading || !!sendingRequest || !dealerUnlocked}>
               <Send className="mr-2 h-4 w-4" />{sendingRequest === 'dealer' ? 'Sending…' : 'Send Dealer Request'}
             </Button>
           </div>
@@ -890,7 +943,7 @@ export function Orders() {
                       <td className="p-3 text-xs leading-snug max-w-[220px]">{compactRequestedFrom(item, selected)}</td>
                       <td className="p-3">
                         <StatusBadge status={badgeStatus} />
-                        {acceptedBranch && <div className="mt-1 text-[11px] font-semibold text-emerald-800">Branch {acceptedBranch}</div>}
+                        {acceptedBranch && <div className="mt-1 text-[11px] font-semibold text-emerald-800">Accepted from {acceptedBranch}</div>}
                         {item.system_order_number && <div className="mt-1 text-[11px] text-slate-600">Factory Order No {item.system_order_number}</div>}
                         {item.expected_next_outcome === 'Factory Order' && Number(remaining) > 0 && <div className="mt-1 text-[11px] text-slate-500">Next: Factory Order</div>}
                       </td>
@@ -971,7 +1024,7 @@ export function Orders() {
                             </div>
                           ) : (
                             <div>
-                              <div className="font-semibold mb-2">{activeStage === 'dealer' ? 'Dealer Availability' : 'Branch Availability'}</div>
+                              <div className="font-semibold mb-2">{activeStage === 'dealer' ? 'Dealer Availability' : activeStage === 'own' ? 'Own Branch Availability' : 'Branches Availability'}</div>
                               <div className="grid gap-2">
                                 {sources.map(source => {
                                   const key = `${source.dealer_name}__${source.branch}`;
@@ -979,7 +1032,7 @@ export function Orders() {
                                   const frozen = source.source_frozen_today || source.rejected_today;
                                   return (
                                     <div key={key} className={`grid grid-cols-2 md:grid-cols-7 gap-2 items-center rounded-lg border p-3 ${frozen ? 'bg-rose-50 opacity-80' : 'bg-white'}`}>
-                                      <div><div className="text-xs text-slate-500">{activeStage === 'dealer' ? 'Dealer' : 'Branch'}</div>{activeStage === 'dealer' ? `${source.dealer_name} / ${source.branch}` : source.branch}</div>
+                                      <div><div className="text-xs text-slate-500">{activeStage === 'dealer' ? 'Dealer' : 'Branch'}</div>{activeStage === 'dealer' ? `${source.dealer_name} / ${source.branch}` : `${source.dealer_name ? `${source.dealer_name} / ` : ''}${source.branch}`}</div>
                                       <div><div className="text-xs text-slate-500">Available Qty</div>{formatNumber(source.available_qty)}{Number(source.reserved_qty || 0) > 0 && <div className="text-[11px] text-amber-600">{formatNumber(source.reserved_qty)} reserved</div>}</div>
                                       <div><div className="text-xs text-slate-500">Purchase Aging</div>{source.purchase_aging_days ?? source.aging_days ?? '-'}</div>
                                       <div><div className="text-xs text-slate-500">Sales Aging</div>{source.sales_aging_days ?? '-'}</div>
