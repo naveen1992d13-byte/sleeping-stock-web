@@ -592,6 +592,21 @@ def build_request_pdf(group: dict) -> bytes:
 # --------------------------------------------------------------------------
 # Parts Transfer Request email (Gmail SMTP, PDF attachment)
 # --------------------------------------------------------------------------
+def build_request_email_subject(group: dict, subject_prefix: str = "") -> str:
+    """Finalized request-email subject line:
+        '<prefix>Sleeping Stock Request - <Supplying Dealer> <Supplying Branch> - <Ref No>'
+    (using en dashes). The supplying dealer/branch is the recipient (TO). Kept
+    here so the email body and the notification_logs audit record stay in sync."""
+    prefix = (subject_prefix or "").strip()
+    if prefix and not prefix.endswith(" "):
+        prefix = prefix + " "
+    request_number = str(group.get("request_number", "-") or "-").strip() or "-"
+    supplying_dealer = str(group.get("supplying_dealer") or "").strip()
+    supplying_branch = str(group.get("supplying_branch") or "").strip()
+    dealer_branch = " ".join(p for p in (supplying_dealer, supplying_branch) if p) or "-"
+    return f"{prefix}Sleeping Stock Request \u2013 {dealer_branch} \u2013 {request_number}"
+
+
 def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_email: str = "", subject_prefix: str = "") -> dict:
     """Sends the Parts Transfer Request PDF as a Gmail SMTP attachment.
     Returns a result dict; never raises — a delivery failure must never
@@ -610,7 +625,7 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
     prefix = (subject_prefix or "").strip()
     if prefix and not prefix.endswith(" "):
         prefix = prefix + " "
-    subject = f"{prefix}Parts Transfer Request - {request_number}"
+    subject = build_request_email_subject(group, subject_prefix)
     filename = group.get("pdf_filename") or f"{request_number}.pdf"
     test_note = "THIS IS A TEST EMAIL. Ignore for operations.\n\n" if prefix.upper().startswith("[TEST]") else ""
     test_html = (
@@ -618,12 +633,25 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
         if test_note else ""
     )
 
-    # Temporary professional placeholder body (PDF attachment is the source of truth).
+    # Summary-only body. Detailed parts (Part Number / Part Name) live ONLY in the
+    # attached Stock Transfer PDF — the email body must never list them.
+    total_items = group.get("total_items")
+    if total_items in (None, ""):
+        total_items = len(group.get("items") or [])
+    total_qty = _pdf_format_number(group.get("total_qty"))
+    total_value = _pdf_format_number(group.get("total_value"))
+    request_message = (
+        "Please review and action the following Sleeping Stock request. "
+        "The detailed part list is in the attached Stock Transfer document."
+    )
+
     text_body = (
         "Dear Team,\n\n"
         f"{test_note}"
-        "Please find attached the Parts Transfer Request for your review and necessary action.\n\n"
-        "Kindly check the requested parts and update the request status accordingly.\n\n"
+        f"{request_message}\n\n"
+        f"Items: {total_items}\n"
+        f"Quantity: {total_qty}\n"
+        f"Value: {total_value}\n\n"
         "Regards,\n"
         "Sleeping Stock Team"
     )
@@ -636,8 +664,13 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
       <div style="padding:16px;font-size:13px;line-height:1.5;color:#111827;">
         <p>Dear Team,</p>
         {test_html}
-        <p>Please find attached the Parts Transfer Request for your review and necessary action.</p>
-        <p>Kindly check the requested parts and update the request status accordingly.</p>
+        <p>{request_message}</p>
+        <table style="border-collapse:collapse;margin:10px 0;">
+          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Items</td><td style="padding:4px 0;">{total_items}</td></tr>
+          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Quantity</td><td style="padding:4px 0;">{total_qty}</td></tr>
+          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Value</td><td style="padding:4px 0;">{total_value}</td></tr>
+        </table>
+        <p style="font-size:12px;color:#6B7280;">Detailed parts are in the attached Stock Transfer document.</p>
         <p>Regards,<br/>Sleeping Stock Team</p>
       </div>
     </div>

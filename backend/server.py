@@ -4554,7 +4554,7 @@ async def _send_request_group_email(group_doc: dict):
         group_doc.get('supplying_brand'), group_doc.get('supplying_dealer'), group_doc.get('supplying_branch'),
     )
     log_id = str(uuid.uuid4())
-    subject = f"Parts Transfer Request - {group_doc['request_number']}"
+    subject = notifications.build_request_email_subject(group_doc)
     base_log = {
         'id': log_id, 'request_id': group_doc['id'], 'request_number': group_doc['request_number'],
         'order_id': group_doc['order_id'], 'receiver_user_id': '', 'receiver_email': receiver_email or '',
