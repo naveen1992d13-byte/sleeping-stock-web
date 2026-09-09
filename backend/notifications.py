@@ -85,6 +85,27 @@ def is_valid_email(value: str) -> bool:
     return bool(value) and bool(_EMAIL_RE.match(value.strip()))
 
 
+def _email_list(value) -> list:
+    """Split a string or sequence into unique valid emails, first-seen order."""
+    if not value:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = re.split(r"[,;]+", str(value))
+    out, seen = [], set()
+    for item in items:
+        email = (item or "").strip()
+        if not is_valid_email(email):
+            continue
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(email)
+    return out
+
+
 def _norm_scope(value: str) -> str:
     return (value or "").strip().lower()
 
@@ -93,62 +114,72 @@ def _role_of(user: dict) -> str:
     return str((user or {}).get("role") or "").strip().lower()
 
 
-def select_request_receiver_email(users, *, brand: str = "", dealer: str = "", branch: str = "") -> str:
-    """Pick the request email recipient from already-loaded user rows.
-
-    Order: supplying branch user → dealer/admin fallback → master fallback.
-    Case-insensitive group/location/brand match. Brand is preferred for
-    master fallback but never required.
-    """
+def _scope_emails(users, *, dealer: str, branch: str = None, roles=()) -> list:
+    """Active non-master emails for a dealer, optionally pinned to a branch.
+    Group/location matches are case-insensitive. Missing roles return []."""
     dealer_n = _norm_scope(dealer)
-    branch_n = _norm_scope(branch)
-    brand_n = _norm_scope(brand)
-    active = []
+    branch_n = _norm_scope(branch) if branch else ""
+    role_set = {str(role or "").strip().lower() for role in (roles or ())}
+    out, seen = [], set()
     for user in users or []:
+        if _role_of(user) == "master":
+            continue
         status = str((user or {}).get("status") or "").strip().lower()
         if status and status != "active":
+            continue
+        if role_set and _role_of(user) not in role_set:
+            continue
+        if dealer_n and _norm_scope(user.get("group")) != dealer_n:
+            continue
+        if branch and _norm_scope(user.get("location")) != branch_n:
             continue
         email = str((user or {}).get("email") or "").strip()
         if not is_valid_email(email):
             continue
-        active.append(user)
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(email)
+    return out
 
-    def _email(user: dict) -> str:
-        return str((user or {}).get("email") or "").strip()
 
-    def _pick_by_roles(rows, roles):
-        for role in roles:
-            for user in rows:
-                if _role_of(user) == role:
-                    return _email(user)
-        return _email(rows[0]) if rows else ""
-
-    if dealer_n and branch_n:
-        branch_users = [
-            u for u in active
-            if _norm_scope(u.get("group")) == dealer_n and _norm_scope(u.get("location")) == branch_n
-        ]
-        picked = _pick_by_roles(branch_users, ("user", "admin", "master"))
-        if picked:
-            return picked
-
-    if dealer_n:
-        dealer_admins = [
-            u for u in active
-            if _norm_scope(u.get("group")) == dealer_n and _role_of(u) in ("admin", "master")
-        ]
-        picked = _pick_by_roles(dealer_admins, ("admin", "master"))
-        if picked:
-            return picked
-
-    masters = [u for u in active if _role_of(u) == "master"]
-    if brand_n:
-        branded = [u for u in masters if _norm_scope(u.get("brand")) == brand_n]
-        if branded:
-            return _email(branded[0])
-    if masters:
-        return _email(masters[0])
-    return ""
+def resolve_request_email_routing(users, group: dict) -> tuple:
+    """TO = supplying Dealer/Branch user only.
+    CC = requesting Dealer/Branch user + requesting Admin (optional)
+    + supplying Admin (optional). Master Admin is never included.
+    Missing Admin never blocks sending. Addresses are deduplicated.
+    """
+    group = group or {}
+    to_emails = _scope_emails(
+        users,
+        dealer=group.get("supplying_dealer"),
+        branch=group.get("supplying_branch"),
+        roles=("user",),
+    )
+    cc_emails = []
+    cc_emails.extend(_scope_emails(
+        users,
+        dealer=group.get("requesting_dealer"),
+        branch=group.get("requesting_branch"),
+        roles=("user",),
+    ))
+    cc_emails.extend(_scope_emails(
+        users, dealer=group.get("requesting_dealer"), roles=("admin",),
+    ))
+    cc_emails.extend(_scope_emails(
+        users, dealer=group.get("supplying_dealer"), roles=("admin",),
+    ))
+    to_keys = {email.lower() for email in to_emails}
+    seen_cc = set()
+    deduped_cc = []
+    for email in cc_emails:
+        key = email.lower()
+        if key in to_keys or key in seen_cc:
+            continue
+        seen_cc.add(key)
+        deduped_cc.append(email)
+    return to_emails, deduped_cc
 
 
 def normalize_phone_number(value: str, default_country_code: str = "91") -> str:
@@ -611,10 +642,10 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
     """Sends the Parts Transfer Request PDF as a Gmail SMTP attachment.
     Returns a result dict; never raises — a delivery failure must never
     roll back the already-saved request."""
-    to_email = (to_email or "").strip()
-    cc_email = (cc_email or "").strip()
-    if cc_email and not is_valid_email(cc_email): cc_email = ""
-    if not is_valid_email(to_email):
+    to_list = _email_list(to_email)
+    to_keys = {email.lower() for email in to_list}
+    cc_list = [email for email in _email_list(cc_email) if email.lower() not in to_keys]
+    if not to_list:
         return {"status": "skipped", "error": "invalid_or_missing_email"}
 
     settings = gmail_settings()
@@ -680,8 +711,9 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
         msg = MIMEMultipart("mixed")
         msg["Subject"] = sanitize_text(subject, 200)
         msg["From"] = f"{settings['sender_name']} <{settings['username']}>"
-        msg["To"] = to_email
-        if cc_email: msg["Cc"] = cc_email
+        msg["To"] = ", ".join(to_list)
+        if cc_list:
+            msg["Cc"] = ", ".join(cc_list)
 
         alt = MIMEMultipart("alternative")
         alt.attach(MIMEText(text_body, "plain"))
@@ -696,7 +728,7 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
         with smtplib.SMTP(settings["host"], settings["port"], timeout=20) as server:
             server.starttls(context=context_ssl)
             server.login(settings["username"], settings["password"])
-            server.sendmail(settings["username"], [to_email] + ([cc_email] if cc_email else []), msg.as_string())
+            server.sendmail(settings["username"], to_list + cc_list, msg.as_string())
         return {"status": "sent", "provider_response": "smtp_ok"}
     except Exception as exc:  # noqa: BLE001 — a delivery failure must never propagate
         password = settings.get("password") or ""
