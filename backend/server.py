@@ -4505,21 +4505,60 @@ def _send_requests_fingerprint(order_id: str, items: list) -> str:
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 
-async def _resolve_request_receiver_email(brand: str, dealer: str, branch: str) -> str:
-    """Best single receiver for a Requested-To destination: an active Admin
-    scoped to the exact supplying dealer+branch, else an active Master for
-    the supplying brand. Never guesses — returns '' if nothing matches."""
+async def _active_scope_emails(dealer: str, branch: str = None, roles=('user',)) -> list:
+    """Active non-master emails for a dealer, optionally pinned to a branch.
+    Missing users/admins return []. Never includes Master Admin."""
+    if not dealer:
+        return []
     query = {
         'status': {'$regex': '^active$', '$options': 'i'},
-        'group': dealer, 'location': branch, 'role': 'admin',
+        'role': {'$in': list(roles)},
+        'group': dealer,
     }
-    user = await db.users.find_one(query, {'_id': 0, 'email': 1, 'id': 1})
-    if not user or not (user.get('email') or '').strip():
-        master_query = {'status': {'$regex': '^active$', '$options': 'i'}, 'role': 'master'}
-        if brand:
-            master_query['brand'] = brand
-        user = await db.users.find_one(master_query, {'_id': 0, 'email': 1, 'id': 1})
-    return ((user or {}).get('email') or '').strip()
+    if branch:
+        query['location'] = branch
+    emails, seen = [], set()
+    async for user in db.users.find(query, {'_id': 0, 'email': 1, 'role': 1}):
+        if (user.get('role') or '').lower() == 'master':
+            continue
+        email = (user.get('email') or '').strip()
+        if not notifications.is_valid_email(email):
+            continue
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        emails.append(email)
+    return emails
+
+
+async def _resolve_request_email_routing(group_doc: dict) -> tuple:
+    """TO = supplying Dealer/Branch user only.
+    CC = requesting Dealer/Branch user + requesting Admin (optional)
+    + supplying Admin (optional). Master Admin is never included."""
+    to_emails = await _active_scope_emails(
+        group_doc.get('supplying_dealer'), group_doc.get('supplying_branch'), roles=('user',),
+    )
+    cc_emails = []
+    cc_emails.extend(await _active_scope_emails(
+        group_doc.get('requesting_dealer'), group_doc.get('requesting_branch'), roles=('user',),
+    ))
+    cc_emails.extend(await _active_scope_emails(
+        group_doc.get('requesting_dealer'), roles=('admin',),
+    ))
+    cc_emails.extend(await _active_scope_emails(
+        group_doc.get('supplying_dealer'), roles=('admin',),
+    ))
+    to_keys = {email.lower() for email in to_emails}
+    seen_cc = set()
+    deduped_cc = []
+    for email in cc_emails:
+        key = email.lower()
+        if key in to_keys or key in seen_cc:
+            continue
+        seen_cc.add(key)
+        deduped_cc.append(email)
+    return to_emails, deduped_cc
 
 
 async def _send_request_group_email(group_doc: dict):
@@ -4528,9 +4567,8 @@ async def _send_request_group_email(group_doc: dict):
     saved before this runs, so any failure here only updates email_* status
     and notification_logs, and never rolls back the saved request."""
     now = datetime.now(timezone.utc).isoformat()
-    receiver_email = await _resolve_request_receiver_email(
-        group_doc.get('supplying_brand'), group_doc.get('supplying_dealer'), group_doc.get('supplying_branch'),
-    )
+    to_emails, cc_emails = await _resolve_request_email_routing(group_doc)
+    receiver_email = ', '.join(to_emails)
     log_id = str(uuid.uuid4())
     subject = f"Parts Transfer Request - {group_doc['request_number']}"
     base_log = {
@@ -4541,7 +4579,7 @@ async def _send_request_group_email(group_doc: dict):
         'created_at': now,
     }
 
-    if not receiver_email or not notifications.is_valid_email(receiver_email):
+    if not to_emails:
         await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {
             'email_sent': False, 'email_status': 'failed', 'email_error': 'Receiver email not configured',
             'receiver_email': receiver_email or '', 'updated_at': now,
@@ -4562,10 +4600,8 @@ async def _send_request_group_email(group_doc: dict):
                                                 'failed_at': now, 'error_message': safe_error})
         return
 
-    requester_cc = (group_doc.get('requester_email') or '').strip()
-    if not notifications.is_valid_email(requester_cc) or requester_cc.lower() == receiver_email.lower(): requester_cc = ''
     result = await asyncio.get_event_loop().run_in_executor(
-        None, notifications.send_request_pdf_email, receiver_email, group_doc, pdf_bytes, requester_cc,
+        None, notifications.send_request_pdf_email, to_emails, group_doc, pdf_bytes, cc_emails,
     )
     sent = result.get('status') == 'sent'
     await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {

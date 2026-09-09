@@ -85,6 +85,27 @@ def is_valid_email(value: str) -> bool:
     return bool(value) and bool(_EMAIL_RE.match(value.strip()))
 
 
+def _email_list(value) -> list:
+    """Split a string or sequence into unique valid emails, first-seen order."""
+    if not value:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = re.split(r"[,;]+", str(value))
+    out, seen = [], set()
+    for item in items:
+        email = (item or "").strip()
+        if not is_valid_email(email):
+            continue
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(email)
+    return out
+
+
 def normalize_phone_number(value: str, default_country_code: str = "91") -> str:
     """Normalize to E.164-ish digits-only international format (no leading +)."""
     if not value:
@@ -530,10 +551,10 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
     """Sends the Parts Transfer Request PDF as a Gmail SMTP attachment.
     Returns a result dict; never raises — a delivery failure must never
     roll back the already-saved request."""
-    to_email = (to_email or "").strip()
-    cc_email = (cc_email or "").strip()
-    if cc_email and not is_valid_email(cc_email): cc_email = ""
-    if not is_valid_email(to_email):
+    to_list = _email_list(to_email)
+    to_keys = {email.lower() for email in to_list}
+    cc_list = [email for email in _email_list(cc_email) if email.lower() not in to_keys]
+    if not to_list:
         return {"status": "skipped", "error": "invalid_or_missing_email"}
 
     settings = gmail_settings()
@@ -571,8 +592,9 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
         msg = MIMEMultipart("mixed")
         msg["Subject"] = sanitize_text(subject, 200)
         msg["From"] = f"{settings['sender_name']} <{settings['username']}>"
-        msg["To"] = to_email
-        if cc_email: msg["Cc"] = cc_email
+        msg["To"] = ", ".join(to_list)
+        if cc_list:
+            msg["Cc"] = ", ".join(cc_list)
 
         alt = MIMEMultipart("alternative")
         alt.attach(MIMEText(text_body, "plain"))
@@ -587,7 +609,7 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
         with smtplib.SMTP(settings["host"], settings["port"], timeout=20) as server:
             server.starttls(context=context_ssl)
             server.login(settings["username"], settings["password"])
-            server.sendmail(settings["username"], [to_email] + ([cc_email] if cc_email else []), msg.as_string())
+            server.sendmail(settings["username"], to_list + cc_list, msg.as_string())
         return {"status": "sent", "provider_response": "smtp_ok"}
     except Exception as exc:  # noqa: BLE001 — a delivery failure must never propagate
         password = settings.get("password") or ""
