@@ -85,6 +85,72 @@ def is_valid_email(value: str) -> bool:
     return bool(value) and bool(_EMAIL_RE.match(value.strip()))
 
 
+def _norm_scope(value: str) -> str:
+    return (value or "").strip().lower()
+
+
+def _role_of(user: dict) -> str:
+    return str((user or {}).get("role") or "").strip().lower()
+
+
+def select_request_receiver_email(users, *, brand: str = "", dealer: str = "", branch: str = "") -> str:
+    """Pick the request email recipient from already-loaded user rows.
+
+    Order: supplying branch user → dealer/admin fallback → master fallback.
+    Case-insensitive group/location/brand match. Brand is preferred for
+    master fallback but never required.
+    """
+    dealer_n = _norm_scope(dealer)
+    branch_n = _norm_scope(branch)
+    brand_n = _norm_scope(brand)
+    active = []
+    for user in users or []:
+        status = str((user or {}).get("status") or "").strip().lower()
+        if status and status != "active":
+            continue
+        email = str((user or {}).get("email") or "").strip()
+        if not is_valid_email(email):
+            continue
+        active.append(user)
+
+    def _email(user: dict) -> str:
+        return str((user or {}).get("email") or "").strip()
+
+    def _pick_by_roles(rows, roles):
+        for role in roles:
+            for user in rows:
+                if _role_of(user) == role:
+                    return _email(user)
+        return _email(rows[0]) if rows else ""
+
+    if dealer_n and branch_n:
+        branch_users = [
+            u for u in active
+            if _norm_scope(u.get("group")) == dealer_n and _norm_scope(u.get("location")) == branch_n
+        ]
+        picked = _pick_by_roles(branch_users, ("user", "admin", "master"))
+        if picked:
+            return picked
+
+    if dealer_n:
+        dealer_admins = [
+            u for u in active
+            if _norm_scope(u.get("group")) == dealer_n and _role_of(u) in ("admin", "master")
+        ]
+        picked = _pick_by_roles(dealer_admins, ("admin", "master"))
+        if picked:
+            return picked
+
+    masters = [u for u in active if _role_of(u) == "master"]
+    if brand_n:
+        branded = [u for u in masters if _norm_scope(u.get("brand")) == brand_n]
+        if branded:
+            return _email(branded[0])
+    if masters:
+        return _email(masters[0])
+    return ""
+
+
 def normalize_phone_number(value: str, default_country_code: str = "91") -> str:
     """Normalize to E.164-ish digits-only international format (no leading +)."""
     if not value:
@@ -526,7 +592,22 @@ def build_request_pdf(group: dict) -> bytes:
 # --------------------------------------------------------------------------
 # Parts Transfer Request email (Gmail SMTP, PDF attachment)
 # --------------------------------------------------------------------------
-def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_email: str = "") -> dict:
+def build_request_email_subject(group: dict, subject_prefix: str = "") -> str:
+    """Finalized request-email subject line:
+        '<prefix>Sleeping Stock Request - <Supplying Dealer> <Supplying Branch> - <Ref No>'
+    (using en dashes). The supplying dealer/branch is the recipient (TO). Kept
+    here so the email body and the notification_logs audit record stay in sync."""
+    prefix = (subject_prefix or "").strip()
+    if prefix and not prefix.endswith(" "):
+        prefix = prefix + " "
+    request_number = str(group.get("request_number", "-") or "-").strip() or "-"
+    supplying_dealer = str(group.get("supplying_dealer") or "").strip()
+    supplying_branch = str(group.get("supplying_branch") or "").strip()
+    dealer_branch = " ".join(p for p in (supplying_dealer, supplying_branch) if p) or "-"
+    return f"{prefix}Sleeping Stock Request \u2013 {dealer_branch} \u2013 {request_number}"
+
+
+def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_email: str = "", subject_prefix: str = "") -> dict:
     """Sends the Parts Transfer Request PDF as a Gmail SMTP attachment.
     Returns a result dict; never raises — a delivery failure must never
     roll back the already-saved request."""
@@ -541,14 +622,36 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
         return {"status": "skipped", "error": "gmail_not_configured"}
 
     request_number = group.get("request_number", "-")
-    subject = f"Parts Transfer Request - {request_number}"
+    prefix = (subject_prefix or "").strip()
+    if prefix and not prefix.endswith(" "):
+        prefix = prefix + " "
+    subject = build_request_email_subject(group, subject_prefix)
     filename = group.get("pdf_filename") or f"{request_number}.pdf"
+    test_note = "THIS IS A TEST EMAIL. Ignore for operations.\n\n" if prefix.upper().startswith("[TEST]") else ""
+    test_html = (
+        '<p style="color:#9F1239;font-weight:700;">THIS IS A TEST EMAIL. Ignore for operations.</p>'
+        if test_note else ""
+    )
 
-    # Temporary professional placeholder body (PDF attachment is the source of truth).
+    # Summary-only body. Detailed parts (Part Number / Part Name) live ONLY in the
+    # attached Stock Transfer PDF — the email body must never list them.
+    total_items = group.get("total_items")
+    if total_items in (None, ""):
+        total_items = len(group.get("items") or [])
+    total_qty = _pdf_format_number(group.get("total_qty"))
+    total_value = _pdf_format_number(group.get("total_value"))
+    request_message = (
+        "Please review and action the following Sleeping Stock request. "
+        "The detailed part list is in the attached Stock Transfer document."
+    )
+
     text_body = (
         "Dear Team,\n\n"
-        "Please find attached the Parts Transfer Request for your review and necessary action.\n\n"
-        "Kindly check the requested parts and update the request status accordingly.\n\n"
+        f"{test_note}"
+        f"{request_message}\n\n"
+        f"Items: {total_items}\n"
+        f"Quantity: {total_qty}\n"
+        f"Value: {total_value}\n\n"
         "Regards,\n"
         "Sleeping Stock Team"
     )
@@ -556,12 +659,18 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
     <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;border:1px solid #D1D5DB;border-radius:10px;overflow:hidden;">
       <div style="background:#047857;color:#fff;padding:16px;">
         <div style="font-size:16px;font-weight:800;">Sleeping Stock · NMTS</div>
-        <div style="font-size:13px;opacity:0.9;">Parts Transfer Request - {sanitize_text(request_number, 80)}</div>
+        <div style="font-size:13px;opacity:0.9;">{sanitize_text(subject, 120)}</div>
       </div>
       <div style="padding:16px;font-size:13px;line-height:1.5;color:#111827;">
         <p>Dear Team,</p>
-        <p>Please find attached the Parts Transfer Request for your review and necessary action.</p>
-        <p>Kindly check the requested parts and update the request status accordingly.</p>
+        {test_html}
+        <p>{request_message}</p>
+        <table style="border-collapse:collapse;margin:10px 0;">
+          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Items</td><td style="padding:4px 0;">{total_items}</td></tr>
+          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Quantity</td><td style="padding:4px 0;">{total_qty}</td></tr>
+          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Value</td><td style="padding:4px 0;">{total_value}</td></tr>
+        </table>
+        <p style="font-size:12px;color:#6B7280;">Detailed parts are in the attached Stock Transfer document.</p>
         <p>Regards,<br/>Sleeping Stock Team</p>
       </div>
     </div>

@@ -360,6 +360,19 @@ class FakeCollection:
             return SimpleNamespace(matched_count=0, modified_count=0, upserted_id="u")
         return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=None)
 
+    async def update_many(self, query, update, upsert=False):
+        matched = 0
+        modified = 0
+        for i, d in enumerate(self.docs):
+            if self._match(d, query):
+                matched += 1
+                applied = self._apply({**d, "_existing": True}, update)
+                applied.pop("_existing", None)
+                if applied != d:
+                    modified += 1
+                self.docs[i] = applied
+        return SimpleNamespace(matched_count=matched, modified_count=modified, upserted_id=None)
+
 
 class FakeDB:
     def __init__(self):
@@ -869,6 +882,62 @@ def test_scheduler_archives_previous_day_helper():
 
     fixed = datetime(2026, 8, 12, 0, 20, tzinfo=IST)
     assert previous_calendar_day_iso(fixed) == "2026-08-11"
+
+
+def test_stale_is_active_today_cleared_for_previous_dates():
+    async def _run():
+        db = FakeDB()
+        today_key = datetime.now(IST).date().strftime("%Y%m%d")
+        yesterday = (datetime.now(IST).date() - timedelta(days=1)).strftime("%Y%m%d")
+        db.products.docs = [
+            {"part_number": "TODAY", "publish_status": "Published", "active_date_key": today_key, "is_active_today": True},
+            {"part_number": "OLD", "publish_status": "Published", "active_date_key": yesterday, "is_active_today": True},
+        ]
+        out = await ha.clear_stale_is_active_today(db)
+        by_part = {d["part_number"]: d["is_active_today"] for d in db.products.docs}
+        assert by_part["TODAY"] is True
+        assert by_part["OLD"] is False
+        assert out["cleared"] >= 1
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+
+def test_prune_deletes_misflagged_historical_rows_after_s3_reverify():
+    async def _run():
+        db = FakeDB()
+        date_iso = "2026-05-01"
+        date_key = "20260501"
+        db.products.docs = [
+            {
+                "part_number": "OLD1",
+                "quantity": 1,
+                "total_value": 1,
+                "brand_name": "Hyundai",
+                "dealer_name": "DealerA",
+                "branch": "Branch1",
+                "publish_status": "Published",
+                "active_date_key": date_key,
+                "is_active_today": True,
+            }
+        ]
+        os.environ["ARCHIVE_PRUNE_ENABLED"] = "true"
+        try:
+            with _FakeS3Mode():
+                archived = await ha.archive_product_history_for_date(db, date_iso)
+                assert archived["status"] == "verified"
+                assert archived["manifest"].get("eligible_for_prune") is True
+                storage = s3_storage.get_storage()
+                key = archived["manifest"]["storage_key"]
+                assert storage.exists(key)
+                pruned = await ha.prune_product_history_date(db, date_iso)
+                assert pruned["status"] == "pruned"
+                assert pruned["deleted"] == 1
+                assert db.products.docs == []
+                assert storage.exists(key)  # S3 archive retained
+        finally:
+            os.environ["ARCHIVE_PRUNE_ENABLED"] = "false"
+
+    asyncio.get_event_loop().run_until_complete(_run())
 
 
 def test_never_prune_today_even_if_enabled():

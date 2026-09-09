@@ -266,6 +266,7 @@ async def run_monthly_completed_archives(db, archive_month: Optional[str] = None
 async def _scheduler_loop(db) -> None:
     logger.info("Archive scheduler started (owner=%s) — same-day window 23:00–04:00 IST", _OWNER)
     last_monthly = None
+    last_active_flag_rollover = None
     active_archive_date: Optional[str] = None
 
     while True:
@@ -275,6 +276,13 @@ async def _scheduler_loop(db) -> None:
                 continue
             now = _ist_now()
             monthly_stamp = now.strftime("%Y-%m")
+            today_iso = now.date().isoformat()
+            if last_active_flag_rollover != today_iso:
+                try:
+                    await ha.clear_stale_is_active_today(db)
+                    last_active_flag_rollover = today_iso
+                except Exception as exc:
+                    logger.warning("is_active_today rollover skipped: %s", exc)
 
             # Daytime + night: drain pending/failed archive outbox jobs.
             try:

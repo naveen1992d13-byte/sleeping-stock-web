@@ -95,15 +95,25 @@ def _parse_iso(value: Any) -> Optional[datetime]:
 
 
 def allocation_level(source: dict, order: dict) -> str:
-    explicit = _clean(source.get('level') or source.get('source_type')).lower()
-    if explicit in ('branch', 'dealer'):
-        return explicit
+    explicit = _clean(source.get('level') or source.get('source_type')).lower().replace(' ', '_')
+    if explicit in ('own', 'own_branch'):
+        return 'own'
+    if explicit == 'dealer':
+        return 'dealer'
     order_dealer = _clean(order.get('dealer_name')).lower()
+    order_branch = _clean(order.get('branch')).lower()
     source_dealer = _clean(source.get('dealer_name') or source.get('source_dealer')).lower()
+    source_branch = _clean(source.get('branch') or source.get('source_branch')).lower()
     if order_dealer and source_dealer and order_dealer == source_dealer:
+        if order_branch and source_branch and order_branch == source_branch:
+            return 'own'
         return 'branch'
     if source_dealer and order_dealer and source_dealer != order_dealer:
         return 'dealer'
+    if order_branch and source_branch and order_branch == source_branch:
+        return 'own'
+    if explicit == 'branch':
+        return 'branch'
     return 'branch'
 
 
@@ -130,19 +140,23 @@ def response_time_minutes_for_lines(line_item_count: int) -> int:
     return 60
 
 
-def reminder_offsets_minutes(sla_minutes: int) -> Tuple[int, int]:
-    """Return (first_reminder, urgent_reminder) offsets from send time."""
-    if sla_minutes <= 30:
-        return 15, 25
-    if sla_minutes <= 45:
-        return 20, 35
-    return 30, 50
+def reminder_offsets_minutes(sla_minutes: int) -> Tuple[int, int, int]:
+    """Return reminder offsets from send time within the existing SLA window.
+
+    Reminder 1 = first third, Reminder 2 = second third,
+    Reminder 3 = one minute before the unchanged deadline.
+    """
+    minutes = max(3, int(sla_minutes or 0))
+    first = max(1, minutes // 3)
+    second = max(first + 1, (2 * minutes) // 3)
+    third = max(second + 1, minutes - 1)
+    return first, second, third
 
 
 def compute_response_schedule(line_item_count: int, sent_at: datetime = None) -> dict:
     sent = sent_at or _now_utc()
     minutes = response_time_minutes_for_lines(line_item_count)
-    r1, r2 = reminder_offsets_minutes(minutes)
+    r1, r2, r3 = reminder_offsets_minutes(minutes)
     deadline = sent + timedelta(minutes=minutes)
     return {
         'line_item_count': int(line_item_count or 0),
@@ -151,6 +165,7 @@ def compute_response_schedule(line_item_count: int, sent_at: datetime = None) ->
         'response_deadline': deadline.isoformat(),
         'reminder_at': (sent + timedelta(minutes=r1)).isoformat(),
         'urgent_reminder_at': (sent + timedelta(minutes=r2)).isoformat(),
+        'reminder_3_at': (sent + timedelta(minutes=r3)).isoformat(),
         'response_status': 'awaiting',
     }
 
@@ -358,12 +373,30 @@ def evaluate_group_timer(header: dict, now: datetime = None) -> dict:
         'cancel_allowed': cancel_allowed,
         'reminder_at': header.get('reminder_at'),
         'urgent_reminder_at': header.get('urgent_reminder_at'),
+        'reminder_3_at': header.get('reminder_3_at'),
     }
+
+
+def is_own_ordering_branch(source: dict, order: dict) -> bool:
+    """True when the source branch is the exact ordering branch."""
+    return _clean(source.get('branch')).lower() == _clean(order.get('branch')).lower() and bool(_clean(order.get('branch')))
+
+
+def partition_own_branch_first(pool: List[dict], order: dict) -> List[dict]:
+    """Eligible own-branch rows first; remaining sources keep their relative order."""
+    own, others = [], []
+    for source in pool or []:
+        if is_own_ordering_branch(source, order):
+            own.append(source)
+        else:
+            others.append(source)
+    return own + others
 
 
 def eligible_pool(item: dict, order: dict, level: str, freezes: Set[str], aging_type: str, min_aging_days: float) -> List[dict]:
     """Eligible sources for a stage after aging + freeze + net qty filters."""
-    pool_field = 'same_dealer_sources' if level == 'branch' else 'other_dealer_sources'
+    level = 'own' if level in ('own', 'own_branch') else level
+    pool_field = 'other_dealer_sources' if level == 'dealer' else 'same_dealer_sources'
     part = _clean(item.get('part_number'))
     brand = _clean(order.get('brand_name'))
     excluded = {source_key(x.get('dealer_name'), x.get('branch')) for x in (item.get('excluded_sources') or [])}
@@ -372,6 +405,11 @@ def eligible_pool(item: dict, order: dict, level: str, freezes: Set[str], aging_
     for s in item.get(pool_field) or []:
         dealer = _clean(s.get('dealer_name'))
         branch = _clean(s.get('branch'))
+        own = is_own_ordering_branch(s, order)
+        if level == 'own' and not own:
+            continue
+        if level == 'branch' and own:
+            continue
         if source_key(dealer, branch) in excluded:
             continue
         if is_source_frozen(freezes, part, brand, dealer, branch):
@@ -387,6 +425,7 @@ def eligible_pool(item: dict, order: dict, level: str, freezes: Set[str], aging_
             'rejected_today': False,
             'level': level,
             'source_type': level,
+            'is_own_ordering_branch': own,
         })
     return result
 
@@ -412,7 +451,7 @@ def compute_stage_flags(item: dict, order: dict, freezes: Set[str],
                         branch_aging_type='purchase', branch_min_aging=0,
                         dealer_aging_type='purchase', dealer_min_aging=0) -> dict:
     remaining = _f(item.get('remaining_qty'))
-    # If remaining not yet set, approximate from required - accepted later by caller
+    own_pool = eligible_pool(item, order, 'own', freezes, branch_aging_type, branch_min_aging)
     branch_pool = eligible_pool(item, order, 'branch', freezes, branch_aging_type, branch_min_aging)
     dealer_pool = eligible_pool(item, order, 'dealer', freezes, dealer_aging_type, dealer_min_aging)
 
@@ -422,73 +461,228 @@ def compute_stage_flags(item: dict, order: dict, freezes: Set[str],
         for a in (item.get('allocations') or [])
     )
 
+    own_stage_status = 'locked'
+    branch_stage_status = 'locked'
+    dealer_stage_status = 'locked'
+    factory_stage_status = 'locked'
+    next_source_allowed = False
+    active_stage = 'own'
+
     if remaining <= 0 and _f(item.get('accepted_qty')) > 0:
+        own_stage_status = 'complete'
         branch_stage_status = 'complete'
         dealer_stage_status = 'complete'
         factory_stage_status = 'locked'
-        next_source_allowed = False
         active_stage = 'complete'
-    elif branch_pool or (remaining > 0 and not item.get('branch_stage_exhausted')):
-        # Branch still has eligible sources OR not yet marked exhausted
-        if branch_pool:
+    else:
+        own_open = bool(own_pool) and not item.get('own_stage_exhausted')
+        if own_open:
+            own_stage_status = 'open'
+            active_stage = 'own'
+            next_source_allowed = not has_pending and remaining > 0
+        else:
+            own_stage_status = 'exhausted' if remaining > 0 or item.get('own_stage_exhausted') else 'complete'
+            branch_open = bool(branch_pool) and not item.get('branch_stage_exhausted')
+            if branch_open:
+                branch_stage_status = 'open'
+                active_stage = 'branch'
+                next_source_allowed = not has_pending and remaining > 0
+            else:
+                branch_stage_status = 'exhausted' if remaining > 0 or item.get('branch_stage_exhausted') else 'complete'
+                dealer_open = bool(dealer_pool) and not item.get('dealer_stage_exhausted')
+                if dealer_open:
+                    dealer_stage_status = 'open'
+                    active_stage = 'dealer'
+                    next_source_allowed = not has_pending and remaining > 0
+                else:
+                    dealer_stage_status = 'exhausted' if remaining > 0 or item.get('dealer_stage_exhausted') else 'complete'
+                    if remaining > 0:
+                        factory_stage_status = 'open'
+                        active_stage = 'factory'
+                    else:
+                        factory_stage_status = 'locked'
+                        active_stage = 'complete'
+
+    if item.get('own_stage_exhausted') and remaining > 0:
+        own_stage_status = 'exhausted'
+        if not branch_pool:
+            branch_stage_status = 'exhausted'
+            if dealer_pool and not item.get('dealer_stage_exhausted'):
+                dealer_stage_status = 'open'
+                factory_stage_status = 'locked'
+                active_stage = 'dealer'
+                next_source_allowed = not has_pending
+            else:
+                dealer_stage_status = 'exhausted'
+                factory_stage_status = 'open'
+                active_stage = 'factory'
+                next_source_allowed = False
+        elif not item.get('branch_stage_exhausted'):
             branch_stage_status = 'open'
             dealer_stage_status = 'locked'
             factory_stage_status = 'locked'
             active_stage = 'branch'
-            next_source_allowed = not has_pending and remaining > 0
-        else:
-            branch_stage_status = 'exhausted'
-            if dealer_pool:
-                dealer_stage_status = 'open'
-                factory_stage_status = 'locked'
-                active_stage = 'dealer'
-                next_source_allowed = not has_pending and remaining > 0
-            else:
-                dealer_stage_status = 'exhausted'
-                factory_stage_status = 'open' if remaining > 0 else 'locked'
-                active_stage = 'factory' if remaining > 0 else 'complete'
-                next_source_allowed = False
-    else:
-        branch_stage_status = 'exhausted'
-        if dealer_pool:
-            dealer_stage_status = 'open'
-            factory_stage_status = 'locked'
-            active_stage = 'dealer'
-            next_source_allowed = not has_pending and remaining > 0
-        else:
-            dealer_stage_status = 'exhausted'
-            factory_stage_status = 'open' if remaining > 0 else 'locked'
-            active_stage = 'factory' if remaining > 0 else 'complete'
-            next_source_allowed = False
+            next_source_allowed = not has_pending
 
-    # Explicit exhaustion flags from prior computations win for dealer unlock
-    if item.get('branch_stage_exhausted') and remaining > 0:
+    if item.get('branch_stage_exhausted') and remaining > 0 and own_stage_status in ('exhausted', 'complete'):
         branch_stage_status = 'exhausted'
-        if dealer_pool:
+        if dealer_pool and not item.get('dealer_stage_exhausted'):
             dealer_stage_status = 'open'
             factory_stage_status = 'locked'
             active_stage = 'dealer'
             next_source_allowed = not has_pending
-        elif item.get('dealer_stage_exhausted') or not dealer_pool:
+        else:
             dealer_stage_status = 'exhausted'
             factory_stage_status = 'open'
             active_stage = 'factory'
             next_source_allowed = False
 
-    if item.get('dealer_stage_exhausted') and remaining > 0 and branch_stage_status == 'exhausted':
+    if item.get('dealer_stage_exhausted') and remaining > 0 and own_stage_status in ('exhausted', 'complete') and branch_stage_status in ('exhausted', 'complete'):
         dealer_stage_status = 'exhausted'
         factory_stage_status = 'open'
         active_stage = 'factory'
         next_source_allowed = False
 
+    expected_next_outcome = None
+    if remaining > 0 and factory_stage_status == 'open' and not own_pool and not branch_pool and not dealer_pool:
+        expected_next_outcome = 'Factory Order'
+
     return {
+        'own_stage_status': own_stage_status,
         'branch_stage_status': branch_stage_status,
         'dealer_stage_status': dealer_stage_status,
         'factory_stage_status': factory_stage_status,
         'active_stage': active_stage,
         'next_source_allowed': next_source_allowed,
+        'eligible_own_count': len(own_pool),
         'eligible_branch_count': len(branch_pool),
         'eligible_dealer_count': len(dealer_pool),
+        'expected_next_outcome': expected_next_outcome,
+    }
+
+
+def evaluate_finish_readiness(order: Dict[str, Any], items: List[Dict[str, Any]], requests_by_item: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Order-level Finish is allowed only when no request is still open,
+    remaining qty is zero, and every factory-required row has a Factory Order No.
+    """
+    unresolved = []
+    missing_factory_order_no = []
+    remaining_open = []
+    for item in items or []:
+        item_id = item.get('id')
+        remaining = max(0, int(_f(item.get('remaining_qty'))))
+        if remaining > 0:
+            remaining_open.append(item_id)
+        for req in requests_by_item.get(item_id, []) if requests_by_item else []:
+            if _clean(req.get('status')) == 'Requested':
+                unresolved.append({
+                    'item_id': item_id,
+                    'request_number': req.get('request_number'),
+                    'level': req.get('level') or req.get('source_type'),
+                })
+        factory_qty = max(0, int(_f(item.get('factory_fulfilled_qty') or item.get('factory_order_qty') or item.get('factory_qty'))))
+        factory_required = remaining > 0 or factory_qty > 0
+        if factory_required and not _clean(item.get('system_order_number')):
+            missing_factory_order_no.append(item_id)
+    return {
+        'can_finish': not unresolved and not missing_factory_order_no and not remaining_open,
+        'unresolved_requests': unresolved,
+        'missing_factory_order_no': missing_factory_order_no,
+        'remaining_open_items': remaining_open,
+    }
+
+
+_ACCEPTED_REQUEST_STATUSES = {
+    'Approved', 'Partially Approved', 'Dispatched', 'Received', 'Completed',
+}
+
+
+def build_fulfillment_line(order: Dict[str, Any], item: Dict[str, Any], reqs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Final Order History fulfillment view for one part, with source breakup."""
+    ordering_branch = _clean(order.get('branch')).lower()
+    sources: List[Dict[str, Any]] = []
+    own_branch_fulfilled_qty = 0.0
+    accepted_qty = 0.0
+    source_dealer = ''
+    source_branch = ''
+    for req in reqs or []:
+        status = _clean(req.get('status'))
+        qty = _f(req.get('accepted_qty', req.get('approved_qty')))
+        if qty <= 0 or status not in _ACCEPTED_REQUEST_STATUSES:
+            continue
+        accepted_qty += qty
+        dealer = _clean(req.get('supplying_dealer'))
+        branch = _clean(req.get('supplying_branch'))
+        if branch.lower() == ordering_branch and ordering_branch:
+            own_branch_fulfilled_qty += qty
+        level = allocation_level(
+            {'dealer_name': dealer, 'branch': branch, 'level': req.get('source_type') or req.get('level')},
+            order,
+        )
+        sources.append({
+            'source_type': (level or 'branch').title(),
+            'source_dealer': dealer,
+            'source_branch': branch,
+            'accepted_qty': qty,
+            'request_number': req.get('request_number'),
+            'accepted_by': req.get('approved_by') or req.get('accepted_by') or req.get('decided_user_name'),
+            'accepted_at': req.get('approved_at') or req.get('accepted_at') or req.get('decided_at'),
+            'status': 'Accepted' if status == 'Approved' else status,
+            'level': level,
+        })
+        if not source_dealer:
+            source_dealer = dealer
+            source_branch = branch
+        elif dealer != source_dealer or branch != source_branch:
+            source_dealer = 'Multiple'
+            source_branch = 'Multiple'
+
+    factory_qty = _f(item.get('factory_fulfilled_qty') or item.get('factory_order_qty') or item.get('factory_qty'))
+    factory_order_no = _clean(item.get('system_order_number'))
+    remaining = _f(item.get('remaining_qty'))
+    required = _f(item.get('required_qty') or item.get('requested_qty'))
+    if remaining > 0:
+        final_status = 'Open'
+    elif factory_qty > 0 and factory_order_no:
+        final_status = 'Factory Completed'
+    elif factory_qty > 0:
+        final_status = 'Factory Order'
+    elif accepted_qty > 0:
+        final_status = 'Accepted'
+    else:
+        final_status = _clean(item.get('status') or item.get('request_status')) or 'Closed'
+
+    if factory_qty > 0 or factory_order_no:
+        sources.append({
+            'source_type': 'Factory',
+            'source_dealer': '',
+            'source_branch': '',
+            'accepted_qty': factory_qty,
+            'system_order_number': factory_order_no,
+            'factory_order_no': factory_order_no,
+            'accepted_by': item.get('factory_system_order_saved_by_name'),
+            'accepted_at': item.get('factory_system_order_saved_at'),
+            'status': 'Factory Completed' if factory_order_no else 'Factory Order',
+            'level': 'factory',
+        })
+
+    return {
+        'part_number': item.get('part_number') or '',
+        'part_name': item.get('description') or item.get('part_name') or '',
+        'requested_qty': required,
+        'ordered_qty': required,
+        'own_branch_fulfilled_qty': own_branch_fulfilled_qty,
+        'accepted_qty': accepted_qty,
+        'source_dealer': source_dealer,
+        'source_branch': source_branch,
+        'factory_qty': factory_qty,
+        'factory_order_no': factory_order_no,
+        'system_order_number': factory_order_no,
+        'final_status': final_status,
+        'fulfilled_qty': accepted_qty + factory_qty,
+        'remaining_qty': max(0.0, required - accepted_qty - factory_qty),
+        'request_status': item.get('request_status') or item.get('status') or final_status,
+        'sources': sources,
     }
 
 
@@ -528,6 +722,13 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
              'level': req.get('source_type') or req.get('level')},
             order,
         )
+        dealer_nm = _clean(req.get('supplying_dealer'))
+        branch_nm = _clean(req.get('supplying_branch'))
+        if dealer_nm and branch_nm:
+            source_label = f'{dealer_nm} / {branch_nm}'
+        else:
+            source_label = branch_nm or dealer_nm
+        type_label = 'Own Branch' if level == 'own' else ('Dealer' if level == 'dealer' else 'Branch')
         if status == 'Requested' and timer_meta.get('response_status') == 'expired':
             ui_status = REQUEST_STATUS_EXPIRED
         elif status == 'Requested' and timer_meta.get('response_status') == 'awaiting':
@@ -536,9 +737,8 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
             ui_status = REQUEST_STATUS_CANCEL_NO_RESP
 
         history.append({
-            'source_type': level.title(),
-            'source_name': _clean(req.get('supplying_branch')) if level == 'branch'
-                else f"{_clean(req.get('supplying_dealer'))} / {_clean(req.get('supplying_branch'))}",
+            'source_type': type_label,
+            'source_name': source_label,
             'dealer_name': _clean(req.get('supplying_dealer')),
             'branch_name': _clean(req.get('supplying_branch')),
             'source_dealer': _clean(req.get('supplying_dealer')),
@@ -683,9 +883,9 @@ def _source_type_summary(history, allocations, order) -> str:
     for row in history or []:
         t = _clean(row.get('source_type') or row.get('level')).lower()
         if t:
-            types.add('Branch' if 'branch' in t else 'Dealer')
+            types.add('Dealer' if 'dealer' in t else 'Branch')
     for alloc in allocations or []:
-        types.add('Branch' if allocation_level(alloc, order) == 'branch' else 'Dealer')
+        types.add('Dealer' if allocation_level(alloc, order) == 'dealer' else 'Branch')
     if not types:
         return ''
     if types == {'Branch'}:
@@ -697,20 +897,40 @@ def _source_type_summary(history, allocations, order) -> str:
 
 def compute_order_stage(enriched_items: List[dict]) -> dict:
     """Order-level active stage from item stage flags."""
+    locked = {
+        'active_stage': 'own',
+        'own_stage_status': 'open',
+        'branch_stage_status': 'locked',
+        'dealer_stage_status': 'locked',
+        'factory_stage_status': 'locked',
+    }
     if not enriched_items:
-        return {'active_stage': 'branch', 'branch_stage_status': 'open',
-                'dealer_stage_status': 'locked', 'factory_stage_status': 'locked'}
+        return locked
+    if any(i.get('own_stage_status') == 'open' for i in enriched_items):
+        return {**locked, 'active_stage': 'own', 'own_stage_status': 'open'}
     if any(i.get('branch_stage_status') == 'open' for i in enriched_items):
-        return {'active_stage': 'branch', 'branch_stage_status': 'open',
-                'dealer_stage_status': 'locked', 'factory_stage_status': 'locked'}
+        return {
+            'active_stage': 'branch', 'own_stage_status': 'exhausted',
+            'branch_stage_status': 'open',
+            'dealer_stage_status': 'locked', 'factory_stage_status': 'locked',
+        }
     if any(i.get('dealer_stage_status') == 'open' for i in enriched_items):
-        return {'active_stage': 'dealer', 'branch_stage_status': 'exhausted',
-                'dealer_stage_status': 'open', 'factory_stage_status': 'locked'}
+        return {
+            'active_stage': 'dealer', 'own_stage_status': 'exhausted',
+            'branch_stage_status': 'exhausted',
+            'dealer_stage_status': 'open', 'factory_stage_status': 'locked',
+        }
     if any(i.get('factory_stage_status') == 'open' for i in enriched_items):
-        return {'active_stage': 'factory', 'branch_stage_status': 'exhausted',
-                'dealer_stage_status': 'exhausted', 'factory_stage_status': 'open'}
-    return {'active_stage': 'complete', 'branch_stage_status': 'complete',
-            'dealer_stage_status': 'complete', 'factory_stage_status': 'locked'}
+        return {
+            'active_stage': 'factory', 'own_stage_status': 'exhausted',
+            'branch_stage_status': 'exhausted',
+            'dealer_stage_status': 'exhausted', 'factory_stage_status': 'open',
+        }
+    return {
+        'active_stage': 'complete', 'own_stage_status': 'complete',
+        'branch_stage_status': 'complete',
+        'dealer_stage_status': 'complete', 'factory_stage_status': 'locked',
+    }
 
 
 async def enrich_order_items(db, order: dict, items: List[dict],
@@ -755,8 +975,19 @@ async def enrich_order_items(db, order: dict, items: List[dict],
         other = annotate_sources_with_freeze(item.get('other_dealer_sources') or [], item, order, freezes, 'dealer')
         # Apply aging visibility flags (still shown but marked ineligible if below cutoff)
         for s in same:
+            own = is_own_ordering_branch(s, order)
+            src_level = 'own' if own else 'branch'
+            s['level'] = src_level
+            s['source_type'] = src_level
+            s['is_own_ordering_branch'] = own
             s['aging_eligible'] = source_passes_aging(s, branch_aging_type, branch_min_aging) and not s.get('source_frozen_today')
-            s['selection_disabled'] = bool(s.get('source_frozen_today') or not source_passes_aging(s, branch_aging_type, branch_min_aging) or wf.get('qty_locked') and wf.get('remaining_qty', 1) <= 0)
+            locked_by_stage = (not own and stages.get('own_stage_status') == 'open') or (own and stages.get('own_stage_status') == 'locked')
+            s['selection_disabled'] = bool(
+                s.get('source_frozen_today')
+                or not source_passes_aging(s, branch_aging_type, branch_min_aging)
+                or (wf.get('qty_locked') and wf.get('remaining_qty', 1) <= 0)
+                or locked_by_stage
+            )
         for s in other:
             s['aging_eligible'] = source_passes_aging(s, dealer_aging_type, dealer_min_aging) and not s.get('source_frozen_today')
             s['selection_disabled'] = bool(s.get('source_frozen_today') or not source_passes_aging(s, dealer_aging_type, dealer_min_aging) or stages.get('dealer_stage_status') == 'locked')
@@ -774,8 +1005,10 @@ async def enrich_order_items(db, order: dict, items: List[dict],
                 'locked': bool(alloc.get('request_no') or alloc.get('request_number')),
             })
 
-        # Mark branch/dealer exhausted when pools empty and remaining > 0
-        if wf['remaining_qty'] > 0 and stages['eligible_branch_count'] == 0 and (item.get('same_dealer_sources') or item.get('availability_checked_at')):
+        # Mark own/branch/dealer exhausted when pools empty and remaining > 0
+        if wf['remaining_qty'] > 0 and stages['eligible_own_count'] == 0 and (item.get('same_dealer_sources') or item.get('availability_checked_at')):
+            stages['own_stage_status'] = 'exhausted' if stages['own_stage_status'] != 'complete' else stages['own_stage_status']
+        if wf['remaining_qty'] > 0 and stages['own_stage_status'] == 'exhausted' and stages['eligible_branch_count'] == 0 and (item.get('same_dealer_sources') or item.get('availability_checked_at')):
             stages['branch_stage_status'] = 'exhausted' if stages['branch_stage_status'] != 'complete' else stages['branch_stage_status']
         if wf['remaining_qty'] > 0 and stages['branch_stage_status'] == 'exhausted' and stages['eligible_dealer_count'] == 0:
             stages['dealer_stage_status'] = 'exhausted'
@@ -805,6 +1038,7 @@ async def enrich_order_items(db, order: dict, items: List[dict],
     order_stage = compute_order_stage(enriched)
     for row in enriched:
         row['order_active_stage'] = order_stage['active_stage']
+        row['order_own_stage_status'] = order_stage.get('own_stage_status')
         row['order_branch_stage_status'] = order_stage['branch_stage_status']
         row['order_dealer_stage_status'] = order_stage['dealer_stage_status']
         row['order_factory_stage_status'] = order_stage['factory_stage_status']
@@ -902,6 +1136,7 @@ async def sync_order_item_after_request_decision(db, req: dict, now: str = None)
     freezes = await load_today_freezes(db, [refreshed.get('part_number')], order.get('brand_name') or '')
     stages = compute_stage_flags(refreshed, order, freezes)
     stage_update = {
+        'own_stage_exhausted': stages.get('own_stage_status') == 'exhausted',
         'branch_stage_exhausted': stages['branch_stage_status'] == 'exhausted',
         'dealer_stage_exhausted': stages['dealer_stage_status'] == 'exhausted',
         'enquiry_stage': stages['active_stage'],
@@ -967,5 +1202,8 @@ async def ensure_order_desk_indexes(db):
         ])
         await db.request_headers.create_index([('response_deadline', 1), ('response_status', 1)])
         await db.request_headers.create_index([('status', 1), ('response_deadline', 1)])
+        await db.mobile_request_push_claims.create_index(
+            [('request_group_key', 1), ('kind', 1)], unique=True,
+        )
     except Exception:
         pass
