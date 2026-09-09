@@ -1,0 +1,20 @@
+{
+  "name": "NMTS / Sleeping Stock Web",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "backend",
+      "command": "cd backend && ./venv/bin/python -m uvicorn server:socket_app --host 0.0.0.0 --port 8000",
+      "description": "FastAPI + Socket.IO API (server:socket_app) on port 8000. Runs from the project venv so boto3 is available for REAL S3."
+    },
+    {
+      "name": "frontend",
+      "command": "cd frontend && npm start",
+      "description": "React (CRA/craco) dev server on port 3000, pointed at the local backend via frontend/.env.local."
+    }
+  ],
+  "ports": [
+    { "name": "backend", "port": 8000 },
+    { "name": "frontend", "port": 3000 }
+  ]
+}
