@@ -4125,14 +4125,22 @@ async def product_hub_branch_summary(
 def _apply_category_filter(query: dict, category: str = None):
     """Part Type filter — additive, never required.
 
-    Matches the final Part Type options (OE Parts / Accessories / Others) and
-    all known legacy aliases (Genuine Parts, Non OEM parts, etc.).
+    Matches the selected stored Part Type label exactly (case-insensitive)
+    across known product fields. Does not rewrite values onto a canonical list.
     """
     if _is_all_part_type(category) or _is_all_scope(category):
         return
-    clause = _part_type_mongo_clause(category)
-    if not clause:
+    label = str(category or "").strip()
+    if not label:
         return
+    pattern = f"^{re.escape(label)}$"
+    clause = {
+        "$or": [
+            {"part_category": {"$regex": pattern, "$options": "i"}},
+            {"category": {"$regex": pattern, "$options": "i"}},
+            {"parts_type": {"$regex": pattern, "$options": "i"}},
+        ]
+    }
     # Merge into existing query without dropping other $or/$and conditions.
     if "$and" in query:
         query["$and"].append(clause)
@@ -4175,16 +4183,27 @@ def _apply_uploaded_date_range_filter(query: dict, from_date: str = None, to_dat
         query["created_at"] = date_range
 
 
-def _canonical_part_types_from_raw(raw_values):
-    """Collapse stored Part Type labels to the final scoped option list."""
+def _distinct_part_types_from_raw(raw_values):
+    """Keep actual stored Part Type labels present in the current scope.
+
+    Does not replace real values with the canonical OE Parts / Accessories / Others list.
+    """
     available = []
     seen = set()
     for raw in raw_values:
-        normalized = _normalize_part_category(str(raw or "").strip())
-        if normalized in PART_TYPE_OPTIONS and normalized not in seen:
-            seen.add(normalized)
-            available.append(normalized)
-    return sorted(available)
+        label = str(raw or "").strip()
+        if not label:
+            continue
+        key = label.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        available.append(label)
+    return sorted(available, key=str.casefold)
+
+
+# Back-compat alias for the focused Product Hub Part Type tests/helpers.
+_canonical_part_types_from_raw = _distinct_part_types_from_raw
 
 
 @api_router.get("/product-hub/part-types")
@@ -4193,32 +4212,13 @@ async def product_hub_part_types(
     search: str = None, stock_status: str = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    """Distinct canonical Part Types present in scoped Product Hub data.
+    """Distinct stored Part Types present in scoped Product Hub data.
 
     Returns:
-      part_types: ["All", ...] for the current Brand/Dealer/Branch scope
+      part_types: ["All", ...] actual labels for the current Brand/Dealer/Branch scope
       available_types: the same list without All
     """
     query = _product_hub_active_query(current_user, brand, dealer, branch)
-    _apply_stock_status_filter(query, stock_status)
-    search = (search or "").strip()
-    if search:
-        safe_search = re.escape(search)
-        search_clause = {
-            "$or": [
-                {"part_number": {"$regex": safe_search, "$options": "i"}},
-                {"item_name": {"$regex": safe_search, "$options": "i"}},
-            ]
-        }
-        if "$and" in query:
-            query["$and"].append(search_clause)
-        elif any(k.startswith("$") for k in query.keys()):
-            existing = {k: v for k, v in list(query.items())}
-            query.clear()
-            query["$and"] = [existing, search_clause]
-        else:
-            query["$or"] = search_clause["$or"]
-
     pipeline = [
         {"$match": query},
         {"$group": {
@@ -4231,7 +4231,7 @@ async def product_hub_part_types(
         }},
     ]
     results = await db.products.aggregate(pipeline, allowDiskUse=True).to_list(10000)
-    available_types = _canonical_part_types_from_raw(r.get("_id") for r in results)
+    available_types = _distinct_part_types_from_raw(r.get("_id") for r in results)
     return {
         "part_types": ["All"] + available_types,
         "available_types": available_types,
