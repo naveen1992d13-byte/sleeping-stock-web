@@ -1070,7 +1070,7 @@ export function Orders() {
                                       <td className="p-2 text-emerald-700 font-medium">{row.request_no || '-'}</td>
                                       <td className="p-2"><StatusBadge status={row.request_status} /></td>
                                       <td className="p-2">
-                                        {row.response_deadline
+                                        {row.countdown_active && row.response_status === 'awaiting' && row.response_deadline
                                           ? (formatDeadlineCountdown(row.response_deadline, nowMs) || row.response_status || '—')
                                           : (row.response_status || '—')}
                                         {row.response_status && <div className="text-[10px] text-slate-500">{row.response_status}</div>}

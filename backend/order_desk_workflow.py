@@ -154,6 +154,7 @@ def reminder_offsets_minutes(sla_minutes: int) -> Tuple[int, int, int]:
 
 
 def compute_response_schedule(line_item_count: int, sent_at: datetime = None) -> dict:
+    """Full SLA window for THIS request only. Never copies leftover time."""
     sent = sent_at or _now_utc()
     minutes = response_time_minutes_for_lines(line_item_count)
     r1, r2, r3 = reminder_offsets_minutes(minutes)
@@ -167,6 +168,10 @@ def compute_response_schedule(line_item_count: int, sent_at: datetime = None) ->
         'urgent_reminder_at': (sent + timedelta(minutes=r2)).isoformat(),
         'reminder_3_at': (sent + timedelta(minutes=r3)).isoformat(),
         'response_status': 'awaiting',
+        'timer_frozen': False,
+        'countdown_active': True,
+        'remaining_seconds': minutes * 60,
+        'timer_stopped_at': None,
     }
 
 
@@ -333,6 +338,36 @@ def is_source_frozen(freezes: Set[str], part: str, brand: str, dealer: str, bran
     return freeze_key(part, brand, dealer, branch, date_key) in freezes
 
 
+HEADER_TIMER_STOP_STATUSES = {
+    'Approved', 'Partially Approved', 'Rejected', 'Cancelled',
+    'Completed', 'Dispatched', 'Received',
+}
+FROZEN_RESPONSE_STATUSES = {
+    'responded', 'cancelled', 'timeout',
+}
+
+
+def freeze_response_timer(header: dict, now: datetime = None, response_status: str = 'responded') -> dict:
+    """Stop this request's SLA clock at `now`. Remaining time is snapshotted."""
+    if isinstance(now, str):
+        now_iso = now
+        now_dt = _parse_iso(now) or _now_utc()
+    else:
+        now_dt = now or _now_utc()
+        now_iso = now_dt.isoformat()
+    deadline = _parse_iso((header or {}).get('response_deadline'))
+    remaining = 0
+    if deadline:
+        remaining = max(0, int((deadline - now_dt).total_seconds()))
+    return {
+        'response_status': response_status,
+        'timer_frozen': True,
+        'timer_stopped_at': now_iso,
+        'remaining_seconds': remaining,
+        'countdown_active': False,
+    }
+
+
 def evaluate_group_timer(header: dict, now: datetime = None) -> dict:
     """Derive response timer fields for a request_headers document."""
     now = now or _now_utc()
@@ -346,13 +381,49 @@ def evaluate_group_timer(header: dict, now: datetime = None) -> dict:
         deadline = sent_at + timedelta(minutes=minutes)
 
     status_raw = _clean(header.get('status'))
-    terminal = status_raw in ('Approved', 'Partially Approved', 'Rejected', 'Cancelled', 'Completed', 'Dispatched', 'Received')
-    response_status = _clean(header.get('response_status') or 'awaiting')
+    stored_response = _clean(header.get('response_status') or 'awaiting')
+    terminal = status_raw in HEADER_TIMER_STOP_STATUSES
+    frozen = bool(header.get('timer_frozen')) or stored_response in FROZEN_RESPONSE_STATUSES or terminal
+
+    base = {
+        'line_item_count': line_count or header.get('line_item_count') or 0,
+        'response_time_minutes': minutes or header.get('response_time_minutes'),
+        'request_sent_at': header.get('request_sent_at') or header.get('created_at'),
+        'response_deadline': deadline.isoformat() if deadline else header.get('response_deadline'),
+        'reminder_at': header.get('reminder_at'),
+        'urgent_reminder_at': header.get('urgent_reminder_at'),
+        'reminder_3_at': header.get('reminder_3_at'),
+        'timer_stopped_at': header.get('timer_stopped_at'),
+    }
+
+    if frozen:
+        response_status = stored_response
+        if response_status in ('', 'awaiting'):
+            if header.get('timeout_cancelled') or status_raw == 'Cancelled':
+                response_status = 'timeout' if header.get('timeout_cancelled') else 'cancelled'
+            else:
+                response_status = 'responded'
+        remaining = header.get('remaining_seconds')
+        if remaining is None:
+            remaining = 0
+        else:
+            try:
+                remaining = max(0, int(remaining))
+            except (TypeError, ValueError):
+                remaining = 0
+        return {
+            **base,
+            'response_status': response_status,
+            'remaining_seconds': remaining,
+            'cancel_allowed': False,
+            'timer_frozen': True,
+            'countdown_active': False,
+        }
+
     remaining_seconds = None
     cancel_allowed = False
-    if terminal:
-        response_status = 'responded' if status_raw not in ('Cancelled',) else 'cancelled'
-    elif deadline:
+    response_status = 'awaiting'
+    if deadline:
         remaining_seconds = max(0, int((deadline - now).total_seconds()))
         if remaining_seconds <= 0:
             response_status = 'expired'
@@ -360,20 +431,14 @@ def evaluate_group_timer(header: dict, now: datetime = None) -> dict:
         else:
             response_status = 'awaiting'
             cancel_allowed = False
-    else:
-        cancel_allowed = False
 
     return {
-        'line_item_count': line_count or header.get('line_item_count') or 0,
-        'response_time_minutes': minutes or header.get('response_time_minutes'),
-        'request_sent_at': header.get('request_sent_at') or header.get('created_at'),
-        'response_deadline': deadline.isoformat() if deadline else header.get('response_deadline'),
+        **base,
         'response_status': response_status,
         'remaining_seconds': remaining_seconds,
         'cancel_allowed': cancel_allowed,
-        'reminder_at': header.get('reminder_at'),
-        'urgent_reminder_at': header.get('urgent_reminder_at'),
-        'reminder_3_at': header.get('reminder_3_at'),
+        'timer_frozen': False,
+        'countdown_active': response_status == 'awaiting',
     }
 
 
@@ -759,6 +824,10 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
             'cancel_allowed': timer_meta.get('cancel_allowed', False),
             'response_time_minutes': timer_meta.get('response_time_minutes'),
             'line_item_count': timer_meta.get('line_item_count'),
+            'timer_frozen': bool(timer_meta.get('timer_frozen')),
+            'countdown_active': bool(
+                status == 'Requested' and timer_meta.get('countdown_active')
+            ),
         })
 
         if status in ('Approved', 'Partially Approved', 'Dispatched', 'Received', 'Completed'):
@@ -871,6 +940,8 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
         'line_item_count': (pending_timer or {}).get('line_item_count'),
         'remaining_seconds': (pending_timer or {}).get('remaining_seconds'),
         'cancel_allowed': cancel_allowed,
+        'timer_frozen': bool((pending_timer or {}).get('timer_frozen')),
+        'countdown_active': bool((pending_timer or {}).get('countdown_active')),
         'pending_request_number': next(
             (h['request_no'] for h in history if h.get('status_raw') == 'Requested'),
             None,
