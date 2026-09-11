@@ -85,6 +85,103 @@ def is_valid_email(value: str) -> bool:
     return bool(value) and bool(_EMAIL_RE.match(value.strip()))
 
 
+def _email_list(value) -> list:
+    """Split a string or sequence into unique valid emails, first-seen order."""
+    if not value:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = re.split(r"[,;]+", str(value))
+    out, seen = [], set()
+    for item in items:
+        email = (item or "").strip()
+        if not is_valid_email(email):
+            continue
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(email)
+    return out
+
+
+def _norm_scope(value: str) -> str:
+    return (value or "").strip().lower()
+
+
+def _role_of(user: dict) -> str:
+    return str((user or {}).get("role") or "").strip().lower()
+
+
+def _scope_emails(users, *, dealer: str, branch: str = None, roles=()) -> list:
+    """Active non-master emails for a dealer, optionally pinned to a branch.
+    Group/location matches are case-insensitive. Missing roles return []."""
+    dealer_n = _norm_scope(dealer)
+    branch_n = _norm_scope(branch) if branch else ""
+    role_set = {str(role or "").strip().lower() for role in (roles or ())}
+    out, seen = [], set()
+    for user in users or []:
+        if _role_of(user) == "master":
+            continue
+        status = str((user or {}).get("status") or "").strip().lower()
+        if status and status != "active":
+            continue
+        if role_set and _role_of(user) not in role_set:
+            continue
+        if dealer_n and _norm_scope(user.get("group")) != dealer_n:
+            continue
+        if branch and _norm_scope(user.get("location")) != branch_n:
+            continue
+        email = str((user or {}).get("email") or "").strip()
+        if not is_valid_email(email):
+            continue
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(email)
+    return out
+
+
+def resolve_request_email_routing(users, group: dict) -> tuple:
+    """TO = supplying Dealer/Branch user only.
+    CC = requesting Dealer/Branch user + requesting Admin (optional)
+    + supplying Admin (optional). Master Admin is never included.
+    Missing Admin never blocks sending. Addresses are deduplicated.
+    """
+    group = group or {}
+    to_emails = _scope_emails(
+        users,
+        dealer=group.get("supplying_dealer"),
+        branch=group.get("supplying_branch"),
+        roles=("user",),
+    )
+    cc_emails = []
+    cc_emails.extend(_scope_emails(
+        users,
+        dealer=group.get("requesting_dealer"),
+        branch=group.get("requesting_branch"),
+        roles=("user",),
+    ))
+    cc_emails.extend(_scope_emails(
+        users, dealer=group.get("requesting_dealer"), roles=("admin",),
+    ))
+    cc_emails.extend(_scope_emails(
+        users, dealer=group.get("supplying_dealer"), roles=("admin",),
+    ))
+    to_keys = {email.lower() for email in to_emails}
+    seen_cc = set()
+    deduped_cc = []
+    for email in cc_emails:
+        key = email.lower()
+        if key in to_keys or key in seen_cc:
+            continue
+        seen_cc.add(key)
+        deduped_cc.append(email)
+    return to_emails, deduped_cc
+
+
 def normalize_phone_number(value: str, default_country_code: str = "91") -> str:
     """Normalize to E.164-ish digits-only international format (no leading +)."""
     if not value:
@@ -526,14 +623,29 @@ def build_request_pdf(group: dict) -> bytes:
 # --------------------------------------------------------------------------
 # Parts Transfer Request email (Gmail SMTP, PDF attachment)
 # --------------------------------------------------------------------------
-def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_email: str = "") -> dict:
+def build_request_email_subject(group: dict, subject_prefix: str = "") -> str:
+    """Finalized request-email subject line:
+        '<prefix>Sleeping Stock Request - <Supplying Dealer> <Supplying Branch> - <Ref No>'
+    (using en dashes). The supplying dealer/branch is the recipient (TO). Kept
+    here so the email body and the notification_logs audit record stay in sync."""
+    prefix = (subject_prefix or "").strip()
+    if prefix and not prefix.endswith(" "):
+        prefix = prefix + " "
+    request_number = str(group.get("request_number", "-") or "-").strip() or "-"
+    supplying_dealer = str(group.get("supplying_dealer") or "").strip()
+    supplying_branch = str(group.get("supplying_branch") or "").strip()
+    dealer_branch = " ".join(p for p in (supplying_dealer, supplying_branch) if p) or "-"
+    return f"{prefix}Sleeping Stock Request \u2013 {dealer_branch} \u2013 {request_number}"
+
+
+def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_email: str = "", subject_prefix: str = "") -> dict:
     """Sends the Parts Transfer Request PDF as a Gmail SMTP attachment.
     Returns a result dict; never raises — a delivery failure must never
     roll back the already-saved request."""
-    to_email = (to_email or "").strip()
-    cc_email = (cc_email or "").strip()
-    if cc_email and not is_valid_email(cc_email): cc_email = ""
-    if not is_valid_email(to_email):
+    to_list = _email_list(to_email)
+    to_keys = {email.lower() for email in to_list}
+    cc_list = [email for email in _email_list(cc_email) if email.lower() not in to_keys]
+    if not to_list:
         return {"status": "skipped", "error": "invalid_or_missing_email"}
 
     settings = gmail_settings()
@@ -541,14 +653,36 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
         return {"status": "skipped", "error": "gmail_not_configured"}
 
     request_number = group.get("request_number", "-")
-    subject = f"Parts Transfer Request - {request_number}"
+    prefix = (subject_prefix or "").strip()
+    if prefix and not prefix.endswith(" "):
+        prefix = prefix + " "
+    subject = build_request_email_subject(group, subject_prefix)
     filename = group.get("pdf_filename") or f"{request_number}.pdf"
+    test_note = "THIS IS A TEST EMAIL. Ignore for operations.\n\n" if prefix.upper().startswith("[TEST]") else ""
+    test_html = (
+        '<p style="color:#9F1239;font-weight:700;">THIS IS A TEST EMAIL. Ignore for operations.</p>'
+        if test_note else ""
+    )
 
-    # Temporary professional placeholder body (PDF attachment is the source of truth).
+    # Summary-only body. Detailed parts (Part Number / Part Name) live ONLY in the
+    # attached Stock Transfer PDF — the email body must never list them.
+    total_items = group.get("total_items")
+    if total_items in (None, ""):
+        total_items = len(group.get("items") or [])
+    total_qty = _pdf_format_number(group.get("total_qty"))
+    total_value = _pdf_format_number(group.get("total_value"))
+    request_message = (
+        "Please review and action the following Sleeping Stock request. "
+        "The detailed part list is in the attached Stock Transfer document."
+    )
+
     text_body = (
         "Dear Team,\n\n"
-        "Please find attached the Parts Transfer Request for your review and necessary action.\n\n"
-        "Kindly check the requested parts and update the request status accordingly.\n\n"
+        f"{test_note}"
+        f"{request_message}\n\n"
+        f"Items: {total_items}\n"
+        f"Quantity: {total_qty}\n"
+        f"Value: {total_value}\n\n"
         "Regards,\n"
         "Sleeping Stock Team"
     )
@@ -556,12 +690,18 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
     <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;border:1px solid #D1D5DB;border-radius:10px;overflow:hidden;">
       <div style="background:#047857;color:#fff;padding:16px;">
         <div style="font-size:16px;font-weight:800;">Sleeping Stock · NMTS</div>
-        <div style="font-size:13px;opacity:0.9;">Parts Transfer Request - {sanitize_text(request_number, 80)}</div>
+        <div style="font-size:13px;opacity:0.9;">{sanitize_text(subject, 120)}</div>
       </div>
       <div style="padding:16px;font-size:13px;line-height:1.5;color:#111827;">
         <p>Dear Team,</p>
-        <p>Please find attached the Parts Transfer Request for your review and necessary action.</p>
-        <p>Kindly check the requested parts and update the request status accordingly.</p>
+        {test_html}
+        <p>{request_message}</p>
+        <table style="border-collapse:collapse;margin:10px 0;">
+          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Items</td><td style="padding:4px 0;">{total_items}</td></tr>
+          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Quantity</td><td style="padding:4px 0;">{total_qty}</td></tr>
+          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Value</td><td style="padding:4px 0;">{total_value}</td></tr>
+        </table>
+        <p style="font-size:12px;color:#6B7280;">Detailed parts are in the attached Stock Transfer document.</p>
         <p>Regards,<br/>Sleeping Stock Team</p>
       </div>
     </div>
@@ -571,8 +711,9 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
         msg = MIMEMultipart("mixed")
         msg["Subject"] = sanitize_text(subject, 200)
         msg["From"] = f"{settings['sender_name']} <{settings['username']}>"
-        msg["To"] = to_email
-        if cc_email: msg["Cc"] = cc_email
+        msg["To"] = ", ".join(to_list)
+        if cc_list:
+            msg["Cc"] = ", ".join(cc_list)
 
         alt = MIMEMultipart("alternative")
         alt.attach(MIMEText(text_body, "plain"))
@@ -587,7 +728,7 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
         with smtplib.SMTP(settings["host"], settings["port"], timeout=20) as server:
             server.starttls(context=context_ssl)
             server.login(settings["username"], settings["password"])
-            server.sendmail(settings["username"], [to_email] + ([cc_email] if cc_email else []), msg.as_string())
+            server.sendmail(settings["username"], to_list + cc_list, msg.as_string())
         return {"status": "sent", "provider_response": "smtp_ok"}
     except Exception as exc:  # noqa: BLE001 — a delivery failure must never propagate
         password = settings.get("password") or ""

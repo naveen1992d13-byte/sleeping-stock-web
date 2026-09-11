@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import axios from 'axios';
 import { API } from '@/App';
@@ -9,16 +9,37 @@ import { toast } from 'sonner';
 const CLOSED_STATUSES = new Set(['Rejected', 'Cancelled', 'Completed']);
 const STATUS_STYLES = {
   Requested: { bg: '#FEF3C7', fg: '#92400E' },
+  Waiting: { bg: '#FEF3C7', fg: '#92400E' },
   Approved: { bg: '#D1FAE5', fg: '#065F46' },
   Accepted: { bg: '#D1FAE5', fg: '#065F46' },
-  'Partially Approved': { bg: '#DBEAFE', fg: '#1E40AF' },
-  'Partially Accepted': { bg: '#DBEAFE', fg: '#1E40AF' },
-  Rejected: { bg: '#FEE2E2', fg: '#991B1B' },
-  Cancelled: { bg: '#E5E7EB', fg: '#374151' },
+  'Partially Approved': { bg: '#D1FAE5', fg: '#065F46' },
+  'Partially Accepted': { bg: '#D1FAE5', fg: '#065F46' },
+  Rejected: { bg: '#FCE7F3', fg: '#9F1239' },
+  'No Response': { bg: '#FCE7F3', fg: '#9F1239' },
+  Cancelled: { bg: '#FCE7F3', fg: '#9F1239' },
   Dispatched: { bg: '#E0F2FE', fg: '#075985' },
   Received: { bg: '#EDE9FE', fg: '#5B21B6' },
   Completed: { bg: '#D1FAE5', fg: '#065F46' },
 };
+
+function formatDeadlineCountdown(deadline, nowMs) {
+  if (!deadline) return '';
+  const end = Date.parse(String(deadline));
+  if (!Number.isFinite(end)) return '';
+  const left = Math.max(0, Math.floor((end - nowMs) / 1000));
+  if (left <= 0) return 'Expired';
+  const minutes = Math.floor(left / 60);
+  const seconds = left % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')} left`;
+}
+
+function groupRowTint(status) {
+  const label = displayStatus(status);
+  if (['Accepted', 'Completed', 'Partially Accepted'].includes(label)) return 'bg-emerald-50/70';
+  if (label === 'Requested' || label === 'Waiting') return 'bg-amber-50/80';
+  if (['Rejected', 'Cancelled', 'No Response'].includes(label)) return 'bg-rose-50/70';
+  return '';
+}
 const nfmt = (v) => Number(v || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 const dtfmt = (v) => v ? String(v).slice(0, 16).replace('T', ' ') : '-';
 const esc = (v) => String(v ?? '').replace(/[&<>'"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c]));
@@ -133,18 +154,24 @@ export function Requests() {
   const [search, setSearch] = useState('');
   const [expanded, setExpanded] = useState({});
   const [itemDrafts, setItemDrafts] = useState({});
+  const [nowMs, setNowMs] = useState(Date.now());
+  const loadRef = useRef(null);
 
-  const load = async () => {
-    setLoading(true);
+  const load = async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
     try {
       const res = await axios.get(`${API}/requests`, { params: {
         view, search: search || undefined,
         brand: scopeBrand || undefined, dealer: scopeDealer || undefined, branch: scopeBranch || undefined,
       } });
       setRows(res.data || []);
-    } catch (e) { toast.error(e.response?.data?.detail || 'Unable to load Request Center'); }
-    finally { setLoading(false); }
+    } catch (e) {
+      if (!silent) toast.error(e.response?.data?.detail || 'Unable to load Request Center');
+    } finally {
+      if (!silent) setLoading(false);
+    }
   };
+  loadRef.current = load;
   // Global Dashboard scope is the single source of truth for Request Center.
   // Scope changes reset transient UI and fetch server-enforced results.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -153,6 +180,16 @@ export function Requests() {
     setItemDrafts({});
     load();
   }, [view, scopeBrand, scopeDealer, scopeBranch]);
+
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    const id = setInterval(() => { loadRef.current?.({ silent: true }); }, 30000);
+    return () => clearInterval(id);
+  }, []);
 
   const groups = useMemo(() => {
     const map = new Map();
@@ -227,12 +264,15 @@ export function Requests() {
       <div className="divide-y">
         {groups.map(g => {
           const open=!!expanded[g.key]; const supplier=`${g.supplying_branch || '-'} / ${g.supplying_dealer || '-'}`; const destination=`${g.requesting_branch || '-'} / ${g.requesting_dealer || '-'}`;
-          return <div key={g.key} className="p-4">
-            <div className="grid w-full items-center gap-4 md:grid-cols-[32px_1.2fr_2fr_.6fr_.7fr_.9fr_.8fr_auto]">
+          const deadline = g.response_deadline || g.items.find(i => i.response_deadline)?.response_deadline;
+          const unresolved = g.items.some(i => (i.status || 'Requested') === 'Requested');
+          const countdown = unresolved ? formatDeadlineCountdown(deadline, nowMs) : '';
+          return <div key={g.key} className={`p-4 ${groupRowTint(g.status)}`}>
+            <div className="grid w-full items-center gap-4 md:grid-cols-[32px_1.2fr_2fr_.6fr_.7fr_.9fr_1fr_auto]">
               <button onClick={()=>setExpanded(p=>({...p,[g.key]:!open}))}>{open?<ChevronDown className="h-5 w-5"/>:<ChevronRight className="h-5 w-5"/>}</button>
               <button className="text-left" onClick={()=>setExpanded(p=>({...p,[g.key]:!open}))}><div className="text-xs text-slate-500">Request / Order No</div><div className="font-bold text-emerald-700">{g.request_number || 'Legacy Request'}</div><div className="text-xs text-slate-600">{g.order_number || '-'}</div></button>
               <button className="text-left" onClick={()=>setExpanded(p=>({...p,[g.key]:!open}))}><div className="text-xs text-slate-500">Stock Movement</div><div className="flex items-center gap-2 font-semibold"><span>{supplier}</span><ArrowRight className="h-4 w-4 text-emerald-600"/><span>{destination}</span></div></button>
-              <span><div className="text-xs text-slate-500">Line Items</div><div className="font-semibold">{g.total_items}</div></span><span><div className="text-xs text-slate-500">Total Qty</div><div className="font-semibold">{nfmt(g.total_qty)}</div></span><span><div className="text-xs text-slate-500">Total Value</div><div className="font-semibold">₹{nfmt(g.total_value)}</div></span><span><StatusBadge status={g.status}/><div className="mt-1 text-xs text-slate-500">{dtfmt(g.requested_at)}</div></span>
+              <span><div className="text-xs text-slate-500">Line Items</div><div className="font-semibold">{g.total_items}</div></span><span><div className="text-xs text-slate-500">Total Qty</div><div className="font-semibold">{nfmt(g.total_qty)}</div></span><span><div className="text-xs text-slate-500">Total Value</div><div className="font-semibold">₹{nfmt(g.total_value)}</div></span><span><StatusBadge status={g.status}/>{countdown && <div className="mt-1 text-xs font-semibold text-amber-800">{countdown}</div>}<div className="mt-1 text-xs text-slate-500">{g.response_status || dtfmt(g.requested_at)}</div></span>
               <Button size="sm" variant="outline" onClick={()=>openRequestPrint(g)}><Printer className="mr-1 h-4 w-4"/>Print</Button>
             </div>
             {open && <div className="mt-5 rounded-xl border bg-white p-4">
