@@ -5500,7 +5500,8 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         'email_sent': False, 'email_status': 'pending', 'email_sent_at': None, 'email_error': None,
         'receiver_email': '', 'pdf_filename': f'{request_number}.pdf', 'notification_log_id': None,
     }
-    # Response SLA timer — based on THIS request group's line-item count only.
+    # Response SLA timer — always a fresh full window for THIS destination
+    # request. Never copy remaining time from a previous Branch request.
     schedule = odw.compute_response_schedule(len(line_items), datetime.now(timezone.utc))
     group_doc.update(schedule)
 
@@ -6115,7 +6116,7 @@ async def _apply_request_group_timeout(group_doc: dict, actor: UserResponse):
             })
 
     await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {
-        'response_status': 'cancelled',
+        **odw.freeze_response_timer(group_doc, now, 'timeout'),
         'timeout_cancelled': True,
         'timeout_cancelled_at': now,
         'updated_at': now,
@@ -6632,7 +6633,8 @@ async def request_center_list(
         async for header in db.request_headers.find(
             {'request_number': {'$in': list(request_numbers)}},
             {'_id': 0, 'request_number': 1, 'response_deadline': 1, 'response_status': 1,
-             'request_sent_at': 1, 'response_time_minutes': 1, 'status': 1},
+             'request_sent_at': 1, 'response_time_minutes': 1, 'status': 1,
+             'timer_frozen': 1, 'remaining_seconds': 1, 'timer_stopped_at': 1, 'timeout_cancelled': 1},
         ):
             header_by_number[header.get('request_number')] = header
 
@@ -6651,6 +6653,9 @@ async def request_center_list(
             row['response_status'] = timer.get('response_status') or header.get('response_status')
             row['request_sent_at'] = timer.get('request_sent_at') or header.get('request_sent_at')
             row['response_time_minutes'] = timer.get('response_time_minutes') or header.get('response_time_minutes')
+            row['remaining_seconds'] = timer.get('remaining_seconds')
+            row['timer_frozen'] = timer.get('timer_frozen')
+            row['countdown_active'] = bool(timer.get('countdown_active') and (row.get('status') or 'Requested') == 'Requested')
     try:
         existing_ids = {r.get('id') for r in rows if r.get('id')}
         archived = await hybrid_request_history.list_archived_requests(db, exclude_ids=existing_ids, limit=2000)
@@ -6737,9 +6742,20 @@ async def _sync_request_header_after_item_decision(req: dict, now: str):
             'loc': i.get('loc_at_request', ''), 'status': i.get('status'),
             'remarks': i.get('approval_remarks') or i.get('remarks') or '',
         })
+    header_update = {
+        'status': header_status, 'items': header_items, 'accepted_total_qty': accepted_total, 'updated_at': now,
+    }
+    if header_status != 'Requested':
+        existing = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0}) or {}
+        if not existing.get('timer_frozen'):
+            if existing.get('timeout_cancelled') or header_status == 'Cancelled':
+                freeze_status = 'timeout' if existing.get('timeout_cancelled') else 'cancelled'
+            else:
+                freeze_status = 'responded'
+            header_update.update(odw.freeze_response_timer(existing, now, freeze_status))
     await db.request_headers.update_one(
         {'request_number': request_number},
-        {'$set': {'status': header_status, 'items': header_items, 'accepted_total_qty': accepted_total, 'updated_at': now}},
+        {'$set': header_update},
     )
 
 

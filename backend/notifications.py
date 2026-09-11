@@ -17,7 +17,6 @@ import ssl
 import uuid
 import asyncio
 import logging
-from io import BytesIO
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -25,12 +24,7 @@ from datetime import datetime, timezone
 
 import requests
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import BaseDocTemplate, PageTemplate, Frame, Table, TableStyle, Paragraph, Spacer
-from reportlab.pdfgen import canvas as pdfcanvas
+from request_print import build_request_pdf as build_request_print_pdf
 
 logger = logging.getLogger("nmts.notifications")
 
@@ -406,18 +400,8 @@ async def notify_request_event(db, event: str, request_doc: dict, recipients: li
 
 
 # --------------------------------------------------------------------------
-# Parts Transfer Request PDF (ReportLab) — used as the Gmail attachment for
-# a newly created request. One PDF per Requested-To destination group.
+# Parts Transfer Request PDF — Request Center Print layout converted to PDF.
 # --------------------------------------------------------------------------
-_PDF_BASE_STYLE = getSampleStyleSheet()["Normal"]
-
-
-def _pdf_escape(value) -> str:
-    text = sanitize_text(value, 300) if value not in (None, "") else ""
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return text or "-"
-
-
 def _pdf_format_number(value) -> str:
     try:
         number = float(value)
@@ -428,196 +412,9 @@ def _pdf_format_number(value) -> str:
     return f"{number:,.2f}"
 
 
-def _pdf_format_aging(value) -> str:
-    """Purchase/Sales Aging must show '-' (per existing UI convention) rather
-    than crash when older records are missing the field."""
-    if value in (None, ""):
-        return "—"
-    try:
-        return str(int(float(value)))
-    except (TypeError, ValueError):
-        return "—"
-
-
-def _pdf_kv(label: str, value) -> Paragraph:
-    return Paragraph(
-        f"<font size=7 color='#6B7280'>{_pdf_escape(label)}</font><br/>"
-        f"<font size=9.5 color='#111827'><b>{_pdf_escape(value)}</b></font>",
-        _PDF_BASE_STYLE,
-    )
-
-
-class _NumberedCanvas(pdfcanvas.Canvas):
-    """Draws 'Page X of Y' on every page — requires a two-pass save, which
-    is the standard ReportLab pattern for a total page count that isn't
-    known until the whole flowable story has been laid out."""
-
-    def __init__(self, *args, **kwargs):
-        pdfcanvas.Canvas.__init__(self, *args, **kwargs)
-        self._saved_page_states = []
-
-    def showPage(self):
-        self._saved_page_states.append(dict(self.__dict__))
-        self._startPage()
-
-    def save(self):
-        total_pages = len(self._saved_page_states)
-        for state in self._saved_page_states:
-            self.__dict__.update(state)
-            self._draw_page_number(total_pages)
-            pdfcanvas.Canvas.showPage(self)
-        pdfcanvas.Canvas.save(self)
-
-    def _draw_page_number(self, total_pages: int):
-        self.setFont("Helvetica", 8)
-        self.setFillColor(colors.HexColor("#6B7280"))
-        self.drawRightString(A4[0] - 14 * mm, 10 * mm, f"Page {self._pageNumber} of {total_pages}")
-        self.drawString(14 * mm, 10 * mm, "This is a system-generated Parts Transfer Request from Sleeping Stock / NMTS.")
-
-
 def build_request_pdf(group: dict) -> bytes:
-    """Builds the official Parts Transfer Request PDF for one Requested-To
-    destination group (one request_number, one receiver). Multi-page safe:
-    the item table's header row repeats on every page (repeatRows=1) and
-    the signature block is the last flowable in the story, so it only ever
-    renders on the final page."""
-    buffer = BytesIO()
-    doc = BaseDocTemplate(
-        buffer, pagesize=A4,
-        leftMargin=14 * mm, rightMargin=14 * mm, topMargin=14 * mm, bottomMargin=20 * mm,
-    )
-    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
-    doc.addPageTemplates([PageTemplate(id="main", frames=[frame])])
-
-    styles = getSampleStyleSheet()
-    title_style = styles["Title"].clone("RequestTitle")
-    title_style.textColor = colors.HexColor("#047857")
-    title_style.fontSize = 18
-    title_style.spaceAfter = 2
-    subtitle_style = styles["Normal"].clone("RequestSubtitle")
-    subtitle_style.fontSize = 12
-    subtitle_style.textColor = colors.HexColor("#374151")
-    subtitle_style.spaceAfter = 8
-    section_style = styles["Normal"].clone("SectionLabel")
-    section_style.fontSize = 10
-    section_style.textColor = colors.HexColor("#047857")
-    cell_style = styles["Normal"].clone("Cell")
-    cell_style.fontSize = 8
-    cell_style.leading = 10
-    header_cell_style = cell_style.clone("HeaderCell")
-    header_cell_style.textColor = colors.white
-    header_cell_style.fontName = "Helvetica-Bold"
-
-    story = []
-    story.append(Paragraph("Sleeping Stock", title_style))
-    story.append(Paragraph("Parts Transfer Request", subtitle_style))
-
-    created_display = str(group.get("created_at", ""))[:16].replace("T", "   ")
-    header_table = Table(
-        [
-            [_pdf_kv("Request Number", group.get("request_number", "-")),
-             _pdf_kv("Order / Reference Number", group.get("order_number", "-"))],
-            [_pdf_kv("Created Date & Time", created_display),
-             _pdf_kv("Request Status", group.get("status", "Requested"))],
-        ],
-        colWidths=[doc.width / 2, doc.width / 2],
-    )
-    header_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
-    story.append(header_table)
-    story.append(Spacer(1, 6))
-
-    requested_by = Table(
-        [
-            [Paragraph("Requested By", section_style)],
-            [_pdf_kv("Name", group.get("requested_user_name", "-"))],
-            [_pdf_kv("Brand", group.get("requesting_brand", "-"))],
-            [_pdf_kv("Dealer", group.get("requesting_dealer", "-"))],
-            [_pdf_kv("Branch", group.get("requesting_branch", "-"))],
-        ],
-        colWidths=[doc.width / 2 - 4],
-    )
-    requested_to = Table(
-        [
-            [Paragraph("Requested To", section_style)],
-            [_pdf_kv("Brand", group.get("supplying_brand", "-"))],
-            [_pdf_kv("Dealer", group.get("supplying_dealer", "-"))],
-            [_pdf_kv("Branch", group.get("supplying_branch", "-"))],
-            [_pdf_kv("Location", group.get("supplying_branch", "-"))],
-        ],
-        colWidths=[doc.width / 2 - 4],
-    )
-    for t in (requested_by, requested_to):
-        t.setStyle(TableStyle([("BOTTOMPADDING", (0, 0), (-1, -1), 3), ("TOPPADDING", (0, 0), (-1, -1), 1)]))
-    two_col = Table([[requested_by, requested_to]], colWidths=[doc.width / 2, doc.width / 2])
-    two_col.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
-    story.append(two_col)
-    story.append(Spacer(1, 10))
-
-    header_row = ["S.No", "Part Number", "Part Name / Description", "Req. Qty", "Avail. Qty",
-                  "Value", "Purchase Aging", "Sales Aging", "LOC"]
-    table_data = [[Paragraph(h, header_cell_style) for h in header_row]]
-    items = group.get("items", []) or []
-    for idx, item in enumerate(items, start=1):
-        table_data.append([
-            Paragraph(str(idx), cell_style),
-            Paragraph(_pdf_escape(item.get("part_number")), cell_style),
-            Paragraph(_pdf_escape(item.get("description")), cell_style),
-            Paragraph(_pdf_format_number(item.get("requested_qty")), cell_style),
-            Paragraph(_pdf_format_number(item.get("available_qty_at_request")), cell_style),
-            Paragraph(_pdf_format_number(item.get("value")), cell_style),
-            Paragraph(_pdf_format_aging(item.get("purchase_aging_days")), cell_style),
-            Paragraph(_pdf_format_aging(item.get("sales_aging_days")), cell_style),
-            Paragraph(_pdf_escape(item.get("loc")) if item.get("loc") else "—", cell_style),
-        ])
-
-    fixed_widths_mm = [8, 24, 16, 18, 18, 18, 18, 18]  # all columns except description
-    description_width = doc.width - sum(fixed_widths_mm) * mm
-    col_widths = [
-        fixed_widths_mm[0] * mm, fixed_widths_mm[1] * mm, description_width,
-        fixed_widths_mm[2] * mm, fixed_widths_mm[3] * mm, fixed_widths_mm[4] * mm,
-        fixed_widths_mm[5] * mm, fixed_widths_mm[6] * mm, fixed_widths_mm[7] * mm,
-    ]
-    item_table = Table(table_data, colWidths=col_widths, repeatRows=1)
-    item_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#047857")),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F0FDF4")]),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-    ]))
-    story.append(item_table)
-    story.append(Spacer(1, 10))
-
-    summary_table = Table(
-        [[
-            _pdf_kv("Total Items", str(group.get("total_items", len(items)))),
-            _pdf_kv("Total Quantity", _pdf_format_number(group.get("total_qty"))),
-            _pdf_kv("Total Value", _pdf_format_number(group.get("total_value"))),
-        ]],
-        colWidths=[doc.width / 3] * 3,
-    )
-    story.append(summary_table)
-    story.append(Spacer(1, 26))
-
-    # Signature block — always the last flowable, so it only ever appears on
-    # the final printed page, never repeated mid-document.
-    signature_table = Table(
-        [[
-            Paragraph("Requested By (Signature)", cell_style),
-            Paragraph("Requested To / Approved By (Signature)", cell_style),
-        ]],
-        colWidths=[doc.width / 2, doc.width / 2],
-    )
-    signature_table.setStyle(TableStyle([
-        ("LINEABOVE", (0, 0), (0, 0), 0.75, colors.HexColor("#9CA3AF")),
-        ("LINEABOVE", (1, 0), (1, 0), 0.75, colors.HexColor("#9CA3AF")),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-    ]))
-    story.append(signature_table)
-
-    doc.build(story, canvasmaker=_NumberedCanvas)
-    return buffer.getvalue()
+    """Email attachment is the Request Center Print output converted to PDF."""
+    return build_request_print_pdf(group)
 
 
 # --------------------------------------------------------------------------
