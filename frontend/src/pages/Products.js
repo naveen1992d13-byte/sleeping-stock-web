@@ -11,8 +11,6 @@ const isAll = (v) => !v || String(v).startsWith('All ') || v === 'N/A';
 const PAGE_SIZE_OPTIONS = [100, 300, 500, 1000];
 // Required Product Hub column order (Part Number → Active Status).
 const PRODUCT_HUB_COLUMNS = ['Part Number', 'Part Name', 'LOC', 'On-Hand', 'Last Receipt Date', 'Last Sales Date', 'MAV', 'Part Type', 'Branch', 'Brand', 'Dealer', 'Purchase Aging', 'Sales Aging', 'Uploaded Date', 'Uploaded User', 'Active Status'];
-// Part Type — same final options as Analytics (All | OE Parts | Accessories | Others).
-const CATEGORY_OPTIONS = ['All', 'OE Parts', 'Accessories', 'Others'];
 
 const displayPartType = (raw) => {
   const v = String(raw || '').trim();
@@ -80,6 +78,7 @@ export function Products() {
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [category, setCategory] = useState('All');
+  const [partTypeOptions, setPartTypeOptions] = useState(['All']);
   const [stockStatus, setStockStatus] = useState('all');
   const [loadingRecords, setLoadingRecords] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -109,6 +108,24 @@ export function Products() {
     return params.toString();
   };
 
+  const fetchPartTypes = async () => {
+    try {
+      const params = new URLSearchParams();
+      if (!isAll(scopeBrand)) params.append('brand', scopeBrand);
+      if (!isAll(scopeDealer)) params.append('dealer', scopeDealer);
+      if (!isAll(effectiveBranch)) params.append('branch', effectiveBranch);
+      const res = await axios.get(`${API}/product-hub/part-types?${params.toString()}`);
+      const incoming = Array.isArray(res.data?.part_types) ? res.data.part_types : [];
+      const types = incoming.filter((v) => v && v !== 'All');
+      const next = ['All', ...types];
+      setPartTypeOptions(next);
+      setCategory((current) => (next.includes(current) ? current : 'All'));
+    } catch {
+      setPartTypeOptions(['All']);
+      setCategory('All');
+    }
+  };
+
   const fetchSummary = async () => {
     try {
       const res = await axios.get(`${API}/product-hub/summary?${scopeParams({ search })}`);
@@ -126,6 +143,11 @@ export function Products() {
     } catch { toast.error('Product Hub records load failed'); }
     finally { setLoadingRecords(false); }
   };
+
+  useEffect(() => {
+    fetchPartTypes();
+    /* eslint-disable-next-line */
+  }, [scopeBrand, scopeDealer, effectiveBranch]);
 
   useEffect(() => {
     fetchSummary();
@@ -196,8 +218,8 @@ export function Products() {
             <Search className="h-4 w-4 absolute left-3 top-3" style={{ color: COLORS.muted }} />
             <input value={searchInput} onChange={(e) => setSearchInput(e.target.value)} placeholder="Search Part No / Part Name" className="w-full pl-9 pr-4 py-2 rounded-xl border" />
           </div>
-          <select value={category} onChange={(e) => setCategory(e.target.value)} className="px-3 py-2 rounded-xl border text-sm" title="Part Type">
-            {CATEGORY_OPTIONS.map(c => <option key={c} value={c}>{c === 'All' ? 'All Part Types' : c}</option>)}
+          <select value={partTypeOptions.includes(category) ? category : 'All'} onChange={(e) => setCategory(e.target.value)} className="px-3 py-2 rounded-xl border text-sm" title="Part Type" data-testid="product-hub-part-type">
+            {partTypeOptions.map(c => <option key={c} value={c}>{c === 'All' ? 'All Part Types' : c}</option>)}
           </select>
           <select value={stockStatus} onChange={(e) => setStockStatus(e.target.value)} className="px-3 py-2 rounded-xl border text-sm" title="Stock Status">
             <option value="all">All Items</option>
