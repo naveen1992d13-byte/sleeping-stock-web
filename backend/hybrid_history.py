@@ -571,44 +571,27 @@ async def read_product_history(
 
     paginate = page is not None or page_size is not None
 
-    # Optimized single-day paginated path (View UI)
+    # Optimized single-day paginated path (View UI).
+    # Mongo wins whenever source rows still exist; S3 is used only after prune
+    # (or when Mongo is empty and a readable archive exists).
     if paginate and len(keys) == 1:
         dk = keys[0]
         ps = max(1, min(int(page_size or 50), 500))
         pg = max(1, int(page or 1))
         sources: Dict[str, str] = {}
-        result = None
-        if is_mongo_hot(dk, hot_days):
-            result = await _read_mongo_product_day_page(
-                db,
-                dk,
-                brand=brand,
-                dealer=dealer,
-                branch=branch,
-                part_number=part_number,
-                search=search,
-                page=pg,
-                page_size=ps,
-            )
-            if result["total"] == 0:
-                streamed = await _stream_s3_product_day_page(
-                    db,
-                    dk,
-                    brand=brand,
-                    dealer=dealer,
-                    branch=branch,
-                    part_number=part_number,
-                    search=search,
-                    page=pg,
-                    page_size=ps,
-                )
-                if streamed:
-                    result = streamed
-                    sources[dk] = "s3"
-                else:
-                    sources[dk] = "mongo"
-            else:
-                sources[dk] = "mongo"
+        result = await _read_mongo_product_day_page(
+            db,
+            dk,
+            brand=brand,
+            dealer=dealer,
+            branch=branch,
+            part_number=part_number,
+            search=search,
+            page=pg,
+            page_size=ps,
+        )
+        if result["total"] > 0:
+            sources[dk] = "mongo"
         else:
             streamed = await _stream_s3_product_day_page(
                 db,
@@ -645,19 +628,7 @@ async def read_product_history(
                 result = streamed
                 sources[dk] = "s3"
             else:
-                # Transitional Mongo fallback only when no VERIFIED S3 manifest exists.
-                result = await _read_mongo_product_day_page(
-                    db,
-                    dk,
-                    brand=brand,
-                    dealer=dealer,
-                    branch=branch,
-                    part_number=part_number,
-                    search=search,
-                    page=pg,
-                    page_size=ps,
-                )
-                sources[dk] = "mongo_fallback"
+                sources[dk] = "mongo"
 
         rows = result.get("rows") or []
         if record_usage and sources.get(dk) == "s3":
@@ -694,30 +665,19 @@ async def read_product_history(
     sources = {}
 
     for dk in keys:
-        if is_mongo_hot(dk, hot_days):
-            rows = await _read_mongo_product_day(db, dk, brand, dealer, branch)
-            if rows:
-                mongo_rows.extend(rows)
-                sources[dk] = "mongo"
-                continue
-            archived = await am.find_s3_readable(db, MODULE_PRODUCT_HISTORY, archive_date=date_key_to_iso(dk))
-            if archived:
-                rows = await _read_s3_product_day(db, dk)
-                rows = [r for r in rows if _match_scope(r, brand, dealer, branch)]
-                s3_rows.extend(rows)
-                sources[dk] = "s3"
-            else:
-                sources[dk] = "mongo"
-        else:
+        rows = await _read_mongo_product_day(db, dk, brand, dealer, branch)
+        if rows:
+            mongo_rows.extend(rows)
+            sources[dk] = "mongo"
+            continue
+        archived = await am.find_s3_readable(db, MODULE_PRODUCT_HISTORY, archive_date=date_key_to_iso(dk))
+        if archived:
             rows = await _read_s3_product_day(db, dk)
-            if rows:
-                rows = [r for r in rows if _match_scope(r, brand, dealer, branch)]
-                s3_rows.extend(rows)
-                sources[dk] = "s3"
-            else:
-                rows = await _read_mongo_product_day(db, dk, brand, dealer, branch)
-                mongo_rows.extend(rows)
-                sources[dk] = "mongo_fallback"
+            rows = [r for r in rows if _match_scope(r, brand, dealer, branch)]
+            s3_rows.extend(rows)
+            sources[dk] = "s3"
+        else:
+            sources[dk] = "mongo"
 
     combined = mongo_rows + s3_rows
     if part_number or search:
@@ -793,15 +753,75 @@ async def summarize_product_history(
     buckets: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
 
     for dk in keys:
-        # Always use filtered read for scoped summaries (streams when cold+single)
+        date_iso = date_key_to_iso(dk)
+        query: Dict[str, Any] = {
+            "publish_status": "Published",
+            "active_date_key": {"$in": [dk, date_iso]},
+        }
+        if brand:
+            query["brand_name"] = brand
+        if dealer:
+            query["dealer_name"] = dealer
+        if branch:
+            query["branch"] = branch
+        used_mongo = False
+        try:
+            mongo_n = await db.products.count_documents(query)
+        except Exception:
+            mongo_n = 0
+        if mongo_n:
+            pipeline = [
+                {"$match": query},
+                {
+                    "$group": {
+                        "_id": {
+                            "brand": {"$ifNull": ["$brand_name", ""]},
+                            "dealer": {"$ifNull": ["$dealer_name", ""]},
+                            "branch": {"$ifNull": ["$branch", ""]},
+                        },
+                        "records": {"$sum": 1},
+                        "total_available_qty": {
+                            "$sum": {"$ifNull": ["$available_qty_number", {"$ifNull": ["$quantity", 0]}]}
+                        },
+                        "total_value": {
+                            "$sum": {"$ifNull": ["$total_value_number", {"$ifNull": ["$total_value", 0]}]}
+                        },
+                        "last_published_at": {"$max": "$published_at"},
+                    }
+                },
+            ]
+            try:
+                grouped = await db.products.aggregate(pipeline).to_list(10000)
+                used_mongo = True
+                for r in grouped:
+                    ident = r.get("_id") or {}
+                    key = (
+                        dk,
+                        str(ident.get("brand") or ""),
+                        str(ident.get("dealer") or ""),
+                        str(ident.get("branch") or ""),
+                    )
+                    buckets[key] = {
+                        "date_key": dk,
+                        "brand": key[1],
+                        "dealer": key[2],
+                        "branch": key[3],
+                        "records": int(r.get("records") or 0),
+                        "total_available_qty": float(r.get("total_available_qty") or 0),
+                        "total_value": float(r.get("total_value") or 0),
+                        "last_published_at": r.get("last_published_at"),
+                    }
+            except Exception:
+                used_mongo = False
+        if used_mongo:
+            continue
         result = await read_product_history(
             db,
             date_key=dk,
             brand=brand,
             dealer=dealer,
             branch=branch,
-            # No page → full day for summary aggregation of one day at a time
-            # but we process one date_key per loop to bound peak memory to one day.
+            record_usage=False,
         )
         for r in result["rows"]:
             b = r.get("brand_name") or ""

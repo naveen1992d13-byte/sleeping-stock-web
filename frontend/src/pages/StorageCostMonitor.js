@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
-import { HardDrive, RefreshCw, AlertTriangle, RotateCcw, ExternalLink, ShieldCheck, Trash2, Download } from 'lucide-react';
+import { HardDrive, RefreshCw, AlertTriangle, ExternalLink, ShieldCheck, Trash2, Download } from 'lucide-react';
 import { toast } from 'sonner';
 
 const COLORS = {
@@ -91,15 +91,11 @@ export function StorageCostMonitor() {
   const load = async () => {
     setLoading(true);
     try {
-      // Intentionally ignore Brand/Dealer/Branch header filters — overall storage only.
-      const [mon, mig, cleanup] = await Promise.all([
-        axios.get(`${API}/storage/monitor`),
-        axios.get(`${API}/storage/monitor/migration-report`),
-        axios.get(`${API}/storage/archives/cleanup-table?years=3`),
-      ]);
+      // One payload: monitor includes cleanup rows + migration (avoids duplicate S3 HEAD/list).
+      const mon = await axios.get(`${API}/storage/monitor`);
       setData(mon.data);
-      setMigration(mig.data);
-      setCleanupRows(cleanup.data?.rows || []);
+      setMigration(mon.data?.migration || null);
+      setCleanupRows(mon.data?.cleanup_rows || []);
     } catch (err) {
       const status = err?.response?.status;
       toast.error(status === 403 ? 'Master Admin only' : 'Failed to load storage monitor');
@@ -129,6 +125,7 @@ export function StorageCostMonitor() {
   const schedule = data?.archive_schedule || {};
   const totals = data?.storage_totals || {};
   const s3 = data?.s3 || {};
+  const pruneEnabled = Boolean(data?.archive_prune_enabled);
 
   const retry = async (archiveId) => {
     setBusyId(archiveId);
@@ -142,6 +139,21 @@ export function StorageCostMonitor() {
       load();
     } catch (err) {
       toast.error(err?.response?.data?.detail || 'Retry Archive failed');
+    } finally {
+      setBusyId('');
+    }
+  };
+
+  const reVerify = async (archiveId) => {
+    setBusyId(archiveId);
+    try {
+      const res = await axios.post(`${API}/storage/archives/${archiveId}/re-verify`);
+      setVerifyReport(res.data);
+      setDryRunReport(null);
+      if (res.data?.ok) toast.success('Re-Verify passed — object exists, readable, counts match');
+      else toast.error(res.data?.reason || res.data?.lock_reason || 'Re-Verify failed');
+    } catch {
+      toast.error('Re-Verify failed');
     } finally {
       setBusyId('');
     }
@@ -169,36 +181,12 @@ export function StorageCostMonitor() {
     }
   };
 
-  const dryRunMigration = async () => {
-    try {
-      const res = await axios.post(`${API}/storage/migration/archive-dates?dry_run=true`);
-      toast.success(`Dry-run ready: ${res.data?.dates || 0} historical dates`);
-      setMigration((m) => ({ ...(m || {}), dry_run: res.data }));
-    } catch {
-      toast.error('Migration dry-run failed');
-    }
-  };
-
   const openExternal = (url, label) => {
     if (!url) {
       toast.error(`${label} console URL is not configured`);
       return;
     }
     window.open(url, '_blank', 'noopener,noreferrer');
-  };
-
-  const runVerify = async (archiveId) => {
-    setBusyId(archiveId);
-    try {
-      const res = await axios.post(`${API}/storage/archives/${archiveId}/verify`);
-      setVerifyReport(res.data);
-      setDryRunReport(null);
-      toast.success(res.data?.safe_to_delete ? 'SAFE TO DELETE' : (res.data?.lock_reason || 'NOT SAFE TO DELETE'));
-    } catch {
-      toast.error('Verify failed');
-    } finally {
-      setBusyId('');
-    }
   };
 
   const runDryRun = async (archiveId) => {
@@ -242,7 +230,8 @@ export function StorageCostMonitor() {
   };
 
   const canUnlockDelete = (r) =>
-    verifyReport?.archive_id === r.archive_id
+    pruneEnabled
+    && verifyReport?.archive_id === r.archive_id
     && verifyReport?.safe_to_delete
     && dryRunReport?.archive_id === r.archive_id
     && dryRunReport?.safe_to_delete;
@@ -259,9 +248,6 @@ export function StorageCostMonitor() {
         </div>
         <Button onClick={load} disabled={loading} className="gap-2" style={{ backgroundColor: COLORS.primary, color: '#fff' }}>
           <RefreshCw className="h-4 w-4" />{loading ? 'Loading…' : 'Refresh'}
-        </Button>
-        <Button onClick={dryRunMigration} variant="outline" className="gap-2">
-          <RotateCcw className="h-4 w-4" />Migration dry-run
         </Button>
       </div>
 
@@ -388,7 +374,7 @@ export function StorageCostMonitor() {
             ['Pending', health.pending ?? 0],
             ['Failed', health.failed ?? 0],
             ['Verification failed', health.verification_failed ?? 0],
-            ['Safe to Delete', health.safe_to_delete ?? 0],
+            ['Cleanup', pruneEnabled ? (health.cleanup_status || 'ENABLED') : 'DISABLED'],
             ['Overall verified %', `${health.overall_verified_percent ?? 0}%`],
           ].map(([label, value]) => (
             <div key={label} className="rounded-lg border p-3" style={{ borderColor: COLORS.border, background: COLORS.soft }}>
@@ -401,20 +387,10 @@ export function StorageCostMonitor() {
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         {[
-          ['Allocated Mongo Usage', fmtBytes(cards.mongodb_allocated_usage ?? totals.mongodb_allocated_usage_bytes)],
-          ['Physical MongoDB Storage', fmtBytes(cards.mongodb_physical_storage ?? cards.mongodb_used_storage)],
-          ['MongoDB Data Size', fmtBytes(cards.mongodb_data_size)],
-          ['MongoDB Index Size', fmtBytes(cards.mongodb_index_size)],
-          ['MongoDB Plan/Capacity', 'Unavailable'],
-          ['MongoDB Available/Balance', 'Unavailable'],
-          ['Actual S3 Used Storage', s3.actual_s3_available ? fmtBytes(s3.actual_s3_used_bytes) : 'Unavailable'],
-          ['Dealer-attributed Verified Archive Usage', fmtBytes(totals.s3_dealer_attributed_bytes ?? cards.s3_dealer_attributed)],
-          ['Manifest Recorded Size', fmtBytes(s3.manifest_recorded_bytes ?? cards.s3_manifest_recorded)],
-          ['Today Product Rows', String(cards.today_product_count ?? '-')],
           ['Last Archive Status', String(cards.last_archive_status || '-')],
           ['Last Successful Archive', String(cards.last_successful_archive_date || '-')],
           ['Failed Archive Count', String(cards.failed_archive_count ?? 0)],
-          ['Storage Backend', String(data?.storage_backend || '-')],
+          ['Mongo cleanup', pruneEnabled ? 'Enabled' : 'DISABLED'],
         ].map(([label, value]) => (
           <div key={label} className="rounded-xl border bg-white p-4" style={{ borderColor: COLORS.border, background: COLORS.soft }}>
             <div className="text-xs font-semibold uppercase tracking-wide" style={{ color: COLORS.muted }}>{label}</div>
@@ -492,8 +468,8 @@ export function StorageCostMonitor() {
               <tr style={{ backgroundColor: COLORS.primary, color: '#fff' }}>
                 {[
                   'Dataset', 'Archive date', 'Source count', 'Archived count', 'File size',
-                  'S3 object', 'Readable', 'SHA256', 'Transferred', 'Verified', 'S3 path',
-                  'Status', 'Failure reason', 'Actions',
+                  'S3 object', 'Readable', 'SHA256', 'Completed', 'S3 path',
+                  'Status', 'Cleanup', 'Failure reason', 'Actions',
                 ].map((h) => (
                   <th key={h} className="p-2 text-left font-medium whitespace-nowrap">{h}</th>
                 ))}
@@ -504,7 +480,6 @@ export function StorageCostMonitor() {
                 <tr><td colSpan={14} className="p-4 text-center" style={{ color: COLORS.muted }}>No archive jobs yet</td></tr>
               ) : (cleanupRows.length ? cleanupRows : archives).map((a, i) => {
                 const display = a.display_status || a.status;
-                const locked = a.delete_locked !== false && !canUnlockDelete(a);
                 return (
                   <tr key={a.archive_id || i} className="border-b" style={{ backgroundColor: i % 2 ? '#fff' : COLORS.soft }}>
                     <td className="p-2">{a.dataset || a.module || '-'}</td>
@@ -515,14 +490,17 @@ export function StorageCostMonitor() {
                     <td className="p-2">{a.s3_object_status || '-'}</td>
                     <td className="p-2">{a.s3_readable == null ? '-' : (a.s3_readable ? 'Yes' : 'No')}</td>
                     <td className="p-2">{a.sha256_match || a.sha256_status || '-'}</td>
-                    <td className="p-2 text-xs">{a.transferred_at || a.verified || a.verified_at || '-'}</td>
-                    <td className="p-2 text-xs">{a.verified_at || a.verified || '-'}</td>
+                    <td className="p-2 text-xs">{a.verified_at || a.transferred_at || a.verified || '-'}</td>
                     <td className="p-2 text-xs max-w-[180px] truncate" title={a.storage_key || ''}>{a.storage_key || '-'}</td>
                     <td className="p-2 font-semibold whitespace-nowrap" style={{ color: statusColor(display) }}>{display}</td>
+                    <td className="p-2 text-xs whitespace-nowrap">{a.cleanup_status || (pruneEnabled ? (a.mongo_data_status || '-') : 'DISABLED')}</td>
                     <td className="p-2 text-xs" style={{ color: COLORS.danger }}>{a.failure_reason || a.error || '—'}</td>
                     <td className="p-2">
                       <div className="flex flex-wrap gap-1">
-                        {(a.retryable || display === 'NOT TRANSFERRED' || display === 'VERIFICATION FAILED' || a.status === 'FAILED') && (
+                        <Button size="sm" variant="outline" className="gap-1" disabled={busyId === a.archive_id} onClick={() => reVerify(a.archive_id)}>
+                          <ShieldCheck className="h-3 w-3" />Re-Verify
+                        </Button>
+                        {(a.retryable || display === 'NOT TRANSFERRED' || display === 'VERIFICATION FAILED') && display !== 'NO ELIGIBLE DATA' && display !== 'NO ELIGIBLE ORDERS' && (
                           <Button size="sm" variant="outline" disabled={busyId === a.archive_id} onClick={() => retry(a.archive_id)}>
                             Retry Archive
                           </Button>
@@ -530,11 +508,8 @@ export function StorageCostMonitor() {
                         <Button size="sm" variant="outline" className="gap-1" onClick={() => downloadArchive(a.archive_id)}>
                           <Download className="h-3 w-3" />Download Archive
                         </Button>
-                        {a.module === 'product-history' || a.dataset === 'product-history' ? (
+                        {pruneEnabled && (a.module === 'product-history' || a.dataset === 'product-history') ? (
                           <>
-                            <Button size="sm" variant="outline" className="gap-1" disabled={busyId === a.archive_id} onClick={() => runVerify(a.archive_id)}>
-                              <ShieldCheck className="h-3 w-3" />View / Verify
-                            </Button>
                             <Button size="sm" variant="outline" disabled={busyId === a.archive_id} onClick={() => runDryRun(a.archive_id)}>Dry Run</Button>
                             <Button
                               size="sm"
@@ -553,9 +528,6 @@ export function StorageCostMonitor() {
                             </Button>
                           </>
                         ) : null}
-                        {locked && (a.module === 'product-history' || a.dataset === 'product-history') && !canUnlockDelete(a) && (
-                          <div className="text-xs w-full" style={{ color: COLORS.warn }}>{a.lock_reason || 'Locked — not verified'}</div>
-                        )}
                       </div>
                     </td>
                   </tr>
@@ -569,7 +541,9 @@ export function StorageCostMonitor() {
       {(verifyReport || dryRunReport) && (
         <div className="rounded-xl border bg-white p-4 text-sm" style={{ borderColor: COLORS.border }}>
           <div className="mb-2 font-semibold" style={{ color: COLORS.dark }}>
-            {dryRunReport ? 'Dry Run Result' : 'View / Verify Result'} — {verifyReport?.safe_to_delete ? 'SAFE TO DELETE' : (verifyReport?.lock_reason || 'NOT SAFE TO DELETE')}
+            {verifyReport?.action === 'Re-Verify'
+              ? `Re-Verify — ${verifyReport?.ok ? 'PASSED' : (verifyReport?.reason || 'FAILED')}`
+              : (dryRunReport ? 'Dry Run Result' : 'Verify Result') + ` — ${verifyReport?.safe_to_delete ? 'SAFE TO DELETE' : (verifyReport?.lock_reason || 'NOT SAFE TO DELETE')}`}
           </div>
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3" style={{ color: COLORS.muted }}>
             <div>Date: <b style={{ color: COLORS.dark }}>{verifyReport?.archive_date}</b></div>
