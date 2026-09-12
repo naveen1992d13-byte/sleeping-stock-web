@@ -23,8 +23,8 @@ def test_request_push_message_uses_custom_sound_and_high_priority_channel():
         'response_deadline': (datetime.now(timezone.utc) + timedelta(minutes=18)).isoformat(),
     }
     msg = mobile_push.build_branch_request_message('ExponentPushToken[abc]', group, 'new')
-    assert msg['sound'] == 'nmts-request-ring'
-    assert msg['channelId'] == 'sleeping-stock-requests-v2'
+    assert msg['sound'] == 'sleeping_stock_alert_2_rising_dispatch.wav'
+    assert msg['channelId'] == 'sleeping-stock-requests-v3'
     assert msg['categoryId'] == 'branch-request'
     assert msg['priority'] == 'high'
     assert msg['data']['request_group_key'] == 'group-1'
@@ -40,6 +40,6 @@ def test_reminder_kinds_keep_same_sound_and_three_sla_copy_slots():
     group = {'id': 'g2', 'request_number': 'RQ-2', 'supplying_dealer': 'A', 'supplying_branch': 'B'}
     for kind in ('reminder_1', 'reminder_2', 'reminder_3'):
         msg = mobile_push.build_branch_request_message('ExponentPushToken[xyz]', group, kind)
-        assert msg['sound'] == 'nmts-request-ring'
+        assert msg['sound'] == 'sleeping_stock_alert_2_rising_dispatch.wav'
         assert msg['data']['kind'] == kind
         assert msg['data']['request_group_key'] == 'g2'

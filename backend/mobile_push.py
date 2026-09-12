@@ -13,8 +13,8 @@ logger = logging.getLogger("nmts.mobile_push")
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 _EXPO_TOKEN_RE = re.compile(r"^ExponentPushToken\[.+\]$")
-REQUEST_ALERT_SOUND = "nmts-request-ring"
-REQUEST_CHANNEL_ID = "sleeping-stock-requests-v2"
+REQUEST_ALERT_SOUND = "sleeping_stock_alert_2_rising_dispatch.wav"
+REQUEST_CHANNEL_ID = "sleeping-stock-requests-v3"
 REQUEST_CATEGORY_ID = "branch-request"
 
 
