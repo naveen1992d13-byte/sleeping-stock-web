@@ -124,10 +124,10 @@ export function Requests() {
   // Scope changes reset transient UI and fetch server-enforced results.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
-    setExpanded({});
+    setExpanded(highlightRequest ? { [highlightRequest]: true } : {});
     setItemDrafts({});
     load();
-  }, [view, scopeBrand, scopeDealer, scopeBranch]);
+  }, [view, scopeBrand, scopeDealer, scopeBranch, highlightRequest]);
 
   useEffect(() => {
     if (stageParam === 'completed' || stageParam === 'pending') {
@@ -138,7 +138,6 @@ export function Requests() {
   useEffect(() => {
     if (!highlightRequest) return;
     setView('all');
-    setExpanded((p) => ({ ...p, [highlightRequest]: true }));
   }, [highlightRequest]);
 
   useEffect(() => {
