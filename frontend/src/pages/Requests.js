@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useOutletContext } from 'react-router-dom';
+import { useOutletContext, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { API } from '@/App';
 import { Button } from '@/components/ui/button';
@@ -9,18 +9,20 @@ import { displayRequestStatus, openRequestPrint } from '@/utils/requestPrint';
 
 const CLOSED_STATUSES = new Set(['Rejected', 'Cancelled', 'Completed']);
 const STATUS_STYLES = {
-  Requested: { bg: '#FEF3C7', fg: '#92400E' },
-  Waiting: { bg: '#FEF3C7', fg: '#92400E' },
-  Approved: { bg: '#D1FAE5', fg: '#065F46' },
-  Accepted: { bg: '#D1FAE5', fg: '#065F46' },
-  'Partially Approved': { bg: '#D1FAE5', fg: '#065F46' },
-  'Partially Accepted': { bg: '#D1FAE5', fg: '#065F46' },
-  Rejected: { bg: '#FCE7F3', fg: '#9F1239' },
-  'No Response': { bg: '#FCE7F3', fg: '#9F1239' },
-  Cancelled: { bg: '#FCE7F3', fg: '#9F1239' },
-  Dispatched: { bg: '#E0F2FE', fg: '#075985' },
-  Received: { bg: '#EDE9FE', fg: '#5B21B6' },
-  Completed: { bg: '#D1FAE5', fg: '#065F46' },
+  Requested: { bg: '#B45309', fg: '#FFFBEB' },
+  Waiting: { bg: '#B45309', fg: '#FFFBEB' },
+  Active: { bg: '#B45309', fg: '#FFFBEB' },
+  Approved: { bg: '#047857', fg: '#ECFDF5' },
+  Accepted: { bg: '#047857', fg: '#ECFDF5' },
+  'Partially Approved': { bg: '#047857', fg: '#ECFDF5' },
+  'Partially Accepted': { bg: '#047857', fg: '#ECFDF5' },
+  Rejected: { bg: '#BE123C', fg: '#FFF1F2' },
+  'No Response': { bg: '#BE123C', fg: '#FFF1F2' },
+  Cancelled: { bg: '#BE123C', fg: '#FFF1F2' },
+  Dispatched: { bg: '#0369A1', fg: '#E0F2FE' },
+  Received: { bg: '#6D28D9', fg: '#F5F3FF' },
+  Completed: { bg: '#047857', fg: '#ECFDF5' },
+  'Factory Order': { bg: '#1E3A8A', fg: '#DBEAFE' },
 };
 
 function formatDeadlineCountdown(deadline, nowMs) {
@@ -52,7 +54,7 @@ function displayStatus(status) {
 function StatusBadge({ status }) {
   const label = displayStatus(status);
   const s = STATUS_STYLES[label] || STATUS_STYLES[status] || { bg: '#F3F4F6', fg: '#374151' };
-  return <span className="inline-block rounded-full px-2.5 py-1 text-xs font-semibold" style={{ backgroundColor: s.bg, color: s.fg }}>{label}</span>;
+  return <span className="inline-block rounded-full px-2.5 py-1 text-xs font-bold" style={{ backgroundColor: s.bg, color: s.fg }}>{label}</span>;
 }
 
 function ScopeCard({ title, subtitle, brand, dealer, branch, users, requestedBy }) {
@@ -90,8 +92,11 @@ function getGroupStatus(items) {
 
 export function Requests() {
   const { scopeBrand, scopeDealer, scopeBranch } = useOutletContext() || {};
+  const [searchParams] = useSearchParams();
+  const highlightRequest = String(searchParams.get('highlight') || '').trim();
+  const stageParam = String(searchParams.get('stage') || '').trim().toLowerCase();
   const [view, setView] = useState('incoming');
-  const [stage, setStage] = useState('pending');
+  const [stage, setStage] = useState(stageParam === 'completed' ? 'completed' : 'pending');
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
@@ -125,6 +130,18 @@ export function Requests() {
   }, [view, scopeBrand, scopeDealer, scopeBranch]);
 
   useEffect(() => {
+    if (stageParam === 'completed' || stageParam === 'pending') {
+      setStage(stageParam);
+    }
+  }, [stageParam]);
+
+  useEffect(() => {
+    if (!highlightRequest) return;
+    setView('all');
+    setExpanded((p) => ({ ...p, [highlightRequest]: true }));
+  }, [highlightRequest]);
+
+  useEffect(() => {
     const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
@@ -147,6 +164,14 @@ export function Requests() {
       total_value: g.items.reduce((a, i) => a + Number(i.value_at_request || 0), 0),
     })).filter(g => stage === 'completed' ? CLOSED_STATUSES.has(g.status) : !CLOSED_STATUSES.has(g.status));
   }, [rows, stage]);
+
+  useEffect(() => {
+    if (!highlightRequest) return;
+    const el = document.querySelector(`[data-request-number="${highlightRequest}"]`);
+    if (el && typeof el.scrollIntoView === 'function') {
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, [highlightRequest, groups]);
 
   const updateDraft = (item, field, value) => setItemDrafts(p => ({ ...p, [item.id]: { accepted_qty: item.accepted_qty ?? item.approved_qty ?? item.requested_qty, remarks: item.approval_remarks || '', ...(p[item.id] || {}), [field]: value } }));
   const draftFor = (item) => itemDrafts[item.id] || { accepted_qty: item.accepted_qty ?? item.approved_qty ?? item.requested_qty, remarks: item.approval_remarks || '' };
@@ -211,7 +236,7 @@ export function Requests() {
           const unresolved = g.items.some(i => (i.status || 'Requested') === 'Requested');
           const frozen = g.timer_frozen || ['responded', 'cancelled', 'timeout'].includes(g.response_status);
           const countdown = (unresolved && !frozen) ? formatDeadlineCountdown(deadline, nowMs) : '';
-          return <div key={g.key} className={`p-4 ${groupRowTint(g.status)}`}>
+          return <div key={g.key} data-request-number={g.request_number || ''} className={`p-4 ${groupRowTint(g.status)} ${highlightRequest && g.request_number === highlightRequest ? 'ring-2 ring-emerald-600 bg-emerald-50' : ''}`}>
             <div className="grid w-full items-center gap-4 md:grid-cols-[32px_1.2fr_2fr_.6fr_.7fr_.9fr_1fr_auto]">
               <button onClick={()=>setExpanded(p=>({...p,[g.key]:!open}))}>{open?<ChevronDown className="h-5 w-5"/>:<ChevronRight className="h-5 w-5"/>}</button>
               <button className="text-left" onClick={()=>setExpanded(p=>({...p,[g.key]:!open}))}><div className="text-xs text-slate-500">Request / Order No</div><div className="font-bold text-emerald-700">{g.request_number || 'Legacy Request'}</div><div className="text-xs text-slate-600">{g.order_number || '-'}</div></button>
@@ -221,7 +246,7 @@ export function Requests() {
             </div>
             {open && <div className="mt-5 rounded-xl border bg-white p-4">
               <div className="grid gap-4 lg:grid-cols-[1fr_48px_1fr]"><ScopeCard title="Stock Source (From)" subtitle="Supplying Location" brand={g.supplying_brand || g.requesting_brand} dealer={g.supplying_dealer} branch={g.supplying_branch} users={g.receiver_users}/><div className="hidden items-center justify-center lg:flex"><ArrowRight className="h-7 w-7 text-emerald-600"/></div><ScopeCard title="Stock Destination (To)" subtitle="Requesting Location" brand={g.requesting_brand} dealer={g.requesting_dealer} branch={g.requesting_branch} requestedBy={{name:g.requested_user_name,id:g.requested_user_id}}/></div>
-              <div className="mt-5 overflow-x-auto"><div className="mb-2 flex items-center gap-2 font-semibold"><Package className="h-4 w-4 text-emerald-600"/>Item-wise Acceptance</div><table className="w-full min-w-[1450px] text-sm"><thead className="bg-emerald-50"><tr>{['Part Number','Part Name','Request Qty','Accept Quantity','Purchase Aging','Sales Aging','LOC','Part Value','Status','Remarks','Action'].map(h=><th key={h} className="p-3 text-left">{h}</th>)}</tr></thead><tbody>{g.items.map(i=>{ const d=draftFor(i); const editable=view!=='outgoing' && i.status==='Requested'; return <tr key={i.id} className="border-t"><td className="p-3 font-semibold">{i.part_number}</td><td className="p-3">{i.description||'-'}</td><td className="p-3">{nfmt(i.requested_qty)}</td><td className="p-3">{editable?<input type="number" min="0" max={Number(i.requested_qty||0)} step="any" value={d.accepted_qty} onChange={e=>updateDraft(i,'accepted_qty',e.target.value)} className="h-9 w-28 rounded border px-2 font-semibold"/>:<span className="font-semibold">{nfmt(i.accepted_qty ?? i.approved_qty ?? 0)}</span>}</td><td className="p-3">{i.purchase_aging_days_at_request ?? i.purchase_aging_at_request ?? '-'}</td><td className="p-3">{i.sales_aging_days_at_request ?? i.sales_aging_at_request ?? '-'}</td><td className="p-3 font-medium">{i.loc_at_request || '-'}</td><td className="p-3">₹{nfmt(i.value_at_request)}</td><td className="p-3"><StatusBadge status={i.status}/>{i.decision_type==='Partial'&&<div className="mt-1 text-xs font-semibold text-blue-700">Partially Accepted</div>}{i.decided_at&&<div className="mt-1 text-xs text-slate-500">Sent: {dtfmt(i.decided_at)}</div>}</td><td className="p-3">{editable?<input value={d.remarks} onChange={e=>updateDraft(i,'remarks',e.target.value)} placeholder={Number(d.accepted_qty)<Number(i.requested_qty||0)?'Remark required':'Item remarks'} className="h-9 w-44 rounded border px-2"/>:(i.approval_remarks||i.remarks||'-')}</td><td className="p-3">{editable?<Button size="sm" disabled={loading} onClick={()=>decideItem(i)}><Send className="mr-1 h-4 w-4"/>Send</Button>:'Sent'}</td></tr>})}</tbody></table></div>
+              <div className="mt-5 overflow-x-auto"><div className="mb-2 flex items-center gap-2 font-semibold"><Package className="h-4 w-4 text-emerald-600"/>Item-wise Acceptance</div><table className="w-full min-w-[1450px] text-sm"><thead className="bg-emerald-50"><tr>{['Part Number','Part Name','Request Qty','Accept Quantity','Purchase Aging','Sales Aging','LOC','Part Value','Status','Remarks','Action'].map(h=><th key={h} className="p-3 text-left">{h}</th>)}</tr></thead><tbody>{g.items.map(i=>{ const d=draftFor(i); const editable=view!=='outgoing' && i.status==='Requested'; return <tr key={i.id} className="border-t"><td className="p-3 font-semibold">{i.part_number}</td><td className="p-3">{i.description||'-'}</td><td className="p-3">{nfmt(i.requested_qty)}</td><td className="p-3">{editable?<input type="number" min="0" max={Number(i.requested_qty||0)} step="any" value={d.accepted_qty} onChange={e=>updateDraft(i,'accepted_qty',e.target.value)} className="h-9 w-28 rounded border px-2 font-semibold"/>:<span className="font-semibold">{nfmt(i.accepted_qty ?? i.approved_qty ?? 0)}</span>}</td><td className="p-3">{i.purchase_aging_days_at_request ?? i.purchase_aging_at_request ?? '-'}</td><td className="p-3">{i.sales_aging_days_at_request ?? i.sales_aging_at_request ?? '-'}</td><td className="p-3 font-medium">{i.loc_at_request || i.loc || '-'}</td><td className="p-3">₹{nfmt(i.value_at_request)}</td><td className="p-3"><StatusBadge status={i.status}/>{i.decision_type==='Partial'&&<div className="mt-1 text-xs font-semibold text-blue-700">Partially Accepted</div>}{i.decided_at&&<div className="mt-1 text-xs text-slate-500">Sent: {dtfmt(i.decided_at)}</div>}</td><td className="p-3">{editable?<input value={d.remarks} onChange={e=>updateDraft(i,'remarks',e.target.value)} placeholder={Number(d.accepted_qty)<Number(i.requested_qty||0)?'Remark required':'Item remarks'} className="h-9 w-44 rounded border px-2"/>:(i.approval_remarks||i.remarks||'-')}</td><td className="p-3">{editable?<Button size="sm" disabled={loading} onClick={()=>decideItem(i)}><Send className="mr-1 h-4 w-4"/>Send</Button>:'Sent'}</td></tr>})}</tbody></table></div>
               <div className="mt-4 flex flex-wrap justify-end gap-2"><Button variant="outline" onClick={()=>openRequestPrint(g)}><Printer className="mr-1 h-4 w-4"/>Print Request</Button>{view!=='outgoing' && g.items.some(i=>i.status==='Approved' && Number(i.accepted_qty ?? i.approved_qty ?? 0)>0) && <Button disabled={loading} onClick={()=>transitionGroup(g,'dispatch')}>Dispatch Accepted</Button>}{view!=='incoming' && g.items.some(i=>['Dispatched','Received'].includes(i.status) && Number(i.accepted_qty ?? i.approved_qty ?? 0)>0) && <Button disabled={loading} onClick={()=>transitionGroup(g,'complete')}>Complete</Button>}{(view==='outgoing'||view==='all') && g.items.some(i=>['Requested','Approved'].includes(i.status)) && <Button variant="outline" disabled={loading} onClick={()=>cancelGroup(g)}><Ban className="mr-1 h-4 w-4"/>Cancel Request</Button>}</div>
             </div>}
           </div>;

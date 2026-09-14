@@ -22,7 +22,7 @@ PRINT_MARKERS = [
     'STATUS / REMARKS',
     'REQUESTED BY',
     'RECEIVED BY',
-    'APPROVED BY',
+    'ACCEPTED / PICKED BY',
     'DISPATCHED BY',
     'Please verify part number, accepted quantity and LOC before dispatch.',
 ]
@@ -41,6 +41,13 @@ GROUP = {
     'status': 'Requested',
     'requested_user_name': 'Test User',
     'requested_user_id': 'U1',
+    'requester_mobile': '9876543210',
+    'accepted_user_name': 'Picker User',
+    'accepted_user_mobile': '9000000001',
+    'dispatched_user_name': 'Dispatch User',
+    'dispatched_user_mobile': '9000000002',
+    'received_user_name': 'Receive User',
+    'received_user_mobile': '9000000003',
     'requesting_brand': 'Hyundai',
     'requesting_dealer': 'Test Dealer',
     'requesting_branch': 'Vanagaram',
@@ -84,6 +91,12 @@ def test_print_html_is_request_center_print_layout():
         assert marker in html, marker
     assert 'P-PRINT-1' in html
     assert 'Print Layout Part' in html
+    assert 'A1' in html
+    assert 'Test User' in html
+    assert '9876543210' in html
+    assert 'Picker User' in html
+    assert 'Dispatch User' in html
+    assert 'Receive User' in html
     for marker in OLD_TEMPLATE_MARKERS:
         assert marker not in html, marker
 

@@ -4605,7 +4605,7 @@ async def _resolve_request_email_routing(group_doc: dict) -> tuple:
     return notifications.resolve_request_email_routing(users, group_doc)
 
 
-async def _send_request_group_email(group_doc: dict):
+async def _send_request_group_email(group_doc: dict, *, result: bool = False):
     """Best-effort PDF + Gmail dispatch for one Requested-To destination
     group. Never raises — the request/request number/items are already
     saved before this runs, so any failure here only updates email_* status
@@ -4615,17 +4615,23 @@ async def _send_request_group_email(group_doc: dict):
     receiver_email = ', '.join(to_emails)
     log_id = str(uuid.uuid4())
     subject = notifications.build_request_email_subject(group_doc)
+    sent_field = 'result_email_sent' if result else 'email_sent'
+    status_field = 'result_email_status' if result else 'email_status'
+    error_field = 'result_email_error' if result else 'email_error'
+    sent_at_field = 'result_email_sent_at' if result else 'email_sent_at'
     base_log = {
         'id': log_id, 'request_id': group_doc['id'], 'request_number': group_doc['request_number'],
         'order_id': group_doc['order_id'], 'receiver_user_id': '', 'receiver_email': receiver_email or '',
-        'notification_type': 'parts_transfer_request', 'channel': 'email', 'subject': subject,
-        'attachment_filename': group_doc['pdf_filename'], 'retry_count': group_doc.get('retry_count', 0),
+        'notification_type': 'parts_transfer_request_result' if result else 'parts_transfer_request',
+        'channel': 'email', 'subject': subject,
+        'attachment_filename': group_doc.get('pdf_filename') or f"{group_doc.get('request_number')}.pdf",
+        'retry_count': group_doc.get('retry_count', 0),
         'created_at': now,
     }
 
     if not to_emails:
         await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {
-            'email_sent': False, 'email_status': 'failed', 'email_error': 'Receiver email not configured',
+            sent_field: False, status_field: 'failed', error_field: 'Receiver email not configured',
             'receiver_email': receiver_email or '', 'updated_at': now,
         }})
         await db.notification_logs.insert_one({**base_log, 'status': 'failed', 'attempted_at': now, 'sent_at': None,
@@ -4637,26 +4643,27 @@ async def _send_request_group_email(group_doc: dict):
     except Exception as exc:  # noqa: BLE001 — a PDF failure must never break the saved request
         safe_error = f'PDF generation failed: {str(exc)[:250]}'
         await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {
-            'email_sent': False, 'email_status': 'failed', 'email_error': safe_error,
+            sent_field: False, status_field: 'failed', error_field: safe_error,
             'receiver_email': receiver_email, 'updated_at': now,
         }})
         await db.notification_logs.insert_one({**base_log, 'status': 'failed', 'attempted_at': now, 'sent_at': None,
                                                 'failed_at': now, 'error_message': safe_error})
         return
 
-    result = await asyncio.get_event_loop().run_in_executor(
+    send_result = await asyncio.get_event_loop().run_in_executor(
         None, notifications.send_request_pdf_email, to_emails, group_doc, pdf_bytes, cc_emails,
     )
-    sent = result.get('status') == 'sent'
+    sent = send_result.get('status') == 'sent'
     await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {
-        'email_sent': sent, 'email_status': result.get('status'), 'email_error': (result.get('error') or None) if not sent else None,
-        'email_sent_at': now if sent else None, 'receiver_email': receiver_email,
+        sent_field: sent, status_field: send_result.get('status'),
+        error_field: (send_result.get('error') or None) if not sent else None,
+        sent_at_field: now if sent else None, 'receiver_email': receiver_email,
         'notification_log_id': log_id, 'updated_at': now,
     }})
     await db.notification_logs.insert_one({
-        **base_log, 'status': result.get('status'), 'attempted_at': now,
+        **base_log, 'status': send_result.get('status'), 'attempted_at': now,
         'sent_at': now if sent else None, 'failed_at': None if sent else now,
-        'error_message': result.get('error') or '', 'provider_message_id': result.get('provider_response', ''),
+        'error_message': send_result.get('error') or '', 'provider_message_id': send_result.get('provider_response', ''),
     })
 
 
@@ -5092,7 +5099,7 @@ async def order_desk_check_availability(order_id: str, brand: Optional[str] = No
                 'sales_aging_days': sales_aging,
                 'aging_days': purchase_aging,  # backward compatible: defaults to Purchase Aging
                 'unit_value': float(stock.get('unit_value_number', stock.get('mav_value', 0)) or 0),
-                'loc': stock.get('location', ''),
+                'loc': odw.stock_bin_loc(stock),
                 'last_upload': stock.get('created_at', ''),
             }
             all_stock_ids.append(entry['stock_id'])
@@ -5668,6 +5675,8 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
                 'request_status': odw.REQUEST_STATUS_SENT,
                 'retry_required': False,
                 're_enquire': False,
+                'no_further_stock': False,
+                'factory_order_qty': 0,
                 'updated_at': now,
             }})
         for item_id in touched_item_ids:
@@ -6634,7 +6643,13 @@ async def request_center_list(
             {'request_number': {'$in': list(request_numbers)}},
             {'_id': 0, 'request_number': 1, 'response_deadline': 1, 'response_status': 1,
              'request_sent_at': 1, 'response_time_minutes': 1, 'status': 1,
-             'timer_frozen': 1, 'remaining_seconds': 1, 'timer_stopped_at': 1, 'timeout_cancelled': 1},
+             'timer_frozen': 1, 'remaining_seconds': 1, 'timer_stopped_at': 1, 'timeout_cancelled': 1,
+             'requested_user_name': 1, 'requester_mobile': 1,
+             'accepted_user_name': 1, 'accepted_user_mobile': 1,
+             'decided_user_name': 1, 'decided_user_mobile': 1,
+             'dispatched_user_name': 1, 'dispatched_user_mobile': 1,
+             'received_user_name': 1, 'received_user_mobile': 1,
+             'completed_user_name': 1, 'completed_user_mobile': 1},
         ):
             header_by_number[header.get('request_number')] = header
 
@@ -6656,6 +6671,16 @@ async def request_center_list(
             row['remaining_seconds'] = timer.get('remaining_seconds')
             row['timer_frozen'] = timer.get('timer_frozen')
             row['countdown_active'] = bool(timer.get('countdown_active') and (row.get('status') or 'Requested') == 'Requested')
+            for field in (
+                'requester_mobile', 'accepted_user_name', 'accepted_user_mobile',
+                'decided_user_name', 'decided_user_mobile', 'dispatched_user_name',
+                'dispatched_user_mobile', 'received_user_name', 'received_user_mobile',
+                'completed_user_name', 'completed_user_mobile',
+            ):
+                if header.get(field) and not row.get(field):
+                    row[field] = header.get(field)
+            if header.get('requested_user_name') and not row.get('requested_user_name'):
+                row['requested_user_name'] = header.get('requested_user_name')
     try:
         existing_ids = {r.get('id') for r in rows if r.get('id')}
         archived = await hybrid_request_history.list_archived_requests(db, exclude_ids=existing_ids, limit=2000)
@@ -6691,6 +6716,35 @@ async def request_center_detail(request_id: str, current_user: UserResponse = De
     if not (is_supplier or is_requester):
         raise HTTPException(status_code=403, detail='Not authorized for this request')
     return req
+
+
+def _actor_name(user) -> str:
+    if user is None:
+        return ''
+    if isinstance(user, dict):
+        return str(user.get('username') or user.get('name') or '').strip()
+    return str(getattr(user, 'username', None) or getattr(user, 'name', None) or '').strip()
+
+
+def _actor_mobile(user) -> str:
+    if user is None:
+        return ''
+    if isinstance(user, dict):
+        return str(user.get('phone') or user.get('mobile') or '').strip()
+    return str(getattr(user, 'phone', None) or getattr(user, 'mobile', None) or '').strip()
+
+
+def _first_item_actor(items, name_keys, mobile_keys):
+    for item in items or []:
+        name = ''
+        mobile = ''
+        for key in name_keys:
+            name = name or str(item.get(key) or '').strip()
+        for key in mobile_keys:
+            mobile = mobile or str(item.get(key) or '').strip()
+        if name or mobile:
+            return name, mobile
+    return '', ''
 
 
 async def _sync_request_header_after_item_decision(req: dict, now: str):
@@ -6742,9 +6796,50 @@ async def _sync_request_header_after_item_decision(req: dict, now: str):
             'loc': i.get('loc_at_request', ''), 'status': i.get('status'),
             'remarks': i.get('approval_remarks') or i.get('remarks') or '',
         })
+    requested_name, requested_mobile = _first_item_actor(
+        items,
+        ('requested_user_name',),
+        ('requester_mobile', 'requested_user_mobile'),
+    )
+    accepted_items_for_actor = [i for i in items if float(i.get('accepted_qty', i.get('approved_qty', 0)) or 0) > 0]
+    accepted_name, accepted_mobile = _first_item_actor(
+        accepted_items_for_actor or items,
+        ('decided_user_name', 'accepted_user_name', 'picked_user_name'),
+        ('decided_user_mobile', 'accepted_user_mobile', 'picked_user_mobile'),
+    )
+    dispatched_name, dispatched_mobile = _first_item_actor(
+        items,
+        ('dispatched_user_name',),
+        ('dispatched_user_mobile',),
+    )
+    received_name, received_mobile = _first_item_actor(
+        items,
+        ('completed_user_name', 'received_user_name'),
+        ('completed_user_mobile', 'received_user_mobile'),
+    )
     header_update = {
         'status': header_status, 'items': header_items, 'accepted_total_qty': accepted_total, 'updated_at': now,
     }
+    if requested_name:
+        header_update['requested_user_name'] = requested_name
+    if requested_mobile:
+        header_update['requester_mobile'] = requested_mobile
+    if accepted_name:
+        header_update['accepted_user_name'] = accepted_name
+        header_update['decided_user_name'] = accepted_name
+    if accepted_mobile:
+        header_update['accepted_user_mobile'] = accepted_mobile
+        header_update['decided_user_mobile'] = accepted_mobile
+    if dispatched_name:
+        header_update['dispatched_user_name'] = dispatched_name
+    if dispatched_mobile:
+        header_update['dispatched_user_mobile'] = dispatched_mobile
+    if received_name:
+        header_update['received_user_name'] = received_name
+        header_update['completed_user_name'] = received_name
+    if received_mobile:
+        header_update['received_user_mobile'] = received_mobile
+        header_update['completed_user_mobile'] = received_mobile
     if header_status != 'Requested':
         existing = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0}) or {}
         if not existing.get('timer_frozen'):
@@ -6796,8 +6891,14 @@ async def _request_center_transition(request_id: str, new_status: str, remarks: 
         'status': new_status, 'updated_at': now, 'approval_remarks': sanitize_text_safe(remarks),
         'accepted_qty': accepted, 'approved_qty': accepted,
         'decision_type': ('Partial' if new_status == 'Approved' and accepted < requested_qty else new_status),
-        'decided_by': current_user.id, 'decided_user_name': current_user.username, 'decided_at': now,
+        'decided_by': current_user.id, 'decided_user_name': _actor_name(current_user),
+        'decided_user_mobile': _actor_mobile(current_user), 'decided_at': now,
     }
+    if new_status == 'Approved':
+        update['accepted_user_name'] = _actor_name(current_user)
+        update['accepted_user_mobile'] = _actor_mobile(current_user)
+        update['picked_user_name'] = _actor_name(current_user)
+        update['picked_user_mobile'] = _actor_mobile(current_user)
     await db.order_requests.update_one({'id': request_id}, {'$set': update})
 
     if new_status in ('Rejected', 'Cancelled') or (new_status == 'Approved' and accepted < requested_qty):
@@ -6835,37 +6936,57 @@ async def _request_center_transition(request_id: str, new_status: str, remarks: 
         await event_archive.maybe_enqueue_request_terminal(db, updated or {}, actor_id=current_user.id)
     except Exception as exc:
         logger.warning("request terminal archive enqueue failed: %s", exc)
+    await _notify_request_group_outcome((updated or {}).get('request_number'), actor_id=current_user.id)
     return updated, True
 
 def sanitize_text_safe(value):
     return notifications.sanitize_text(value, 500) if value else ''
 
 
-async def _notify_request_status_change(req: dict, event: str, actor_id: str = ""):
-    try:
-        recipients = []
-        if req.get('requester_email') or req.get('requester_mobile'):
-            recipients.append({'email': req.get('requester_email'), 'mobile': req.get('requester_mobile'), 'name': req.get('requested_user_name')})
-        supplier_recipients = await _active_recipients_for_scope(req.get('supplying_brand'), req.get('supplying_dealer'), req.get('supplying_branch'))
-        recipients.extend(supplier_recipients)
-        if recipients:
-            await notifications.notify_request_event(db, event, req, recipients, remarks=req.get('approval_remarks', ''))
-    except Exception as exc:  # noqa: BLE001
-        logging.getLogger('nmts.notifications').warning('%s notification dispatch failed: %s', event, str(exc)[:300])
-    # Additive in-app bell alert (does not replace email/WhatsApp); non-blocking
-    try:
-        import asyncio
-        import user_alerts as ua
+REQUEST_GROUP_BELL_EVENTS = {
+    'Approved': ('Request Accepted', 'pending'),
+    'Partially Approved': ('Request Partially Accepted', 'pending'),
+    'Rejected': ('Request Rejected', 'completed'),
+    'Completed': ('Request Completed', 'completed'),
+}
 
-        async def _bg_alert():
+
+async def _notify_request_group_outcome(request_number: str, actor_id: str = ""):
+    """One Request No = one bell and one final email. No per-part emails."""
+    if not request_number:
+        return
+    header = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
+    if not header:
+        return
+    status = header.get('status')
+    spec = REQUEST_GROUP_BELL_EVENTS.get(status)
+    if spec:
+        event, stage = spec
+        try:
+            import user_alerts as ua
+            await ua.alert_request_event(header, event, actor_id=actor_id or "", stage=stage)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger('nmts.user_alerts').warning('request in-app alert failed: %s', str(exc)[:300])
+    if status in ('Completed', 'Rejected') and not header.get('result_email_sent') and not header.get('result_email_claimed_at'):
+        claimed = await db.request_headers.find_one_and_update(
+            {
+                'request_number': request_number,
+                'status': {'$in': ['Completed', 'Rejected']},
+                'result_email_sent': {'$ne': True},
+                'result_email_claimed_at': {'$exists': False},
+            },
+            {'$set': {'result_email_claimed_at': datetime.now(timezone.utc).isoformat()}},
+        )
+        if claimed:
             try:
-                await ua.alert_request_event(req, event, actor_id=actor_id or "")
+                await _send_request_group_email(header, result=True)
             except Exception as exc:  # noqa: BLE001
-                logging.getLogger('nmts.user_alerts').warning('request in-app alert failed: %s', str(exc)[:300])
+                logging.getLogger('nmts.notifications').warning('request result email failed: %s', str(exc)[:300])
 
-        asyncio.create_task(_bg_alert())
-    except Exception as exc:  # noqa: BLE001
-        logging.getLogger('nmts.user_alerts').warning('request in-app alert schedule failed: %s', str(exc)[:300])
+
+async def _notify_request_status_change(req: dict, event: str, actor_id: str = ""):
+    """Back-compat wrapper: request-level outcome only, never a per-part email."""
+    await _notify_request_group_outcome((req or {}).get('request_number'), actor_id=actor_id)
 
 
 @api_router.post('/requests/{request_id}/approve')
@@ -6882,7 +7003,6 @@ async def request_center_approve(request_id: str, payload: dict = None, current_
     if accepted < requested and not str(remarks).strip(): raise HTTPException(status_code=400, detail='Remark is required for Partial or Rejected responses')
     target = 'Rejected' if accepted == 0 else 'Approved'
     updated, changed = await _request_center_transition(request_id, target, remarks, current_user, accepted_qty=accepted)
-    if changed: await _notify_request_status_change(updated, 'Request Rejected' if target == 'Rejected' else ('Request Partially Accepted' if accepted < requested else 'Request Accepted'), actor_id=current_user.id)
     return updated
 
 
@@ -6892,8 +7012,6 @@ async def request_center_reject(request_id: str, payload: dict = None, current_u
     if not str(remarks).strip():
         raise HTTPException(status_code=400, detail='A rejection reason or remark is required')
     updated, changed = await _request_center_transition(request_id, 'Rejected', remarks, current_user)
-    if changed:
-        await _notify_request_status_change(updated, 'Request Rejected', actor_id=current_user.id)
     return updated
 
 
@@ -6901,8 +7019,6 @@ async def request_center_reject(request_id: str, payload: dict = None, current_u
 async def request_center_cancel(request_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     remarks = (payload or {}).get('remarks', '') if payload else ''
     updated, changed = await _request_center_transition(request_id, 'Cancelled', remarks, current_user)
-    if changed:
-        await _notify_request_status_change(updated, 'Request Cancelled', actor_id=current_user.id)
     return updated
 
 
@@ -6929,8 +7045,19 @@ async def _request_logistics_transition(request_id: str, new_status: str, remark
     if accepted <= 0:
         raise HTTPException(status_code=400, detail='Only accepted quantities can continue in the transfer workflow')
     now = datetime.now(timezone.utc).isoformat()
-    update = {'status': new_status, 'updated_at': now, 'workflow_remarks': sanitize_text_safe(remarks),
-              f'{new_status.lower()}_by': current_user.id, f'{new_status.lower()}_at': now}
+    actor_name = _actor_name(current_user)
+    actor_mobile = _actor_mobile(current_user)
+    update = {
+        'status': new_status, 'updated_at': now, 'workflow_remarks': sanitize_text_safe(remarks),
+        f'{new_status.lower()}_by': current_user.id, f'{new_status.lower()}_at': now,
+        f'{new_status.lower()}_user_name': actor_name,
+        f'{new_status.lower()}_user_mobile': actor_mobile,
+    }
+    if new_status in ('Received', 'Completed'):
+        update['received_user_name'] = actor_name
+        update['received_user_mobile'] = actor_mobile
+        update['completed_user_name'] = actor_name
+        update['completed_user_mobile'] = actor_mobile
     await db.order_requests.update_one({'id': request_id}, {'$set': update})
     if new_status == 'Completed':
         await db.stock_reservations.update_many(
@@ -6949,30 +7076,25 @@ async def _request_logistics_transition(request_id: str, new_status: str, remark
         await event_archive.maybe_enqueue_request_terminal(db, updated or {}, actor_id=current_user.id)
     except Exception as exc:
         logger.warning("request logistics archive enqueue failed: %s", exc)
+    await _notify_request_group_outcome((updated or {}).get('request_number'), actor_id=current_user.id)
     return updated, True
 
 
 @api_router.post('/requests/{request_id}/dispatch')
 async def request_center_dispatch(request_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     updated, changed = await _request_logistics_transition(request_id, 'Dispatched', (payload or {}).get('remarks', ''), current_user)
-    if changed:
-        await _notify_request_status_change(updated, 'Request Dispatched', actor_id=current_user.id)
     return updated
 
 
 @api_router.post('/requests/{request_id}/receive')
 async def request_center_receive(request_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     updated, changed = await _request_logistics_transition(request_id, 'Received', (payload or {}).get('remarks', ''), current_user)
-    if changed:
-        await _notify_request_status_change(updated, 'Request Received', actor_id=current_user.id)
     return updated
 
 
 @api_router.post('/requests/{request_id}/complete')
 async def request_center_complete(request_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     updated, changed = await _request_logistics_transition(request_id, 'Completed', (payload or {}).get('remarks', ''), current_user)
-    if changed:
-        await _notify_request_status_change(updated, 'Request Completed', actor_id=current_user.id)
     return updated
 
 

@@ -121,6 +121,23 @@ def source_key(dealer: str, branch: str) -> Tuple[str, str]:
     return (_clean(dealer).lower(), _clean(branch).lower())
 
 
+def stock_bin_loc(stock: dict) -> str:
+    """Exact uploaded supplying-branch bin LOC. Never use branch name as LOC."""
+    if not stock:
+        return ''
+    for field in ('loc', 'LOC', 'bin_location'):
+        value = stock.get(field)
+        if value not in (None, ''):
+            return value
+    location = stock.get('location')
+    if location in (None, ''):
+        return ''
+    branch = stock.get('branch')
+    if str(location).strip().lower() == str(branch or '').strip().lower():
+        return ''
+    return location
+
+
 def freeze_key(part_number: str, brand: str, dealer: str, branch: str, date_key: str) -> str:
     return '|'.join([
         _clean(part_number).upper(),
@@ -520,9 +537,9 @@ def compute_stage_flags(item: dict, order: dict, freezes: Set[str],
     branch_pool = eligible_pool(item, order, 'branch', freezes, branch_aging_type, branch_min_aging)
     dealer_pool = eligible_pool(item, order, 'dealer', freezes, dealer_aging_type, dealer_min_aging)
 
+    pending_alloc_statuses = {'request sent', 'requested', 'awaiting response'}
     has_pending = any(
-        _clean(a.get('status')).lower() in ('request sent', 'requested', 'awaiting response')
-        or (a.get('request_no') and _clean(a.get('request_status')).lower() in ('request sent', 'awaiting response'))
+        _clean(a.get('status') or a.get('request_status')).lower() in pending_alloc_statuses
         for a in (item.get('allocations') or [])
     )
 
@@ -862,6 +879,10 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
         unsent_alloc_qty += _f(alloc.get('request_qty'))
 
     factory_order_qty = _f(item.get('factory_order_qty'))
+    if active_requested > 0:
+        # A live availability request still owns remaining qty — do not leak a
+        # sticky Factory qty that would show Factory UI while the request is active.
+        factory_order_qty = 0
     if item.get('cancellation_status') == 'approved' or _clean(item.get('request_status')) == REQUEST_STATUS_CANCELLED:
         request_status = REQUEST_STATUS_CANCELLED
     elif item.get('cancellation_status') == 'pending' or has_cancel_req:
@@ -1163,20 +1184,23 @@ async def sync_order_item_after_request_decision(db, req: dict, now: str = None)
     }
 
     kept_allocs = []
+    req_number = _clean(req.get('request_number'))
     for alloc in item.get('allocations') or []:
         same = source_key(alloc.get('dealer_name'), alloc.get('branch')) == source_key(
             failed_source['dealer_name'], failed_source['branch']
         )
         already_sent = bool(alloc.get('request_no') or alloc.get('request_number'))
+        same_request = req_number and _clean(alloc.get('request_no') or alloc.get('request_number')) == req_number
         if same and not already_sent:
             continue
-        if same and already_sent:
+        if (same or same_request) and already_sent:
+            mapped = map_request_center_status(status, requested, accepted)
             alloc = {
                 **alloc,
                 'accepted_qty': accepted,
                 'remaining_qty': max(0.0, requested - accepted),
-                'request_status': map_request_center_status(status, requested, accepted),
-                'status': map_request_center_status(status, requested, accepted),
+                'request_status': mapped,
+                'status': mapped,
                 'locked': accepted > 0,
             }
         kept_allocs.append(alloc)

@@ -120,6 +120,33 @@ def _requested_by_label(group: dict) -> str:
     return f"{name} ({uid})" if uid else name
 
 
+def _actor_name_mobile(name, mobile) -> str:
+    name = _text(name, "-")
+    mobile = _text(mobile, "-")
+    return f"{name}<br/>{mobile}"
+
+
+def _print_actors(group: dict) -> dict:
+    return {
+        "requested": (
+            group.get("requested_user_name"),
+            group.get("requester_mobile") or group.get("requested_user_mobile"),
+        ),
+        "accepted": (
+            group.get("accepted_user_name") or group.get("decided_user_name") or group.get("picked_user_name"),
+            group.get("accepted_user_mobile") or group.get("decided_user_mobile") or group.get("picked_user_mobile"),
+        ),
+        "dispatched": (
+            group.get("dispatched_user_name"),
+            group.get("dispatched_user_mobile"),
+        ),
+        "received": (
+            group.get("received_user_name") or group.get("completed_user_name"),
+            group.get("received_user_mobile") or group.get("completed_user_mobile"),
+        ),
+    }
+
+
 def print_column_headers() -> list:
     return [
         "S.No",
@@ -161,12 +188,13 @@ def build_request_print_html(group: dict, logo_url: str = "") -> str:
                 f"<td>{_esc(_display_status(item.get('status')))}<br/><small>{_esc(remarks)}</small></td>"
                 "</tr>"
             )
+        actors = _print_actors(group)
         footer = (
             '<div class="signatures">'
-            "<div>REQUESTED BY<span></span><small>Signature</small></div>"
-            "<div>RECEIVED BY<span></span><small>Signature</small></div>"
-            "<div>APPROVED BY<span></span><small>Signature</small></div>"
-            "<div>DISPATCHED BY<span></span><small>Signature</small></div>"
+            f"<div>REQUESTED BY<span>{_actor_name_mobile(*actors['requested'])}</span><small>Name + Mobile</small></div>"
+            f"<div>ACCEPTED / PICKED BY<span>{_actor_name_mobile(*actors['accepted'])}</span><small>Name + Mobile</small></div>"
+            f"<div>DISPATCHED BY<span>{_actor_name_mobile(*actors['dispatched'])}</span><small>Name + Mobile</small></div>"
+            f"<div>RECEIVED BY<span>{_actor_name_mobile(*actors['received'])}</span><small>Name + Mobile</small></div>"
             "</div>"
             f'<div class="notes"><b>Notes:</b> {PRINT_NOTES}</div>'
             if page_index == len(pages) - 1
@@ -432,12 +460,27 @@ def build_request_pdf(group: dict) -> bytes:
     sig_small = styles["Normal"].clone("SigSmall")
     sig_small.fontSize = 7
     sig_small.alignment = 1
+    sig_value = styles["Normal"].clone("SigValue")
+    sig_value.fontSize = 8
+    sig_value.alignment = 1
+    sig_value.leading = 11
+    actors = _print_actors(group)
+
+    def _sig_block(title, name, mobile):
+        return [
+            Paragraph(title, sig_cell),
+            Spacer(1, 4 * mm),
+            Paragraph(f"{_text(name, '-')}<br/>{_text(mobile, '-')}", sig_value),
+            Spacer(1, 4 * mm),
+            Paragraph("Name + Mobile", sig_small),
+        ]
+
     signatures = Table(
         [[
-            [Paragraph("REQUESTED BY", sig_cell), Spacer(1, 14 * mm), Paragraph("Signature", sig_small)],
-            [Paragraph("RECEIVED BY", sig_cell), Spacer(1, 14 * mm), Paragraph("Signature", sig_small)],
-            [Paragraph("APPROVED BY", sig_cell), Spacer(1, 14 * mm), Paragraph("Signature", sig_small)],
-            [Paragraph("DISPATCHED BY", sig_cell), Spacer(1, 14 * mm), Paragraph("Signature", sig_small)],
+            _sig_block("REQUESTED BY", *actors["requested"]),
+            _sig_block("ACCEPTED / PICKED BY", *actors["accepted"]),
+            _sig_block("DISPATCHED BY", *actors["dispatched"]),
+            _sig_block("RECEIVED BY", *actors["received"]),
         ]],
         colWidths=[doc.width / 4] * 4,
     )

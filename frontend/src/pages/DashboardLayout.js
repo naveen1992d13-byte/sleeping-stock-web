@@ -387,7 +387,7 @@ export function DashboardLayout() {
     const path = alert.link_path || '/';
     const source = alert.source_type;
     if (source === 'request') {
-      openTab('requests', 'Request Center', '/requests', 'Request Center');
+      openTab('requests', 'Request Center', path.startsWith('/requests') ? path : '/requests', 'Request Center');
     } else if (source === 'notice') {
       openTab('dashboard', 'Notice Board', '/notice-board', 'Notice Board');
     } else if (source === 'query') {
