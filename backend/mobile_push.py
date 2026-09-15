@@ -13,6 +13,9 @@ logger = logging.getLogger("nmts.mobile_push")
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 _EXPO_TOKEN_RE = re.compile(r"^ExponentPushToken\[.+\]$")
+ANDROID_REQUEST_CHANNEL_ID = "sleeping-stock-requests-v3"
+ANDROID_REQUEST_SOUND = "sleeping_stock_alert_2_rising_dispatch.wav"
+REQUEST_CATEGORY_ID = "branch-request"
 
 
 def _ci_exact(field: str, value: str) -> dict:
@@ -129,22 +132,67 @@ async def notify_auto_perpetual_assignments(db, *, assignments_by_user: Dict[str
 
 _REQUEST_PUSH_COPY = {
     "new": (
-        "New Parts Transfer Request",
-        "New request {request_number} from {requesting_branch}. Open Request Center to respond.",
+        "{request_number}",
+        "Requested Branch: {requesting_branch} · Items: {total_items} · Qty: {total_qty}",
     ),
     "reminder_1": (
-        "Request reminder",
-        "Request {request_number} is still awaiting your response.",
+        "{request_number}",
+        "Requested Branch: {requesting_branch} · Items: {total_items} · Qty: {total_qty}",
     ),
     "reminder_2": (
-        "Request reminder",
-        "Request {request_number} still needs a response.",
+        "{request_number}",
+        "Requested Branch: {requesting_branch} · Items: {total_items} · Qty: {total_qty}",
     ),
     "reminder_3": (
-        "Request deadline approaching",
-        "Request {request_number} is near its response deadline.",
+        "{request_number}",
+        "Requested Branch: {requesting_branch} · Items: {total_items} · Qty: {total_qty}",
     ),
 }
+
+
+def build_branch_request_push_message(token: str, group_doc: dict, kind: str = "new") -> dict:
+    """Expo push payload for a branch request. Channel, sound, and category
+    must match the mobile request-alert setup so killed/background alerts
+    use the custom request sound."""
+    request_number = (group_doc or {}).get("request_number") or ""
+    requesting_branch = (group_doc or {}).get("requesting_branch") or ""
+    total_items = (group_doc or {}).get("total_items")
+    total_qty = (group_doc or {}).get("total_qty")
+    if total_items in (None, ""):
+        total_items = len((group_doc or {}).get("items") or [])
+    if total_qty in (None, ""):
+        total_qty = (group_doc or {}).get("total_quantity") or 0
+    title_tpl, body_tpl = _REQUEST_PUSH_COPY.get(kind, _REQUEST_PUSH_COPY["new"])
+    fields = {
+        "request_number": request_number,
+        "requesting_branch": requesting_branch,
+        "total_items": total_items,
+        "total_qty": total_qty,
+    }
+    request_group_key = (group_doc or {}).get("id") or request_number
+    return {
+        "to": token,
+        "title": title_tpl.format(**fields),
+        "body": body_tpl.format(**fields),
+        "sound": ANDROID_REQUEST_SOUND,
+        "priority": "high",
+        "channelId": ANDROID_REQUEST_CHANNEL_ID,
+        "categoryId": REQUEST_CATEGORY_ID,
+        "data": {
+            "type": "branch_request",
+            "screen": "request",
+            "kind": kind,
+            "request_group_key": request_group_key,
+            "request_number": request_number,
+            "requesting_branch": requesting_branch,
+            "requested_branch": requesting_branch,
+            "total_items": total_items,
+            "total_qty": total_qty,
+            "categoryId": REQUEST_CATEGORY_ID,
+            "sticky": True,
+            "autoDismiss": False,
+        },
+    }
 
 
 async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
@@ -156,19 +204,10 @@ async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
         request_group_key = (group_doc or {}).get("id") or request_number
         if not dealer or not branch or not request_number:
             return {"ok": False, "error": "missing_scope"}
-        title_tpl, body_tpl = _REQUEST_PUSH_COPY.get(kind, _REQUEST_PUSH_COPY["new"])
-        title = title_tpl
-        body = body_tpl.format(
-            request_number=request_number,
-            requesting_branch=(group_doc or {}).get("requesting_branch") or "",
-        )
-        data = {
-            "type": "branch_request",
-            "screen": "request",
-            "kind": kind,
-            "request_group_key": request_group_key,
-            "request_number": request_number,
-        }
+        preview = build_branch_request_push_message("ExponentPushToken[preview]", group_doc, kind)
+        title = preview["title"]
+        body = preview["body"]
+        data = preview["data"]
         devices = await db.mobile_devices.find(
             {
                 **_ci_exact("dealer_name", dealer),
@@ -193,15 +232,7 @@ async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
             )
             return {"ok": True, "sent": 0, "skipped": True}
         batch = [
-            {
-                "to": dev.get("push_token"),
-                "title": title,
-                "body": body,
-                "sound": "default",
-                "priority": "high",
-                "channelId": "sleeping-stock-requests",
-                "data": data,
-            }
+            build_branch_request_push_message(dev.get("push_token"), group_doc, kind)
             for dev in devices
             if dev.get("push_token")
         ]
