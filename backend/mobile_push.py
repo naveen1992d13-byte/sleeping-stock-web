@@ -150,10 +150,21 @@ _REQUEST_PUSH_COPY = {
 }
 
 
+_KIND_TO_ROUND = {
+    "new": 0,
+    "reminder_1": 1,
+    "reminder_2": 2,
+    "reminder_3": 3,
+}
+
+
 def build_branch_request_push_message(token: str, group_doc: dict, kind: str = "new") -> dict:
-    """Expo push payload for a branch request. Channel, sound, and category
-    must match the mobile request-alert setup so killed/background alerts
-    use the custom request sound."""
+    """Data-only FCM payload for a branch request (initial + SLA reminder rounds).
+
+    Title/body/sound/channel are omitted so Android delivers a data message to
+    the native FirebaseMessagingService while the app is killed. SLA scheduling
+    and reminder-count logic are unchanged; only the payload shape is aligned.
+    """
     request_number = (group_doc or {}).get("request_number") or ""
     requesting_branch = (group_doc or {}).get("requesting_branch") or ""
     total_items = (group_doc or {}).get("total_items")
@@ -162,26 +173,22 @@ def build_branch_request_push_message(token: str, group_doc: dict, kind: str = "
         total_items = len((group_doc or {}).get("items") or [])
     if total_qty in (None, ""):
         total_qty = (group_doc or {}).get("total_quantity") or 0
-    title_tpl, body_tpl = _REQUEST_PUSH_COPY.get(kind, _REQUEST_PUSH_COPY["new"])
-    fields = {
-        "request_number": request_number,
-        "requesting_branch": requesting_branch,
-        "total_items": total_items,
-        "total_qty": total_qty,
-    }
     request_group_key = (group_doc or {}).get("id") or request_number
+    round_n = _KIND_TO_ROUND.get(kind, 0)
     return {
         "to": token,
-        "title": title_tpl.format(**fields),
-        "body": body_tpl.format(**fields),
-        "sound": ANDROID_REQUEST_SOUND,
         "priority": "high",
-        "channelId": ANDROID_REQUEST_CHANNEL_ID,
-        "categoryId": REQUEST_CATEGORY_ID,
+        "_contentAvailable": True,
         "data": {
             "type": "branch_request",
             "screen": "request",
             "kind": kind,
+            "round": round_n,
+            "requestId": request_group_key,
+            "requestNumber": request_number,
+            "branchName": requesting_branch,
+            "totalItems": total_items,
+            "totalQuantity": total_qty,
             "request_group_key": request_group_key,
             "request_number": request_number,
             "requesting_branch": requesting_branch,
@@ -205,9 +212,9 @@ async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
         if not dealer or not branch or not request_number:
             return {"ok": False, "error": "missing_scope"}
         preview = build_branch_request_push_message("ExponentPushToken[preview]", group_doc, kind)
-        title = preview["title"]
-        body = preview["body"]
         data = preview["data"]
+        title = data.get("requestNumber") or request_number
+        body = f"round={data.get('round')} {data.get('branchName') or ''} items={data.get('totalItems')} qty={data.get('totalQuantity')}"
         devices = await db.mobile_devices.find(
             {
                 **_ci_exact("dealer_name", dealer),

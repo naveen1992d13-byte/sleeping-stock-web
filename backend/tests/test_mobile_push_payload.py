@@ -18,16 +18,20 @@ def test_branch_request_push_uses_mobile_channel_and_custom_sound():
         'total_qty': 12,
     }
     message = mobile_push.build_branch_request_push_message('ExponentPushToken[abc]', group, 'new')
-    assert message['channelId'] == 'sleeping-stock-requests-v3'
-    assert message['sound'] == 'sleeping_stock_alert_2_rising_dispatch.wav'
-    assert message['categoryId'] == 'branch-request'
+    assert 'title' not in message
+    assert 'body' not in message
+    assert 'sound' not in message
+    assert 'channelId' not in message
     assert message['priority'] == 'high'
-    assert message['title'] == 'RQHY2609150001'
-    assert 'Requested Branch: Vanagaram' in message['body']
-    assert 'Items: 3' in message['body']
-    assert 'Qty: 12' in message['body']
+    assert message['_contentAvailable'] is True
     assert message['data']['type'] == 'branch_request'
+    assert message['data']['requestId'] == 'g1'
     assert message['data']['request_group_key'] == 'g1'
-    assert message['data']['categoryId'] == 'branch-request'
-    assert message['data']['sticky'] is True
-    assert message['data']['autoDismiss'] is False
+    assert message['data']['requestNumber'] == 'RQHY2609150001'
+    assert message['data']['branchName'] == 'Vanagaram'
+    assert message['data']['totalItems'] == 3
+    assert message['data']['totalQuantity'] == 12
+    assert message['data']['round'] == 0
+    reminder = mobile_push.build_branch_request_push_message('ExponentPushToken[abc]', group, 'reminder_2')
+    assert reminder['data']['round'] == 2
+    assert 'title' not in reminder
