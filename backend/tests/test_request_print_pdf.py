@@ -117,3 +117,17 @@ def test_print_columns_match_request_center():
         'S.No', 'PART NUMBER', 'PART DESCRIPTION', 'LOC', 'REQUEST QTY',
         'ACCEPT QTY', 'PURCHASE AGING', 'SALES AGING', 'STATUS / REMARKS',
     ]
+
+
+def test_assemble_print_group_keeps_uploaded_loc():
+    header = {'request_number': 'RQ-LOC', 'requested_user_name': 'A'}
+    items = [{'part_number': 'P1', 'loc_at_request': '', 'loc': 'RACK-9', 'requested_qty': 1}]
+    group = request_print.assemble_print_group(header, items, [{'name': 'User', 'id': 'U2'}])
+    assert group['items'][0]['loc_at_request'] == 'RACK-9'
+    assert group['items'][0]['loc'] == 'RACK-9'
+    assert group['receiver_users'][0]['name'] == 'User'
+    html = request_print.build_request_print_html(group)
+    assert 'RACK-9' in html
+    pdf = notifications.build_request_pdf(group)
+    assert pdf[:4] == b'%PDF'
+    assert 'RACK-9' in _pdf_haystack(pdf)

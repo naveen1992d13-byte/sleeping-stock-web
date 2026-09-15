@@ -147,6 +147,29 @@ def _print_actors(group: dict) -> dict:
     }
 
 
+def assemble_print_group(header: dict, items: list, receiver_users: list | None = None) -> dict:
+    """Normalize header + line items into the Request Center Print/PDF payload."""
+    group = dict(header or {})
+    normalized = []
+    for item in items or []:
+        row = dict(item)
+        if not row.get("loc_at_request"):
+            row["loc_at_request"] = row.get("loc") or row.get("LOC") or row.get("bin_location") or ""
+        if not row.get("loc"):
+            row["loc"] = row.get("loc_at_request") or ""
+        normalized.append(row)
+    group["items"] = normalized
+    group.setdefault("requested_at", group.get("created_at"))
+    group.setdefault("total_items", len(normalized))
+    if group.get("total_qty") in (None, ""):
+        group["total_qty"] = sum(float(i.get("requested_qty") or 0) for i in normalized)
+    if group.get("total_value") in (None, ""):
+        group["total_value"] = sum(float(i.get("value_at_request") or i.get("value") or 0) for i in normalized)
+    if receiver_users is not None:
+        group["receiver_users"] = receiver_users
+    return group
+
+
 def print_column_headers() -> list:
     return [
         "S.No",

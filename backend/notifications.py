@@ -470,7 +470,7 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
     total_value = _pdf_format_number(group.get("total_value"))
     request_message = (
         "Please review and action the following Sleeping Stock request. "
-        "The detailed part list is in the attached Stock Transfer document."
+        "The detailed part list is in the attached Parts Transfer Request PDF."
     )
 
     text_body = (
@@ -498,7 +498,7 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
           <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Quantity</td><td style="padding:4px 0;">{total_qty}</td></tr>
           <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Value</td><td style="padding:4px 0;">{total_value}</td></tr>
         </table>
-        <p style="font-size:12px;color:#6B7280;">Detailed parts are in the attached Stock Transfer document.</p>
+        <p style="font-size:12px;color:#6B7280;">Detailed parts are in the attached Parts Transfer Request PDF.</p>
         <p>Regards,<br/>Sleeping Stock Team</p>
       </div>
     </div>

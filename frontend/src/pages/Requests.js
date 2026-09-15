@@ -46,6 +46,23 @@ function groupRowTint(status) {
 const nfmt = (v) => Number(v || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 const dtfmt = (v) => v ? String(v).slice(0, 16).replace('T', ' ') : '-';
 
+async function openRequestCenterPdf(group) {
+  const requestNumber = group?.request_number;
+  if (!requestNumber) {
+    openRequestPrint(group);
+    return;
+  }
+  try {
+    const res = await axios.get(`${API}/request-center/${encodeURIComponent(requestNumber)}/pdf`, {
+      responseType: 'blob',
+    });
+    const url = URL.createObjectURL(res.data);
+    window.open(url, '_blank', 'noopener');
+  } catch (_e) {
+    openRequestPrint(group);
+  }
+}
+
 /** UI display mapping — DB may still store Approved; show Accepted. */
 function displayStatus(status) {
   return displayRequestStatus(status);
@@ -241,12 +258,12 @@ export function Requests() {
               <button className="text-left" onClick={()=>setExpanded(p=>({...p,[g.key]:!open}))}><div className="text-xs text-slate-500">Request / Order No</div><div className="font-bold text-emerald-700">{g.request_number || 'Legacy Request'}</div><div className="text-xs text-slate-600">{g.order_number || '-'}</div></button>
               <button className="text-left" onClick={()=>setExpanded(p=>({...p,[g.key]:!open}))}><div className="text-xs text-slate-500">Stock Movement</div><div className="flex items-center gap-2 font-semibold"><span>{supplier}</span><ArrowRight className="h-4 w-4 text-emerald-600"/><span>{destination}</span></div></button>
               <span><div className="text-xs text-slate-500">Line Items</div><div className="font-semibold">{g.total_items}</div></span><span><div className="text-xs text-slate-500">Total Qty</div><div className="font-semibold">{nfmt(g.total_qty)}</div></span><span><div className="text-xs text-slate-500">Total Value</div><div className="font-semibold">₹{nfmt(g.total_value)}</div></span><span><StatusBadge status={g.status}/>{countdown && <div className="mt-1 text-xs font-semibold text-amber-800">{countdown}</div>}<div className="mt-1 text-xs text-slate-500">{g.response_status || dtfmt(g.requested_at)}</div></span>
-              <Button size="sm" variant="outline" onClick={()=>openRequestPrint(g)}><Printer className="mr-1 h-4 w-4"/>Print</Button>
+              <Button size="sm" variant="outline" onClick={()=>openRequestCenterPdf(g)}><Printer className="mr-1 h-4 w-4"/>Print</Button>
             </div>
             {open && <div className="mt-5 rounded-xl border bg-white p-4">
               <div className="grid gap-4 lg:grid-cols-[1fr_48px_1fr]"><ScopeCard title="Stock Source (From)" subtitle="Supplying Location" brand={g.supplying_brand || g.requesting_brand} dealer={g.supplying_dealer} branch={g.supplying_branch} users={g.receiver_users}/><div className="hidden items-center justify-center lg:flex"><ArrowRight className="h-7 w-7 text-emerald-600"/></div><ScopeCard title="Stock Destination (To)" subtitle="Requesting Location" brand={g.requesting_brand} dealer={g.requesting_dealer} branch={g.requesting_branch} requestedBy={{name:g.requested_user_name,id:g.requested_user_id}}/></div>
               <div className="mt-5 overflow-x-auto"><div className="mb-2 flex items-center gap-2 font-semibold"><Package className="h-4 w-4 text-emerald-600"/>Item-wise Acceptance</div><table className="w-full min-w-[1450px] text-sm"><thead className="bg-emerald-50"><tr>{['Part Number','Part Name','Request Qty','Accept Quantity','Purchase Aging','Sales Aging','LOC','Part Value','Status','Remarks','Action'].map(h=><th key={h} className="p-3 text-left">{h}</th>)}</tr></thead><tbody>{g.items.map(i=>{ const d=draftFor(i); const editable=view!=='outgoing' && i.status==='Requested'; return <tr key={i.id} className="border-t"><td className="p-3 font-semibold">{i.part_number}</td><td className="p-3">{i.description||'-'}</td><td className="p-3">{nfmt(i.requested_qty)}</td><td className="p-3">{editable?<input type="number" min="0" max={Number(i.requested_qty||0)} step="any" value={d.accepted_qty} onChange={e=>updateDraft(i,'accepted_qty',e.target.value)} className="h-9 w-28 rounded border px-2 font-semibold"/>:<span className="font-semibold">{nfmt(i.accepted_qty ?? i.approved_qty ?? 0)}</span>}</td><td className="p-3">{i.purchase_aging_days_at_request ?? i.purchase_aging_at_request ?? '-'}</td><td className="p-3">{i.sales_aging_days_at_request ?? i.sales_aging_at_request ?? '-'}</td><td className="p-3 font-medium">{i.loc_at_request || i.loc || '-'}</td><td className="p-3">₹{nfmt(i.value_at_request)}</td><td className="p-3"><StatusBadge status={i.status}/>{i.decision_type==='Partial'&&<div className="mt-1 text-xs font-semibold text-blue-700">Partially Accepted</div>}{i.decided_at&&<div className="mt-1 text-xs text-slate-500">Sent: {dtfmt(i.decided_at)}</div>}</td><td className="p-3">{editable?<input value={d.remarks} onChange={e=>updateDraft(i,'remarks',e.target.value)} placeholder={Number(d.accepted_qty)<Number(i.requested_qty||0)?'Remark required':'Item remarks'} className="h-9 w-44 rounded border px-2"/>:(i.approval_remarks||i.remarks||'-')}</td><td className="p-3">{editable?<Button size="sm" disabled={loading} onClick={()=>decideItem(i)}><Send className="mr-1 h-4 w-4"/>Send</Button>:'Sent'}</td></tr>})}</tbody></table></div>
-              <div className="mt-4 flex flex-wrap justify-end gap-2"><Button variant="outline" onClick={()=>openRequestPrint(g)}><Printer className="mr-1 h-4 w-4"/>Print Request</Button>{view!=='outgoing' && g.items.some(i=>i.status==='Approved' && Number(i.accepted_qty ?? i.approved_qty ?? 0)>0) && <Button disabled={loading} onClick={()=>transitionGroup(g,'dispatch')}>Dispatch Accepted</Button>}{view!=='incoming' && g.items.some(i=>['Dispatched','Received'].includes(i.status) && Number(i.accepted_qty ?? i.approved_qty ?? 0)>0) && <Button disabled={loading} onClick={()=>transitionGroup(g,'complete')}>Complete</Button>}{(view==='outgoing'||view==='all') && g.items.some(i=>['Requested','Approved'].includes(i.status)) && <Button variant="outline" disabled={loading} onClick={()=>cancelGroup(g)}><Ban className="mr-1 h-4 w-4"/>Cancel Request</Button>}</div>
+              <div className="mt-4 flex flex-wrap justify-end gap-2"><Button variant="outline" onClick={()=>openRequestCenterPdf(g)}><Printer className="mr-1 h-4 w-4"/>Print Request</Button>{view!=='outgoing' && g.items.some(i=>i.status==='Approved' && Number(i.accepted_qty ?? i.approved_qty ?? 0)>0) && <Button disabled={loading} onClick={()=>transitionGroup(g,'dispatch')}>Dispatch Accepted</Button>}{view!=='incoming' && g.items.some(i=>['Dispatched','Received'].includes(i.status) && Number(i.accepted_qty ?? i.approved_qty ?? 0)>0) && <Button disabled={loading} onClick={()=>transitionGroup(g,'complete')}>Complete</Button>}{(view==='outgoing'||view==='all') && g.items.some(i=>['Requested','Approved'].includes(i.status)) && <Button variant="outline" disabled={loading} onClick={()=>cancelGroup(g)}><Ban className="mr-1 h-4 w-4"/>Cancel Request</Button>}</div>
             </div>}
           </div>;
         })}

@@ -8,6 +8,7 @@ load_dotenv(ROOT_DIR / '.env')
 # values cannot override Codespaces/process secrets.
 
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request, Query
+from fastapi.responses import Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -33,6 +34,10 @@ try:
     from . import notifications
 except ImportError:
     import notifications
+try:
+    from . import request_print
+except ImportError:
+    import request_print
 try:
     from . import order_desk_workflow as odw
 except ImportError:
@@ -4605,6 +4610,37 @@ async def _resolve_request_email_routing(group_doc: dict) -> tuple:
     return notifications.resolve_request_email_routing(users, group_doc)
 
 
+async def _receiver_users_for_group(group_doc: dict) -> list:
+    """Same supplying-branch user list Request Center Print shows as Requested To."""
+    brand = str(group_doc.get('supplying_brand') or group_doc.get('requesting_brand') or '').strip()
+    dealer = str(group_doc.get('supplying_dealer') or '').strip()
+    branch = str(group_doc.get('supplying_branch') or '').strip()
+    uq = {'status': 'active'}
+    if brand:
+        uq['brand'] = brand
+    if dealer:
+        uq['group'] = dealer
+    if branch:
+        uq['location'] = branch
+    users = await db.users.find(uq, {'_id': 0, 'id': 1, 'user_id': 1, 'username': 1, 'name': 1}).to_list(200)
+    return [{
+        'id': u.get('user_id') or u.get('id') or '',
+        'name': u.get('name') or u.get('username') or '',
+    } for u in users]
+
+
+async def _print_group_for_email(group_doc: dict) -> dict:
+    items = list(group_doc.get('items') or [])
+    if not items and group_doc.get('request_number'):
+        items = await db.order_requests.find(
+            {'request_number': group_doc.get('request_number')}, {'_id': 0}
+        ).to_list(10000)
+    receivers = group_doc.get('receiver_users')
+    if not receivers:
+        receivers = await _receiver_users_for_group(group_doc)
+    return request_print.assemble_print_group(group_doc, items, receivers)
+
+
 async def _send_request_group_email(group_doc: dict, *, result: bool = False):
     """Best-effort PDF + Gmail dispatch for one Requested-To destination
     group. Never raises — the request/request number/items are already
@@ -4639,7 +4675,8 @@ async def _send_request_group_email(group_doc: dict, *, result: bool = False):
         return
 
     try:
-        pdf_bytes = notifications.build_request_pdf(group_doc)
+        print_group = await _print_group_for_email(group_doc)
+        pdf_bytes = notifications.build_request_pdf(print_group)
     except Exception as exc:  # noqa: BLE001 — a PDF failure must never break the saved request
         safe_error = f'PDF generation failed: {str(exc)[:250]}'
         await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {
@@ -5464,6 +5501,12 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         total_value += line_value
         order_request_id = str(uuid.uuid4())
         order_request_ids.append(order_request_id)
+        loc_value = odw.stock_bin_loc(source)
+        if loc_value in (None, ''):
+            stock_id = source.get('stock_id')
+            if stock_id:
+                product = await db.products.find_one({'id': stock_id}, {'_id': 0, 'loc': 1, 'LOC': 1, 'bin_location': 1, 'location': 1, 'branch': 1})
+                loc_value = odw.stock_bin_loc(product or {})
         request_doc = {
             'id': order_request_id, 'order_id': order.get('id'), 'order_number': order.get('order_number'),
             'order_item_id': item.get('id'), 'part_number': item.get('part_number'),
@@ -5475,7 +5518,8 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
             'aging_days_at_request': source.get('aging_days'),
             'purchase_aging_days_at_request': source.get('purchase_aging_days', source.get('purchase_aging', source.get('aging_days'))),
             'sales_aging_days_at_request': source.get('sales_aging_days', source.get('sales_aging')),
-            'loc_at_request': source.get('loc', ''),
+            'loc_at_request': loc_value,
+            'loc': loc_value,
             'status': 'Requested', 'remarks': '', 'approval_remarks': '',
             'requested_by': current_user.id, 'requested_user_name': current_user.username, 'requested_at': now,
             'requester_email': current_user.email, 'requester_mobile': getattr(current_user, 'phone', ''),
@@ -5489,7 +5533,8 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
             'unit_value': unit_value, 'value': line_value,
             'purchase_aging_days': source.get('purchase_aging_days', source.get('purchase_aging', source.get('aging_days'))),
             'sales_aging_days': source.get('sales_aging_days', source.get('sales_aging')),
-            'loc': source.get('loc', ''),
+            'loc': loc_value,
+            'loc_at_request': loc_value,
         })
 
     group_doc = {
@@ -5499,7 +5544,9 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         'requesting_brand': order.get('brand_name'), 'requesting_dealer': order.get('dealer_name'),
         'requesting_branch': order.get('branch'),
         'supplying_brand': supplying_brand, 'supplying_dealer': supplying_dealer, 'supplying_branch': supplying_branch,
-        'requested_by': current_user.id, 'requested_user_name': current_user.username,
+        'requested_by': current_user.id,
+        'requested_user_id': getattr(current_user, 'user_id', None) or current_user.id,
+        'requested_user_name': current_user.username,
         'requester_email': current_user.email, 'requester_mobile': getattr(current_user, 'phone', ''),
         'order_request_ids': order_request_ids, 'items': line_items,
         'total_items': len(line_items), 'total_qty': total_qty, 'total_value': total_value,
@@ -6716,6 +6763,33 @@ async def request_center_detail(request_id: str, current_user: UserResponse = De
     if not (is_supplier or is_requester):
         raise HTTPException(status_code=403, detail='Not authorized for this request')
     return req
+
+
+@api_router.get('/request-center/{request_number}/pdf')
+async def request_center_print_pdf(request_number: str, current_user: UserResponse = Depends(get_current_user)):
+    """Same PDF attached to request email — Request Center Print layout."""
+    header = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
+    items = await db.order_requests.find({'request_number': request_number}, {'_id': 0}).to_list(10000)
+    if not header and not items:
+        raise HTTPException(status_code=404, detail='Request not found')
+    sample = items[0] if items else header or {}
+    role = (current_user.role or '').lower()
+    is_supplier = role == 'master' or sample.get('supplying_dealer') == current_user.group
+    is_requester = (
+        sample.get('requested_by') == current_user.id
+        or (role != 'user' and sample.get('requesting_dealer') == current_user.group)
+    )
+    if not (is_supplier or is_requester):
+        raise HTTPException(status_code=403, detail='Not authorized for this request')
+    group = request_print.assemble_print_group(header or {}, items)
+    group['receiver_users'] = await _receiver_users_for_group(group)
+    pdf_bytes = notifications.build_request_pdf(group)
+    filename = group.get('pdf_filename') or f'{request_number}.pdf'
+    return Response(
+        content=pdf_bytes,
+        media_type='application/pdf',
+        headers={'Content-Disposition': f'inline; filename="{filename}"'},
+    )
 
 
 def _actor_name(user) -> str:
