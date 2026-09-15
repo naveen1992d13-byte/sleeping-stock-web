@@ -1401,6 +1401,49 @@ def _group_key_for(line: dict) -> str:
     return line.get("request_group_id") or line.get("request_number")
 
 
+def _request_line_loc(line: dict) -> str:
+    """Exact uploaded supplying-branch part LOC. Never use branch name as LOC."""
+    if not line:
+        return ""
+    for field in ("loc_at_request", "loc", "LOC", "bin_location"):
+        value = line.get(field)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+async def _today_product_locs(part_numbers, brand_name, dealer_name, branch):
+    """Fallback LOC from today's published Product Hub row for this branch."""
+    from auto_perpetual import inventory_date_key
+    import order_desk_workflow as odw
+
+    wanted = {str(n or "").strip().upper() for n in (part_numbers or []) if str(n or "").strip()}
+    if not wanted:
+        return {}
+    query = {
+        "dealer_name": dealer_name,
+        "branch": branch,
+        "publish_status": "Published",
+        "is_active_today": True,
+        "active_date_key": inventory_date_key(),
+    }
+    if brand_name:
+        query["brand_name"] = brand_name
+    products = await db.products.find(
+        query,
+        {"_id": 0, "part_number": 1, "loc": 1, "LOC": 1, "bin_location": 1, "location": 1, "branch": 1},
+    ).to_list(8000)
+    loc_map = {}
+    for product in products:
+        key = str(product.get("part_number") or "").strip().upper()
+        if key not in wanted or key in loc_map:
+            continue
+        loc = odw.stock_bin_loc(product)
+        if loc not in (None, ""):
+            loc_map[key] = loc
+    return loc_map
+
+
 @router.get("/notifications")
 async def list_branch_notifications(session=Depends(get_device_session)):
     """Pending request line items for the device's bound Branch only —
@@ -1443,10 +1486,29 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             "description": line.get("description"),
             "requested_qty": line.get("requested_qty"),
             "available_qty_at_request": line.get("available_qty_at_request"),
-            "loc": line.get("loc_at_request"),
+            "loc": _request_line_loc(line),
+            "loc_at_request": _request_line_loc(line),
+            "bin_location": line.get("bin_location"),
             "purchase_aging_days": line.get("purchase_aging_days_at_request"),
             "sales_aging_days": line.get("sales_aging_days_at_request"),
         })
+
+    missing_parts = [
+        part for group in groups.values() for part in group["parts"]
+        if part.get("loc") in (None, "")
+    ]
+    if missing_parts:
+        loc_map = await _today_product_locs(
+            [part.get("part_number") for part in missing_parts],
+            session.get("brand_name"),
+            dealer,
+            branch,
+        )
+        for part in missing_parts:
+            loc = loc_map.get(str(part.get("part_number") or "").strip().upper())
+            if loc not in (None, ""):
+                part["loc"] = loc
+                part["loc_at_request"] = loc
 
     group_keys = list(groups.keys())
     locks = await db.mobile_request_group_locks.find({"request_group_key": {"$in": group_keys}}, {"_id": 0}).to_list(2000)

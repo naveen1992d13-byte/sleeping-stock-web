@@ -171,9 +171,10 @@ function parsePasteText(text) {
 }
 
 function compactRequestedFrom(item, selectedAllocations = []) {
-  if (item.requested_from) return item.requested_from;
   const parts = [];
   (item.request_history || []).forEach((row) => {
+    const raw = String(row.status_raw || row.request_status || '');
+    if (/rejected|cancelled/i.test(raw)) return;
     const qty = Number(row.requested_qty || 0); if (!qty) return;
     if (String(row.source_type || row.level || '').toLowerCase().includes('dealer')) {
       parts.push(`${row.dealer_name || '-'} / ${row.branch_name || '-'} - ${qty}`);
@@ -181,6 +182,7 @@ function compactRequestedFrom(item, selectedAllocations = []) {
   });
   (selectedAllocations || []).forEach((alloc) => {
     if (alloc.request_no || alloc.request_number) return;
+    if (/rejected|cancelled/i.test(String(alloc.status || alloc.request_status || ''))) return;
     const qty = Number(alloc.request_qty || 0); if (!qty) return;
     const level = String(alloc.level || alloc.source_type || '').toLowerCase();
     if (level === 'dealer') parts.push(`${alloc.dealer_name || '-'} / ${alloc.branch || '-'} - ${qty}`);
@@ -1074,9 +1076,13 @@ export function Orders() {
                                       <td className="p-2"><StatusBadge status={row.request_status} /></td>
                                       <td className="p-2">
                                         {row.countdown_active && row.response_status === 'awaiting' && row.response_deadline
-                                          ? (formatDeadlineCountdown(row.response_deadline, nowMs) || row.response_status || '—')
-                                          : (row.response_status || '—')}
-                                        {row.response_status && <div className="text-[10px] text-slate-500">{row.response_status}</div>}
+                                          ? (formatDeadlineCountdown(row.response_deadline, nowMs) || 'Awaiting')
+                                          : (row.timer_frozen || /rejected|cancelled/i.test(String(row.status_raw || row.request_status || ''))
+                                            ? 'Stopped'
+                                            : (row.response_status && row.response_status !== 'awaiting' ? row.response_status : '—'))}
+                                        {row.countdown_active && row.response_status === 'awaiting' && (
+                                          <div className="text-[10px] text-slate-500">{row.response_status}</div>
+                                        )}
                                         {row.cancel_allowed && (
                                           <Button size="sm" variant="outline" className="ml-2 h-7" onClick={() => cancelTimeout(row.request_no)}>Cancel – No Response</Button>
                                         )}

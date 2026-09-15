@@ -9,9 +9,20 @@ if str(BACKEND_DIR) not in sys.path:
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
+import mobile_api
 import order_desk_workflow as odw
 import request_print
 import user_alerts as ua
+
+
+def test_mobile_request_line_loc_uses_snapshot_not_branch_name():
+    assert mobile_api._request_line_loc({
+        'loc_at_request': 'DISPLAY STOCK', 'loc': '', 'location': 'Vanagaram', 'branch': 'Vanagaram',
+    }) == 'DISPLAY STOCK'
+    assert mobile_api._request_line_loc({'loc': 'RACK-3', 'location': 'Ambattur'}) == 'RACK-3'
+    assert mobile_api._request_line_loc({'bin_location': '11A010101A'}) == '11A010101A'
+    assert mobile_api._request_line_loc({'location': 'Vanagaram', 'branch': 'Vanagaram'}) == ''
+    assert mobile_api._request_line_loc({}) == ''
 
 
 def test_stock_bin_loc_uses_uploaded_loc_not_branch_name():
@@ -53,8 +64,12 @@ def test_reject_unlocks_remaining_and_stops_that_request_timer():
     assert rejected['remaining_qty'] == 4
     assert rejected['qty_locked'] is False
     assert rejected['request_history'][0]['countdown_active'] is False
+    assert rejected['request_history'][0]['timer_frozen'] is True
     assert rejected['request_history'][0]['remarks'] == 'No stock today'
     assert rejected['pending_request_number'] is None
+    assert rejected['countdown_active'] is False
+    assert 'Ambattur' not in (rejected.get('requested_from') or '')
+    assert rejected['request_history'][0]['request_status'] == 'Rejected'
 
 
 def test_rejected_allocation_is_not_pending():

@@ -248,6 +248,10 @@ def primary_filter_status(detail_status: str) -> str:
 def compact_requested_from(history_rows: List[dict], allocations: List[dict], order: dict) -> str:
     parts = []
     seen = set()
+    skipped_statuses = {
+        'rejected', 'rejected today', 'cancelled', 'cancelled – no response',
+        'cancelled - no response', 'no further stock', 'no further stock available',
+    }
 
     def add(dealer: str, branch: str, qty: float, level: str):
         key = (dealer.lower(), branch.lower(), round(qty, 4))
@@ -260,8 +264,11 @@ def compact_requested_from(history_rows: List[dict], allocations: List[dict], or
             parts.append(f'{branch} - {int(qty) if qty == int(qty) else qty}')
 
     for row in history_rows or []:
+        status = _clean(row.get('status_raw') or row.get('request_status') or row.get('status')).lower()
+        if status in skipped_statuses:
+            continue
         dealer = _clean(row.get('source_dealer') or row.get('supplying_dealer') or row.get('dealer_name'))
-        branch = _clean(row.get('source_branch') or row.get('supplying_branch') or row.get('branch'))
+        branch = _clean(row.get('source_branch') or row.get('supplying_branch') or row.get('branch') or row.get('branch_name'))
         qty = _f(row.get('requested_qty'))
         level = _clean(row.get('source_type') or row.get('level')).lower() or allocation_level(
             {'dealer_name': dealer, 'branch': branch}, order
@@ -836,14 +843,18 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
             'status_raw': status,
             'level': level,
             'response_deadline': timer_meta.get('response_deadline'),
-            'response_status': timer_meta.get('response_status'),
             'remaining_seconds': timer_meta.get('remaining_seconds'),
             'cancel_allowed': timer_meta.get('cancel_allowed', False),
             'response_time_minutes': timer_meta.get('response_time_minutes'),
             'line_item_count': timer_meta.get('line_item_count'),
-            'timer_frozen': bool(timer_meta.get('timer_frozen')),
+            'timer_frozen': bool(timer_meta.get('timer_frozen')) or status in ('Rejected', 'Cancelled'),
             'countdown_active': bool(
                 status == 'Requested' and timer_meta.get('countdown_active')
+            ),
+            'response_status': (
+                'responded' if status == 'Rejected'
+                else 'cancelled' if status == 'Cancelled'
+                else timer_meta.get('response_status')
             ),
         })
 
