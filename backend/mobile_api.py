@@ -1426,6 +1426,8 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             "request_number": line.get("request_number"),
             "requesting_dealer": line.get("requesting_dealer"),
             "requesting_branch": line.get("requesting_branch"),
+            "supplying_dealer": dealer,
+            "supplying_branch": branch,
             "requested_at": line.get("requested_at"),
             "total_items": 0,
             "total_quantity": 0.0,
