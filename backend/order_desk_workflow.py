@@ -217,6 +217,34 @@ def map_request_center_status(status: str, requested_qty: float = 0, accepted_qt
     return status or REQUEST_STATUS_READY
 
 
+_REJECTED_ALLOC_STATUSES = {
+    'rejected',
+    'rejected today',
+}
+
+
+def allocation_is_rejected(alloc: dict) -> bool:
+    """True when an allocation row is a rejection history record, not active qty."""
+    status = _clean(alloc.get('status') or alloc.get('request_status')).lower()
+    return status in _REJECTED_ALLOC_STATUSES
+
+
+def active_allocation_qty(alloc: dict) -> float:
+    """Qty that counts toward required/reserved caps. Rejected qty is 0."""
+    if allocation_is_rejected(alloc):
+        return 0.0
+    return max(0.0, _f(alloc.get('request_qty') or alloc.get('requested_qty')))
+
+
+def sum_active_allocation_qty(allocations: Optional[List[dict]]) -> float:
+    return sum(active_allocation_qty(a) for a in (allocations or []))
+
+
+def request_qty_exceeds_required(allocations: Optional[List[dict]], required_qty: float) -> bool:
+    """Existing max-qty rule: active requested/reserved qty may not exceed required."""
+    return sum_active_allocation_qty(allocations) > _f(required_qty)
+
+
 def email_status_label(raw: Any) -> str:
     value = _clean(raw).lower()
     if value in ('sent', 'email sent'):
@@ -1217,7 +1245,7 @@ async def sync_order_item_after_request_decision(db, req: dict, now: str = None)
         kept_allocs.append(alloc)
 
     update['allocations'] = kept_allocs
-    update['allocated_qty'] = sum(_f(a.get('request_qty')) for a in kept_allocs)
+    update['allocated_qty'] = sum_active_allocation_qty(kept_allocs)
 
     needs_retry = wf['remaining_qty'] > 0 and status in ('Rejected', 'Cancelled', 'Approved') and (
         status != 'Approved' or accepted < requested

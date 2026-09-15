@@ -5194,7 +5194,7 @@ async def order_desk_allocate(order_id: str, payload: dict, current_user: UserRe
             (str(a.get('dealer_name') or '').lower(), str(a.get('branch') or '').lower())
             for a in preserved
         }
-        total_preserved = sum(max(0, float(a.get('request_qty') or 0)) for a in preserved)
+        total_preserved = odw.sum_active_allocation_qty(preserved)
         cleaned = list(preserved)
         for source in selected:
             qty = max(0, float(source.get('request_qty') or 0))
@@ -5219,7 +5219,7 @@ async def order_desk_allocate(order_id: str, payload: dict, current_user: UserRe
                 'requested_qty': qty, 'accepted_qty': 0, 'remaining_qty': qty,
                 'request_status': odw.REQUEST_STATUS_READY,
             })
-        total = sum(max(0, float(s.get('request_qty') or 0)) for s in cleaned)
+        total = odw.sum_active_allocation_qty(cleaned)
         required = float(item.get('required_qty', 0) or 0)
         # Cap against already-accepted + active remaining requirement
         existing_reqs = await db.order_requests.find({'order_item_id': item_id}, {'_id': 0}).to_list(1000)
@@ -5417,7 +5417,7 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
                 kept.append(alloc)
         new_allocations = kept + picked
 
-        total_allocated = sum(float(a.get('request_qty') or 0) for a in new_allocations)
+        total_allocated = odw.sum_active_allocation_qty(new_allocations)
         await db.order_items.update_one({'id': item['id']}, {'$set': {
             'allocations': new_allocations, 'allocated_qty': total_allocated,
             'balance_qty': max(0.0, required_qty - total_allocated),
