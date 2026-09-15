@@ -1591,17 +1591,9 @@ async def submit_part_response(payload: RequestPartResponse, session=Depends(get
         requested_qty = float(lines_by_id[part.order_request_id].get("requested_qty") or 0)
         target_status = "Rejected" if part.accepted_qty <= 0 else "Approved"
         remark = part.remark or ""
-        updated, changed = await request_center_transition(
+        updated, _changed = await request_center_transition(
             part.order_request_id, target_status, remark, acting_user, accepted_qty=part.accepted_qty
         )
-        if changed and notify_request_status_change:
-            if target_status == "Rejected":
-                event = "Request Rejected"
-            elif part.accepted_qty < requested_qty:
-                event = "Request Partially Accepted"
-            else:
-                event = "Request Accepted"
-            await notify_request_status_change(updated, event, getattr(acting_user, "id", "") or "")
         results.append({
             "order_request_id": part.order_request_id,
             "part_number": part.part_number,

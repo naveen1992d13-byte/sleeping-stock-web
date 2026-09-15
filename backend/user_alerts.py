@@ -253,11 +253,11 @@ async def active_user_ids_for_request_scope(
     return [_text(u.get("id")) for u in users if _text(u.get("id"))]
 
 
-async def alert_request_event(req: dict, event: str, *, actor_id: str = "") -> int:
+async def alert_request_event(req: dict, event: str, *, actor_id: str = "", stage: str = "") -> int:
     """Bell recipients mirror email/WhatsApp: requester + supplying-scope
-    admin/master. Actor is excluded."""
-    source_id = _text(req.get("id") or req.get("request_number"))
-    if not source_id:
+    admin/master. Actor is excluded. One Request No = one alert."""
+    req_no = _text(req.get("request_number") or req.get("id"))
+    if not req_no:
         return 0
     recipient_ids: List[str] = []
     requester = await resolve_user_id_flexible(req.get("requested_by") or "")
@@ -273,23 +273,22 @@ async def alert_request_event(req: dict, event: str, *, actor_id: str = "") -> i
         )
     )
     title = _text(event) or "Request update"
-    part = _text(req.get("part_number"))
-    req_no = _text(req.get("request_number") or req.get("id"))
-    message = f"{req_no}" + (f" · {part}" if part else "")
-    event_key = _request_event_identity(req, event)
+    event_l = title.lower()
+    if not stage:
+        stage = "completed" if any(s in event_l for s in ("complet", "reject")) else "pending"
+    link_path = f"/requests?stage={stage}&highlight={req_no}"
     exclude = [actor_id] if actor_id else []
-    # Also exclude decided_by / *_by fields when actor_id was omitted
-    for key in ("decided_by", "dispatched_by", "received_by", "completed_by", "cancelled_by"):
-        if req.get(key):
+    for key in ("decided_by", "dispatched_by", "received_by", "completed_by", "cancelled_by", "requested_by"):
+        if req.get(key) and key != "requested_by":
             exclude.append(_text(req.get(key)))
     return await create_alerts_for_recipients(
         recipient_ids,
         source_type="request",
-        source_id=source_id,
-        event=event_key,
+        source_id=req_no,
+        event=title,
         title=title,
-        message=message,
-        link_path="/requests",
+        message=req_no,
+        link_path=link_path,
         brand=_text(req.get("supplying_brand") or req.get("requesting_brand")),
         dealer=_text(req.get("supplying_dealer") or req.get("requesting_dealer")),
         branch=_text(req.get("supplying_branch") or req.get("requesting_branch")),

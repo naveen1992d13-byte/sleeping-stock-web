@@ -16,28 +16,29 @@ const CANCELLATION_REASONS = [
   'Wrong Part', 'Wrong Qty', 'Duplicate Entry', 'Purchased Outside', 'No Longer Required', 'Other',
 ];
 const STATUS_STYLES = {
-  'To Process': { bg: '#E5E7EB', fg: '#374151' },
-  'Ready to Send': { bg: '#E5E7EB', fg: '#374151' },
-  Eligible: { bg: '#ECFCCB', fg: '#3F6212' },
-  Available: { bg: '#ECFCCB', fg: '#3F6212' },
-  'Request Sent': { bg: '#FEF3C7', fg: '#92400E' },
-  'Awaiting Response': { bg: '#FEF3C7', fg: '#92400E' },
-  Waiting: { bg: '#FEF3C7', fg: '#92400E' },
-  Accepted: { bg: '#D1FAE5', fg: '#065F46' },
-  Confirmed: { bg: '#D1FAE5', fg: '#065F46' },
-  'Partially Accepted': { bg: '#D1FAE5', fg: '#065F46' },
-  Rejected: { bg: '#FCE7F3', fg: '#9F1239' },
-  'Rejected Today': { bg: '#FCE7F3', fg: '#9F1239' },
-  'No Response': { bg: '#FCE7F3', fg: '#9F1239' },
-  'Response Time Expired': { bg: '#FCE7F3', fg: '#9F1239' },
-  'Cancelled – No Response': { bg: '#FCE7F3', fg: '#9F1239' },
-  Cancelled: { bg: '#FCE7F3', fg: '#9F1239' },
-  Completed: { bg: '#D1FAE5', fg: '#065F46' },
-  'Factory Order': { bg: '#E5E7EB', fg: '#374151' },
-  'Factory Completed': { bg: '#D1FAE5', fg: '#065F46' },
-  'No Further Stock Available': { bg: '#E5E7EB', fg: '#111827' },
-  'Branch Exhausted': { bg: '#FEF3C7', fg: '#92400E' },
-  'Dealer Exhausted': { bg: '#FEF3C7', fg: '#92400E' },
+  'To Process': { bg: '#334155', fg: '#F8FAFC' },
+  'Ready to Send': { bg: '#334155', fg: '#F8FAFC' },
+  Eligible: { bg: '#3F6212', fg: '#ECFCCB' },
+  Available: { bg: '#3F6212', fg: '#ECFCCB' },
+  'Request Sent': { bg: '#B45309', fg: '#FFFBEB' },
+  'Awaiting Response': { bg: '#B45309', fg: '#FFFBEB' },
+  Waiting: { bg: '#B45309', fg: '#FFFBEB' },
+  Active: { bg: '#B45309', fg: '#FFFBEB' },
+  Accepted: { bg: '#047857', fg: '#ECFDF5' },
+  Confirmed: { bg: '#047857', fg: '#ECFDF5' },
+  'Partially Accepted': { bg: '#047857', fg: '#ECFDF5' },
+  Rejected: { bg: '#BE123C', fg: '#FFF1F2' },
+  'Rejected Today': { bg: '#BE123C', fg: '#FFF1F2' },
+  'No Response': { bg: '#BE123C', fg: '#FFF1F2' },
+  'Response Time Expired': { bg: '#BE123C', fg: '#FFF1F2' },
+  'Cancelled – No Response': { bg: '#BE123C', fg: '#FFF1F2' },
+  Cancelled: { bg: '#BE123C', fg: '#FFF1F2' },
+  Completed: { bg: '#047857', fg: '#ECFDF5' },
+  'Factory Order': { bg: '#1E3A8A', fg: '#DBEAFE' },
+  'Factory Completed': { bg: '#047857', fg: '#ECFDF5' },
+  'No Further Stock Available': { bg: '#1E3A8A', fg: '#DBEAFE' },
+  'Branch Exhausted': { bg: '#B45309', fg: '#FFFBEB' },
+  'Dealer Exhausted': { bg: '#B45309', fg: '#FFFBEB' },
 };
 
 function formatDeadlineCountdown(deadline, nowMs) {
@@ -97,7 +98,7 @@ function StatusBadge({ status }) {
     else style = STATUS_STYLES[base] || { bg: '#F3F4F6', fg: '#374151' };
   }
   return (
-    <span className="inline-block rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap" style={{ backgroundColor: style.bg, color: style.fg }} title={key}>
+    <span className="inline-block rounded-full px-2 py-0.5 text-[11px] font-bold whitespace-nowrap" style={{ backgroundColor: style.bg, color: style.fg }} title={key}>
       {key || '—'}
     </span>
   );
@@ -974,7 +975,7 @@ export function Orders() {
                                   )}
                                 </div>
                               ) : null}
-                              {canSaveSystemOrder && ((remaining > 0 && !item.system_order_number) || (item.system_order_number && isMaster)) ? (
+                              {canSaveSystemOrder && ((remaining > 0 && !item.qty_locked && !item.system_order_number) || (item.system_order_number && isMaster)) ? (
                                 <div className="grid gap-2 md:grid-cols-[1fr_auto] items-end max-w-xl">
                                   <label className="text-xs text-slate-600">
                                     Factory Order No
@@ -1015,7 +1016,9 @@ export function Orders() {
                               ) : (
                                 !item.system_order_number && (
                                   <div className="text-xs text-amber-700">
-                                    {canSaveSystemOrder
+                                    {item.qty_locked
+                                      ? 'Factory Order Number is locked while a branch availability request is still active.'
+                                      : canSaveSystemOrder
                                       ? 'Enter System Order Number to fulfill remaining Factory quantity.'
                                       : 'View only — Admin / Master Admin enter the System Order Number.'}
                                   </div>

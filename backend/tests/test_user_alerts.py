@@ -282,7 +282,10 @@ def test_request_scope_excludes_unrelated_and_actor():
         assert "other_master" not in recipients
         assert "actor_admin" not in recipients
         assert n == 3
-        assert all(d["event"].startswith("Request Accepted@") for d in database.user_alerts.docs)
+        assert all(d["event"] == "Request Accepted" for d in database.user_alerts.docs)
+        assert all(d["source_id"] == "RN1" for d in database.user_alerts.docs)
+        assert all("P1" not in (d.get("message") or "") for d in database.user_alerts.docs)
+        assert all("highlight=RN1" in (d.get("link_path") or "") for d in database.user_alerts.docs)
 
     asyncio.get_event_loop().run_until_complete(_run())
 
