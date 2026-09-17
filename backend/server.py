@@ -83,9 +83,16 @@ except ImportError:
 
 s3_storage.load_storage_dotenv()
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
+try:
+    from .mongo_connection import build_mongo_client_args, resolve_mongo_url
+except ImportError:
+    from mongo_connection import build_mongo_client_args, resolve_mongo_url
+
+# MongoDB connection (Atlas MONGO_URL by default; DocumentDB via Secrets Manager
+# when DOCDB_TLS_CA_FILE is set — password is never read from .env or logged)
+mongo_url = resolve_mongo_url()
+_mongo_url, _mongo_kwargs = build_mongo_client_args(mongo_url)
+client = AsyncIOMotorClient(_mongo_url, **_mongo_kwargs)
 db = client[os.environ['DB_NAME']]
 
 # Security
