@@ -1,22 +1,31 @@
 /**
  * Resolve the backend base URL for browser clients.
- * On GitHub Codespaces, always derive from the current *-3000.app.github.dev host
- * so a stale/local REACT_APP_BACKEND_URL cannot break the app.
+ *
+ * Local development: honor an explicit REACT_APP_BACKEND_URL, including
+ * http://127.0.0.1:8000, and fall back to that loopback URL when unset.
+ *
+ * GitHub Codespaces / github.dev hosted frontend: always use the EC2 HTTPS
+ * API. Stale localhost values in Codespace .env files must not route the SPA
+ * to the Codespace's own :8000 process (Atlas/local).
  */
+const HOSTED_API_BASE = 'https://api.sleepingstock.in';
+
+function trimBase(url) {
+  return String(url || '').trim().replace(/\/$/, '');
+}
+
+function isGithubHostedFrontend() {
+  if (typeof window === 'undefined' || !window.location?.hostname) return false;
+  const host = String(window.location.hostname || '').toLowerCase();
+  return host.endsWith('.app.github.dev') || host.endsWith('.github.dev');
+}
+
 export function resolveBackendUrl() {
-  if (typeof window !== 'undefined' && window.location?.hostname) {
-    const host = String(window.location.hostname || '');
-    const codespace = host.match(/^(.+)-(\d+)\.app\.github\.dev$/i);
-    if (codespace) {
-      const base = codespace[1];
-      const frontPort = codespace[2];
-      if (frontPort === '3000') {
-        return `https://${base}-8000.app.github.dev`;
-      }
-    }
+  if (isGithubHostedFrontend()) {
+    return HOSTED_API_BASE;
   }
 
-  const fromEnv = String(process.env.REACT_APP_BACKEND_URL || '').trim().replace(/\/$/, '');
+  const fromEnv = trimBase(process.env.REACT_APP_BACKEND_URL);
   if (fromEnv) return fromEnv;
   return 'http://127.0.0.1:8000';
 }
