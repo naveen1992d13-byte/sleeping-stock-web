@@ -273,7 +273,57 @@ async def archive_status_summary(db) -> Dict[str, Any]:
     return await archive_health_summary(db)
 
 
-async def dealer_storage_snapshot(db) -> Dict[str, Any]:
+async def _dealer_product_shares(db) -> List[Dict[str, Any]]:
+    """Dealer/branch counts without loading full product documents into the app."""
+    pipeline = [
+        {
+            "$group": {
+                "_id": {"$ifNull": ["$dealer_name", {"$ifNull": ["$dealer", "(unknown)"]}]},
+                "product_rows": {"$sum": 1},
+                "branches": {"$addToSet": {"$ifNull": ["$branch", "$branch_name"]}},
+            }
+        }
+    ]
+    try:
+        raw = await db.products.aggregate(pipeline).to_list(10000)
+        out = []
+        for doc in raw:
+            dname = str(doc.get("_id") or "(unknown)").strip() or "(unknown)"
+            branches = sorted(
+                str(b).strip() for b in (doc.get("branches") or []) if str(b or "").strip()
+            )
+            out.append(
+                {
+                    "dealer": dname,
+                    "product_rows": int(doc.get("product_rows") or 0),
+                    "branch_names": branches,
+                }
+            )
+        return out
+    except Exception:
+        rows = await db.products.find(
+            {},
+            {"_id": 0, "dealer_name": 1, "dealer": 1, "branch": 1, "branch_name": 1},
+        ).to_list(500000)
+        dealers: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            dname = str(r.get("dealer_name") or r.get("dealer") or "(unknown)").strip() or "(unknown)"
+            slot = dealers.setdefault(dname, {"dealer": dname, "product_rows": 0, "branch_names": set()})
+            slot["product_rows"] += 1
+            br = str(r.get("branch") or r.get("branch_name") or "").strip()
+            if br:
+                slot["branch_names"].add(br)
+        return [
+            {
+                "dealer": d["dealer"],
+                "product_rows": d["product_rows"],
+                "branch_names": sorted(d["branch_names"]),
+            }
+            for d in dealers.values()
+        ]
+
+
+async def dealer_storage_snapshot(db, *, mongo: Optional[Dict[str, Any]] = None, s3m: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Canonical dealer-wise Mongo + S3 usage so top cards and table never drift.
 
     Mongo per-dealer values are a *logical data-size allocation* from product
@@ -282,40 +332,26 @@ async def dealer_storage_snapshot(db) -> Dict[str, Any]:
     S3 archive bytes are attributed from verified REAL-S3 manifests' scope_dealers
     (equal split when multiple dealers share one consolidated archive).
     """
-    mongo = await mongo_storage_metrics(db)
-    s3m = await s3_storage_metrics(db)
+    mongo = mongo if mongo is not None else await mongo_storage_metrics(db)
+    s3m = s3m if s3m is not None else await s3_storage_metrics(db)
 
-    # Logical Mongo allocation by dealer from products collection share
+    shares = await _dealer_product_shares(db)
     dealers: Dict[str, Dict[str, Any]] = {}
-    try:
-        rows = await db.products.find(
-            {},
-            {"_id": 0, "dealer_name": 1, "dealer": 1, "branch": 1, "branch_name": 1},
-        ).to_list(500000)
-    except Exception:
-        rows = []
-    product_total = max(1, len(rows))
+    product_total = max(1, sum(int(s.get("product_rows") or 0) for s in shares) or 1)
     product_storage = int(mongo.get("product_size") or 0)
     mongo_used_total = int(mongo.get("storage_size") or mongo.get("data_size") or 0)
 
-    for r in rows:
-        dname = str(r.get("dealer_name") or r.get("dealer") or "(unknown)").strip() or "(unknown)"
-        slot = dealers.setdefault(
-            dname,
-            {
-                "dealer": dname,
-                "branches": set(),
-                "product_rows": 0,
-                "mongodb_used_bytes": 0,
-                "s3_archive_used_bytes": 0,
-                "archive_verified": 0,
-                "archive_total": 0,
-            },
-        )
-        slot["product_rows"] += 1
-        br = str(r.get("branch") or r.get("branch_name") or "").strip()
-        if br:
-            slot["branches"].add(br)
+    for s in shares:
+        dname = str(s.get("dealer") or "(unknown)").strip() or "(unknown)"
+        dealers[dname] = {
+            "dealer": dname,
+            "branches": set(s.get("branch_names") or []),
+            "product_rows": int(s.get("product_rows") or 0),
+            "mongodb_used_bytes": 0,
+            "s3_archive_used_bytes": 0,
+            "archive_verified": 0,
+            "archive_total": 0,
+        }
 
     # Allocate product storage share + residual mongo proportionally by row count
     for slot in dealers.values():
@@ -323,12 +359,10 @@ async def dealer_storage_snapshot(db) -> Dict[str, Any]:
         slot["mongodb_used_bytes"] = int(round(product_storage * share)) if product_storage else 0
 
     # If product_size unknown, allocate full mongo storage_size by row share
-    allocated = sum(s["mongodb_used_bytes"] for s in dealers.values())
     if product_storage <= 0 and mongo_used_total > 0 and dealers:
         for slot in dealers.values():
             share = slot["product_rows"] / product_total
             slot["mongodb_used_bytes"] = int(round(mongo_used_total * share))
-        allocated = sum(s["mongodb_used_bytes"] for s in dealers.values())
 
     # Verified REAL-S3 archive bytes by dealer scope
     manifests = await db.archive_manifests.find(
@@ -462,10 +496,10 @@ async def dealer_storage_snapshot(db) -> Dict[str, Any]:
     }
 
 
-async def migration_space_report(db) -> Dict[str, Any]:
+async def migration_space_report(db, mongo: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Report historical candidates BEFORE any prune."""
     storage = get_storage()
-    mongo = await mongo_storage_metrics(db)
+    mongo = mongo if mongo is not None else await mongo_storage_metrics(db)
     today_key, today_iso = _today_keys()
     hist = await ha.list_historical_product_dates(db)
     candidate_records = sum(int(h.get("count") or 0) for h in hist)
@@ -535,20 +569,27 @@ async def migration_space_report(db) -> Dict[str, Any]:
 async def monitor_dashboard(db, *, month: Optional[str] = None) -> Dict[str, Any]:
     storage = get_storage()
     status = storage.status()
-    mongo = await mongo_storage_metrics(db)
-    s3m = await s3_storage_metrics(db)
-    archives = await archive_health_summary(db)
-    usage = await su.month_usage_totals(db, month)
-    snapshot = await dealer_storage_snapshot(db)
-    # Keep estimated cost ranking available but Storage page dealer table uses snapshot
-    cost_ranking = await su.dealer_usage_ranking(db, month=month)
-    today_key, _ = _today_keys()
+    token = av.begin_head_cache()
     try:
-        import archive_cleanup as ac
+        mongo = await mongo_storage_metrics(db)
+        s3m = await s3_storage_metrics(db)
+        archives = await archive_health_summary(db)
+        usage = await su.month_usage_totals(db, month)
+        snapshot = await dealer_storage_snapshot(db, mongo=mongo, s3m=s3m)
+        cost_ranking = await su.dealer_usage_ranking(db, month=month)
+        try:
+            import archive_cleanup as ac
 
-        external = ac.external_console_links()
-    except Exception:
-        external = {"aws": {}, "mongodb": {}, "pattern": "identical_cards"}
+            external = ac.external_console_links()
+            cleanup_rows = await ac.list_cleanup_archives(db, years=3)
+        except Exception:
+            external = {"aws": {}, "mongodb": {}, "pattern": "identical_cards"}
+            cleanup_rows = []
+        migration = await migration_space_report(db, mongo=mongo)
+    finally:
+        av.end_head_cache(token)
+
+    today_key, _ = _today_keys()
 
     refreshed = datetime.now(timezone.utc).isoformat()
     totals = snapshot.get("totals") or {}
@@ -593,6 +634,7 @@ async def monitor_dashboard(db, *, month: Optional[str] = None) -> Dict[str, Any
     return {
         "storage_backend": status.get("storage_backend"),
         "real_s3": status.get("real_s3"),
+        "archive_prune_enabled": bool(status.get("archive_prune_enabled")),
         "warning": status.get("warning"),
         "cards": {
             "mongodb_allocated_usage": totals.get("mongodb_allocated_usage_bytes"),
@@ -631,7 +673,8 @@ async def monitor_dashboard(db, *, month: Optional[str] = None) -> Dict[str, Any
             "pending": archives.get("pending"),
             "failed": archives.get("failed"),
             "verification_failed": archives.get("verification_failed"),
-            "safe_to_delete": archives.get("safe_to_delete"),
+            "safe_to_delete": 0 if not status.get("archive_prune_enabled") else archives.get("safe_to_delete"),
+            "cleanup_status": "DISABLED" if not status.get("archive_prune_enabled") else "ENABLED",
             "overall_verified_percent": archives.get("overall_verified_percent"),
         },
         "mongo": mongo,
@@ -662,6 +705,8 @@ async def monitor_dashboard(db, *, month: Optional[str] = None) -> Dict[str, Any
             await ar.latest_run(db),
             maintenance_active=maint.in_maintenance_window(),
         ),
+        "cleanup_rows": cleanup_rows,
+        "migration": migration,
         "filters_note": (
             "Storage & Data Cleanup always shows overall health. "
             "Global Brand/Dealer/Branch header filters do not apply on this page."
