@@ -25,6 +25,9 @@ os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
 os.environ.pop("NMTS_S3_BUCKET", None)
 
 import s3_storage  # noqa: E402
+
+s3_storage._DOTENV_LOADED = True
+s3_storage.load_storage_dotenv = lambda force=False: None
 import archive_keys as ak  # noqa: E402
 import archive_manifest as am  # noqa: E402
 import archive_outbox as ao  # noqa: E402

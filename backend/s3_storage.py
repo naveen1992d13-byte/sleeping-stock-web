@@ -3,6 +3,11 @@
 Credentials are read only from environment variables and never returned to
 callers (so frontend/mobile never see AWS secrets).
 
+Bucket name is always required. Explicit AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+are used when both are set. When static keys are absent, boto3 uses its default
+credential chain (EC2 instance role, env, shared config). Never pass empty key
+strings — that disables the chain.
+
 When AWS is unavailable or credentials are invalid, the service falls back to
 a local object-store directory so archives and uploads can still be exercised
 in tests / cloud agents without inventing credentials.
@@ -345,9 +350,12 @@ class S3StorageService:
         self._keys_unswapped = swapped
         self.session_token = _clean_env(os.getenv("AWS_SESSION_TOKEN"))
 
-    def _credentials_look_valid(self) -> bool:
+    def _static_keys_provided(self) -> bool:
+        return bool(self.access_key) or bool(self.secret_key)
+
+    def _static_keys_look_valid(self) -> bool:
         # IAM access keys are typically 16–24 chars starting with AKIA/ASIA.
-        if not self.access_key or not self.secret_key or not self.bucket:
+        if not self.access_key or not self.secret_key:
             return False
         if "/" in self.access_key or len(self.access_key) > 32:
             return False
@@ -355,18 +363,42 @@ class S3StorageService:
             return False
         return True
 
+    def _credentials_look_valid(self) -> bool:
+        """True when S3 init should be attempted.
+
+        Bucket is required. Missing static keys is valid (default credential
+        chain / EC2 instance role). Half-set or malformed static keys are not.
+        """
+        if not self.bucket:
+            return False
+        if not self._static_keys_provided():
+            return True
+        return self._static_keys_look_valid()
+
+    def _boto3_credential_kwargs(self) -> Dict[str, Any]:
+        """Pass explicit keys only when both are present. Omit otherwise so
+        boto3 can use the default chain (EC2 instance role). Empty strings
+        must never be passed — boto3 treats them as provided credentials.
+        """
+        if not (self.access_key and self.secret_key):
+            return {}
+        kwargs: Dict[str, Any] = {
+            "aws_access_key_id": self.access_key,
+            "aws_secret_access_key": self.secret_key,
+        }
+        if self.session_token:
+            kwargs["aws_session_token"] = self.session_token
+        return kwargs
+
     def _make_client(self, region: str):
         import boto3
         from botocore.config import Config
 
         kwargs: Dict[str, Any] = {
             "region_name": region,
-            "aws_access_key_id": self.access_key,
-            "aws_secret_access_key": self.secret_key,
             "config": Config(signature_version="s3v4"),
+            **self._boto3_credential_kwargs(),
         }
-        if self.session_token:
-            kwargs["aws_session_token"] = self.session_token
         return boto3.client("s3", **kwargs)
 
     def _lookup_bucket_region(self) -> str:
@@ -450,16 +482,17 @@ class S3StorageService:
             raise
 
     def _require_recognized_access_key(self) -> None:
-        """Reject unknown/revoked access key ids. Does not log identity values."""
+        """Reject unknown/revoked access key ids. Does not log identity values.
+
+        When static keys are absent this uses the default credential chain
+        (EC2 instance role) the same way the S3 client does.
+        """
         import boto3
 
         kwargs: Dict[str, Any] = {
             "region_name": self.region or "us-east-1",
-            "aws_access_key_id": self.access_key,
-            "aws_secret_access_key": self.secret_key,
+            **self._boto3_credential_kwargs(),
         }
-        if self.session_token:
-            kwargs["aws_session_token"] = self.session_token
         boto3.client("sts", **kwargs).get_caller_identity()
 
     def _init_client(self) -> None:
@@ -475,6 +508,7 @@ class S3StorageService:
             return
         try:
             self._client = self._make_client(self.region)
+            # Verify bucket access at startup (not only at first upload).
             self._probe_bucket()
             self._mode = "s3"
             logger.info("S3 storage ready (bucket=%s region=%s env=%s)", self.bucket, self.region, self.env)
@@ -484,9 +518,10 @@ class S3StorageService:
             err_code = _aws_error_code(exc)
             self._init_error_code = err_code or type(exc).__name__
             logger.warning(
-                "S3 init failed (%s%s); using local object store",
+                "S3 init failed (%s%s): %s; using local object store",
                 type(exc).__name__,
                 f" code={err_code}" if err_code else "",
+                exc,
             )
 
     def ensure_s3(self) -> bool:

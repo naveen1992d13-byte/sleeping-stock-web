@@ -35,6 +35,11 @@ os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
 os.environ.pop("NMTS_S3_BUCKET", None)
 
 import s3_storage  # noqa: E402
+
+# Keep hybrid tests on the local object store. Do not re-apply backend/.env
+# (bucket + IAM role would otherwise become REAL S3 on the EC2 host).
+s3_storage._DOTENV_LOADED = True
+s3_storage.load_storage_dotenv = lambda force=False: None
 import file_objects  # noqa: E402
 import archive_manifest as am  # noqa: E402
 import history_archive as ha  # noqa: E402

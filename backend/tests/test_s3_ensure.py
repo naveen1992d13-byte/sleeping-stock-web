@@ -157,6 +157,95 @@ def test_signature_mismatch_does_not_claim_real_s3(monkeypatch, tmp_path):
     assert svc.mode == "local"
 
 
+def test_absent_static_keys_use_default_chain_and_head_bucket(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeClient:
+        def head_bucket(self, Bucket):
+            captured["head_bucket"] = Bucket
+
+    def fake_boto_client(service, **kwargs):
+        captured.setdefault("calls", []).append({"service": service, "kwargs": dict(kwargs)})
+        return FakeClient()
+
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+    monkeypatch.setenv("NMTS_S3_BUCKET", "nmts-sleeping-stock-archive")
+    monkeypatch.setenv("AWS_REGION", "ap-south-1")
+    monkeypatch.setenv("NMTS_LOCAL_OBJECT_STORE", str(tmp_path))
+    monkeypatch.setattr(m, "load_storage_dotenv", lambda force=False: None)
+
+    import boto3
+
+    monkeypatch.setattr(boto3, "client", fake_boto_client)
+
+    svc = m.S3StorageService.__new__(m.S3StorageService)
+    svc._local = m._LocalObjectStore(Path(tmp_path))
+    svc._client = None
+    svc._mode = "local"
+    svc._init_error_code = ""
+    svc._refresh_from_env()
+    svc._init_client()
+    assert svc.is_s3() is True
+    assert captured.get("head_bucket") == "nmts-sleeping-stock-archive"
+    s3_calls = [c for c in captured["calls"] if c["service"] == "s3"]
+    assert s3_calls
+    kwargs = s3_calls[0]["kwargs"]
+    assert "aws_access_key_id" not in kwargs
+    assert "aws_secret_access_key" not in kwargs
+    assert "aws_session_token" not in kwargs
+
+
+def test_static_keys_still_passed_to_boto3(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeClient:
+        def head_bucket(self, Bucket):
+            return None
+
+    def fake_boto_client(service, **kwargs):
+        captured["kwargs"] = dict(kwargs)
+        return FakeClient()
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIATESTKEYEXAMPLE1")  # pragma: allowlist secret
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testsecret")  # pragma: allowlist secret
+    monkeypatch.setenv("NMTS_S3_BUCKET", "nmts-test-bucket")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("NMTS_LOCAL_OBJECT_STORE", str(tmp_path))
+    monkeypatch.setattr(m, "load_storage_dotenv", lambda force=False: None)
+
+    import boto3
+
+    monkeypatch.setattr(boto3, "client", fake_boto_client)
+
+    svc = m.S3StorageService.__new__(m.S3StorageService)
+    svc._local = m._LocalObjectStore(Path(tmp_path))
+    svc._client = None
+    svc._mode = "local"
+    svc._init_error_code = ""
+    svc._refresh_from_env()
+    svc._init_client()
+    assert svc.is_s3() is True
+    assert captured["kwargs"]["aws_access_key_id"] == "AKIATESTKEYEXAMPLE1"
+    assert captured["kwargs"]["aws_secret_access_key"] == "testsecret"
+
+
+def test_init_logs_boto_error_before_local_fallback(monkeypatch, tmp_path, caplog):
+    class FakeClient:
+        def head_bucket(self, Bucket):
+            raise _client_error("NoSuchBucket", 404, "The specified bucket does not exist")
+
+    with caplog.at_level("WARNING", logger="s3_storage"):
+        svc = _service_with_fake_client(monkeypatch, tmp_path, FakeClient())
+    assert svc.is_s3() is False
+    assert svc.mode == "local"
+    assert svc._init_error_code == "NoSuchBucket"
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "NoSuchBucket" in joined
+    assert "The specified bucket does not exist" in joined
+
+
 def test_missing_credentials_stay_local(monkeypatch, tmp_path):
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
     monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
