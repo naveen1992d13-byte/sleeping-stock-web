@@ -29,3 +29,7 @@ backend/mobile_apk_storage/
 # Local AWS mapping override (never commit)
 backend/.env.s3.local
 .env.s3.local
+
+# EC2-local secrets and TLS material (never commit)
+backend/.env.backup
+backend/certs/
