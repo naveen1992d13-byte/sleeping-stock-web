@@ -1,9 +1,35 @@
 /**
  * Resolve the backend base URL for browser clients.
- * On GitHub Codespaces, always derive from the current *-3000.app.github.dev host
- * so a stale/local REACT_APP_BACKEND_URL cannot break the app.
+ *
+ * An explicit non-loopback REACT_APP_BACKEND_URL always wins — including on
+ * GitHub Codespaces — so the SPA can target a remote EC2/HTTPS API instead of
+ * the Codespace's own :8000 process (Atlas/local).
+ *
+ * Codespace host derivation is used only when env is empty or loopback, so a
+ * stale localhost REACT_APP_BACKEND_URL cannot break in-Codespace routing.
  */
+function trimBase(url) {
+  return String(url || '').trim().replace(/\/$/, '');
+}
+
+function isLoopbackBackend(url) {
+  const text = trimBase(url);
+  if (!text) return true;
+  try {
+    const host = new URL(text).hostname.toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
+  } catch {
+    return /localhost|127\.0\.0\.1/i.test(text);
+  }
+}
+
 export function resolveBackendUrl() {
+  const fromEnv = trimBase(process.env.REACT_APP_BACKEND_URL);
+
+  if (fromEnv && !isLoopbackBackend(fromEnv)) {
+    return fromEnv;
+  }
+
   if (typeof window !== 'undefined' && window.location?.hostname) {
     const host = String(window.location.hostname || '');
     const codespace = host.match(/^(.+)-(\d+)\.app\.github\.dev$/i);
@@ -16,7 +42,6 @@ export function resolveBackendUrl() {
     }
   }
 
-  const fromEnv = String(process.env.REACT_APP_BACKEND_URL || '').trim().replace(/\/$/, '');
   if (fromEnv) return fromEnv;
   return 'http://127.0.0.1:8000';
 }
