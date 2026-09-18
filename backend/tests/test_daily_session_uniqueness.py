@@ -150,13 +150,19 @@ async def test_cleanup_idempotent_and_preserves_history():
     day = ist_date_key()
     sid_a = f"AOPSTEST{uuid.uuid4().hex[:6].upper()}"
     sid_b = f"AOPSTEST{uuid.uuid4().hex[:6].upper()}"
-    index_name = "uq_daily_verification_session_identity"
+    index_names = (
+        "uq_daily_verification_session_identity",
+        "uq_daily_verification_session_identity_auto_perpetual",
+        "uq_daily_verification_session_identity_physical_perpetual",
+        "uq_daily_verification_session_identity_mobile_daily",
+    )
     try:
         # Temporarily relax uniqueness so we can seed a duplicate group.
-        try:
-            await db.stock_verification_sessions.drop_index(index_name)
-        except Exception:
-            pass
+        for index_name in index_names:
+            try:
+                await db.stock_verification_sessions.drop_index(index_name)
+            except Exception:
+                pass
         await db.stock_verification_sessions.insert_many([
             {
                 "id": str(uuid.uuid4()),
@@ -211,26 +217,31 @@ async def test_cleanup_idempotent_and_preserves_history():
         await db.stock_verification_sessions.delete_many({"mobile_user_id": mu})
         await db.stock_verification_history.delete_many({"mobile_user_id": mu})
         try:
-            await db.stock_verification_sessions.create_index(
-                [
-                    ("session_kind", 1),
-                    ("verification_date", 1),
-                    ("mobile_user_id", 1),
-                    ("brand_id", 1),
-                    ("dealer_id", 1),
-                    ("branch_id", 1),
-                ],
-                unique=True,
-                name=index_name,
-                partialFilterExpression={
-                    "session_kind": {"$in": ["auto_perpetual", "physical_perpetual", "mobile_daily"]},
-                    "mobile_user_id": {"$type": "string"},
-                    "brand_id": {"$type": "string"},
-                    "dealer_id": {"$type": "string"},
-                    "branch_id": {"$type": "string"},
-                    "verification_date": {"$type": "string"},
-                },
-            )
+            daily_session_index_keys = [
+                ("session_kind", 1),
+                ("verification_date", 1),
+                ("mobile_user_id", 1),
+                ("brand_id", 1),
+                ("dealer_id", 1),
+                ("branch_id", 1),
+            ]
+            daily_session_type_filter = {
+                "mobile_user_id": {"$type": "string"},
+                "brand_id": {"$type": "string"},
+                "dealer_id": {"$type": "string"},
+                "branch_id": {"$type": "string"},
+                "verification_date": {"$type": "string"},
+            }
+            for kind in ("auto_perpetual", "physical_perpetual", "mobile_daily"):
+                await db.stock_verification_sessions.create_index(
+                    daily_session_index_keys,
+                    unique=True,
+                    name=f"uq_daily_verification_session_identity_{kind}",
+                    partialFilterExpression={
+                        "session_kind": {"$eq": kind},
+                        **daily_session_type_filter,
+                    },
+                )
         except Exception:
             pass
 

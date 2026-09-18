@@ -2718,26 +2718,33 @@ async def ensure_mobile_indexes():
     try:
         # One parent per kind + user + brand + dealer + branch + IST day.
         # Status is intentionally NOT part of uniqueness (status flips must reuse).
-        await db.stock_verification_sessions.create_index(
-            [
-                ("session_kind", 1),
-                ("verification_date", 1),
-                ("mobile_user_id", 1),
-                ("brand_id", 1),
-                ("dealer_id", 1),
-                ("branch_id", 1),
-            ],
-            unique=True,
-            name="uq_daily_verification_session_identity",
-            partialFilterExpression={
-                "session_kind": {"$in": ["auto_perpetual", "physical_perpetual", "mobile_daily"]},
-                "mobile_user_id": {"$type": "string"},
-                "brand_id": {"$type": "string"},
-                "dealer_id": {"$type": "string"},
-                "branch_id": {"$type": "string"},
-                "verification_date": {"$type": "string"},
-            },
-        )
+        # DocumentDB 5.0 rejects $in in partialFilterExpression, so uniqueness
+        # is enforced with one $eq partial unique index per daily session kind.
+        daily_session_index_keys = [
+            ("session_kind", 1),
+            ("verification_date", 1),
+            ("mobile_user_id", 1),
+            ("brand_id", 1),
+            ("dealer_id", 1),
+            ("branch_id", 1),
+        ]
+        daily_session_type_filter = {
+            "mobile_user_id": {"$type": "string"},
+            "brand_id": {"$type": "string"},
+            "dealer_id": {"$type": "string"},
+            "branch_id": {"$type": "string"},
+            "verification_date": {"$type": "string"},
+        }
+        for kind in ("auto_perpetual", "physical_perpetual", "mobile_daily"):
+            await db.stock_verification_sessions.create_index(
+                daily_session_index_keys,
+                unique=True,
+                name=f"uq_daily_verification_session_identity_{kind}",
+                partialFilterExpression={
+                    "session_kind": {"$eq": kind},
+                    **daily_session_type_filter,
+                },
+            )
     except (DuplicateKeyError, OperationFailure) as exc:
         logger.error("Cannot create daily verification session unique index: %s", exc)
 
