@@ -14,8 +14,13 @@ import * as Notifications from 'expo-notifications';
 import * as Device from 'expo-device';
 import Constants from 'expo-constants';
 import { registerPushToken } from '../api';
-
-const ANDROID_CHANNEL_ID = 'sleeping-stock-requests';
+import {
+  ANDROID_CHANNEL_ID,
+  ACTION_SNOOZE,
+  ACTION_START_PICKING,
+  ensureRequestAlertCategory,
+  ensureRequestAlertChannel,
+} from './nativeRequestAlert';
 
 let responseListenerSub = null;
 let receivedListenerSub = null;
@@ -36,15 +41,8 @@ Notifications.setNotificationHandler({
 });
 
 async function ensureAndroidChannel() {
-  if (Platform.OS !== 'android') return;
-  await Notifications.setNotificationChannelAsync(ANDROID_CHANNEL_ID, {
-    name: 'Branch Stock Requests',
-    importance: Notifications.AndroidImportance.HIGH,
-    vibrationPattern: [0, 250, 250, 250],
-    lightColor: '#176b43',
-    sound: 'default',
-    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
-  });
+  await ensureRequestAlertChannel();
+  await ensureRequestAlertCategory();
 }
 
 /**
@@ -128,7 +126,17 @@ export async function initPushNotifications({ onNotificationReceived, onNotifica
   // cold-start-from-killed (Expo replays the last response on launch).
   responseListenerSub = Notifications.addNotificationResponseReceivedListener((response) => {
     try {
-      onNotificationTapped?.(response.notification.request.content.data);
+      const actionId = response.actionIdentifier;
+      const data = {
+        ...(response.notification.request.content.data || {}),
+        notificationAction:
+          actionId === ACTION_SNOOZE
+            ? 'snooze'
+            : actionId === ACTION_START_PICKING
+              ? 'start_picking'
+              : 'open',
+      };
+      onNotificationTapped?.(data);
     } catch (error) {
       console.log('[push] onNotificationTapped handler error', error);
     }
@@ -138,9 +146,18 @@ export async function initPushNotifications({ onNotificationReceived, onNotifica
   // it once here too.
   Notifications.getLastNotificationResponseAsync()
     .then((response) => {
-      if (response) {
-        onNotificationTapped?.(response.notification.request.content.data);
-      }
+      if (!response) return;
+      const actionId = response.actionIdentifier;
+      const data = {
+        ...(response.notification.request.content.data || {}),
+        notificationAction:
+          actionId === ACTION_SNOOZE
+            ? 'snooze'
+            : actionId === ACTION_START_PICKING
+              ? 'start_picking'
+              : 'open',
+      };
+      onNotificationTapped?.(data);
     })
     .catch((error) => console.log('[push] getLastNotificationResponseAsync failed', error));
 

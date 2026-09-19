@@ -23,6 +23,14 @@ const formatDisplayNumber = (value, { currency = false } = {}) => {
 const formatDisplayCurrency = (value) => `₹${formatDisplayNumber(value, { currency: true })}`;
 const isAll = (v) => !v || String(v).startsWith('All ') || v === 'N/A';
 
+function missingUploadScopeMessages(scopeBrand, scopeDealer, scopeBranch) {
+  const msgs = [];
+  if (isAll(scopeBrand)) msgs.push('Please select Brand.');
+  if (isAll(scopeDealer)) msgs.push('Please select Dealer.');
+  if (isAll(scopeBranch)) msgs.push('Please select Branch.');
+  return msgs;
+}
+
 // Authenticated file download helper. Uses axios (which already attaches the
 // Bearer token via the global interceptor in App.js) instead of window.open,
 // which sends no Authorization header and results in "Not Authenticated".
@@ -141,9 +149,14 @@ export function UploadCenter() {
 
   const handleUpload = async () => {
     if (!activeFile) return toast.error('Please select an Excel file first');
+    const scopeErrors = missingUploadScopeMessages(scopeBrand, scopeDealer, scopeBranch);
+    if (scopeErrors.length) return toast.error(scopeErrors.join(' '));
     const form = new FormData();
     form.append('file', activeFile);
     form.append('upload_type', activeType);
+    form.append('brand', scopeBrand);
+    form.append('dealer', scopeDealer);
+    form.append('branch', scopeBranch);
     setUploading(true);
     try {
       const endpoint = activeType === 'product' ? `${API}/upload/v2` : `${API}/orders/upload`;
@@ -265,6 +278,8 @@ export function UploadCenter() {
 
   const latest = activeUploads[0] || null;
   const summary = latest ? { totalItems: latest.item_count || latest.rows_imported || 0, totalQty: latest.total_available_qty || 0, totalValue: latest.total_value || 0 } : { totalItems: 0, totalQty: 0, totalValue: 0 };
+  const uploadScopeErrors = missingUploadScopeMessages(scopeBrand, scopeDealer, scopeBranch);
+  const uploadScopeReady = uploadScopeErrors.length === 0;
 
   return <div className="space-y-3" data-testid="upload-center-page">
     {(isMaster || isAdmin) && masterSummary && (
@@ -334,7 +349,10 @@ export function UploadCenter() {
         </div>
         <div className="rounded-xl p-2 space-y-2" style={{backgroundColor:'#F9FAFB', border:`1px solid ${COLORS.border}`}}>
           <Button onClick={downloadSampleTemplate} variant="outline" size="sm" className="w-full gap-2"><Download className="h-4 w-4"/> Template</Button>
-          <Button onClick={handleUpload} disabled={uploading} size="sm" className="w-full" style={{backgroundColor: COLORS.primary, color:'#fff'}}>{uploading?'Uploading...':'Upload'}</Button>
+          <Button onClick={handleUpload} disabled={uploading || !uploadScopeReady} size="sm" className="w-full" style={{backgroundColor: COLORS.primary, color:'#fff'}}>{uploading?'Uploading...':'Upload'}</Button>
+          {!uploadScopeReady && (
+            <p className="text-xs" style={{color: COLORS.danger}}>{uploadScopeErrors.join(' ')}</p>
+          )}
           <Button onClick={clearFile} variant="outline" size="sm" className="w-full">Clear</Button>
         </div>
       </div>

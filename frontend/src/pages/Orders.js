@@ -6,7 +6,7 @@ import { useLocation, useOutletContext } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { openOrderDeskPrint } from '@/utils/orderDeskPrint';
-import { FileSpreadsheet, ClipboardPaste, Search, Send, ChevronDown, ChevronUp, Printer, Eraser, Plus, Lock } from 'lucide-react';
+import { FileSpreadsheet, ClipboardPaste, Search, Send, ChevronDown, ChevronUp, Printer, Eraser, Plus, Lock, Download } from 'lucide-react';
 import { toast } from 'sonner';
 
 const emptyRows = [];
@@ -86,6 +86,28 @@ function isOwnOrderingBranch(source, order) {
 function formatNumber(value) {
   const n = Number(value || 0);
   return Number.isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '0';
+}
+
+function itemUnitValue(item) {
+  const raw = item?.value ?? item?.unit_value;
+  if (raw === null || raw === undefined || raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function itemTotalValue(item) {
+  const raw = item?.total_value;
+  if (raw !== null && raw !== undefined && raw !== '') {
+    const n = Number(raw);
+    if (Number.isFinite(n)) return n;
+  }
+  const unit = itemUnitValue(item);
+  if (unit === null) return null;
+  return unit * Number(item?.required_qty || 0);
+}
+
+function formatValueCell(value) {
+  return value === null || value === undefined ? '-' : formatNumber(value);
 }
 
 function StatusBadge({ status }) {
@@ -203,6 +225,7 @@ export function Orders() {
   const location = useLocation();
 
   const [currentOrder, setCurrentOrder] = useState(null);
+  const orderFinished = !!(currentOrder?.finished_at || currentOrder?.status === 'Finished' || (currentOrder?.status === 'Completed' && currentOrder?.finished_by));
   const [items, setItems] = useState(emptyRows);
   const [allocations, setAllocations] = useState({});
   const [loading, setLoading] = useState(false);
@@ -632,6 +655,23 @@ export function Orders() {
     }
   };
 
+  const downloadCurrentOrder = async () => {
+    if (!currentOrder?.id) return toast.error('Open an order first');
+    try {
+      const res = await axios.get(`${API}/order-desk/orders/${currentOrder.id}/export`, { responseType: 'blob' });
+      const disposition = res.headers?.['content-disposition'] || '';
+      const match = /filename="?([^"]+)"?/i.exec(disposition);
+      const fileName = match?.[1] || `Order_Desk_${currentOrder.order_number || currentOrder.id}.xlsx`;
+      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const link = document.createElement('a');
+      link.href = url; link.setAttribute('download', fileName);
+      document.body.appendChild(link); link.click(); link.remove(); window.URL.revokeObjectURL(url);
+      toast.success('Excel downloaded');
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Unable to download Excel');
+    }
+  };
+
   const exportTemplate = async () => {
     try {
       const res = await axios.get(`${API}/order-desk/template`, { responseType: 'blob' });
@@ -678,10 +718,11 @@ export function Orders() {
       <div className="rounded-xl border bg-white p-3 shadow-sm">
         <div className="flex flex-wrap items-center gap-2">
           <input ref={fileRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={handleUpload} />
-          <Button onClick={() => fileRef.current?.click()} disabled={loading}><FileSpreadsheet className="mr-2 h-4 w-4" />Upload Excel</Button>
-          <Button variant="outline" onClick={() => setPasteOpen(true)} disabled={loading}><ClipboardPaste className="mr-2 h-4 w-4" />Copy From Excel</Button>
+          <Button onClick={() => fileRef.current?.click()} disabled={loading || orderFinished}><FileSpreadsheet className="mr-2 h-4 w-4" />Upload Excel</Button>
+          <Button variant="outline" onClick={() => setPasteOpen(true)} disabled={loading || orderFinished}><ClipboardPaste className="mr-2 h-4 w-4" />Copy From Excel</Button>
           <Button variant="outline" onClick={exportTemplate}>Download Template</Button>
-          <Button variant="outline" onClick={() => setAddItemsOpen(true)} disabled={!currentOrder || loading}><Plus className="mr-2 h-4 w-4" />Add Items</Button>
+          <Button variant="outline" onClick={downloadCurrentOrder} disabled={!currentOrder || loading}><Download className="mr-2 h-4 w-4" />Download Excel</Button>
+          <Button variant="outline" onClick={() => setAddItemsOpen(true)} disabled={!currentOrder || loading || orderFinished}><Plus className="mr-2 h-4 w-4" />Add Items</Button>
           <div className="ml-auto text-sm">
             <span className="text-slate-500">Order Number: </span>
             <span className="font-bold text-emerald-700">{currentOrder?.order_number || 'Created after upload'}</span>
@@ -777,11 +818,11 @@ export function Orders() {
                 <option value="365">365+ Days</option>
               </select>
             </label>
-            <Button onClick={checkAvailability} disabled={!currentOrder || loading || !scopeReady}><Search className="mr-2 h-4 w-4" />Check Own Branch Availability</Button>
-            <Button variant="outline" onClick={() => runAutoSuggest('own')} disabled={!currentOrder || !currentOrder?.availability_checked || loading || !!autoSuggestLoading}>
+            <Button onClick={checkAvailability} disabled={!currentOrder || loading || !scopeReady || orderFinished}><Search className="mr-2 h-4 w-4" />Check Own Branch Availability</Button>
+            <Button variant="outline" onClick={() => runAutoSuggest('own')} disabled={!currentOrder || !currentOrder?.availability_checked || loading || !!autoSuggestLoading || orderFinished}>
               {autoSuggestLoading === 'own' ? 'Suggesting…' : 'Auto Suggest Own Branch'}
             </Button>
-            <Button onClick={() => sendRequests('own')} disabled={!currentOrder || loading || !!sendingRequest}>
+            <Button onClick={() => sendRequests('own')} disabled={!currentOrder || loading || !!sendingRequest || orderFinished}>
               <Send className="mr-2 h-4 w-4" />{sendingRequest === 'own' ? 'Sending…' : 'Send Own Branch Request'}
             </Button>
           </div>
@@ -806,11 +847,11 @@ export function Orders() {
                 <option value="365">365+ Days</option>
               </select>
             </label>
-            <Button onClick={checkAvailability} disabled={!currentOrder || loading || !scopeReady}><Search className="mr-2 h-4 w-4" />Check Branches Availability</Button>
-            <Button variant="outline" onClick={() => runAutoSuggest('branch')} disabled={!currentOrder || !currentOrder?.availability_checked || loading || !!autoSuggestLoading || !branchUnlocked}>
+            <Button onClick={checkAvailability} disabled={!currentOrder || loading || !scopeReady || orderFinished}><Search className="mr-2 h-4 w-4" />Check Branches Availability</Button>
+            <Button variant="outline" onClick={() => runAutoSuggest('branch')} disabled={!currentOrder || !currentOrder?.availability_checked || loading || !!autoSuggestLoading || !branchUnlocked || orderFinished}>
               {autoSuggestLoading === 'branch' ? 'Suggesting…' : 'Auto Suggest Branches'}
             </Button>
-            <Button onClick={() => sendRequests('branch')} disabled={!currentOrder || loading || !!sendingRequest || !branchUnlocked}>
+            <Button onClick={() => sendRequests('branch')} disabled={!currentOrder || loading || !!sendingRequest || !branchUnlocked || orderFinished}>
               <Send className="mr-2 h-4 w-4" />{sendingRequest === 'branch' ? 'Sending…' : 'Send Branches Request'}
             </Button>
           </div>
@@ -835,11 +876,11 @@ export function Orders() {
                 <option value="365">365+ Days</option>
               </select>
             </label>
-            <Button onClick={checkAvailability} disabled={!currentOrder || loading || !scopeReady || !dealerUnlocked}><Search className="mr-2 h-4 w-4" />Check Dealer Availability</Button>
-            <Button variant="outline" onClick={() => runAutoSuggest('dealer')} disabled={!currentOrder || !currentOrder?.availability_checked || loading || !!autoSuggestLoading || !dealerUnlocked}>
+            <Button onClick={checkAvailability} disabled={!currentOrder || loading || !scopeReady || !dealerUnlocked || orderFinished}><Search className="mr-2 h-4 w-4" />Check Dealer Availability</Button>
+            <Button variant="outline" onClick={() => runAutoSuggest('dealer')} disabled={!currentOrder || !currentOrder?.availability_checked || loading || !!autoSuggestLoading || !dealerUnlocked || orderFinished}>
               {autoSuggestLoading === 'dealer' ? 'Suggesting…' : 'Auto Suggest Dealer'}
             </Button>
-            <Button onClick={() => sendRequests('dealer')} disabled={!currentOrder || loading || !!sendingRequest || !dealerUnlocked}>
+            <Button onClick={() => sendRequests('dealer')} disabled={!currentOrder || loading || !!sendingRequest || !dealerUnlocked || orderFinished}>
               <Send className="mr-2 h-4 w-4" />{sendingRequest === 'dealer' ? 'Sending…' : 'Send Dealer Request'}
             </Button>
           </div>
@@ -873,7 +914,7 @@ export function Orders() {
                     placeholder="Apply to selected parts"
                   />
                 </label>
-                <Button size="sm" disabled={!canSaveSystemOrder || factorySaving === 'bulk'} onClick={applyFactoryBulk}>
+                <Button size="sm" disabled={!canSaveSystemOrder || factorySaving === 'bulk' || orderFinished} onClick={applyFactoryBulk}>
                   {factorySaving === 'bulk' ? 'Applying…' : 'Apply to Selected'}
                 </Button>
               </div>
@@ -903,7 +944,7 @@ export function Orders() {
         <div className="overflow-x-auto">
           <table className="w-full text-sm min-w-[920px]">
             <thead className="bg-emerald-50">
-              <tr>{[activeStage === 'factory' ? 'Select' : '', 'Part No', 'Part Name', 'Required', 'Accepted', 'Remaining', 'Requested From', 'Status', 'Action'].filter((h, idx) => h || idx > 0).map(h => <th key={h || 'select'} className="p-3 text-left">{h}</th>)}</tr>
+              <tr>{[activeStage === 'factory' ? 'Select' : '', 'Part No', 'Part Name', 'Requested Qty', 'Arranged Qty', 'Balance Order Qty', 'Value', 'Total Value', 'Arranged From', 'Status', 'Action'].filter((h, idx) => h || idx > 0).map(h => <th key={h || 'select'} className="p-3 text-left">{h}</th>)}</tr>
             </thead>
             <tbody>
               {filteredItems.map(item => {
@@ -943,6 +984,8 @@ export function Orders() {
                       <td className="p-3">{formatNumber(item.required_qty)}</td>
                       <td className="p-3">{formatNumber(item.accepted_qty)}</td>
                       <td className="p-3">{formatNumber(remaining)}</td>
+                      <td className="p-3">{formatValueCell(itemUnitValue(item))}</td>
+                      <td className="p-3">{formatValueCell(itemTotalValue(item))}</td>
                       <td className="p-3 text-xs leading-snug max-w-[220px]">{compactRequestedFrom(item, selected)}</td>
                       <td className="p-3">
                         <StatusBadge status={badgeStatus} />
@@ -954,14 +997,14 @@ export function Orders() {
                         {item.cancel_allowed && item.pending_request_number && (
                           <Button size="sm" variant="outline" onClick={() => cancelTimeout(item.pending_request_number)}>Cancel – No Response</Button>
                         )}
-                        {!item.qty_locked && !['Cancelled', 'Cancellation Requested', 'Accepted', 'Completed'].includes(item.request_status) && (
+                        {!item.qty_locked && !orderFinished && !['Cancelled', 'Cancellation Requested', 'Accepted', 'Completed'].includes(item.request_status) && (
                           <Button size="sm" variant="outline" className="text-amber-800" onClick={() => { setCancelItem(item); setCancelOpen(true); setCancelReason(''); setCancelRemarks(''); }}>Request Cancellation</Button>
                         )}
                       </td>
                     </tr>
                     {expanded && (
                       <tr className="bg-slate-50 border-t">
-                        <td colSpan={activeStage === 'factory' ? 9 : 8} className="p-4 space-y-4">
+                        <td colSpan={activeStage === 'factory' ? 11 : 10} className="p-4 space-y-4">
                           {showFactory && activeStage === 'factory' ? (
                             <div className="rounded-lg border bg-white p-4 space-y-3">
                               <div className="font-semibold mb-1">Factory / Other Source</div>
@@ -990,12 +1033,12 @@ export function Orders() {
                                         ...p,
                                         [item.id]: { ...(p[item.id] || {}), system_order_number: e.target.value },
                                       }))}
-                                      disabled={!canSaveSystemOrder || (!!item.system_order_number && !isMaster)}
+                                      disabled={!canSaveSystemOrder || orderFinished || (!!item.system_order_number && !isMaster)}
                                     />
                                   </label>
                                   <Button
                                     size="sm"
-                                    disabled={factorySaving === item.id || (!remaining && !item.system_order_number)}
+                                    disabled={orderFinished || factorySaving === item.id || (!remaining && !item.system_order_number)}
                                     onClick={() => saveFactorySystemOrder(item)}
                                   >
                                     {factorySaving === item.id ? 'Saving…' : (item.system_order_number && isMaster ? 'Correct & Save' : 'Save & Close Factory')}
@@ -1101,8 +1144,8 @@ export function Orders() {
                   </React.Fragment>
                 );
               })}
-              {!items.length && <tr><td colSpan={activeStage === 'factory' ? 9 : 8} className="p-10 text-center text-slate-500">Upload Excel or Copy From Excel to create an order.</td></tr>}
-              {items.length > 0 && !filteredItems.length && <tr><td colSpan={activeStage === 'factory' ? 9 : 8} className="p-10 text-center text-slate-500">No items match filters.</td></tr>}
+              {!items.length && <tr><td colSpan={activeStage === 'factory' ? 11 : 10} className="p-10 text-center text-slate-500">Upload Excel or Copy From Excel to create an order.</td></tr>}
+              {items.length > 0 && !filteredItems.length && <tr><td colSpan={activeStage === 'factory' ? 11 : 10} className="p-10 text-center text-slate-500">No items match filters.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1112,7 +1155,7 @@ export function Orders() {
         <DialogContent className="max-w-3xl">
           <DialogHeader><DialogTitle>Copy From Excel</DialogTitle></DialogHeader>
           <textarea value={pasteText} onChange={e => setPasteText(e.target.value)} rows={12} className="w-full rounded-lg border p-3 font-mono text-sm" placeholder={'Part Number\tQuantity\tDescription\tValue'} />
-          <div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setPasteOpen(false)}>Cancel</Button><Button onClick={submitPaste} disabled={loading}>Create Order</Button></div>
+          <div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setPasteOpen(false)}>Cancel</Button><Button onClick={submitPaste} disabled={loading || orderFinished}>Create Order</Button></div>
         </DialogContent>
       </Dialog>
 
@@ -1120,7 +1163,7 @@ export function Orders() {
         <DialogContent className="max-w-3xl">
           <DialogHeader><DialogTitle>Add Items to {currentOrder?.order_number || 'Order'}</DialogTitle></DialogHeader>
           <textarea value={addItemsText} onChange={e => setAddItemsText(e.target.value)} rows={10} className="w-full rounded-lg border p-3 font-mono text-sm" />
-          <div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setAddItemsOpen(false)}>Cancel</Button><Button onClick={submitAddItems} disabled={loading}>Add Items</Button></div>
+          <div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setAddItemsOpen(false)}>Cancel</Button><Button onClick={submitAddItems} disabled={loading || orderFinished}>Add Items</Button></div>
         </DialogContent>
       </Dialog>
 

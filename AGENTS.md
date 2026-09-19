@@ -24,9 +24,11 @@ run from the project venv (see below). Details: `.devcontainer/README.md`.
   `cd backend && ./venv/bin/python -m uvicorn server:socket_app --host 0.0.0.0 --port 8000`
   (equivalent: `./venv/bin/uvicorn server:socket_app --host 0.0.0.0 --port 8000`).
   Do not use system `python` / system `uvicorn`.
-- Config comes from `backend/.env` (committed). `MONGO_URL` points at a **shared
-  hosted MongoDB Atlas cluster** with real-ish data — there is no local Mongo.
-  Treat writes as affecting shared data; prefer clearly-labelled test values.
+- Config comes from `backend/.env` (committed). On production EC2,
+ `DOCDB_TLS_CA_FILE` is set and credentials come from AWS Secrets Manager
+ (Amazon DocumentDB). When `DOCDB_TLS_CA_FILE` is unset, `MONGO_URL` is used
+ unchanged as a local/dev fallback. There is no local Mongo process.
+ Treat writes as affecting shared data; prefer clearly-labelled test values.
 - For REAL S3, Codespaces secrets (or gitignored `backend/.env.s3.local`) must
   provide `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `NMTS_S3_BUCKET`,
   `AWS_REGION` (optional `NMTS_STORAGE_ENV`). Keep `ARCHIVE_PRUNE_ENABLED=false`
@@ -55,8 +57,8 @@ run from the project venv (see below). Details: `.devcontainer/README.md`.
 
 - Backend API tests: `cd backend && REACT_APP_BACKEND_URL=http://127.0.0.1:8000
   ./venv/bin/python -m pytest tests/test_api.py -v`. These hit a **running**
-  backend over HTTP (start it first) and talk to the shared Atlas DB, so the run
-  is slow (a few minutes). One test, `TestUsers::test_create_user`, is a known
+  backend over HTTP (start it first) and talk to the shared DocumentDB (or
+  the `MONGO_URL` fallback), so the run is slow (a few minutes). One test, `TestUsers::test_create_user`, is a known
   pre-existing failure: its payload omits the now-required `state` field, so the
   server correctly returns `400 State is required`.
 - Frontend lint runs as part of `npm start` / `npm run build` (craco + eslint

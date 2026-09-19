@@ -70,6 +70,27 @@ function friendlyError(error) {
   return error?.message || 'Something went wrong. Please try again.';
 }
 
+function KeyboardScreen({ children, extraBottom = 24, contentStyle, scroll = false }) {
+  return (
+    <KeyboardAvoidingView
+      style={styles.flex}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 18}
+    >
+      {scroll ? (
+        <ScrollView
+          style={styles.flex}
+          contentContainerStyle={[{ flexGrow: 1, paddingBottom: extraBottom }, contentStyle]}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="interactive"
+        >
+          {children}
+        </ScrollView>
+      ) : children}
+    </KeyboardAvoidingView>
+  );
+}
+
 function cleanPartNumber(value) {
   return String(value || '')
     .toUpperCase()
@@ -181,6 +202,7 @@ export default function App() {
   const [autoBusy, setAutoBusy] = useState(false);
   const [autoSelected, setAutoSelected] = useState(null);
   const [autoDamageQty, setAutoDamageQty] = useState('');
+  const [lastAutoResult, setLastAutoResult] = useState(null);
   const [damageQty, setDamageQty] = useState('');
 
   const [searchInput, setSearchInput] = useState('');
@@ -268,7 +290,19 @@ export default function App() {
           loadAutoTasks().finally(() => setScreen('auto'));
           return;
         }
+        if (data?.notificationAction === 'snooze') {
+          if (data?.request_group_key) {
+            skipNotification(data.request_group_key).catch(() => {});
+          }
+          setScreen('notifications');
+          return;
+        }
         setScreen('notifications');
+        if (data?.notificationAction === 'start_picking' && data?.request_group_key) {
+          loadNotifications().then(() => {
+            /* Request list is the Start Picking entry point */
+          }).catch(() => {});
+        }
       },
     })
       .then((fn) => {
@@ -555,6 +589,7 @@ Server: ${apiBaseUrl}`, [
 
   const selectAutoTask = (task) => {
     setAutoSelected(task);
+    setLastAutoResult(null);
     setVerificationInput(cleanPartNumber(task.part_number));
     setSelectedPart({
       partNumber: cleanPartNumber(task.part_number),
@@ -587,6 +622,16 @@ Server: ${apiBaseUrl}`, [
         isNewPart: false,
         verificationType: 'auto',
         damageQty: numberValue(autoDamageQty),
+      });
+      const sys = numberValue(autoSelected.system_qty ?? autoSelected.systemQty);
+      const phys = numberValue(physicalQty);
+      setLastAutoResult({
+        partNumber: autoSelected.part_number,
+        partName: autoSelected.part_name,
+        location: (physicalLocation || autoSelected.loc || '').trim().toUpperCase(),
+        systemQty: sys,
+        physicalQty: phys,
+        ...differenceFor(sys, phys, 0),
       });
       Alert.alert('Saved', 'Auto Perpetual verification queued for sync.');
       setAutoSelected(null);
@@ -808,6 +853,7 @@ Server: ${apiBaseUrl}`, [
           onRefresh={loadAutoTasks}
           onSubmit={submitAutoVerification}
           onFinish={finishAutoWork}
+          lastResult={lastAutoResult}
         />
       )}
       {screen === 'verification' && (
@@ -882,7 +928,7 @@ Server: ${apiBaseUrl}`, [
 
 function PairScreen(props) {
   return (
-    <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 18}>
+    <KeyboardScreen>
       <ScrollView contentContainerStyle={styles.pairPage} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
         <Image source={require("./assets/sleeping-stock-logo-transparent.png")} style={styles.brandLogo} resizeMode="contain" />
         <Text style={styles.appTitle}>Sleeping Stock Mobile</Text>
@@ -895,7 +941,7 @@ function PairScreen(props) {
           {!!props.mobileUserId && <Text style={styles.detectedUser}>Detected User: {props.mobileUserId}</Text>}
         </View>
       </ScrollView>
-    </KeyboardAvoidingView>
+    </KeyboardScreen>
   );
 }
 
@@ -919,13 +965,9 @@ function HomeScreen({ session, pendingCount, navigate, logout }) {
   );
 }
 
-function AutoPerpetualScreen({ onBack, sessionId, tasks, progress, busy, selected, onSelect, physicalQty, setPhysicalQty, physicalLocation, setPhysicalLocation, remark, setRemark, damageQty, setDamageQty, onRefresh, onSubmit, onFinish }) {
-  const diff = selected ? differenceFor(selected.system_qty ?? selected.systemQty, physicalQty, 0) : null;
-  const locMatch = selected && physicalLocation
-    ? (String(selected.loc || selected.system_location || '').trim().toUpperCase() === String(physicalLocation).trim().toUpperCase())
-    : null;
+function AutoPerpetualScreen({ onBack, sessionId, tasks, progress, busy, selected, onSelect, physicalQty, setPhysicalQty, physicalLocation, setPhysicalLocation, remark, setRemark, damageQty, setDamageQty, onRefresh, onSubmit, onFinish, lastResult }) {
   return (
-    <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 18}>
+    <KeyboardScreen>
       <Header title="Auto Perpetual" onBack={onBack} action="Refresh" onAction={onRefresh} />
       <ScrollView style={styles.flex} contentContainerStyle={[styles.topContent, { paddingBottom: 220 }]} keyboardShouldPersistTaps="handled">
         <Text style={styles.sectionLabel}>TODAY&apos;S AUTO PERPETUAL</Text>
@@ -938,8 +980,8 @@ function AutoPerpetualScreen({ onBack, sessionId, tasks, progress, busy, selecte
         )}
         {selected && (
           <View style={styles.detailCard}>
-            <Text style={styles.sectionLabel}>SYSTEM (read-only)</Text>
-            <InfoGrid rows={[['Part No', selected.part_number], ['Description', selected.part_name || '-'], ['System Qty', selected.system_qty ?? '-'], ['System LOC', selected.loc || selected.system_location || '-']]} />
+            <Text style={styles.sectionLabel}>COUNT THIS PART</Text>
+            <InfoGrid rows={[['Part No', selected.part_number], ['Description', selected.part_name || '-'], ['Location', selected.loc || selected.system_location || '-']]} />
             <Text style={styles.sectionLabel}>PHYSICAL VERIFICATION</Text>
             <View style={styles.twoInputs}>
               <TextInput style={[styles.bottomInput, styles.halfInput]} value={physicalQty} onChangeText={(v) => setPhysicalQty(v.replace(/[^0-9.]/g, ''))} placeholder="Physical Qty" keyboardType="decimal-pad" placeholderTextColor="#8793a6" />
@@ -947,10 +989,21 @@ function AutoPerpetualScreen({ onBack, sessionId, tasks, progress, busy, selecte
             </View>
             <TextInput style={styles.bottomInput} value={physicalLocation} onChangeText={setPhysicalLocation} placeholder="Physical Location" autoCapitalize="characters" placeholderTextColor="#8793a6" />
             <TextInput style={styles.bottomInput} value={remark} onChangeText={setRemark} placeholder="Remark (optional)" placeholderTextColor="#8793a6" />
-            {diff && <StatusPill value={diff.status} />}
-            {locMatch === false && <Text style={{ color: '#b45309', marginTop: 6 }}>Location mismatch vs system</Text>}
-            {locMatch === true && diff?.status === 'MATCHED' && <Text style={{ color: '#15803d', marginTop: 6 }}>Qty & location matched</Text>}
             <PrimaryButton title="Submit & Next" onPress={onSubmit} busy={busy} />
+          </View>
+        )}
+        {lastResult && (
+          <View style={styles.detailCard}>
+            <Text style={styles.sectionLabel}>LAST COUNT RESULT</Text>
+            <InfoGrid rows={[
+              ['Part No', lastResult.partNumber],
+              ['System Qty', lastResult.systemQty],
+              ['Physical Qty', lastResult.physicalQty],
+              ['Matched/Shortage/Excess', lastResult.status],
+              ['Shortage Qty', lastResult.shortageQty ?? 0],
+              ['Excess Qty', lastResult.excessQty ?? 0],
+            ]} />
+            {lastResult.status && <StatusPill value={lastResult.status} />}
           </View>
         )}
         <SecondaryButton title="Finish Auto Perpetual Session" onPress={onFinish} disabled={!sessionId} />
@@ -961,7 +1014,7 @@ function AutoPerpetualScreen({ onBack, sessionId, tasks, progress, busy, selecte
           </TouchableOpacity>
         ))}
       </ScrollView>
-    </KeyboardAvoidingView>
+    </KeyboardScreen>
   );
 }
 
@@ -973,11 +1026,7 @@ function VerificationScreen(props) {
   }), { matched: 0, shortage: 0, excess: 0 });
   const diff = props.selectedPart ? differenceFor(props.selectedPart.systemQty, props.physicalQty, props.selectedPart.unitValue) : null;
   return (
-    <KeyboardAvoidingView
-      style={styles.flex}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 18}
-    >
+    <KeyboardScreen>
       <Header title="Stock Verification" onBack={props.onBack} />
       <ScrollView style={styles.flex} contentContainerStyle={[styles.topContent, { paddingBottom: 220 }]} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
         <Text style={styles.sectionLabel}>ADDED PARTS ({props.list.length})</Text>
@@ -1030,32 +1079,30 @@ function VerificationScreen(props) {
             <PrimaryButton title={`Submit All (${props.list.length})`} onPress={props.onSubmit} disabled={!props.list.length} busy={props.busy} compact />
           </View>
         </View>
-    </KeyboardAvoidingView>
+    </KeyboardScreen>
   );
 }
 
 function SearchScreen(props) {
   return (
-    <View style={styles.flex}>
+    <KeyboardScreen>
       <Header title="Stock Availability" onBack={props.onBack} />
-      <ScrollView style={styles.flex} contentContainerStyle={styles.topContent} keyboardShouldPersistTaps="handled">
+      <ScrollView style={styles.flex} contentContainerStyle={styles.topContent} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
         <Text style={styles.sectionLabel}>SEARCH RESULTS ({props.results.length})</Text>
         {props.results.length === 0 ? <Empty text="Search results will appear here." /> : props.results.map((row) => <StockRow key={row.partNumber} row={row} />)}
         {props.parts.length > 0 && <View style={styles.chipWrap}>{props.parts.map((part) => <TouchableOpacity key={part} style={styles.chip} onPress={() => props.removePart(part)}><Text style={styles.chipText}>{part} ×</Text></TouchableOpacity>)}</View>}
       </ScrollView>
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 18}>
-        <View style={styles.bottomPanel}>
-          <View style={styles.inlineInputRow}>
-            <TextInput style={[styles.bottomInput, { minHeight: 48 }]} value={props.input} onChangeText={props.setInput} placeholder="Enter / Paste Part Numbers" placeholderTextColor="#8793a6" autoCapitalize="characters" multiline />
-            <SquareButton title="▣" onPress={props.onScan} />
-          </View>
-          <View style={styles.actionRow}>
-            <SecondaryButton title="Add to List" onPress={props.onAdd} />
-            <PrimaryButton title="Search All" onPress={props.onSearch} busy={props.busy} compact />
-          </View>
+      <View style={styles.bottomPanel}>
+        <View style={styles.inlineInputRow}>
+          <TextInput style={[styles.bottomInput, { minHeight: 48 }]} value={props.input} onChangeText={props.setInput} placeholder="Enter / Paste Part Numbers" placeholderTextColor="#8793a6" autoCapitalize="characters" multiline />
+          <SquareButton title="▣" onPress={props.onScan} />
         </View>
-      </KeyboardAvoidingView>
-    </View>
+        <View style={styles.actionRow}>
+          <SecondaryButton title="Add to List" onPress={props.onAdd} />
+          <PrimaryButton title="Search All" onPress={props.onSearch} busy={props.busy} compact />
+        </View>
+      </View>
+    </KeyboardScreen>
   );
 }
 
@@ -1087,10 +1134,10 @@ function NotificationsScreen({ onBack, rows, busy, refresh, openRequest, pickReq
 
 function RequestScreen({ onBack, request, rows, updateRow, onSubmit, busy }) {
   return (
-    <View style={styles.flex}>
+    <KeyboardScreen>
       <Header title="Request Parts" onBack={onBack} />
       <View style={styles.requestHeader}><Text style={styles.requestHeaderNo}>{request?.request_number}</Text><Text style={styles.requestHeaderSub}>{request?.requesting_branch || request?.requesting_dealer || '-'}</Text></View>
-      <ScrollView style={styles.flex} contentContainerStyle={styles.requestPartsContent} keyboardShouldPersistTaps="handled">
+      <ScrollView style={styles.flex} contentContainerStyle={styles.requestPartsContent} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
         <View style={styles.tableHeader}><Text style={[styles.th, { flex: 2 }]}>Part Number</Text><Text style={styles.th}>Req</Text><Text style={styles.th}>Avail</Text><Text style={styles.th}>Accept</Text><Text style={styles.th}>LOC</Text></View>
         {rows.map((row) => {
           const accepted = numberValue(row.acceptedQty);
@@ -1109,7 +1156,7 @@ function RequestScreen({ onBack, request, rows, updateRow, onSubmit, busy }) {
         })}
       </ScrollView>
       <View style={styles.submitBar}><PrimaryButton title="Submit Request Response" onPress={onSubmit} busy={busy} /></View>
-    </View>
+    </KeyboardScreen>
   );
 }
 
