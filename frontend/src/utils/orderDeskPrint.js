@@ -34,6 +34,8 @@ export function openOrderDeskPrint({ order, items = [] }) {
             <td>${nfmt(avail)}</td>
             <td>${nfmt(alloc)}</td>
             <td>${nfmt(bal)}</td>
+            <td>${item.value == null && item.unit_value == null && item.total_value == null ? '-' : nfmt(item.value ?? item.unit_value ?? 0)}</td>
+            <td>${item.total_value == null && item.value == null && item.unit_value == null ? '-' : nfmt(item.total_value ?? ((Number(item.value ?? item.unit_value ?? 0)) * req))}</td>
             <td>${esc(item.loc || item.location || src.loc || '-')}</td>
             <td>${esc(item.purchase_aging_days ?? '-')}</td>
             <td>${esc(item.sales_aging_days ?? '-')}</td>
@@ -48,7 +50,7 @@ export function openOrderDeskPrint({ order, items = [] }) {
         <div class="summary">
           <div class="meta"><b>ORDER NO</b><span>: ${esc(order?.order_number)}</span><b>BRAND</b><span>: ${esc(order?.brand_name)}</span><b>DEALER</b><span>: ${esc(order?.dealer_name)}</span><b>BRANCH</b><span>: ${esc(order?.branch)}</span><b>STATUS</b><span>: ${esc(order?.status)}</span></div>
         </div>
-        <table><thead><tr><th>S.No</th><th>PART NO</th><th>DESCRIPTION</th><th>REQ QTY</th><th>AVAIL</th><th>ALLOC</th><th>BALANCE</th><th>LOC</th><th>PUR AGING</th><th>SAL AGING</th><th>SOURCE</th><th>STATUS</th></tr></thead><tbody>${body}</tbody></table>
+        <table><thead><tr><th>S.No</th><th>PART NO</th><th>DESCRIPTION</th><th>REQ QTY</th><th>AVAIL</th><th>ALLOC</th><th>BALANCE</th><th>VALUE</th><th>TOTAL VALUE</th><th>LOC</th><th>PUR AGING</th><th>SAL AGING</th><th>SOURCE</th><th>STATUS</th></tr></thead><tbody>${body}</tbody></table>
       </section>`;
     })
     .join('');

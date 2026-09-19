@@ -3,11 +3,15 @@
 This module does not open a connection. It only decides the URL and kwargs
 that callers should pass to AsyncIOMotorClient / MongoClient.
 
-Atlas path (DOCDB_TLS_CA_FILE unset or blank): return the URL unchanged and
-an empty kwargs dict so `AsyncIOMotorClient(url)` is identical to today.
-DocumentDB path (DOCDB_TLS_CA_FILE set): load credentials from AWS Secrets
-Manager at runtime (never from MONGO_URL / never logged), then pass tls=True,
-tlsCAFile, retryWrites=false, and readPreference=secondaryPreferred.
+When DOCDB_TLS_CA_FILE is unset or blank (local/dev fallback): return the
+MONGO_URL unchanged and an empty kwargs dict so `AsyncIOMotorClient(url)`
+is identical to a plain Mongo/Atlas connection.
+
+When DOCDB_TLS_CA_FILE is set (production EC2 uses this path): load
+credentials from AWS Secrets Manager at runtime (never from MONGO_URL /
+never logged), then pass tls=True, tlsCAFile, retryWrites=false, and
+readPreference=secondaryPreferred. Driver names stay Motor/PyMongo —
+DocumentDB is Mongo wire-compatible.
 """
 from __future__ import annotations
 

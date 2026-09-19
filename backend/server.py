@@ -65,6 +65,10 @@ try:
     from . import hybrid_order_history
     from . import hybrid_request_history
     from . import archive_keys as archive_keys
+    from . import upload_scope
+    from . import order_desk_guards as odg
+    from . import request_fulfillment as rff
+    from . import request_in_transit_reminder
 except ImportError:
     import s3_storage
     import file_objects
@@ -80,6 +84,10 @@ except ImportError:
     import hybrid_order_history
     import hybrid_request_history
     import archive_keys
+    import upload_scope
+    import order_desk_guards as odg
+    import request_fulfillment as rff
+    import request_in_transit_reminder
 
 s3_storage.load_storage_dotenv()
 
@@ -88,8 +96,10 @@ try:
 except ImportError:
     from mongo_connection import build_mongo_client_args, resolve_mongo_url
 
-# MongoDB connection (Atlas MONGO_URL by default; DocumentDB via Secrets Manager
-# when DOCDB_TLS_CA_FILE is set — password is never read from .env or logged)
+# MongoDB / DocumentDB connection. When DOCDB_TLS_CA_FILE is set (production
+# EC2), credentials come from Secrets Manager and the client talks to DocumentDB.
+# When unset, MONGO_URL is used unchanged (local/dev Atlas-style fallback).
+# Driver identifiers stay client/db/mongo_url — DocumentDB is Mongo wire-compatible.
 mongo_url = resolve_mongo_url()
 _mongo_url, _mongo_kwargs = build_mongo_client_args(mongo_url)
 client = AsyncIOMotorClient(_mongo_url, **_mongo_kwargs)
@@ -727,10 +737,35 @@ async def delete_product(product_id: str, current_user: UserResponse = Depends(g
 
 # ==================== UPLOAD ROUTES ====================
 
-async def process_product_upload(file: UploadFile, current_user: UserResponse):
+async def _apply_selected_upload_scope(ctx: dict, current_user: UserResponse, brand: str, dealer: str, branch: str) -> dict:
+    """Stamp selected Brand/Dealer/Branch onto an upload context after the guard."""
+    upload_scope.require_specific_upload_scope(brand, dealer, branch)
+    role = (current_user.role or "").lower()
+    if role == "master":
+        ctx["brand_name"] = brand
+        ctx["brand"] = brand
+        ctx["dealer_name"] = dealer
+        ctx["dealer_code"] = dealer or ctx.get("dealer_code")
+        ctx["branch"] = branch
+        ctx["location"] = branch
+        ctx["brand_code"] = await resolve_brand_code_for_upload(brand)
+    elif role == "admin":
+        ctx["branch"] = branch
+        ctx["location"] = branch
+    return ctx
+
+
+async def process_product_upload(
+    file: UploadFile,
+    current_user: UserResponse,
+    brand: str = "",
+    dealer: str = "",
+    branch: str = "",
+):
     if current_user.role not in ["master", "admin", "user"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+    upload_scope.require_specific_upload_scope(brand, dealer, branch)
+
     if not file.filename.endswith(('.xlsx', '.xls')):
         raise HTTPException(status_code=400, detail="Only Excel files are allowed")
     
@@ -738,6 +773,7 @@ async def process_product_upload(file: UploadFile, current_user: UserResponse):
     upload_date_str = upload_dt.strftime('%d-%m-%Y')
     upload_time_str = upload_dt.strftime('%H:%M:%S')
     user_ctx = await get_user_upload_context(current_user)
+    user_ctx = await _apply_selected_upload_scope(user_ctx, current_user, brand, dealer, branch)
     upload_no = await generate_upload_no("product", user_ctx["brand_code"])
 
     content = await file.read()
@@ -907,19 +943,28 @@ async def process_product_upload(file: UploadFile, current_user: UserResponse):
 
 
 @api_router.post("/upload/excel")
-async def upload_excel(file: UploadFile = File(...), current_user: UserResponse = Depends(get_current_user)):
-    return await process_product_upload(file, current_user)
+async def upload_excel(
+    file: UploadFile = File(...),
+    brand: str = Form(""),
+    dealer: str = Form(""),
+    branch: str = Form(""),
+    current_user: UserResponse = Depends(get_current_user),
+):
+    return await process_product_upload(file, current_user, brand=brand, dealer=dealer, branch=branch)
 
 
 @api_router.post("/upload")
 async def upload_product_center(
     file: UploadFile = File(...),
     upload_type: str = Form("product"),
+    brand: str = Form(""),
+    dealer: str = Form(""),
+    branch: str = Form(""),
     current_user: UserResponse = Depends(get_current_user),
 ):
     if upload_type != "product":
         raise HTTPException(status_code=400, detail="Only product upload is supported on this endpoint")
-    return await process_product_upload(file, current_user)
+    return await process_product_upload(file, current_user, brand=brand, dealer=dealer, branch=branch)
 
 @api_router.get("/uploads")
 async def get_uploads(
@@ -1341,9 +1386,16 @@ async def get_merged_order_data(current_user: UserResponse = Depends(get_current
     }
 
 @api_router.post("/orders/upload-stock")
-async def upload_order_stock(file: UploadFile = File(...), current_user: UserResponse = Depends(get_current_user)):
+async def upload_order_stock(
+    file: UploadFile = File(...),
+    brand: str = Form(""),
+    dealer: str = Form(""),
+    branch: str = Form(""),
+    current_user: UserResponse = Depends(get_current_user),
+):
     """Upload stock data for order management - each user's data is kept separate"""
-    
+    upload_scope.require_specific_upload_scope(brand, dealer, branch)
+
     if not file.filename.endswith(('.xlsx', '.xls')):
         raise HTTPException(status_code=400, detail="Only Excel files are allowed")
     
@@ -1351,6 +1403,7 @@ async def upload_order_stock(file: UploadFile = File(...), current_user: UserRes
     upload_date_str = upload_dt.strftime('%d-%m-%Y')
     upload_time_str = upload_dt.strftime('%H:%M:%S')
     user_ctx = await get_user_upload_context(current_user)
+    user_ctx = await _apply_selected_upload_scope(user_ctx, current_user, brand, dealer, branch)
     upload_no = await generate_upload_no("order", user_ctx["brand_code"])
 
     content = await file.read()
@@ -1481,8 +1534,14 @@ async def upload_order_stock(file: UploadFile = File(...), current_user: UserRes
 
 
 @api_router.post("/orders/upload")
-async def upload_order_center(file: UploadFile = File(...), current_user: UserResponse = Depends(get_current_user)):
-    return await upload_order_stock(file, current_user)
+async def upload_order_center(
+    file: UploadFile = File(...),
+    brand: str = Form(""),
+    dealer: str = Form(""),
+    branch: str = Form(""),
+    current_user: UserResponse = Depends(get_current_user),
+):
+    return await upload_order_stock(file, brand=brand, dealer=dealer, branch=branch, current_user=current_user)
 
 @api_router.post("/orders/send-requests")
 async def send_order_requests(request_data: dict, current_user: UserResponse = Depends(get_current_user)):
@@ -3342,14 +3401,22 @@ def _apply_role_scope_v2(query: dict, current_user: UserResponse, brand=None, de
 
 
 @api_router.post("/upload/v2")
-async def upload_product_center_v2(file: UploadFile = File(...), current_user: UserResponse = Depends(get_current_user)):
+async def upload_product_center_v2(
+    file: UploadFile = File(...),
+    brand: str = Form(""),
+    dealer: str = Form(""),
+    branch: str = Form(""),
+    current_user: UserResponse = Depends(get_current_user),
+):
     if current_user.role not in ["master", "admin", "user"]:
         raise HTTPException(status_code=403, detail="Not authorized")
+    upload_scope.require_specific_upload_scope(brand, dealer, branch)
     if not file.filename.lower().endswith((".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail="Only Excel files are allowed")
 
     now = _nmts_now()
     context = await _build_upload_context_v2(current_user)
+    context = await _apply_selected_upload_scope(context, current_user, brand, dealer, branch)
     upload_no = await generate_upload_no("product", context["brand_code"])
     raw_bytes = await file.read()
     file_size = len(raw_bytes)
@@ -4848,7 +4915,7 @@ async def _create_order_v2(rows, current_user: UserResponse, source: str, file_n
         qty = float(row.get('quantity', 0) or 0)
         total_value += item_value * qty
         total_qty += qty
-        items.append({
+        items.append(odg.apply_order_item_values({
             'id': str(uuid.uuid4()), 'order_id': order_id, 'order_number': order_number,
             'part_number': _order_clean_text(row.get('part_number')),
             'description': _order_clean_text(row.get('description')),
@@ -4856,7 +4923,7 @@ async def _create_order_v2(rows, current_user: UserResponse, source: str, file_n
             'allocated_qty': 0.0, 'balance_qty': qty,
             'availability_status': 'Not Checked', 'allocations': [],
             'status': 'Order Created', 'created_at': now.isoformat(), 'updated_at': now.isoformat(),
-        })
+        }, qty=qty, unit=item_value))
     order_doc = {
         'id': order_id, 'order_number': order_number, 'brand_name': ctx.get('brand_name', ''),
         'brand_code': ctx.get('brand_code', ''), 'dealer_name': ctx.get('dealer_name', ''),
@@ -4880,6 +4947,7 @@ async def _create_order_v2(rows, current_user: UserResponse, source: str, file_n
 
 @api_router.post('/order-desk/upload')
 async def order_desk_upload(file: UploadFile = File(...), brand: str = Form(''), dealer: str = Form(''), branch: str = Form(''), current_user: UserResponse = Depends(get_current_user)):
+    upload_scope.require_specific_upload_scope(brand, dealer, branch)
     if not file.filename.lower().endswith(('.xlsx', '.xls')):
         raise HTTPException(status_code=400, detail='Only Excel files are allowed')
     content = await file.read()
@@ -5008,6 +5076,8 @@ async def order_desk_order_detail(
         dealer_aging_type=(dealer_aging_type or 'purchase'),
         dealer_min_aging=float(dealer_min_aging or 0),
     )
+    for item in items:
+        odg.apply_order_item_values(item)
     order_stage = odw.compute_order_stage(items)
     reqs_by_item = {}
     all_reqs = await db.order_requests.find({'order_id': order_id}, {'_id': 0}).to_list(20000)
@@ -5055,7 +5125,7 @@ async def order_desk_order_export(order_id: str, current_user: UserResponse = De
     ws.title = 'Order Desk'
     headers = [
         'Part Number', 'Part Name', 'Requested Qty', 'Available Qty', 'Allocated Qty', 'Balance Qty',
-        'Value', 'LOC', 'Purchase Aging', 'Sales Aging', 'Availability Status', 'Source Branch', 'Source Dealer',
+        'Value', 'Total Value', 'LOC', 'Purchase Aging', 'Sales Aging', 'Availability Status', 'Source Branch', 'Source Dealer',
     ]
     ws.append(headers)
     for item in items:
@@ -5065,6 +5135,8 @@ async def order_desk_order_export(order_id: str, current_user: UserResponse = De
         sources = item.get('selected_sources') or item.get('same_dealer_sources') or []
         src_branch = sources[0].get('branch') if sources else ''
         src_dealer = sources[0].get('dealer_name') if sources else ''
+        unit_value = odg.order_line_unit_value(item)
+        total_value = odg.order_line_total_value(item)
         ws.append([
             item.get('part_number'),
             item.get('description') or item.get('part_name'),
@@ -5072,7 +5144,8 @@ async def order_desk_order_export(order_id: str, current_user: UserResponse = De
             avail,
             alloc_qty,
             max(req - alloc_qty, 0),
-            item.get('value') or item.get('line_value'),
+            unit_value,
+            total_value,
             item.get('loc') or item.get('location'),
             item.get('purchase_aging_days'),
             item.get('sales_aging_days'),
@@ -5086,6 +5159,7 @@ async def order_desk_order_export(order_id: str, current_user: UserResponse = De
     meta.append(['Dealer', order.get('dealer_name')])
     meta.append(['Branch', order.get('branch')])
     meta.append(['Status', order.get('status')])
+    meta.append(['Total Order Value', order.get('total_order_value') if order.get('total_order_value') not in (None, '') else 0])
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -5102,6 +5176,7 @@ async def order_desk_check_availability(order_id: str, brand: Optional[str] = No
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail='Order not found')
+    odg.assert_order_not_finished(order)
     if not brand or str(brand).startswith('All ') or not dealer or str(dealer).startswith('All ') or not branch or str(branch).startswith('All '):
         raise HTTPException(status_code=400, detail='Select a valid Brand, Dealer and Branch before Check Availability')
     role = (current_user.role or '').lower()
@@ -5182,6 +5257,7 @@ async def order_desk_allocate(order_id: str, payload: dict, current_user: UserRe
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail='Order not found')
+    odg.assert_order_not_finished(order)
     for entry in allocations:
         item_id = entry.get('item_id')
         selected = entry.get('sources') or []
@@ -5292,6 +5368,7 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail='Order not found')
+    odg.assert_order_not_finished(order)
     role = (current_user.role or '').lower()
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized for this order')
@@ -5652,6 +5729,8 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized to send requests for this order')
 
+    odg.assert_order_not_finished(order)
+
     level = str(((payload or {}).get('level') or '')).strip().lower()
     if level in ('own_branch',):
         level = 'own'
@@ -5767,6 +5846,7 @@ async def order_desk_add_items(order_id: str, payload: dict, current_user: UserR
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail='Order not found')
+    odg.assert_order_not_finished(order)
     role = (current_user.role or '').lower()
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
@@ -5793,7 +5873,7 @@ async def order_desk_add_items(order_id: str, payload: dict, current_user: UserR
             raise HTTPException(status_code=400, detail=f'Row {row_number}: Quantity must be greater than zero')
         add_qty += qty
         add_value += value * qty
-        new_items.append({
+        new_items.append(odg.apply_order_item_values({
             'id': str(uuid.uuid4()), 'order_id': order_id, 'order_number': order.get('order_number'),
             'part_number': part_number, 'description': description,
             'required_qty': qty, 'unit_value': value,
@@ -5804,7 +5884,7 @@ async def order_desk_add_items(order_id: str, payload: dict, current_user: UserR
             'added_by': current_user.id, 'added_by_name': current_user.username, 'added_at': now,
             'original_order_created_at': original_created_at,
             'created_at': now, 'updated_at': now,
-        })
+        }, qty=qty, unit=value))
     await db.order_items.insert_many([dict(i) for i in new_items])
     await db.order_headers.update_one({'id': order_id}, {'$set': {
         'item_count': int(order.get('item_count') or 0) + len(new_items),
@@ -5831,6 +5911,7 @@ async def order_desk_re_enquire(order_id: str, payload: dict = None, current_use
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail='Order not found')
+    odg.assert_order_not_finished(order)
     role = (current_user.role or '').lower()
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
@@ -5917,6 +5998,7 @@ async def order_desk_request_cancellation(order_id: str, item_id: str, payload: 
     item = await db.order_items.find_one({'id': item_id, 'order_id': order_id}, {'_id': 0})
     if not order or not item:
         raise HTTPException(status_code=404, detail='Order item not found')
+    odg.assert_order_not_finished(order)
     role = (current_user.role or '').lower()
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
@@ -6243,7 +6325,7 @@ REQUEST_CENTER_TRANSITIONS = {
     'Requested': {'Approved', 'Rejected', 'Cancelled'},
     'Approved': {'Dispatched', 'Cancelled'},
     'Partially Approved': {'Dispatched', 'Cancelled'},
-    'Dispatched': {'Completed'},
+    'Dispatched': {'Received', 'Completed'},
     # Legacy readability: allow Complete from Received if any old rows exist.
     'Received': {'Completed'},
 }
@@ -6274,6 +6356,7 @@ async def save_factory_system_order(
     if not item:
         raise HTTPException(status_code=404, detail='Order item not found')
     order = await db.order_headers.find_one({'id': item.get('order_id')}, {'_id': 0}) or {}
+    odg.assert_order_not_finished(order)
     if role == 'admin' and order.get('dealer_name') and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not allowed for this dealer scope')
 
@@ -6380,6 +6463,10 @@ async def save_factory_system_order_bulk(
     current_user: UserResponse = Depends(get_current_user),
 ):
     """Apply one Factory Order No to multiple factory-required rows."""
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
+    odg.assert_order_not_finished(order)
     number = (body.system_order_number or '').strip()
     if not number:
         raise HTTPException(status_code=400, detail='Factory Order No is required')
@@ -6703,7 +6790,9 @@ async def request_center_list(
              'decided_user_name': 1, 'decided_user_mobile': 1,
              'dispatched_user_name': 1, 'dispatched_user_mobile': 1,
              'received_user_name': 1, 'received_user_mobile': 1,
-             'completed_user_name': 1, 'completed_user_mobile': 1},
+             'completed_user_name': 1, 'completed_user_mobile': 1,
+             'picking_finished_at': 1, 'dispatch_document': 1, 'dispatched_at': 1,
+             'in_transit_flags': 1, 'in_transit_level': 1},
         ):
             header_by_number[header.get('request_number')] = header
 
@@ -6735,6 +6824,18 @@ async def request_center_list(
                     row[field] = header.get(field)
             if header.get('requested_user_name') and not row.get('requested_user_name'):
                 row['requested_user_name'] = header.get('requested_user_name')
+            if header.get('dispatch_document') and not row.get('dispatch_document'):
+                row['dispatch_document'] = header.get('dispatch_document')
+            if header.get('picking_finished_at') and not row.get('picking_finished_at'):
+                row['picking_finished_at'] = header.get('picking_finished_at')
+            if header.get('dispatched_at') and not row.get('dispatched_at'):
+                row['dispatched_at'] = header.get('dispatched_at')
+            if header.get('in_transit_flags'):
+                row['in_transit_flags'] = header.get('in_transit_flags')
+            if header.get('in_transit_level') and not row.get('in_transit_level'):
+                row['in_transit_level'] = header.get('in_transit_level')
+        row.update(rff.apply_presentation(row))
+        row.update(rff.in_transit_marker(row))
     try:
         existing_ids = {r.get('id') for r in rows if r.get('id')}
         archived = await hybrid_request_history.list_archived_requests(db, exclude_ids=existing_ids, limit=2000)
@@ -7070,6 +7171,184 @@ async def _notify_request_status_change(req: dict, event: str, actor_id: str = "
     await _notify_request_group_outcome((req or {}).get('request_number'), actor_id=actor_id)
 
 
+async def _require_supplier_for_request(req: dict, current_user: UserResponse):
+    role = (current_user.role or '').lower()
+    is_supplier = role == 'master' or req.get('supplying_dealer') == current_user.group
+    if not is_supplier:
+        raise HTTPException(status_code=403, detail='Only the supplying scope can update picking / dispatch')
+    return is_supplier
+
+
+async def _save_dispatch_document_on_records(records: list, stored: dict, extra: dict, now: str):
+    payload = {**stored, **extra}
+    for rec in records:
+        await db.order_requests.update_one({'id': rec['id']}, {'$set': {
+            'dispatch_document': payload,
+            'updated_at': now,
+        }})
+    request_number = (records[0] or {}).get('request_number')
+    if request_number:
+        await db.request_headers.update_one({'request_number': request_number}, {'$set': {
+            'dispatch_document': payload,
+            'updated_at': now,
+        }})
+    return payload
+
+
+@api_router.post('/requests/{request_id}/picking-finished')
+async def request_center_picking_finished(request_id: str, current_user: UserResponse = Depends(get_current_user)):
+    """Mark picking complete. Does not change stored `status`."""
+    req = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
+    if not req:
+        raise HTTPException(status_code=404, detail='Request not found')
+    await _require_supplier_for_request(req, current_user)
+    status = req.get('status')
+    if status not in ('Approved', 'Partially Approved'):
+        raise HTTPException(status_code=400, detail='Picking can only be finished after Start Picking (Approved / Partially Approved)')
+    now = datetime.now(timezone.utc).isoformat()
+    await db.order_requests.update_one({'id': request_id}, {'$set': {
+        'picking_finished_at': req.get('picking_finished_at') or now,
+        'picking_finished_by': current_user.id,
+        'picking_finished_user_name': _actor_name(current_user),
+        'updated_at': now,
+    }})
+    updated = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
+    return rff.apply_presentation(updated or req)
+
+
+@api_router.post('/requests/group/{request_number}/picking-finished')
+async def request_center_group_picking_finished(request_number: str, current_user: UserResponse = Depends(get_current_user)):
+    items = await db.order_requests.find({'request_number': request_number}, {'_id': 0}).to_list(10000)
+    if not items:
+        raise HTTPException(status_code=404, detail='Request not found')
+    await _require_supplier_for_request(items[0], current_user)
+    now = datetime.now(timezone.utc).isoformat()
+    updated = 0
+    for item in items:
+        if item.get('status') not in ('Approved', 'Partially Approved'):
+            continue
+        if item.get('picking_finished_at'):
+            continue
+        await db.order_requests.update_one({'id': item['id']}, {'$set': {
+            'picking_finished_at': now,
+            'picking_finished_by': current_user.id,
+            'picking_finished_user_name': _actor_name(current_user),
+            'updated_at': now,
+        }})
+        updated += 1
+    await db.request_headers.update_one({'request_number': request_number}, {'$set': {
+        'picking_finished_at': now, 'updated_at': now,
+    }})
+    return {'message': f'Picking finished for {updated} item(s)', 'request_number': request_number}
+
+
+async def _ingest_dispatch_document(
+    *,
+    request_number: str,
+    part_or_id: str,
+    file: UploadFile,
+    document_no: str,
+    document_date: str,
+    document_value: str,
+    remarks: str,
+    current_user: UserResponse,
+    records: list,
+):
+    if not str(document_no or '').strip() or not str(document_date or '').strip() or document_value in (None, ''):
+        raise HTTPException(status_code=400, detail=rff.DISPATCH_INCOMPLETE_MESSAGE)
+    try:
+        float(str(document_value).replace(',', '').replace('₹', '').strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=rff.DISPATCH_INCOMPLETE_MESSAGE)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail=rff.DISPATCH_INCOMPLETE_MESSAGE)
+    ext = Path(file.filename or 'document.bin').suffix or '.bin'
+    safe = f"{request_number}_{part_or_id}_{uuid.uuid4().hex[:8]}{ext}"
+    stored = await file_objects.store_bytes(
+        module='request-dispatch-documents',
+        relative_key=f"{request_number}/{safe}",
+        data=content,
+        original_filename=Path(file.filename or safe).name,
+        content_type=file.content_type or 'application/octet-stream',
+        brand=str((records[0] or {}).get('supplying_brand') or ''),
+        dealer=str((records[0] or {}).get('supplying_dealer') or ''),
+        branch=str((records[0] or {}).get('supplying_branch') or ''),
+        user_id=current_user.id,
+        db=db,
+    )
+    if not stored.get('storage_key'):
+        raise HTTPException(status_code=400, detail=rff.DISPATCH_INCOMPLETE_MESSAGE)
+    now = datetime.now(timezone.utc).isoformat()
+    extra = {
+        'document_no': str(document_no).strip(),
+        'document_date': str(document_date).strip(),
+        'document_value': str(document_value).strip(),
+        'remarks': sanitize_text_safe(remarks or ''),
+        'uploaded_by': current_user.id,
+        'uploaded_by_name': current_user.username,
+    }
+    return await _save_dispatch_document_on_records(records, stored, extra, now)
+
+
+@api_router.post('/requests/{request_id}/dispatch-document')
+async def request_center_upload_dispatch_document(
+    request_id: str,
+    file: UploadFile = File(...),
+    document_no: str = Form(...),
+    document_date: str = Form(...),
+    document_value: str = Form(...),
+    remarks: str = Form(''),
+    current_user: UserResponse = Depends(get_current_user),
+):
+    req = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
+    if not req:
+        raise HTTPException(status_code=404, detail='Request not found')
+    await _require_supplier_for_request(req, current_user)
+    payload = await _ingest_dispatch_document(
+        request_number=req.get('request_number') or request_id,
+        part_or_id=req.get('part_number') or request_id,
+        file=file,
+        document_no=document_no,
+        document_date=document_date,
+        document_value=document_value,
+        remarks=remarks,
+        current_user=current_user,
+        records=[req],
+    )
+    return {'message': 'Dispatch document saved', 'dispatch_document': payload}
+
+
+@api_router.post('/requests/group/{request_number}/dispatch-document')
+async def request_center_group_dispatch_document(
+    request_number: str,
+    file: UploadFile = File(...),
+    document_no: str = Form(...),
+    document_date: str = Form(...),
+    document_value: str = Form(...),
+    remarks: str = Form(''),
+    current_user: UserResponse = Depends(get_current_user),
+):
+    items = await db.order_requests.find({'request_number': request_number}, {'_id': 0}).to_list(10000)
+    if not items:
+        raise HTTPException(status_code=404, detail='Request not found')
+    await _require_supplier_for_request(items[0], current_user)
+    ready = [i for i in items if i.get('status') in ('Approved', 'Partially Approved') and _safe_float(i.get('accepted_qty') or i.get('approved_qty')) > 0]
+    target = ready or items
+    payload = await _ingest_dispatch_document(
+        request_number=request_number,
+        part_or_id='group',
+        file=file,
+        document_no=document_no,
+        document_date=document_date,
+        document_value=document_value,
+        remarks=remarks,
+        current_user=current_user,
+        records=target,
+    )
+    return {'message': 'Dispatch document saved', 'dispatch_document': payload}
+
+
 @api_router.post('/requests/{request_id}/approve')
 async def request_center_approve(request_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     remarks = (payload or {}).get('remarks', '') if payload else ''
@@ -7163,8 +7442,23 @@ async def _request_logistics_transition(request_id: str, new_status: str, remark
 
 @api_router.post('/requests/{request_id}/dispatch')
 async def request_center_dispatch(request_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    req = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
+    if not req:
+        raise HTTPException(status_code=404, detail='Request not found')
+    header = None
+    if req.get('request_number'):
+        header = await db.request_headers.find_one({'request_number': req.get('request_number')}, {'_id': 0})
+    combined = dict(req)
+    if header and header.get('dispatch_document') and not combined.get('dispatch_document'):
+        combined['dispatch_document'] = header.get('dispatch_document')
+    if header and header.get('picking_finished_at') and not combined.get('picking_finished_at'):
+        combined['picking_finished_at'] = header.get('picking_finished_at')
+    if not combined.get('picking_finished_at'):
+        raise HTTPException(status_code=400, detail='Picking must be finished before dispatch.')
+    if not rff.dispatch_document_complete(combined):
+        raise HTTPException(status_code=400, detail=rff.DISPATCH_INCOMPLETE_MESSAGE)
     updated, changed = await _request_logistics_transition(request_id, 'Dispatched', (payload or {}).get('remarks', ''), current_user)
-    return updated
+    return rff.apply_presentation(updated or req)
 
 
 @api_router.post('/requests/{request_id}/receive')
@@ -8474,6 +8768,8 @@ async def seed_master_user_on_startup():
 
         request_sla_scheduler.start_request_sla_scheduler(db, _sla_apply_timeout, _sla_send_reminder)
         logger.info("Request SLA scheduler started")
+        request_in_transit_reminder.start_in_transit_reminder_scheduler(db)
+        logger.info("Request in-transit reminder scheduler started")
         exe = str(sys.executable or "").replace("\\", "/")
         if "/backend/venv/" not in exe:
             logger.warning(

@@ -830,7 +830,10 @@ async def _filter_rows_by_part_type(rows: List[dict], category: Optional[str], s
 
 
 def _request_unit(row: dict) -> float:
-    return _num(row.get("part_value"), _num(row.get("unit_value_at_request"), _num(row.get("unit_value"), 0)))
+    return _num(
+        row.get("value"),
+        _num(row.get("part_value"), _num(row.get("unit_value_at_request"), _num(row.get("unit_value"), 0))),
+    )
 
 
 def _approved_qty(row: dict) -> float:
@@ -1233,7 +1236,7 @@ async def analytics_order_saving(
         orders = [o for o in orders if o.get("id") in keep_ids]
 
     if part_type_filter:
-        original_value = sum(_num(i.get("required_qty")) * _num(i.get("unit_value")) for i in order_item_rows)
+        original_value = sum(_num(i.get("required_qty")) * _num(i.get("value"), _num(i.get("unit_value"))) for i in order_item_rows)
         original_items = sum(_num(i.get("required_qty")) for i in order_item_rows)
     else:
         original_value = sum(_num(o.get("total_order_value")) for o in orders)
@@ -1270,7 +1273,7 @@ async def analytics_order_saving(
             if oid and oid not in counted_orders:
                 series_map[d]["order_count"] += 1
                 counted_orders.add(oid)
-            series_map[d]["original_value"] += _num(i.get("required_qty")) * _num(i.get("unit_value"))
+            series_map[d]["original_value"] += _num(i.get("required_qty")) * _num(i.get("value"), _num(i.get("unit_value")))
             series_map[d]["original_items"] += _num(i.get("required_qty"))
     else:
         for o in orders:

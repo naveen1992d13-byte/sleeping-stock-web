@@ -88,3 +88,21 @@ class TestVanagaramPublishReconcile:
         )
         assert records.status_code == 200
         assert records.json().get('total', 0) == s.get('totalItem')
+
+
+class TestUploadScopeHttp:
+    def test_upload_v2_blocked_without_brand_dealer_branch(self, auth):
+        files = {'file': ('stock.xlsx', b'not-really-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}
+        data = {'brand': 'All Brands', 'dealer': 'All Dealers', 'branch': 'All Branches'}
+        res = requests.post(f'{API}/upload/v2', headers=auth, files=files, data=data, timeout=30)
+        assert res.status_code == 400, res.text
+        detail = res.json().get('detail') or ''
+        assert 'Please select Brand.' in detail
+        assert 'Please select Dealer.' in detail
+        assert 'Please select Branch.' in detail
+
+    def test_upload_legacy_blocked_without_scope(self, auth):
+        files = {'file': ('stock.xlsx', b'x', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}
+        res = requests.post(f'{API}/upload', headers=auth, files=files, data={'upload_type': 'product'}, timeout=30)
+        assert res.status_code == 400, res.text
+        assert 'Please select' in (res.json().get('detail') or '')
