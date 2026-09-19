@@ -93,13 +93,30 @@ def test_branch_match_is_case_insensitive():
     assert 'vanagaram.user@gmail.com' in cc_emails
 
 
-def test_missing_supplying_user_does_not_fall_back_to_admin_or_master():
+def test_missing_supplying_user_promotes_admin_to_and_not_cc():
     to_emails, cc_emails = resolve_request_email_routing(
         USERS,
         dict(GROUP, supplying_branch='Unknown Branch'),
     )
+    assert to_emails == ['dealer.admin@gmail.com']
+    assert 'dealer.admin@gmail.com' not in cc_emails
+    assert 'vanagaram.user@gmail.com' in cc_emails
+    assert 'admin@sleepingstock.in' not in to_emails
+    assert 'admin@sleepingstock.in' not in cc_emails
+
+
+def test_neither_branch_user_nor_admin_keeps_empty_to():
+    neither = [
+        u for u in USERS
+        if not (
+            (u['role'] == 'user' and u['location'] == 'Koyambedu')
+            or u['role'] == 'admin'
+        )
+    ]
+    to_emails, cc_emails = resolve_request_email_routing(neither, GROUP)
     assert to_emails == []
-    assert 'dealer.admin@gmail.com' in cc_emails
+    assert 'dealer.admin@gmail.com' not in to_emails
+    assert 'admin@sleepingstock.in' not in to_emails
     assert 'admin@sleepingstock.in' not in cc_emails
 
 

@@ -4677,9 +4677,8 @@ async def _load_request_email_users(group_doc: dict) -> list:
 
 
 async def _resolve_request_email_routing(group_doc: dict) -> tuple:
-    """TO = supplying Dealer/Branch user only.
-    CC = requesting Dealer/Branch user + optional requesting/supplying Admins.
-    Master Admin is never included. Missing Admin does not block sending."""
+    """TO = supplying Dealer/Branch user, else responsible Admin promoted from CC.
+    Master Admin is never included. Empty TO still fails as not configured."""
     users = await _load_request_email_users(group_doc)
     return notifications.resolve_request_email_routing(users, group_doc)
 

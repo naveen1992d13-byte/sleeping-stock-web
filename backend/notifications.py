@@ -139,10 +139,13 @@ def _scope_emails(users, *, dealer: str, branch: str = None, roles=()) -> list:
 
 
 def resolve_request_email_routing(users, group: dict) -> tuple:
-    """TO = supplying Dealer/Branch user only.
-    CC = requesting Dealer/Branch user + requesting Admin (optional)
-    + supplying Admin (optional). Master Admin is never included.
-    Missing Admin never blocks sending. Addresses are deduplicated.
+    """TO = supplying Dealer/Branch user when present.
+
+    If that branch has no valid role=user email, the responsible Admin
+    (supplying-dealer admin, else requesting-dealer admin) is promoted
+    from CC to TO. CC is requesting Dealer/Branch user + remaining
+    Admins. Master Admin is never included. Addresses are deduplicated.
+    Empty TO still means 'Receiver email not configured'.
     """
     group = group or {}
     to_emails = _scope_emails(
@@ -151,19 +154,24 @@ def resolve_request_email_routing(users, group: dict) -> tuple:
         branch=group.get("supplying_branch"),
         roles=("user",),
     )
-    cc_emails = []
-    cc_emails.extend(_scope_emails(
+    requesting_user_cc = _scope_emails(
         users,
         dealer=group.get("requesting_dealer"),
         branch=group.get("requesting_branch"),
         roles=("user",),
-    ))
-    cc_emails.extend(_scope_emails(
+    )
+    requesting_admin = _scope_emails(
         users, dealer=group.get("requesting_dealer"), roles=("admin",),
-    ))
-    cc_emails.extend(_scope_emails(
+    )
+    supplying_admin = _scope_emails(
         users, dealer=group.get("supplying_dealer"), roles=("admin",),
-    ))
+    )
+    if not to_emails:
+        to_emails = list(supplying_admin) or list(requesting_admin)
+    cc_emails = []
+    cc_emails.extend(requesting_user_cc)
+    cc_emails.extend(requesting_admin)
+    cc_emails.extend(supplying_admin)
     to_keys = {email.lower() for email in to_emails}
     seen_cc = set()
     deduped_cc = []
