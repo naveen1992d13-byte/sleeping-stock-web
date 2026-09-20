@@ -3567,7 +3567,7 @@ async def upload_product_center_v2(
             "active_date_key": _nmts_date_key(now),
             "created_at": now.isoformat(),
             **context,
-        })
+        }))
 
     if item_docs:
         await db.upload_items.insert_many(item_docs)
