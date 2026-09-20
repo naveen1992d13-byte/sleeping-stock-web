@@ -119,7 +119,7 @@ def duplicate_identity_keys(collection: str, docs: Iterable[Mapping[str, Any]]) 
     return dupes
 
 
-def mapping_errors(docs: Iterable[Mapping[str, Any]], brands: set[str], dealers: set[str], branches: set[str]) -> list[str]:
+def mapping_errors(docs: Iterable[Mapping[str, Any]], brands: set[str], dealers: set[str], branches: set[str], collection: str = "") -> list[str]:
     errors: list[str] = []
     brand_l = {x.casefold() for x in brands}
     dealer_l = {x.casefold() for x in dealers}
@@ -127,7 +127,17 @@ def mapping_errors(docs: Iterable[Mapping[str, Any]], brands: set[str], dealers:
     for doc in docs:
         brand = str(doc.get("brand_name") or doc.get("brand") or "").strip()
         dealer = str(doc.get("dealer_name") or doc.get("dealer") or "").strip()
-        branch = str(doc.get("branch") or doc.get("name") or "").strip()
+        if collection == "branches":
+            branch = str(doc.get("name") or doc.get("branch") or "").strip()
+        else:
+            branch = str(doc.get("branch") or "").strip()
+        if collection == "dealers":
+            dealer = str(doc.get("name") or dealer).strip()
+            branch = ""
+        if collection == "brands":
+            brand = str(doc.get("name") or brand).strip()
+            dealer = ""
+            branch = ""
         if brand and brand_l and brand.casefold() not in brand_l:
             errors.append(f"unknown brand {brand}")
         if dealer and dealer_l and dealer.casefold() not in dealer_l:
