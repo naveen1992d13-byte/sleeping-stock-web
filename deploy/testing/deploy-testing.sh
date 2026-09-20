@@ -51,6 +51,12 @@ fi
 echo "Installing backend requirements into testing venv..."
 "$ROOT/backend/venv/bin/pip" install -q -r "$ROOT/backend/requirements.txt"
 
+# This instance has ~1Gi RAM; CRA OOMs if the testing backend is also resident.
+if systemctl is-active --quiet "$SERVICE"; then
+  echo "Stopping $SERVICE during frontend build to free RAM..."
+  sudo systemctl stop "$SERVICE"
+fi
+
 echo "Building testing frontend (API=https://testing.sleepingstock.in)..."
 cd "$ROOT/frontend"
 REACT_APP_BACKEND_URL=https://testing.sleepingstock.in \
