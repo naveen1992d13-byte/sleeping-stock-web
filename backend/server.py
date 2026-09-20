@@ -2010,6 +2010,8 @@ async def ensure_master_user_exists():
     for manual/idempotent use. Both paths share this single implementation so
     there is exactly one place that defines the default admin credentials.
     """
+    if os.getenv("NMTS_DISABLE_DEFAULT_MASTER_SEED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return {"message": "Default master seed disabled"}
     master = await db.users.find_one({"role": "master"})
     if not master:
         master_user = User(

@@ -9,6 +9,8 @@ Design rules (see UPDATE_NOTES.txt for the full explanation):
   best-effort side effect logged to db.notification_logs.
 - WhatsApp test mode (WHATSAPP_TEST_MODE=true) always overrides the recipient
   with WHATSAPP_TEST_RECIPIENT_NUMBER and ignores database numbers.
+- Email test mode (EMAIL_TEST_MODE=true) always overrides Gmail recipients
+  with EMAIL_TEST_RECIPIENT and drops CC. Unset in production.
 """
 import os
 import re
@@ -67,6 +69,19 @@ def whatsapp_configured() -> bool:
 
 def whatsapp_test_mode() -> bool:
     return _env("WHATSAPP_TEST_MODE", "true").strip().lower() in ("1", "true", "yes")
+
+
+def email_test_mode() -> bool:
+    return _env("EMAIL_TEST_MODE", "").strip().lower() in ("1", "true", "yes")
+
+
+def _email_test_redirect(to_email: str, cc_email: str = "") -> tuple:
+    """When EMAIL_TEST_MODE is on, send only to EMAIL_TEST_RECIPIENT."""
+    if not email_test_mode():
+        return to_email, cc_email
+    test_to = _env("EMAIL_TEST_RECIPIENT").strip()
+    logger.info("[Email TEST MODE] Redirecting notification to test recipient only.")
+    return test_to, ""
 
 
 # --------------------------------------------------------------------------
@@ -236,6 +251,7 @@ def _build_email_text(context: dict) -> str:
 
 def send_gmail_email(to_email: str, subject: str, context: dict, cc_email: str = "") -> dict:
     """Returns a result dict; never raises."""
+    to_email, cc_email = _email_test_redirect((to_email or "").strip(), (cc_email or "").strip())
     to_email = (to_email or "").strip()
     cc_email = (cc_email or "").strip()
     if cc_email and not is_valid_email(cc_email):
@@ -447,6 +463,7 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
     """Sends the Parts Transfer Request PDF as a Gmail SMTP attachment.
     Returns a result dict; never raises — a delivery failure must never
     roll back the already-saved request."""
+    to_email, cc_email = _email_test_redirect(to_email, cc_email)
     to_list = _email_list(to_email)
     to_keys = {email.lower() for email in to_list}
     cc_list = [email for email in _email_list(cc_email) if email.lower() not in to_keys]
