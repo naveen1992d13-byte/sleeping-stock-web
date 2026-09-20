@@ -59,8 +59,11 @@ def test_duplicates_and_mappings():
         {"H"},
         {"D"},
         {"B"},
+        collection="products",
     )
     assert errors
+    dealer_docs = [{"name": "FPL automobiles pvt ltd", "brand": "H"}]
+    assert not mapping_errors(dealer_docs, {"H"}, {"FPL automobiles pvt ltd"}, {"Some Branch"}, collection="dealers")
 
 
 def test_readonly_proxy_blocks_writes():

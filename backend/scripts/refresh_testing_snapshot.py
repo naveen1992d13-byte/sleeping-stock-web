@@ -141,7 +141,7 @@ def _validate_ingest(target_db, version: str, business_date: str, expected_count
         if dupes:
             raise RuntimeError(f"{name} duplicate identity keys: {dupes[:8]}")
         if name in {"products", "batch_summaries", "dealers", "branches"}:
-            errors = mapping_errors(sample[:2000], brands, dealers, branches)
+            errors = mapping_errors(sample[:2000], brands, dealers, branches, collection=name)
             if errors:
                 raise RuntimeError(f"{name} mapping errors: {errors[:8]}")
         if name == "products" and count:
