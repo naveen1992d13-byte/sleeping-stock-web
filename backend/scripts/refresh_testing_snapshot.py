@@ -17,7 +17,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from pymongo import MongoClient
+from pymongo import MongoClient, ReplaceOne
 
 BACKEND = Path(os.environ.get("NMTS_TESTING_BACKEND", "/opt/nmts-testing/backend"))
 if str(BACKEND) not in sys.path:
@@ -158,31 +158,57 @@ def _validate_ingest(target_db, version: str, business_date: str, expected_count
                 raise RuntimeError(f"products have {bad_date} rows not on snapshot business date {business_date}")
 
 
+UNIQUE_ACTIVATE = {
+    "brands": ("name",),
+    "dealers": ("name", "brand"),
+    "branches": ("name", "dealer", "brand"),
+    "states": ("name",),
+    "groups": ("name",),
+    "products": ("id",),
+    "batch_summaries": ("brand_name", "dealer_name", "branch", "active_date_key"),
+    "templates": ("id",),
+}
+
+
 def _activate(target_db, version: str, business_date: str, copied_at: str) -> dict[str, int]:
     live_counts: dict[str, int] = {}
     for name in APPROVED_COLLECTIONS:
         ingest = target_db[ingest_collection_name(name, version)]
         live = target_db[name]
-        batch: list[dict[str, Any]] = []
-        copied = 0
+        identity = UNIQUE_ACTIVATE.get(name)
+        if not identity:
+            raise RuntimeError(f"No activation identity configured for {name}")
+        ops = []
+        ingest_count = 0
         for doc in ingest.find():
             payload = {k: v for k, v in dict(doc).items() if k != "_id"}
-            payload.setdefault("snapshot_version", version)
-            payload.setdefault("snapshot_business_date", business_date)
-            payload.setdefault("snapshot_copied_at", copied_at)
+            payload["snapshot_version"] = version
+            payload["snapshot_business_date"] = business_date
+            payload["snapshot_copied_at"] = copied_at
             payload["data_origin"] = "snapshot"
             payload["is_snapshot_reference"] = True
-            batch.append(payload)
-            if len(batch) >= BATCH:
-                live.insert_many(batch, ordered=False)
-                copied += len(batch)
-                batch = []
-        if batch:
-            live.insert_many(batch, ordered=False)
-            copied += len(batch)
+            filt = {}
+            for field in identity:
+                value = payload.get(field)
+                if value in (None, "") and field == "brand":
+                    value = payload.get("brand_name")
+                if value in (None, "") and field == "dealer":
+                    value = payload.get("dealer_name")
+                if value in (None, "") and field == "id":
+                    value = payload.get("id") or payload.get("upload_id")
+                filt[field] = value
+            ops.append(ReplaceOne(filt, payload, upsert=True))
+            ingest_count += 1
+            if len(ops) >= BATCH:
+                live.bulk_write(ops, ordered=False)
+                ops = []
+        if ops:
+            live.bulk_write(ops, ordered=False)
         live_counts[name] = live.count_documents({"data_origin": "snapshot", "snapshot_version": version})
-        if live_counts[name] != ingest.count_documents({}):
-            raise RuntimeError(f"Activation count mismatch for {name}")
+        if live_counts[name] != ingest_count:
+            raise RuntimeError(
+                f"Activation count mismatch for {name}: live={live_counts[name]} ingest={ingest_count}"
+            )
         if name in {"products", "batch_summaries"}:
             live.create_index([("data_origin", 1), ("snapshot_version", 1), ("active_date_key", 1)], background=True)
     return live_counts
