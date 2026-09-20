@@ -228,9 +228,20 @@ This deletes testing-created products, uploads, orders, and requests. It keeps
 all User Hub accounts, including Testing Master Admin. Then refresh the
 snapshot if you need current production reference data again.
 
-## S3 note
+## S3 note and limitations
 
 Testing never copies the production `dev/` archive and must not have delete or
-write permission on `dev/`. Template metadata may be snapshotted; if a screen
-needs a production Excel file from `dev/`, stop and use a narrow read-only
-copy after explicit approval. None is copied automatically.
+write permission on `dev/`. Template metadata may be snapshotted; production
+`dev/` files are not copied.
+
+- Create a dedicated production DocumentDB **read-only** user and set
+  `SNAPSHOT_SOURCE_DOCDB_SECRET_ID`. Until then the refresh script uses the
+  application credential in a code-level read-only wrapper and never writes to
+  `nmts`.
+- The first snapshot into empty testing collections is insert-based and has
+  been verified (71828 Product Hub rows). A later full re-refresh upserts by
+  unique identity. If that job is interrupted, the previous snapshot stays
+  active; do not kill production processes.
+- GitHub Actions deploy needs `TESTING_SSH_*` secrets. Until those exist, run
+  `/usr/local/bin/deploy-pr.sh --pr <n>` on the EC2 host.
+- There is no website button that merges PRs or deploys arbitrary code.
