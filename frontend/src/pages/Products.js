@@ -201,7 +201,7 @@ export function Products() {
       if (!isAll(scopeBrand)) params.append('brand', scopeBrand);
       if (!isAll(scopeDealer)) params.append('dealer', scopeDealer);
       if (testingUi && isMaster && dataOrigin && dataOrigin !== 'all') params.append('data_origin', dataOrigin);
-      await authenticatedDownload(`${API}/product-hub/export/master?${params.toString()}`, 'ProductHub_Full_Export.zip');
+      await authenticatedDownload(`${API}/product-hub/export/master?${params.toString()}`, 'ProductHub_Full_Export.xlsx');
       toast.success('Full export downloaded');
     } catch (e) { toast.error(e.response?.data?.detail || 'Full export failed'); }
     finally { setExporting(false); }
@@ -216,7 +216,7 @@ export function Products() {
       {isMaster && (
         <div className="flex items-center justify-end">
           <Button onClick={exportMasterZip} disabled={exporting} variant="outline" className="gap-2 h-10">
-            <Archive className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Export All (ZIP)'}
+            <Archive className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Export All'}
           </Button>
         </div>
       )}
