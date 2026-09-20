@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
+import { isTestingUiEnabled } from '@/testingUi';
+
 import { Button } from '@/components/ui/button';
 import { Package, Search, Download, Archive, Boxes } from 'lucide-react';
 import { toast } from 'sonner';
@@ -67,6 +69,8 @@ export function Products() {
   const scopeBranch = outletScope.scopeBranch || 'All Branches';
   const isMaster = user?.role === 'master';
   const canExport = user?.role === 'master' || user?.role === 'admin';
+  const testingUi = isTestingUiEnabled();
+  const [dataOrigin, setDataOrigin] = useState('all');
 
   const [summary, setSummary] = useState({ totalItem: 0, totalAvailableItem: 0, totalAvailableQty: 0, totalValue: 0 });
 
@@ -93,6 +97,10 @@ export function Products() {
   }, [scopeBrand, scopeDealer, scopeBranch]);
 
   useEffect(() => {
+    setPage(1);
+  }, [dataOrigin]);
+
+  useEffect(() => {
     const t = setTimeout(() => { setSearch(searchInput.trim()); setPage(1); }, 400);
     return () => clearTimeout(t);
   }, [searchInput]);
@@ -104,6 +112,7 @@ export function Products() {
     if (!isAll(effectiveBranch)) params.append('branch', effectiveBranch);
     if (category && category !== 'All' && category !== 'All Categories') params.append('category', category);
     if (stockStatus && stockStatus !== 'all') params.append('stock_status', stockStatus);
+    if (testingUi && isMaster && dataOrigin && dataOrigin !== 'all') params.append('data_origin', dataOrigin);
     Object.entries(extra).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') params.append(k, v); });
     return params.toString();
   };
@@ -114,6 +123,7 @@ export function Products() {
       if (!isAll(scopeBrand)) params.append('brand', scopeBrand);
       if (!isAll(scopeDealer)) params.append('dealer', scopeDealer);
       if (!isAll(effectiveBranch)) params.append('branch', effectiveBranch);
+      if (testingUi && isMaster && dataOrigin && dataOrigin !== 'all') params.append('data_origin', dataOrigin);
       const res = await axios.get(`${API}/product-hub/part-types?${params.toString()}`);
       const incoming = Array.isArray(res.data?.part_types) ? res.data.part_types : [];
       const types = incoming.filter((v) => v && v !== 'All');
@@ -147,12 +157,12 @@ export function Products() {
   useEffect(() => {
     fetchPartTypes();
     /* eslint-disable-next-line */
-  }, [scopeBrand, scopeDealer, effectiveBranch]);
+  }, [scopeBrand, scopeDealer, effectiveBranch, dataOrigin]);
 
   useEffect(() => {
     fetchSummary();
     /* eslint-disable-next-line */
-  }, [scopeBrand, scopeDealer, effectiveBranch, search, category, stockStatus]);
+  }, [scopeBrand, scopeDealer, effectiveBranch, search, category, stockStatus, dataOrigin]);
 
   useEffect(() => {
     setPage(1);
@@ -161,7 +171,7 @@ export function Products() {
   useEffect(() => {
     fetchRecords();
     /* eslint-disable-next-line */
-  }, [scopeBrand, scopeDealer, effectiveBranch, search, category, stockStatus, page, pageSize]);
+  }, [scopeBrand, scopeDealer, effectiveBranch, search, category, stockStatus, page, pageSize, dataOrigin]);
 
   const exportBranch = async (row) => {
     if (exporting) return toast.info('Export already in progress');
@@ -176,6 +186,7 @@ export function Products() {
       const params = new URLSearchParams({ brand: brandName, dealer: dealerName, branch: branchName });
       if (category && category !== 'All' && category !== 'All Categories') params.append('category', category);
       if (stockStatus && stockStatus !== 'all') params.append('stock_status', stockStatus);
+      if (testingUi && isMaster && dataOrigin && dataOrigin !== 'all') params.append('data_origin', dataOrigin);
       await authenticatedDownload(`${API}/product-hub/export/branch?${params.toString()}`, `ProductHub_${branchName}.xlsx`);
       toast.success('Branch export downloaded');
     } catch (e) { toast.error(e.response?.data?.detail || 'Export failed'); }
@@ -189,6 +200,7 @@ export function Products() {
       const params = new URLSearchParams();
       if (!isAll(scopeBrand)) params.append('brand', scopeBrand);
       if (!isAll(scopeDealer)) params.append('dealer', scopeDealer);
+      if (testingUi && isMaster && dataOrigin && dataOrigin !== 'all') params.append('data_origin', dataOrigin);
       await authenticatedDownload(`${API}/product-hub/export/master?${params.toString()}`, 'ProductHub_Full_Export.zip');
       toast.success('Full export downloaded');
     } catch (e) { toast.error(e.response?.data?.detail || 'Full export failed'); }
@@ -226,6 +238,13 @@ export function Products() {
             <option value="available">Available Items</option>
             <option value="zero">Zero Quantity Items</option>
           </select>
+          {testingUi && isMaster && (
+            <select value={dataOrigin} onChange={(e) => setDataOrigin(e.target.value)} className="px-3 py-2 rounded-xl border text-sm" title="Data source" data-testid="testing-data-origin">
+              <option value="all">All Data</option>
+              <option value="snapshot">Snapshot Reference Data</option>
+              <option value="testing">Testing-Created Data</option>
+            </select>
+          )}
           <select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value)); setPage(1); }} className="px-3 py-2 rounded-xl border text-sm">
             {PAGE_SIZE_OPTIONS.map(sz => <option key={sz} value={sz}>{sz} / page</option>)}
           </select>

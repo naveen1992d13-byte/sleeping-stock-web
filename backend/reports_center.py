@@ -16,6 +16,11 @@ from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from pymongo import ReturnDocument
 
+try:
+    from . import testing_runtime
+except ImportError:
+    import testing_runtime
+
 router = APIRouter(prefix="/reports-center", tags=["Reports Center"])
 REPORT_STORAGE = Path(os.getenv("REPORT_STORAGE_DIR", Path(__file__).parent / "report_files"))
 REPORT_STORAGE.mkdir(parents=True, exist_ok=True)
@@ -428,7 +433,7 @@ async def analytics(from_date:str,to_date:str,brand:Optional[str]=None,dealer:Op
     return {"scope":scope,"stock":{"line_items":len(inv),"quantity":sum(x["qty"] for x in inv),"value":sum(x["total"] for x in inv),"avg_purchase_aging":sum(pa)/len(pa) if pa else 0,"avg_sales_aging":sum(sa)/len(sa) if sa else 0},"aging":aging,"movement":{"added_line_items":len(inv),"added_quantity":sum(x["qty"] for x in inv),"added_value":sum(x["total"] for x in inv),"reduced_line_items":0,"reduced_quantity":0,"reduced_value":0},"orders":{"total":len(orders),"line_items":sum(_num(o.get("item_count")) for o in orders),"requested_qty":sum(_num(o.get("total_required_qty")) for o in orders),"available_qty":sum(_num(o.get("total_available_qty")) for o in orders),"not_available_qty":sum(_num(o.get("total_not_available_qty")) for o in orders),"reserved_qty":sum(_num(o.get("total_reserved_qty")) for o in orders),"value":sum(_num(o.get("total_order_value")) for o in orders)},"requests":{"total":len({r.get("request_number") for r in reqs}),"requested_qty":sum(_num(r.get("requested_qty",r.get("quantity"))) for r in reqs),"approved_qty":sum(_num(r.get("accepted_qty",r.get("approved_qty"))) for r in reqs),"statuses":{k:len(v) for k,v in statuses.items()},"value":sum(_num(r.get("part_value",r.get("unit_value")))*_num(r.get("requested_qty",r.get("quantity"))) for r in reqs),"completed_value":sum(_num(r.get("part_value",r.get("unit_value")))*_num(r.get("accepted_qty",r.get("approved_qty"))) for r in reqs if _text(r.get("status")).lower()=="completed")},"missed":{"requests":len({m.get("request_number") for m in missed}),"line_items":len(missed),"quantity":sum(m["eligible"] for m in missed),"value":sum(m["missed_value"] for m in missed)},"branches":branches,"daily":result_daily}
 
 async def _next_old_number():
-    key=datetime.now(timezone.utc).strftime("%y%m%d"); doc=await db.counters.find_one_and_update({"_id":f"old_report_{key}"},{"$inc":{"seq":1}},upsert=True,return_document=ReturnDocument.AFTER); return f"OR{key}{int(doc.get('seq',1)):04d}"
+    key=datetime.now(timezone.utc).strftime("%y%m%d"); doc=await db.counters.find_one_and_update({"_id":f"old_report_{key}"},{"$inc":{"seq":1}},upsert=True,return_document=ReturnDocument.AFTER); return testing_runtime.prefix_business_id(f"OR{key}{int(doc.get('seq',1)):04d}")
 
 @router.post("/old-requests")
 async def create_old_request(payload:Dict[str,Any],current_user=Depends(_current_user)):
