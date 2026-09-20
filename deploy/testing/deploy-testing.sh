@@ -229,7 +229,16 @@ sudo chown -R nginx:nginx "$FRONTEND_DEST"
 
 echo "Restarting $SERVICE only..."
 sudo systemctl restart "$SERVICE"
-sudo systemctl is-active --quiet "$SERVICE"
+sudo systemctl is-active --quiet "$SERVICE" || true
+
+TEST_PID_AFTER=""
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 15 18 20; do
+  TEST_PID_AFTER="$(pid_on_port "$TEST_PORT" || true)"
+  if [[ -n "$TEST_PID_AFTER" ]]; then
+    break
+  fi
+  sleep 2
+done
 
 PROD_PID_AFTER="$(pid_on_port "$PROD_PORT" || true)"
 TEST_PID_AFTER="$(pid_on_port "$TEST_PORT" || true)"
