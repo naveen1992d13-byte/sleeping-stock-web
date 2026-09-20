@@ -4361,15 +4361,16 @@ async def product_hub_records(
     }
 
 
-def _write_products_sheet(ws, rows):
+def _write_products_sheet(ws, rows, include_header=True):
     # Note: existing columns/order are kept exactly as-is (export contract preserved).
     # Part Category, Uploaded Date, Uploaded User, Active Status, Purchase Aging
     # and Sales Aging are appended at the end so any existing consumer reading
     # the first 12 columns is unaffected.
-    ws.append([
-        "Part Number", "Part Name", "Location", "Available Qty", "Last Receipt Date", "Last Sales Date", "MAV", "Total Value", "Upload No", "Brand", "Dealer", "Branch",
-        "Part Category", "Uploaded Date", "Uploaded User", "Active Status", "Purchase Aging Days", "Sales Aging Days",
-    ])
+    if include_header:
+        ws.append([
+            "Part Number", "Part Name", "Location", "Available Qty", "Last Receipt Date", "Last Sales Date", "MAV", "Total Value", "Upload No", "Brand", "Dealer", "Branch",
+            "Part Category", "Uploaded Date", "Uploaded User", "Active Status", "Purchase Aging Days", "Sales Aging Days",
+        ])
     for p in rows:
         ws.append([
             p.get("part_number", ""), p.get("item_name", ""), p.get("loc") or p.get("location", ""),
@@ -4420,11 +4421,9 @@ async def export_product_hub_master(
     brand: str = None, dealer: str = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    """Master-only full export. Streams one ZIP containing a separate Excel
-    per branch plus one Master Summary Excel, so large exports never freeze the
-    browser and never require holding lakhs of rows in memory at once (only one
-    branch's rows are held in memory at any given time)."""
-    import zipfile
+    """Master-only full export. Streams one Excel workbook with a single
+    worksheet of continuous product rows for the selected Brand/Dealer filters.
+    Branch files are queried one at a time in the same order as before."""
     from fastapi.responses import StreamingResponse
 
     await _ensure_master(current_user)
@@ -4438,47 +4437,30 @@ async def export_product_hub_master(
 
     branch_summaries = await db.batch_summaries.find(summary_query, {"_id": 0}).sort([("brand_name", 1), ("dealer_name", 1), ("branch", 1)]).to_list(10000)
 
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Master Summary sheet
-        summary_wb = openpyxl.Workbook()
-        summary_ws = summary_wb.active
-        summary_ws.title = "Master Summary"
-        summary_ws.append(["Brand", "Dealer", "Branch", "Total Item", "Available Item", "Available Qty", "Total Value", "Last Upload No", "Uploaded User"])
-        for b in branch_summaries:
-            summary_ws.append([
-                b.get("brand_name", ""), b.get("dealer_name", ""), b.get("branch", ""),
-                int(b.get("total_item", 0)), int(b.get("available_item", 0)),
-                float(b.get("available_qty", 0)), float(b.get("total_value", 0)),
-                b.get("upload_no", ""), b.get("uploaded_user_name", ""),
-            ])
-        summary_out = BytesIO()
-        summary_wb.save(summary_out)
-        summary_out.seek(0)
-        zf.writestr("Master_Summary.xlsx", summary_out.read())
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Product Hub"
+    include_header = True
+    for b in branch_summaries:
+        branch_query = {
+            "publish_status": "Published", "is_active_today": True, "active_date_key": date_key,
+            "brand_name": b.get("brand_name"), "dealer_name": b.get("dealer_name"), "branch": b.get("branch"),
+        }
+        cursor = db.products.find(branch_query, {"_id": 0}).sort("part_number", 1).batch_size(1000)
+        rows = await cursor.to_list(300000)
+        _write_products_sheet(ws, rows, include_header=include_header)
+        include_header = False
+    if include_header:
+        _write_products_sheet(ws, [])
 
-        # One Excel per branch, streamed/queried one at a time to bound memory use.
-        for b in branch_summaries:
-            branch_query = {
-                "publish_status": "Published", "is_active_today": True, "active_date_key": date_key,
-                "brand_name": b.get("brand_name"), "dealer_name": b.get("dealer_name"), "branch": b.get("branch"),
-            }
-            cursor = db.products.find(branch_query, {"_id": 0}).sort("part_number", 1).batch_size(1000)
-            rows = await cursor.to_list(300000)
-
-            branch_wb = openpyxl.Workbook()
-            branch_ws = branch_wb.active
-            branch_ws.title = str(b.get("branch") or "Branch")[:31]
-            _write_products_sheet(branch_ws, rows)
-            branch_out = BytesIO()
-            branch_wb.save(branch_out)
-            branch_out.seek(0)
-
-            safe_name = f"{b.get('brand_name','')}_{b.get('dealer_name','')}_{b.get('branch','')}".replace(" ", "_").replace("/", "-")
-            zf.writestr(f"{safe_name}.xlsx", branch_out.read())
-
-    zip_buffer.seek(0)
-    return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": "attachment; filename=ProductHub_Full_Export.zip"})
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=ProductHub_Full_Export.xlsx"},
+    )
 
 
 # ==================== ORDER DESK V2 ROUTES ====================
