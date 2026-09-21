@@ -39,6 +39,11 @@ from pydantic import BaseModel, ConfigDict
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError, OperationFailure
 
+try:
+    from . import testing_runtime
+except ImportError:
+    import testing_runtime
+
 logger = logging.getLogger("nmts.mobile")
 
 router = APIRouter(prefix="/mobile", tags=["Sleeping Stock Mobile"])
@@ -145,7 +150,8 @@ async def generate_mobile_user_id(branch_name: str) -> str:
         seq = counter["seq"]
         if seq > 9999:
             raise HTTPException(500, "Daily mobile user serial exhausted for this branch")
-        candidate = f"MU{code}{date_key}{seq:04d}"
+        candidate = testing_runtime.prefix_business_id(f"MU{code}{date_key}{seq:04d}")
+
         if not await db.mobile_users.find_one({"mobile_user_id": candidate}, {"_id": 1}):
             return candidate
     raise HTTPException(500, "Unable to allocate a unique Mobile User ID — try again")
@@ -1844,7 +1850,8 @@ async def _get_or_create_mobile_daily_verification_session(
     seq = int(counter.get("seq", 1))
     if seq > 9999:
         raise HTTPException(status_code=500, detail="Daily MOPS verification session serial exhausted")
-    session_id = f"MOPS{date_key}{seq:04d}"
+    session_id = testing_runtime.prefix_business_id(f"MOPS{date_key}{seq:04d}")
+
     now = _now()
     session_doc = {
         "id": str(uuid.uuid4()),

@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Optional, List
 import hashlib, secrets, re, os, uuid
 
+try:
+    from . import testing_runtime
+except ImportError:
+    import testing_runtime
+
 
 def build_mobile_router(db, get_current_user, hash_password, verify_password):
     router = APIRouter(prefix="/mobile/v2", tags=["Sleeping Stock Mobile"])
@@ -101,7 +106,8 @@ def build_mobile_router(db, get_current_user, hash_password, verify_password):
         if await db.mobile_users.find_one({"mobile_number":mobile,"branch_name":branch,"status":{"$ne":"removed"}}): raise HTTPException(409,"Mobile user already exists for this Branch")
         date=now().strftime("%y%m%d"); code=branch_code(branch); cid=f"mobile_user_{code}_{date}"
         counter=await db.counters.find_one_and_update({"_id":cid},{"$inc":{"seq":1}},upsert=True,return_document=ReturnDocument.AFTER)
-        muid=f"MU{code}{date}{int(counter['seq']):04d}"; temp=p.password or (secrets.token_urlsafe(8)+"aA1!")
+        muid=testing_runtime.prefix_business_id(f"MU{code}{date}{int(counter['seq']):04d}"); temp=p.password or (secrets.token_urlsafe(8)+"aA1!")
+
         doc={"id":str(uuid.uuid4()),"mobile_user_id":muid,"name":clean(p.name,100),"mobile_number":mobile,"password_hash":hash_password(temp),
              "brand_id":brand,"brand_name":brand,"dealer_id":dealer,"dealer_name":dealer,"branch_id":branch,"branch_name":branch,"status":"active",
              "created_by_user_id":current_user.user_id or current_user.id,"created_by_name":current_user.username,"created_by_role":current_user.role,

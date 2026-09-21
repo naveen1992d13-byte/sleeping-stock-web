@@ -1,0 +1,148 @@
+# Manual-only: deploy one selected pull request to testing.sleepingstock.in.
+# Never runs on pull_request / push. Never merges. Never touches production.
+name: Deploy PR to Testing
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to deploy to testing.sleepingstock.in
+        required: true
+        type: string
+
+concurrency:
+  group: nmts-testing-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  deploy-testing:
+    name: Deploy selected PR to testing only
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate PR number
+        id: prnum
+        run: |
+          RAW="${{ github.event.inputs.pr_number }}"
+          RAW="$(printf '%s' "$RAW" | tr -d '[:space:]')"
+          if [[ ! "$RAW" =~ ^[0-9]+$ ]]; then
+            echo "PR number must be digits only" >&2
+            exit 1
+          fi
+          echo "pr_number=$RAW" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve exact PR head branch and SHA
+        id: resolve
+        run: |
+          set -euo pipefail
+          PR="${{ steps.prnum.outputs.pr_number }}"
+          API="repos/${{ github.repository }}/pulls/${PR}"
+          PAYLOAD="$(gh api "$API")"
+          HEAD_SHA="$(printf '%s' "$PAYLOAD" | jq -r '.head.sha')"
+          HEAD_REF="$(printf '%s' "$PAYLOAD" | jq -r '.head.ref')"
+          HEAD_REPO="$(printf '%s' "$PAYLOAD" | jq -r '.head.repo.full_name')"
+          STATE="$(printf '%s' "$PAYLOAD" | jq -r '.state')"
+          MERGED="$(printf '%s' "$PAYLOAD" | jq -r '.merged')"
+          if [[ -z "$HEAD_SHA" || "$HEAD_SHA" == "null" ]]; then
+            echo "Could not resolve PR head SHA" >&2
+            exit 1
+          fi
+          if [[ "$STATE" != "open" ]]; then
+            echo "Refusing to deploy a PR that is not open (state=${STATE})" >&2
+            exit 1
+          fi
+          if [[ "$MERGED" == "true" ]]; then
+            echo "Refusing to deploy a merged PR via the testing workflow" >&2
+            exit 1
+          fi
+          if [[ "$HEAD_REPO" != "${{ github.repository }}" ]]; then
+            echo "Refusing fork deploys; PR head must be in ${{ github.repository }}" >&2
+            exit 1
+          fi
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "Resolved PR #${PR} branch=${HEAD_REF} sha=${HEAD_SHA}"
+
+      - name: Checkout deploy scripts at workflow ref
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install SSH key from GitHub Secrets
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.TESTING_SSH_KEY }}
+
+      - name: Pin SSH host key
+        env:
+          TESTING_SSH_HOST: ${{ secrets.TESTING_SSH_HOST }}
+          TESTING_SSH_KNOWN_HOSTS: ${{ secrets.TESTING_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          if [[ -z "${TESTING_SSH_HOST:-}" ]]; then
+            echo "TESTING_SSH_HOST secret is required" >&2
+            exit 1
+          fi
+          if [[ -n "${TESTING_SSH_KNOWN_HOSTS:-}" ]]; then
+            printf '%s\n' "$TESTING_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "$TESTING_SSH_HOST" >> ~/.ssh/known_hosts
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy exact SHA to testing host
+        env:
+          TESTING_SSH_HOST: ${{ secrets.TESTING_SSH_HOST }}
+          TESTING_SSH_USER: ${{ secrets.TESTING_SSH_USER }}
+          TESTING_SSH_PORT: ${{ secrets.TESTING_SSH_PORT }}
+          PR_NUMBER: ${{ steps.prnum.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+          HEAD_REF: ${{ steps.resolve.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+          USER_NAME="${TESTING_SSH_USER:-ec2-user}"
+          PORT="${TESTING_SSH_PORT:-22}"
+          # Do not print secret values. Host/user are deployment routing metadata.
+          echo "Deploying PR #${PR_NUMBER} ${HEAD_REF}@${HEAD_SHA} to testing only"
+          ssh -p "$PORT" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "${USER_NAME}@${TESTING_SSH_HOST}" \
+            "NMTS_TESTING_ROOT=/opt/nmts-testing bash -s" <<EOF
+          set -euo pipefail
+          cd /opt/nmts-testing
+          git fetch origin
+          if [[ -x /usr/local/bin/deploy-pr.sh ]]; then
+            /usr/local/bin/deploy-pr.sh --pr '${PR_NUMBER}' --sha '${HEAD_SHA}' --branch '${HEAD_REF}'
+          elif [[ -x /opt/nmts-testing/deploy/testing/deploy-pr.sh ]]; then
+            /opt/nmts-testing/deploy/testing/deploy-pr.sh --pr '${PR_NUMBER}' --sha '${HEAD_SHA}' --branch '${HEAD_REF}'
+          else
+            echo "deploy-pr.sh is missing on the testing host" >&2
+            exit 1
+          fi
+          EOF
+
+      - name: Confirm testing banner metadata
+        env:
+          PR_NUMBER: ${{ steps.prnum.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          SHORT="${HEAD_SHA:0:7}"
+          META="$(curl -fsS https://testing.sleepingstock.in/deployment.json)"
+          echo "$META" | jq -e --arg pr "$PR_NUMBER" --arg sha "$HEAD_SHA" --arg short "$SHORT" '
+            .environment == "testing"
+            and (.pr_number|tostring) == $pr
+            and (.commit == $sha or .commit_short == $short)
+          ' >/dev/null
+          echo "Testing deployment.json matches PR #${PR_NUMBER} ${SHORT}"
+          curl -fsS -o /dev/null -w "testing_login=%{http_code}\n" https://testing.sleepingstock.in/login
+          curl -fsS -o /dev/null -w "prod_login=%{http_code}\n" https://sleepingstock.in/login
