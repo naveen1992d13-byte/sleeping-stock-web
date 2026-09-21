@@ -139,10 +139,10 @@ def _validate_ingest(target_db, version: str, collections: list[str], expected_c
             errors = mapping_errors(sample[:2000], brands, dealers, branches, collection=name)
             if errors:
                 raise RuntimeError(f"{name} mapping errors: {errors[:8]}")
-        if name == "products" and count:
+        if name == "products" and sample:
             qty = 0.0
             value = 0.0
-            for row in ingest.find({}, {"available_qty_number": 1, "quantity": 1, "total_value_number": 1, "total_value": 1}):
+            for row in sample:
                 qty += float(row.get("available_qty_number", row.get("quantity", 0)) or 0)
                 value += float(row.get("total_value_number", row.get("total_value", 0)) or 0)
             if qty < 0 or value < 0:
@@ -154,42 +154,65 @@ def _flush_ops(live, ops) -> None:
         live.bulk_write(ops, ordered=False)
 
 
+def _payload_from_ingest(name: str, doc: dict[str, Any], version: str, business_date: str, copied_at: str) -> dict[str, Any]:
+    keep_id = keeps_original_id(name, doc) or ("_id" in activation_filter(name, doc))
+    payload = {k: v for k, v in dict(doc).items() if keep_id or k != "_id"}
+    payload["snapshot_version"] = version
+    payload["snapshot_business_date"] = business_date
+    payload["snapshot_copied_at"] = copied_at
+    payload["data_origin"] = "snapshot"
+    payload["is_snapshot_reference"] = True
+    return payload
+
+
 def _activate(target_db, version: str, business_date: str, copied_at: str, collections: list[str]) -> dict[str, int]:
     live_counts: dict[str, int] = {}
     for name in collections:
         ingest = target_db[ingest_collection_name(name, version)]
         live = target_db[name]
-        ops: list[ReplaceOne] = []
+        ingest_total = ingest.count_documents({})
         ingest_count = 0
         skipped_protected = 0
-        for doc in ingest.find():
-            keep_id = keeps_original_id(name, doc) or ("_id" in activation_filter(name, doc))
-            payload = {k: v for k, v in dict(doc).items() if keep_id or k != "_id"}
-            payload["snapshot_version"] = version
-            payload["snapshot_business_date"] = business_date
-            payload["snapshot_copied_at"] = copied_at
-            payload["data_origin"] = "snapshot"
-            payload["is_snapshot_reference"] = True
-            if name == "users" and is_protected_user(payload):
-                skipped_protected += 1
-                continue
-            if name == "users":
-                existing = live.find_one(
-                    {"$or": [{"id": payload.get("id")}, {"email": payload.get("email")}]},
-                    {"email": 1, "is_testing_master": 1},
-                )
-                if is_protected_user(existing):
+        use_insert = name != "users" and ingest_total >= 1000
+        if use_insert:
+            removed = live.delete_many({"data_origin": "snapshot"}).deleted_count
+            _log(f"  replace snapshot {name}: removed {removed} previous snapshot rows, inserting {ingest_total}")
+            batch: list[dict[str, Any]] = []
+            for doc in ingest.find():
+                payload = _payload_from_ingest(name, doc, version, business_date, copied_at)
+                batch.append(payload)
+                ingest_count += 1
+                if len(batch) >= BATCH:
+                    live.insert_many(batch, ordered=False)
+                    batch = []
+                if ingest_count % PROGRESS_EVERY == 0:
+                    _log(f"  activate {name}: {ingest_count}")
+            if batch:
+                live.insert_many(batch, ordered=False)
+        else:
+            ops: list[ReplaceOne] = []
+            for doc in ingest.find():
+                payload = _payload_from_ingest(name, doc, version, business_date, copied_at)
+                if name == "users" and is_protected_user(payload):
                     skipped_protected += 1
                     continue
-            filt = activation_filter(name, payload)
-            ops.append(ReplaceOne(filt, payload, upsert=True))
-            ingest_count += 1
-            if len(ops) >= BATCH:
-                _flush_ops(live, ops)
-                ops = []
-            if ingest_count and ingest_count % PROGRESS_EVERY == 0:
-                _log(f"  activate {name}: {ingest_count}")
-        _flush_ops(live, ops)
+                if name == "users":
+                    existing = live.find_one(
+                        {"$or": [{"id": payload.get("id")}, {"email": payload.get("email")}]},
+                        {"email": 1, "is_testing_master": 1},
+                    )
+                    if is_protected_user(existing):
+                        skipped_protected += 1
+                        continue
+                filt = activation_filter(name, payload)
+                ops.append(ReplaceOne(filt, payload, upsert=True))
+                ingest_count += 1
+                if len(ops) >= BATCH:
+                    _flush_ops(live, ops)
+                    ops = []
+                if ingest_count and ingest_count % PROGRESS_EVERY == 0:
+                    _log(f"  activate {name}: {ingest_count}")
+            _flush_ops(live, ops)
         live_counts[name] = live.count_documents({"data_origin": "snapshot", "snapshot_version": version})
         if live_counts[name] != ingest_count:
             raise RuntimeError(
