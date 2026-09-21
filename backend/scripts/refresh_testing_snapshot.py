@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Copy current operational reference data from production nmts into nmts_testing.
+"""Copy current production nmts data into nmts_testing as a read-only mirror.
 
-Never writes to production. Never copies users, counters, orders, requests,
-uploads, sessions, or S3 archives. DocumentDB-compatible: no collection rename,
-no transactions, no change streams, no $unionWith.
+Never writes to production. Never copies S3 `dev/` objects. DocumentDB-compatible:
+no collection rename, no transactions, no change streams, no $unionWith.
+
+All production collections are mirrored. Testing Master Admin, testing-created
+rows (`data_origin=testing`), and the testing JWT/S3 prefix stay local to
+nmts_testing.
 """
 from __future__ import annotations
 
@@ -29,23 +32,28 @@ if str(REPO_BACKEND) not in sys.path:
 import testing_runtime
 from mongo_connection import build_mongo_client_args, resolve_mongo_url
 from testing_snapshot import (
-    APPROVED_COLLECTIONS,
-    FORBIDDEN_COLLECTIONS,
+    REFERENCE_COLLECTIONS,
     PRESERVE_TARGET_COLLECTIONS,
+    TESTING_MASTER_EMAIL,
     ReadOnlyDatabase,
     SourceWriteBlocked,
+    activation_filter,
+    discover_mirror_collections,
     duplicate_identity_keys,
     ingest_collection_name,
+    is_protected_user,
+    keeps_original_id,
     mapping_errors,
     missing_required_fields,
     stamp_snapshot_doc,
+    testing_master_parity_fields,
 )
 
 IST = ZoneInfo("Asia/Kolkata")
-BATCH = 400
+BATCH = 500
 TARGET_DB = "nmts_testing"
 SOURCE_DB = "nmts"
-TESTING_MASTER_EMAIL = "testing.master@sleepingstock.in"
+PROGRESS_EVERY = 5000
 
 
 def _log(message: str) -> None:
@@ -65,8 +73,6 @@ def _connect(secret_id: str | None = None):
     url = resolve_mongo_url(env)
     mongo_url, kwargs = build_mongo_client_args(url, env)
     kwargs = dict(kwargs)
-    # Snapshot refresh is a one-shot operator job; prefer primary reads of source
-    # so "current" Product Hub data is not lagged on a replica.
     if "readPreference" in kwargs:
         kwargs["readPreference"] = "primaryPreferred"
     return MongoClient(mongo_url, **kwargs)
@@ -87,36 +93,13 @@ def _business_date(source_db) -> str:
     return datetime.now(IST).strftime("%Y%m%d")
 
 
-def _cursor_docs(collection, query: dict[str, Any], projection: dict[str, Any] | None = None):
-    kwargs = {"no_cursor_timeout": False}
-    cursor = collection.find(query, projection, **kwargs).batch_size(BATCH)
+def _cursor_docs(collection, query: dict[str, Any]):
+    cursor = collection.find(query, no_cursor_timeout=False).batch_size(BATCH)
     for doc in cursor:
         yield doc
 
 
-def _insert_batches(target_col, docs: list[dict[str, Any]]) -> int:
-    written = 0
-    for start in range(0, len(docs), BATCH):
-        chunk = docs[start:start + BATCH]
-        if chunk:
-            target_col.insert_many(chunk, ordered=False)
-            written += len(chunk)
-    return written
-
-
-def _source_query(name: str, business_date: str) -> dict[str, Any]:
-    if name == "products":
-        return {
-            "publish_status": "Published",
-            "is_active_today": True,
-            "active_date_key": business_date,
-        }
-    if name == "batch_summaries":
-        return {"active_date_key": business_date}
-    return {}
-
-
-def _validate_ingest(target_db, version: str, business_date: str, expected_counts: dict[str, int]) -> None:
+def _validate_ingest(target_db, version: str, collections: list[str], expected_counts: dict[str, int]) -> None:
     brands = {str(d.get("name") or "").strip() for d in target_db[ingest_collection_name("brands", version)].find({}, {"name": 1})}
     dealers = {str(d.get("name") or "").strip() for d in target_db[ingest_collection_name("dealers", version)].find({}, {"name": 1})}
     branches = {str(d.get("name") or "").strip() for d in target_db[ingest_collection_name("branches", version)].find({}, {"name": 1})}
@@ -127,12 +110,14 @@ def _validate_ingest(target_db, version: str, business_date: str, expected_count
     if not brands or not dealers or not branches:
         raise RuntimeError("Snapshot validation failed: brand/dealer/branch master data missing")
 
-    for name in APPROVED_COLLECTIONS:
+    for name in collections:
         ingest = target_db[ingest_collection_name(name, version)]
         count = ingest.count_documents({})
         expected = expected_counts.get(name, 0)
         if count != expected:
             raise RuntimeError(f"{name} ingest count {count} != source {expected}")
+        if name not in REFERENCE_COLLECTIONS:
+            continue
         sample = list(ingest.find({}, {"_id": 0}).limit(5000))
         missing = missing_required_fields(name, sample if count <= 5000 else list(ingest.find({}, {"_id": 0}).limit(200)))
         if missing:
@@ -152,78 +137,74 @@ def _validate_ingest(target_db, version: str, business_date: str, expected_count
                 value += float(row.get("total_value_number", row.get("total_value", 0)) or 0)
             if qty < 0 or value < 0:
                 raise RuntimeError("Product totals are negative")
-        if name == "products":
-            bad_date = ingest.count_documents({"active_date_key": {"$ne": business_date}})
-            if bad_date:
-                raise RuntimeError(f"products have {bad_date} rows not on snapshot business date {business_date}")
 
 
-UNIQUE_ACTIVATE = {
-    "brands": ("name",),
-    "dealers": ("name", "brand"),
-    "branches": ("name", "dealer", "brand"),
-    "states": ("name",),
-    "groups": ("name",),
-    "products": ("id",),
-    "batch_summaries": ("brand_name", "dealer_name", "branch", "active_date_key"),
-    "templates": ("id",),
-}
+def _flush_ops(live, ops) -> None:
+    if ops:
+        live.bulk_write(ops, ordered=False)
 
 
-def _activate(target_db, version: str, business_date: str, copied_at: str) -> dict[str, int]:
+def _activate(target_db, version: str, business_date: str, copied_at: str, collections: list[str]) -> dict[str, int]:
     live_counts: dict[str, int] = {}
-    for name in APPROVED_COLLECTIONS:
+    for name in collections:
         ingest = target_db[ingest_collection_name(name, version)]
         live = target_db[name]
-        identity = UNIQUE_ACTIVATE.get(name)
-        if not identity:
-            raise RuntimeError(f"No activation identity configured for {name}")
-        ops = []
+        ops: list[ReplaceOne] = []
         ingest_count = 0
+        skipped_protected = 0
         for doc in ingest.find():
-            payload = {k: v for k, v in dict(doc).items() if k != "_id"}
+            keep_id = keeps_original_id(name, doc)
+            payload = {k: v for k, v in dict(doc).items() if keep_id or k != "_id"}
             payload["snapshot_version"] = version
             payload["snapshot_business_date"] = business_date
             payload["snapshot_copied_at"] = copied_at
             payload["data_origin"] = "snapshot"
             payload["is_snapshot_reference"] = True
-            filt = {}
-            for field in identity:
-                value = payload.get(field)
-                if value in (None, "") and field == "brand":
-                    value = payload.get("brand_name")
-                if value in (None, "") and field == "dealer":
-                    value = payload.get("dealer_name")
-                if value in (None, "") and field == "id":
-                    value = payload.get("id") or payload.get("upload_id")
-                filt[field] = value
+            if name == "users" and is_protected_user(payload):
+                skipped_protected += 1
+                continue
+            if name == "users":
+                existing = live.find_one(
+                    {"$or": [{"id": payload.get("id")}, {"email": payload.get("email")}]},
+                    {"email": 1, "is_testing_master": 1},
+                )
+                if is_protected_user(existing):
+                    skipped_protected += 1
+                    continue
+            filt = activation_filter(name, payload)
             ops.append(ReplaceOne(filt, payload, upsert=True))
             ingest_count += 1
             if len(ops) >= BATCH:
-                live.bulk_write(ops, ordered=False)
+                _flush_ops(live, ops)
                 ops = []
-        if ops:
-            live.bulk_write(ops, ordered=False)
+            if ingest_count and ingest_count % PROGRESS_EVERY == 0:
+                _log(f"  activate {name}: {ingest_count}")
+        _flush_ops(live, ops)
         live_counts[name] = live.count_documents({"data_origin": "snapshot", "snapshot_version": version})
         if live_counts[name] != ingest_count:
             raise RuntimeError(
-                f"Activation count mismatch for {name}: live={live_counts[name]} ingest={ingest_count}"
+                f"Activation count mismatch for {name}: live={live_counts[name]} ingest={ingest_count} skipped_protected={skipped_protected}"
             )
         if name in {"products", "batch_summaries"}:
             live.create_index([("data_origin", 1), ("snapshot_version", 1), ("active_date_key", 1)], background=True)
+        _log(f"Activated {name}: {live_counts[name]}")
     return live_counts
 
 
-def _delete_old_snapshot(target_db, keep_version: str) -> None:
-    for name in APPROVED_COLLECTIONS:
-        target_db[name].delete_many({
+def _delete_old_snapshot(target_db, keep_version: str, collections: list[str]) -> None:
+    for name in collections:
+        filt: dict[str, Any] = {
             "data_origin": "snapshot",
             "snapshot_version": {"$ne": keep_version},
-        })
+        }
+        if name == "users":
+            filt["email"] = {"$ne": TESTING_MASTER_EMAIL}
+            filt["is_testing_master"] = {"$ne": True}
+        target_db[name].delete_many(filt)
 
 
-def _drop_ingest(target_db, version: str) -> None:
-    for name in APPROVED_COLLECTIONS:
+def _drop_ingest(target_db, version: str, collections: list[str]) -> None:
+    for name in collections:
         target_db.drop_collection(ingest_collection_name(name, version))
 
 
@@ -238,6 +219,17 @@ def _preserve_check(target_db) -> dict[str, int]:
     if not master:
         raise RuntimeError("Testing Master Admin is missing; refusing snapshot refresh")
     return counts
+
+
+def _ensure_testing_master_parity(target_db) -> None:
+    """Keep Testing Master Admin at full master-role parity without rotating the password."""
+    fields = testing_master_parity_fields()
+    result = target_db.users.update_one(
+        {"email": TESTING_MASTER_EMAIL},
+        {"$set": fields},
+    )
+    if result.matched_count != 1:
+        raise RuntimeError("Testing Master Admin missing while applying permission parity")
 
 
 def refresh(rollback: bool, reset_testing_created: bool, dry_run: bool) -> int:
@@ -279,18 +271,23 @@ def refresh(rollback: bool, reset_testing_created: bool, dry_run: bool) -> int:
         return 0
 
     if reset_testing_created:
-        for name in ("products", "batch_summaries", "uploads", "upload_items", "orders", "order_requests", "request_headers"):
-            result = target_db[name].delete_many({"data_origin": "testing"})
-            _log(f"Reset testing-created {name}: deleted {result.deleted_count}")
-        master = target_db.users.find_one({"email": TESTING_MASTER_EMAIL}, {"_id": 1})
-        if not master:
-            raise SystemExit("Testing Master Admin missing after reset")
+        names = discover_mirror_collections(target_db)
+        for name in names:
+            query: dict[str, Any] = {"data_origin": "testing"}
+            if name == "users":
+                query["email"] = {"$ne": TESTING_MASTER_EMAIL}
+                query["is_testing_master"] = {"$ne": True}
+            result = target_db[name].delete_many(query)
+            if result.deleted_count:
+                _log(f"Reset testing-created {name}: deleted {result.deleted_count}")
+        _ensure_testing_master_parity(target_db)
         _log("Testing Master Admin preserved")
         return 0
 
-    forbidden_present = [name for name in FORBIDDEN_COLLECTIONS if name in APPROVED_COLLECTIONS]
-    if forbidden_present:
-        raise SystemExit(f"Internal error: forbidden collections in approved set: {forbidden_present}")
+    collections = discover_mirror_collections(source_db)
+    if "products" not in collections:
+        raise SystemExit("Source nmts has no products collection")
+    _log(f"Mirroring {len(collections)} production collections into nmts_testing")
 
     business_date = _business_date(source_db)
     copied_at = datetime.now(timezone.utc).isoformat()
@@ -303,36 +300,53 @@ def refresh(rollback: bool, reset_testing_created: bool, dry_run: bool) -> int:
 
     expected: dict[str, int] = {}
     try:
-        for name in APPROVED_COLLECTIONS:
-            query = _source_query(name, business_date)
-            expected[name] = source_db[name].count_documents(query)
+        for name in collections:
+            expected[name] = source_db[name].count_documents({})
             _log(f"Source {name}: {expected[name]}")
             ingest_name = ingest_collection_name(name, version)
             target_db.drop_collection(ingest_name)
             ingest = target_db[ingest_name]
             batch: list[dict[str, Any]] = []
-            for doc in _cursor_docs(source_db[name], query):
-                batch.append(stamp_snapshot_doc(doc, version, copied_at, business_date))
+            written = 0
+            for doc in _cursor_docs(source_db[name], {}):
+                if name == "users" and is_protected_user(doc):
+                    continue
+                batch.append(stamp_snapshot_doc(
+                    doc, version, copied_at, business_date,
+                    keep_id=keeps_original_id(name, doc),
+                ))
                 if len(batch) >= BATCH:
                     ingest.insert_many(batch, ordered=False)
+                    written += len(batch)
                     batch = []
+                    if written % PROGRESS_EVERY == 0:
+                        _log(f"  ingest {name}: {written}")
             if batch:
                 ingest.insert_many(batch, ordered=False)
-        _validate_ingest(target_db, version, business_date, expected)
+                written += len(batch)
+            expected[name] = written if name == "users" else expected[name]
+            if name == "users":
+                # Protected Testing Master is never ingested from source.
+                source_count = source_db[name].count_documents({})
+                skipped = source_count - written
+                expected[name] = written
+                _log(f"  users ingested={written} source={source_count} skipped_protected_or_absent={skipped}")
+        _validate_ingest(target_db, version, collections, expected)
     except SourceWriteBlocked as exc:
         raise SystemExit(str(exc)) from exc
     except Exception:
-        _drop_ingest(target_db, version)
+        _drop_ingest(target_db, version, collections)
         _log("Ingest validation failed; previous snapshot remains active")
         raise
 
     if dry_run:
-        _drop_ingest(target_db, version)
+        _drop_ingest(target_db, version, collections)
         _log("Dry run OK; ingest dropped and live testing data unchanged")
         return 0
 
     try:
-        live_counts = _activate(target_db, version, business_date, copied_at)
+        live_counts = _activate(target_db, version, business_date, copied_at, collections)
+        _ensure_testing_master_parity(target_db)
         preserve_after_activate = _preserve_check(target_db)
         if preserve_after_activate["users"] < preserve_before["users"]:
             raise RuntimeError("User count dropped during activation")
@@ -346,25 +360,28 @@ def refresh(rollback: bool, reset_testing_created: bool, dry_run: bool) -> int:
             "previous_business_date_key": previous.get("business_date_key"),
             "copied_at": copied_at,
             "source_business_date": business_date,
+            "mirror": "full",
+            "collection_count": len(collections),
             "counts": live_counts,
         }
         _write_meta(meta_path, payload)
-        # Confirm Product Hub query date freeze file is in place before deleting old rows.
         if testing_runtime.snapshot_business_date_key() != business_date:
             raise RuntimeError("Active snapshot metadata did not freeze the testing business date")
-        _delete_old_snapshot(target_db, version)
-        _drop_ingest(target_db, version)
+        _delete_old_snapshot(target_db, version, collections)
+        _drop_ingest(target_db, version, collections)
+        _ensure_testing_master_parity(target_db)
         preserve_after = _preserve_check(target_db)
-        _log(f"Active snapshot {version} date={business_date} products={live_counts.get('products', 0)}")
+        _log(f"Active snapshot {version} date={business_date} products={live_counts.get('products', 0)} collections={len(collections)}")
         _log(f"Preserved after refresh: users={preserve_after['users']} orders={preserve_after['orders']} uploads={preserve_after['uploads']}")
         return 0
     except Exception:
         _log("Activation failed; deleting the new version only and keeping the previous snapshot")
-        for name in APPROVED_COLLECTIONS:
+        for name in collections:
             target_db[name].delete_many({"data_origin": "snapshot", "snapshot_version": version})
         if previous:
             _write_meta(meta_path, previous)
-        _drop_ingest(target_db, version)
+        _drop_ingest(target_db, version, collections)
+        _ensure_testing_master_parity(target_db)
         raise
     finally:
         try:

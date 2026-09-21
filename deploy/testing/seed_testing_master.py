@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """One-time seed: exactly one Testing Master Admin in the testing database.
 
-Uses the existing `master` role as-is. Does not create Brand/Dealer/Branch
-data or Admin/User accounts.
+Uses the existing `master` role as-is, with the full Master Admin module
+permission list. Does not create Brand/Dealer/Branch data or Admin/User
+accounts.
 
 Password is generated at run time and printed once. It is not stored in this
-file. Re-running without --reset is a no-op if the testing master already exists.
+file. Re-running without --reset applies permission parity and does not rotate
+the password.
 """
 from __future__ import annotations
 
@@ -44,6 +46,7 @@ async def seed(reset: bool) -> int:
     sys.path.insert(0, str(BACKEND))
     from motor.motor_asyncio import AsyncIOMotorClient
     from mongo_connection import build_mongo_client_args, resolve_mongo_url
+    from testing_snapshot import testing_master_parity_fields
 
     mongo_url = resolve_mongo_url()
     url, kwargs = build_mongo_client_args(mongo_url)
@@ -52,9 +55,15 @@ async def seed(reset: bool) -> int:
     pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
     existing = await db.users.find_one({"email": TESTING_EMAIL}, {"_id": 0, "password": 0})
+    parity = testing_master_parity_fields()
+    if not existing or not existing.get("user_id"):
+        parity["user_id"] = "TS-SSMASTER01"
+
     if existing and not reset:
-        print(f"ALREADY_SEEDED email={TESTING_EMAIL} role={existing.get('role')} id={existing.get('id')}")
-        print("Password is not re-printed. Pass --reset to rotate it.")
+        await db.users.update_one({"email": TESTING_EMAIL}, {"$set": parity})
+        print(f"PARITY_APPLIED email={TESTING_EMAIL} role=master id={existing.get('id')}")
+        print(f"permissions={len(parity['permissions'])} modules")
+        print("Password was not rotated. Pass --reset to rotate it.")
         client.close()
         return 0
 
@@ -65,12 +74,7 @@ async def seed(reset: bool) -> int:
     if existing:
         await db.users.update_one(
             {"email": TESTING_EMAIL},
-            {"$set": {
-                "username": TESTING_USERNAME,
-                "password": hashed,
-                "role": TESTING_ROLE,
-                "status": "active",
-            }},
+            {"$set": {**parity, "password": hashed}},
         )
         action = "RESET"
         user_id = existing.get("id")
@@ -78,20 +82,12 @@ async def seed(reset: bool) -> int:
         user_id = str(uuid.uuid4())
         await db.users.insert_one({
             "id": user_id,
-            "user_id": "",
-            "username": TESTING_USERNAME,
             "email": TESTING_EMAIL,
             "password": hashed,
-            "role": TESTING_ROLE,
             "phone": "",
-            "state": "",
-            "brand": "",
-            "group": "",
-            "location": "",
-            "status": "active",
-            "permissions": {},
             "last_login": None,
             "created_at": now,
+            **parity,
         })
         action = "CREATED"
 
@@ -101,6 +97,7 @@ async def seed(reset: bool) -> int:
     print(f"username={TESTING_USERNAME}")
     print(f"role={TESTING_ROLE}")
     print(f"id={user_id}")
+    print(f"permissions={len(parity['permissions'])} modules")
     print(f"password={password}")
     return 0
 
@@ -109,7 +106,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reset", action="store_true", help="Rotate the testing master password")
     args = parser.parse_args()
-    return asyncio.run(seed(reset=args.reset))
+    return asyncio.run(seed(args.reset))
 
 
 if __name__ == "__main__":

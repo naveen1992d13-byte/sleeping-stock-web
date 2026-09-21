@@ -88,11 +88,12 @@ PR head commit. https://sleepingstock.in must not show the banner.
 
 ## How you refresh current testing snapshot data
 
-Copies current Brand/Dealer/Branch/State/Group masters, current published
-Product Hub rows, matching `batch_summaries`, and templates from `nmts` into
-`nmts_testing`. It does **not** copy users, password hashes, sessions, tokens,
-JWT secrets, counters, email/WhatsApp recipients, orders, requests, uploads,
-or S3 `dev/` archives.
+Copies current Brand/Dealer/Branch/State/Group masters, Product Hub rows
+(including history still in Mongo), uploads, orders/requests, users,
+notifications, mobile records, analytics snapshots, and every other `nmts`
+collection into `nmts_testing`. It does **not** copy S3 `dev/` objects, JWT
+secrets, or env credentials. Testing Master Admin is preserved and never
+overwritten.
 
 ```bash
 /opt/nmts-testing/deploy/testing/refresh-testing-snapshot.sh
@@ -167,8 +168,10 @@ S3 `testing/` only. New business IDs are prefixed `TS-`:
 | Old report | `OR{yymmdd}…` | `TS-OR…` |
 
 Snapshot reference rows keep their original numbers and are marked
-`data_origin=snapshot`. Production counters are never read or incremented.
-Testing-created rows are `data_origin=testing` and survive snapshot refresh.
+`data_origin=snapshot`. Production counters are copied into `nmts_testing` as
+reference data only; the testing app never writes them back to `nmts`. New
+testing IDs still get a `TS-` prefix and new writes stay in `nmts_testing` /
+S3 `testing/`.
 
 Email, WhatsApp, and push stay in test mode (or test-recipient-only). The
 archive scheduler stays disabled.

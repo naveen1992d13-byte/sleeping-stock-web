@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Manually refresh nmts_testing from current production nmts reference data.
-# Never writes to production nmts, never restarts port 8000, never copies users.
+# Manually refresh nmts_testing from current production nmts data (full collection mirror).
+# Never writes to production nmts, never restarts port 8000, never copies S3 dev/ objects.
+# Preserves Testing Master Admin and testing-created rows.
 set -euo pipefail
 
 ROOT="${NMTS_TESTING_ROOT:-/opt/nmts-testing}"

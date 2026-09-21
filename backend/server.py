@@ -200,6 +200,21 @@ def normalize_email(value: str) -> str:
     return (value or "").strip().lower()
 
 
+def _apply_testing_master_permissions(user: dict) -> dict:
+    """Testing Master Admin (role=master) always receives the full module list.
+
+    Production Master Admin already bypasses permission checks via role. This
+    only fills the payload in APP_ENV=testing so no module is omitted if a
+    client checks the permissions array.
+    """
+    if not user:
+        return user
+    if testing_runtime.is_testing_env() and str(user.get("role") or "").lower() == "master":
+        from testing_snapshot import MASTER_PERMISSION_LABELS
+        user["permissions"] = list(MASTER_PERMISSION_LABELS)
+    return user
+
+
 class UserResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str
@@ -359,6 +374,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     user = await db.users.find_one({"id": user_id}, {"_id": 0})
     if user is None:
         raise credentials_exception
+    _apply_testing_master_permissions(user)
     return UserResponse(**user)
 
 # ==================== SOCKET.IO ====================
@@ -536,6 +552,7 @@ async def login(login_data: LoginRequest):
     )
     user["last_login"] = now
     user["permissions"] = normalize_permissions(user.get("permissions"))
+    _apply_testing_master_permissions(user)
 
     activity_log = ActivityLog(user_id=user["id"], action="login")
     log_doc = activity_log.model_dump()

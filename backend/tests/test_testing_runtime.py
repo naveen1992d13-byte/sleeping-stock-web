@@ -43,7 +43,15 @@ def test_assert_env_isolation_rejects_production_db(monkeypatch):
         assert "nmts_testing" in str(exc)
 
 
-def test_production_rejects_testing_db(monkeypatch):
+def test_production_rejects_testing_storage(monkeypatch):
+    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.setenv("DB_NAME", "nmts")
+    monkeypatch.setenv("NMTS_STORAGE_ENV", "testing")
+    try:
+        tr.assert_env_isolation()
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "testing" in str(exc)
     monkeypatch.delenv("APP_ENV", raising=False)
     monkeypatch.setenv("DB_NAME", "nmts_testing")
     monkeypatch.setenv("NMTS_STORAGE_ENV", "dev")
