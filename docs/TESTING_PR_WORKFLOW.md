@@ -28,34 +28,19 @@ an extra UI safeguard. Production UI, roles, and permissions are unchanged.
 3. **Do not merge** that PR yet.
 4. Fixes stay on the same branch / same PR. Redeploy testing after each push.
 
-PR **#68** (Product Hub single-Excel export) does **not** include the testing
-isolation from PR **#69**. Both share merge-base `05d34e6` and overlap only on
-`backend/server.py`. To test #68 without merging it into `main`, use the
-temporary integration branch:
-
-- Branch: `cursor/testing-int-pr68-c95b`
-- Contents: PR #69 foundation + this workflow + PR #68 export change
-- **Never merge the integration branch into `main`.** Keep PR #68 as the
-  application-change PR.
-
-To pick up later commits from PR #68:
-
-```bash
-git fetch origin cursor/product-hub-single-xlsx-c95b
-git checkout cursor/testing-int-pr68-c95b
-git merge origin/cursor/product-hub-single-xlsx-c95b
-git push origin cursor/testing-int-pr68-c95b
-```
-
-Then redeploy that integration PR to testing.
+Product Hub single-Excel export is already on `main` via PR **#68**. Remaining
+testing isolation, snapshot refresh, TS- identifiers, and this deploy workflow
+live on the consolidation branch (not the old `cursor/testing-int-pr68-c95b`
+integration branch). **Never merge** `cursor/testing-int-pr68-c95b` into
+`main`; it was a temporary testing-only stack used to prove #68.
 
 ## How you select a PR in GitHub Actions
 
 1. Open the repository on GitHub → **Actions**.
 2. Choose workflow **Deploy PR to Testing**.
 3. Click **Run workflow**.
-4. Enter the PR number (for Product Hub export testing, use the integration PR
-   that contains #68, not `main`).
+4. Enter the PR number of the branch you want on testing.sleepingstock.in
+   (not `main`, and never a merged production deploy).
 5. Run it. The workflow does not start when a PR is opened or updated.
 
 Required GitHub Actions secrets (never put these in the repo):
@@ -155,8 +140,8 @@ database).
 3. Testing Master Admin may use **All Data**, **Snapshot Reference Data**, or
    **Testing-Created Data**. Those filters are hidden in production.
 4. Admin/User accounts keep existing Brand/Dealer/Branch restrictions.
-5. On the #68 integration deploy, **Export All** downloads one `.xlsx` with
-   one worksheet, not a ZIP. Pagination still loads one page from the backend.
+5. **Export All** downloads one `.xlsx` with one worksheet, not a ZIP
+   (PR #68, now on `main`). Pagination still loads one page from the backend.
 
 ## How you create testing users through User Hub
 
@@ -197,9 +182,10 @@ SHA. Banner values must change to the new commit.
 ## How you approve and merge only after testing passes
 
 1. Test on https://testing.sleepingstock.in.
-2. Approve the **application** PR (#68 for Product Hub export, or the workflow
-   PR for this testing infrastructure).
-3. Merge **that** PR into `main` yourself. Do not merge the integration branch.
+2. Approve the **application** or testing-infrastructure PR that is currently
+   deployed.
+3. Merge **that** PR into `main` yourself. Do not merge
+   `cursor/testing-int-pr68-c95b`.
 4. Do not use the website to merge or deploy arbitrary code. There is no such
    button.
 
