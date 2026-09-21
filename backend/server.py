@@ -100,6 +100,13 @@ except ImportError:
 # EC2), credentials come from Secrets Manager and the client talks to DocumentDB.
 # When unset, MONGO_URL is used unchanged (local/dev Atlas-style fallback).
 # Driver identifiers stay client/db/mongo_url — DocumentDB is Mongo wire-compatible.
+try:
+    from . import testing_runtime
+except ImportError:
+    import testing_runtime
+
+testing_runtime.assert_env_isolation()
+
 mongo_url = resolve_mongo_url()
 _mongo_url, _mongo_kwargs = build_mongo_client_args(mongo_url)
 client = AsyncIOMotorClient(_mongo_url, **_mongo_kwargs)
@@ -434,7 +441,8 @@ async def generate_upload_no(upload_type: str, brand_code: str):
         return_document=ReturnDocument.AFTER,
     )
     seq = int(counter.get("seq", 1))
-    return f"{type_code}{clean_brand_code}{today_key}{seq:03d}"
+    return testing_runtime.prefix_business_id(f"{type_code}{clean_brand_code}{today_key}{seq:03d}")
+
 
 
 async def get_user_upload_context(current_user: UserResponse):
@@ -610,6 +618,7 @@ async def create_user(user_data: UserCreate, current_user: UserResponse = Depend
     
     doc = user.model_dump()
     doc['created_at'] = doc['created_at'].isoformat()
+    doc = testing_runtime.stamp_testing_origin(doc)
     await db.users.insert_one(doc)
     
     return UserResponse(**user.model_dump())
@@ -1215,7 +1224,7 @@ async def create_order(order_data: OrderCreate, current_user: UserResponse = Dep
     doc = order.model_dump()
     doc['created_at'] = doc['created_at'].isoformat()
     doc['updated_at'] = doc['updated_at'].isoformat()
-    await db.orders.insert_one(doc)
+    await db.orders.insert_one(testing_runtime.stamp_testing_origin(doc))
     
     # Create notification
     notification = Notification(
@@ -1955,7 +1964,7 @@ async def create_brand(brand: BrandCreate, current_user: UserResponse = Depends(
     new_brand = Brand(name=brand.name)
     doc = new_brand.model_dump()
     doc['created_at'] = doc['created_at'].isoformat()
-    await db.brands.insert_one(doc)
+    await db.brands.insert_one(testing_runtime.stamp_testing_origin(doc))
     return {"message": "Brand created successfully", "name": brand.name}
 
 @api_router.delete("/brands/{brand_name}")
@@ -2010,6 +2019,8 @@ async def ensure_master_user_exists():
     for manual/idempotent use. Both paths share this single implementation so
     there is exactly one place that defines the default admin credentials.
     """
+    if os.getenv("NMTS_DISABLE_DEFAULT_MASTER_SEED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return {"message": "Default master seed disabled"}
     master = await db.users.find_one({"role": "master"})
     if not master:
         master_user = User(
@@ -2355,14 +2366,14 @@ async def add_master_brand(data: MasterBrandCreate, current_user: UserResponse =
     if await db.brands.find_one({"name": name}):
         raise HTTPException(status_code=400, detail="Brand name already exists")
 
-    await db.brands.insert_one({
+    await db.brands.insert_one(testing_runtime.stamp_testing_origin({
         "id": str(uuid.uuid4()),
         "code": code,
         "name": name,
         "status": "active",
         "createdAt": _now_iso(),
         "createdBy": current_user.id
-    })
+    }))
 
     return {"message": "Brand added successfully"}
 
@@ -2447,7 +2458,7 @@ async def add_master_dealer(data: MasterDealerCreate, current_user: UserResponse
     if await _find_dealers_by_name(name, brand):
         raise HTTPException(status_code=400, detail="Dealer already exists")
 
-    await db.dealers.insert_one({
+    await db.dealers.insert_one(testing_runtime.stamp_testing_origin({
         "id": str(uuid.uuid4()),
         "name": name,
         "brand": brand,
@@ -2455,7 +2466,7 @@ async def add_master_dealer(data: MasterDealerCreate, current_user: UserResponse
         "status": "active",
         "createdAt": _now_iso(),
         "createdBy": current_user.id
-    })
+    }))
 
     return {"message": "Dealer added successfully"}
 
@@ -2591,7 +2602,7 @@ async def add_master_branch(data: MasterBranchCreate, current_user: UserResponse
     if await _find_branches_by_identity(name, dealer, brand):
         raise HTTPException(status_code=400, detail="Branch already exists")
 
-    await db.branches.insert_one({
+    await db.branches.insert_one(testing_runtime.stamp_testing_origin({
         "id": str(uuid.uuid4()),
         "brand": brand,
         "brand_name": brand,
@@ -2601,7 +2612,7 @@ async def add_master_branch(data: MasterBranchCreate, current_user: UserResponse
         "status": "active",
         "createdAt": _now_iso(),
         "createdBy": current_user.id
-    })
+    }))
 
     return {"message": "Branch added successfully"}
 
@@ -2719,15 +2730,17 @@ async def _build_next_user_id(state_code: str, brand_code: str) -> str:
     # Format: SS + StateCode + BrandCode + YYMMDD + running number
     # Example: SSKLHY26070501
     prefix = f"SS{clean_state_code}{clean_brand_code}{date_code}"
+    id_pattern = f"^(?:TS-)?{re.escape(prefix)}"
 
     count = await db.users.count_documents({
         "$or": [
-            {"userId": {"$regex": f"^{re.escape(prefix)}"}},
-            {"user_id": {"$regex": f"^{re.escape(prefix)}"}}
+            {"userId": {"$regex": id_pattern}},
+            {"user_id": {"$regex": id_pattern}}
         ]
     })
 
-    return f"{prefix}{str(count + 1).zfill(2)}"
+    return testing_runtime.prefix_business_id(f"{prefix}{str(count + 1).zfill(2)}")
+
 
 
 @api_router.get("/users/generate-id")
@@ -3284,12 +3297,23 @@ def _nmts_now():
 
 
 def _nmts_date_key(dt=None):
+    # Testing freezes "today" to the active snapshot business date so copied
+    # Product Hub rows remain visible without rewriting production records.
+    if testing_runtime.is_testing_env() and dt is None:
+        frozen = testing_runtime.snapshot_business_date_key()
+        if frozen:
+            return frozen
     value = dt or _nmts_now()
     if value.tzinfo is None:
         value = value.replace(tzinfo=NMTS_TIMEZONE)
     else:
         value = value.astimezone(NMTS_TIMEZONE)
+    if testing_runtime.is_testing_env():
+        frozen = testing_runtime.snapshot_business_date_key()
+        if frozen:
+            return frozen
     return value.strftime("%Y%m%d")
+
 
 
 def _nmts_display_date(dt=None):
@@ -3516,7 +3540,7 @@ async def upload_product_center_v2(
         total_available_qty += qty
         total_value += line_value
         rows_imported += 1
-        item_docs.append({
+        item_docs.append(testing_runtime.stamp_testing_origin({
             "id": str(uuid.uuid4()),
             "upload_id": upload_id,
             "upload_no": upload_no,
@@ -3543,7 +3567,7 @@ async def upload_product_center_v2(
             "active_date_key": _nmts_date_key(now),
             "created_at": now.isoformat(),
             **context,
-        })
+        }))
 
     if item_docs:
         await db.upload_items.insert_many(item_docs)
@@ -3581,7 +3605,7 @@ async def upload_product_center_v2(
         "created_at": now.isoformat(),
         **context,
     }
-    await db.uploads.insert_one(upload_doc)
+    await db.uploads.insert_one(testing_runtime.stamp_testing_origin(upload_doc))
     try:
         await event_archive.maybe_enqueue_upload_stored(db, upload_doc)
     except Exception as exc:
@@ -3778,13 +3802,13 @@ async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends
             # Partial-publish reconcile: products already exist for this upload_id.
             if existing_products > 0:
                 await db.products.update_many(
-                    {
+                    _testing_created_only_query({
                         "brand_name": upload.get("brand_name"),
                         "dealer_name": upload.get("dealer_name"),
                         "branch": upload.get("branch"),
                         "is_active_today": True,
                         "upload_id": {"$ne": upload_id},
-                    },
+                    }),
                     {"$set": {"is_active_today": False}},
                 )
                 await db.products.update_many(
@@ -3804,12 +3828,12 @@ async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends
 
             # Fresh publish: deactivate prior active stock for this branch scope
             # (any previous business date), then insert today's batch once.
-            await db.products.update_many({
+            await db.products.update_many(_testing_created_only_query({
                 "brand_name": upload.get("brand_name"),
                 "dealer_name": upload.get("dealer_name"),
                 "branch": upload.get("branch"),
                 "is_active_today": True,
-            }, {"$set": {"is_active_today": False}})
+            }), {"$set": {"is_active_today": False}})
 
             product_docs = []
             for item in items:
@@ -3844,7 +3868,7 @@ async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends
                     "mav_value": unit_val_num,
                     "total_value": total_val_num,
                 })
-                product_docs.append(doc)
+                product_docs.append(testing_runtime.stamp_testing_origin(doc))
 
             if product_docs:
                 await db.products.insert_many(product_docs)
@@ -3889,9 +3913,7 @@ async def cancel_upload_v2(upload_id: str, data: CancelUploadRequest, current_us
     if current_user.role == "admin" and (upload.get("brand_name") != current_user.brand or upload.get("dealer_name") != current_user.group):
         raise HTTPException(status_code=403, detail="Not allowed to cancel this upload")
     old_no = upload.get("upload_no") or ""
-    cancel_no = old_no
-    if old_no.startswith(("PU", "OU")):
-        cancel_no = "CN" + old_no[2:]
+    cancel_no = testing_runtime.testing_cancel_upload_no(old_no)
     now = _nmts_now()
     reason = (data.reason or "Other").strip() or "Other"
     await db.uploads.update_one({"id": upload_id}, {"$set": {
@@ -4086,16 +4108,25 @@ async def list_product_hub_history_rows(
 # fields (available_qty_number / unit_value_number / total_value_number)
 # written at upload time, so there is no string-concatenation risk.
 
-def _product_hub_active_query(current_user: UserResponse, brand=None, dealer=None, branch=None):
+def _testing_created_only_query(query: dict) -> dict:
+    """Keep snapshot reference Product Hub rows active when testing publishes."""
+    if testing_runtime.is_testing_env():
+        query = dict(query)
+        query["data_origin"] = testing_runtime.DATA_ORIGIN_TESTING
+    return query
+
+
+def _product_hub_active_query(current_user: UserResponse, brand=None, dealer=None, branch=None, data_origin=None):
     query = {"publish_status": "Published", "is_active_today": True, "active_date_key": _nmts_date_key()}
     _apply_role_scope_v2(query, current_user, brand, dealer, branch)
+    testing_runtime.merge_query(query, testing_runtime.origin_query(data_origin))
     return query
 
 
 @api_router.get("/product-hub/summary")
 async def product_hub_summary(
     brand: str = None, dealer: str = None, branch: str = None, search: str = None,
-    category: str = None, stock_status: str = None,
+    category: str = None, stock_status: str = None, data_origin: str = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
     """Fast summary cards: Total Item, Total Available Item, Total Available Quantity, Total Value.
@@ -4105,7 +4136,7 @@ async def product_hub_summary(
     search = (search or "").strip()
     needs_product_scan = bool(search) or (not _is_all_part_type(category) and not _is_all_scope(category)) or (
         (stock_status or "all").strip().lower() not in {"", "all"}
-    )
+    ) or testing_runtime.is_testing_env()
 
     if not needs_product_scan:
         batch_query = {"active_date_key": date_key}
@@ -4135,7 +4166,7 @@ async def product_hub_summary(
             return summary
         needs_product_scan = True
 
-    query = _product_hub_active_query(current_user, brand, dealer, branch)
+    query = _product_hub_active_query(current_user, brand, dealer, branch, data_origin=data_origin)
     _apply_category_filter(query, category)
     _apply_stock_status_filter(query, stock_status)
     if search:
@@ -4176,7 +4207,7 @@ async def product_hub_summary(
 
 @api_router.get("/product-hub/branch-summary")
 async def product_hub_branch_summary(
-    brand: str = None, dealer: str = None, branch: str = None,
+    brand: str = None, dealer: str = None, branch: str = None, data_origin: str = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
     """Master Product Hub landing view: branch-wise summary cards (not raw records).
@@ -4196,6 +4227,32 @@ async def product_hub_branch_summary(
         query["branch"] = branch
     elif current_user.role == "user":
         query["branch"] = current_user.location
+    testing_runtime.merge_query(query, testing_runtime.origin_query(data_origin))
+
+    if testing_runtime.is_testing_env():
+        product_query = _product_hub_active_query(current_user, brand, dealer, branch, data_origin=data_origin)
+        pipeline = [
+            {"$match": product_query},
+            {"$group": {
+                "_id": {"brand_name": "$brand_name", "dealer_name": "$dealer_name", "branch": "$branch"},
+                "total_item": {"$sum": 1},
+                "available_item": {"$sum": {"$cond": [{"$gt": [{"$toDouble": {"$ifNull": ["$available_qty_number", 0]}}, 0]}, 1, 0]}},
+                "available_qty": {"$sum": {"$toDouble": {"$ifNull": ["$available_qty_number", 0]}}},
+                "total_value": {"$sum": {"$toDouble": {"$ifNull": ["$total_value_number", 0]}}},
+            }},
+            {"$sort": {"_id.branch": 1}},
+        ]
+        grouped = await db.products.aggregate(pipeline, allowDiskUse=True).to_list(10000)
+        return [{
+            "brand_name": r["_id"].get("brand_name"),
+            "dealer_name": r["_id"].get("dealer_name"),
+            "branch": r["_id"].get("branch"),
+            "total_item": r.get("total_item", 0),
+            "available_item": r.get("available_item", 0),
+            "available_qty": r.get("available_qty", 0),
+            "total_value": r.get("total_value", 0),
+            "active_date_key": date_key,
+        } for r in grouped]
 
     rows = await db.batch_summaries.find(query, {"_id": 0}).sort("branch", 1).to_list(10000)
     return rows
@@ -4288,7 +4345,7 @@ _canonical_part_types_from_raw = _distinct_part_types_from_raw
 @api_router.get("/product-hub/part-types")
 async def product_hub_part_types(
     brand: str = None, dealer: str = None, branch: str = None,
-    search: str = None, stock_status: str = None,
+    search: str = None, stock_status: str = None, data_origin: str = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
     """Distinct stored Part Types present in scoped Product Hub data.
@@ -4297,7 +4354,7 @@ async def product_hub_part_types(
       part_types: ["All", ...] actual labels for the current Brand/Dealer/Branch scope
       available_types: the same list without All
     """
-    query = _product_hub_active_query(current_user, brand, dealer, branch)
+    query = _product_hub_active_query(current_user, brand, dealer, branch, data_origin=data_origin)
     pipeline = [
         {"$match": query},
         {"$group": {
@@ -4321,7 +4378,7 @@ async def product_hub_part_types(
 async def product_hub_records(
     brand: str = None, dealer: str = None, branch: str = None, search: str = None,
     category: str = None, stock_status: str = None, from_date: str = None, to_date: str = None,
-    page: int = 1, page_size: int = 300,
+    page: int = 1, page_size: int = 300, data_origin: str = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
     """Paginated Product Hub raw records. Search/filter happen entirely on the
@@ -4329,7 +4386,7 @@ async def product_hub_records(
     page = max(page, 1)
     page_size = max(1, min(page_size, 1000))
 
-    query = _product_hub_active_query(current_user, brand, dealer, branch)
+    query = _product_hub_active_query(current_user, brand, dealer, branch, data_origin=data_origin)
     _apply_category_filter(query, category)
     _apply_stock_status_filter(query, stock_status)
     _apply_uploaded_date_range_filter(query, from_date, to_date)
@@ -4390,6 +4447,7 @@ def _write_products_sheet(ws, rows, include_header=True):
 async def export_product_hub_branch(
     brand: str, dealer: str, branch: str,
     category: str = None, stock_status: str = None, from_date: str = None, to_date: str = None,
+    data_origin: str = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
     """Single-branch Excel export, generated entirely on the backend and streamed
@@ -4397,7 +4455,7 @@ async def export_product_hub_branch(
     from fastapi.responses import StreamingResponse
     excel_permissions.require_excel_export(current_user)
 
-    query = _product_hub_active_query(current_user, brand, dealer, branch)
+    query = _product_hub_active_query(current_user, brand, dealer, branch, data_origin=data_origin)
     _apply_category_filter(query, category)
     _apply_stock_status_filter(query, stock_status)
     _apply_uploaded_date_range_filter(query, from_date, to_date)
@@ -4418,7 +4476,7 @@ async def export_product_hub_branch(
 
 @api_router.get("/product-hub/export/master")
 async def export_product_hub_master(
-    brand: str = None, dealer: str = None,
+    brand: str = None, dealer: str = None, data_origin: str = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
     """Master-only full export. Streams one Excel workbook with a single
@@ -4434,8 +4492,32 @@ async def export_product_hub_master(
         summary_query["brand_name"] = brand
     if not _is_all_scope(dealer):
         summary_query["dealer_name"] = dealer
+    testing_runtime.merge_query(summary_query, testing_runtime.origin_query(data_origin))
 
-    branch_summaries = await db.batch_summaries.find(summary_query, {"_id": 0}).sort([("brand_name", 1), ("dealer_name", 1), ("branch", 1)]).to_list(10000)
+    if testing_runtime.is_testing_env():
+        product_query = _product_hub_active_query(current_user, brand, dealer, None, data_origin=data_origin)
+        grouped = await db.products.aggregate([
+            {"$match": product_query},
+            {"$group": {
+                "_id": {"brand_name": "$brand_name", "dealer_name": "$dealer_name", "branch": "$branch"},
+                "total_item": {"$sum": 1},
+                "available_item": {"$sum": {"$cond": [{"$gt": [{"$toDouble": {"$ifNull": ["$available_qty_number", 0]}}, 0]}, 1, 0]}},
+                "available_qty": {"$sum": {"$toDouble": {"$ifNull": ["$available_qty_number", 0]}}},
+                "total_value": {"$sum": {"$toDouble": {"$ifNull": ["$total_value_number", 0]}}},
+            }},
+            {"$sort": {"_id.brand_name": 1, "_id.dealer_name": 1, "_id.branch": 1}},
+        ], allowDiskUse=True).to_list(10000)
+        branch_summaries = [{
+            "brand_name": r["_id"].get("brand_name"),
+            "dealer_name": r["_id"].get("dealer_name"),
+            "branch": r["_id"].get("branch"),
+            "total_item": r.get("total_item", 0),
+            "available_item": r.get("available_item", 0),
+            "available_qty": r.get("available_qty", 0),
+            "total_value": r.get("total_value", 0),
+        } for r in grouped]
+    else:
+        branch_summaries = await db.batch_summaries.find(summary_query, {"_id": 0}).sort([("brand_name", 1), ("dealer_name", 1), ("branch", 1)]).to_list(10000)
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -4446,6 +4528,7 @@ async def export_product_hub_master(
             "publish_status": "Published", "is_active_today": True, "active_date_key": date_key,
             "brand_name": b.get("brand_name"), "dealer_name": b.get("dealer_name"), "branch": b.get("branch"),
         }
+        testing_runtime.merge_query(branch_query, testing_runtime.origin_query(data_origin))
         cursor = db.products.find(branch_query, {"_id": 0}).sort("part_number", 1).batch_size(1000)
         rows = await cursor.to_list(300000)
         _write_products_sheet(ws, rows, include_header=include_header)
@@ -4587,7 +4670,8 @@ async def _generate_order_number(brand_code: str):
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
-    return f"OR{brand}{date_key}{int(counter.get('seq', 1)):03d}"
+    return testing_runtime.prefix_business_id(f"OR{brand}{date_key}{int(counter.get('seq', 1)):03d}")
+
 
 
 async def _generate_request_number(brand_code: str) -> dict:
@@ -4611,7 +4695,8 @@ async def _generate_request_number(brand_code: str) -> dict:
         # Never silently wrap into a colliding number.
         raise HTTPException(status_code=500, detail=f'Daily request sequence exhausted for brand {clean_brand}. Contact support.')
     return {
-        'request_number': f'RQ{clean_brand}{date_key}{seq:04d}',
+        'request_number': testing_runtime.prefix_business_id(f'RQ{clean_brand}{date_key}{seq:04d}'),
+
         'brand_code': clean_brand, 'date_key': date_key, 'sequence': seq,
     }
 
@@ -5625,7 +5710,7 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
     group_doc.update(schedule)
 
     try:
-        await db.request_headers.insert_one(dict(group_doc))
+        await db.request_headers.insert_one(testing_runtime.stamp_testing_origin(dict(group_doc)))
     except DuplicateKeyError:
         # Concurrent duplicate ACTIVE request to the same destination
         # (partial unique index on status=Requested). Reuse the winner.
@@ -7609,7 +7694,8 @@ async def _next_mops_verification_session_id() -> str:
     seq = int(counter.get("seq", 1))
     if seq > 9999:
         raise HTTPException(status_code=500, detail="Daily MOPS verification session serial exhausted")
-    return f"MOPS{date_key}{seq:04d}"
+    return testing_runtime.prefix_business_id(f"MOPS{date_key}{seq:04d}")
+
 
 
 async def _next_perpetual_session_id(brand_name: str = "") -> str:
@@ -8565,6 +8651,19 @@ async def storage_archive_delete_mongo(
     )
 
 
+@api_router.get("/testing/runtime")
+async def testing_runtime_status():
+    """Non-secret testing banner / filter status. Production returns is_testing=false."""
+    return testing_runtime.public_runtime_status()
+
+
+@api_router.get("/testing/deployment")
+async def testing_deployment_metadata():
+    if not testing_runtime.is_testing_env():
+        raise HTTPException(status_code=404, detail="Not a testing environment")
+    return testing_runtime.load_deployment_metadata()
+
+
 app.include_router(api_router)
 
 @app.middleware("http")
@@ -8585,6 +8684,10 @@ async def maintenance_guard(request: Request, call_next):
     if path.endswith("/auth/login") or path.endswith("/api/auth/login"):
         return await call_next(request)  # login handler enforces role rule
     if path.endswith("/maintenance/status") or path.endswith("/api/maintenance/status"):
+        return await call_next(request)
+    if path.endswith("/testing/runtime") or path.endswith("/api/testing/runtime"):
+        return await call_next(request)
+    if path.endswith("/testing/deployment") or path.endswith("/api/testing/deployment"):
         return await call_next(request)
 
     # Identify caller (best-effort)

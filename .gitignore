@@ -33,3 +33,8 @@ backend/.env.s3.local
 # EC2-local secrets and TLS material (never commit)
 backend/.env.backup
 backend/certs/
+
+# Generated testing-only metadata (never commit)
+backend/deployment.json
+backend/testing_snapshot_active.json
+

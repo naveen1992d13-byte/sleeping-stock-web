@@ -1,0 +1,19 @@
+[Unit]
+Description=NMTS testing backend (uvicorn on 127.0.0.1:8001)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/opt/nmts-testing/backend
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/nmts-testing/backend/venv/bin/python -m uvicorn server:socket_app --host 127.0.0.1 --port 8001
+Restart=on-failure
+RestartSec=5
+
+# Never bind 8000 — that is the production backend.
+
+[Install]
+WantedBy=multi-user.target
