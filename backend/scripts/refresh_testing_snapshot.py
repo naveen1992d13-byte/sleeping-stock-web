@@ -84,7 +84,7 @@ def _business_date(source_db) -> str:
         str(k).replace("-", "")
         for k in source_db.products.distinct(
             "active_date_key",
-            {"publish_status": "Published", "is_active_today": True},
+            {"publish_status": "Published"},
         )
         if k
     ]
@@ -100,7 +100,7 @@ def _cursor_docs(collection, query: dict[str, Any]):
         yield doc
 
 
-def _validate_ingest(target_db, version: str, collections: list[str], expected_counts: dict[str, int]) -> None:
+def _validate_ingest(target_db, version: str, collections: list[str], expected_counts: dict[str, int], business_date: str) -> None:
     brands = {str(d.get("name") or "").strip() for d in target_db[ingest_collection_name("brands", version)].find({}, {"name": 1})}
     dealers = {str(d.get("name") or "").strip() for d in target_db[ingest_collection_name("dealers", version)].find({}, {"name": 1})}
     branches = {str(d.get("name") or "").strip() for d in target_db[ingest_collection_name("branches", version)].find({}, {"name": 1})}
@@ -121,11 +121,11 @@ def _validate_ingest(target_db, version: str, collections: list[str], expected_c
             continue
         if name == "products":
             sample = list(ingest.find(
-                {"publish_status": "Published", "is_active_today": True},
+                {"publish_status": "Published", "active_date_key": business_date},
                 {"_id": 0},
             ).limit(5000))
             if not sample:
-                sample = list(ingest.find({}, {"_id": 0}).limit(200))
+                sample = list(ingest.find({"publish_status": "Published"}, {"_id": 0}).limit(200))
         else:
             sample = list(ingest.find({}, {"_id": 0}).limit(5000))
         missing = missing_required_fields(name, sample if len(sample) <= 5000 else sample[:200])
@@ -346,7 +346,7 @@ def refresh(rollback: bool, reset_testing_created: bool, dry_run: bool) -> int:
                 skipped = source_count - written
                 expected[name] = written
                 _log(f"  users ingested={written} source={source_count} skipped_protected_or_absent={skipped}")
-        _validate_ingest(target_db, version, collections, expected)
+        _validate_ingest(target_db, version, collections, expected, business_date)
     except SourceWriteBlocked as exc:
         raise SystemExit(str(exc)) from exc
     except Exception:
