@@ -38,6 +38,7 @@ from testing_snapshot import (
     ReadOnlyDatabase,
     SourceWriteBlocked,
     activation_filter,
+    activation_identity,
     discover_mirror_collections,
     duplicate_identity_keys,
     ingest_collection_name,
