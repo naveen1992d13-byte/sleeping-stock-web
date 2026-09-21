@@ -287,6 +287,11 @@ def activation_filter(collection: str, payload: Mapping[str, Any]) -> dict[str, 
         if value in (None, "") and field == "id":
             value = payload.get("id") or payload.get("upload_id")
         filt[field] = value
+    if all(v in (None, "") for v in filt.values()):
+        if payload.get("_id") is not None:
+            return {"_id": payload["_id"]}
+        if payload.get("id") not in (None, ""):
+            return {"id": payload["id"]}
     return filt
 
 

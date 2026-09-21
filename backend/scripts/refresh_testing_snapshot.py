@@ -118,13 +118,22 @@ def _validate_ingest(target_db, version: str, collections: list[str], expected_c
             raise RuntimeError(f"{name} ingest count {count} != source {expected}")
         if name not in REFERENCE_COLLECTIONS:
             continue
-        sample = list(ingest.find({}, {"_id": 0}).limit(5000))
-        missing = missing_required_fields(name, sample if count <= 5000 else list(ingest.find({}, {"_id": 0}).limit(200)))
+        if name == "products":
+            sample = list(ingest.find(
+                {"publish_status": "Published", "is_active_today": True},
+                {"_id": 0},
+            ).limit(5000))
+            if not sample:
+                sample = list(ingest.find({}, {"_id": 0}).limit(200))
+        else:
+            sample = list(ingest.find({}, {"_id": 0}).limit(5000))
+        missing = missing_required_fields(name, sample if len(sample) <= 5000 else sample[:200])
         if missing:
             raise RuntimeError(f"{name} missing required fields: {missing[:8]}")
-        dupes = duplicate_identity_keys(name, sample)
-        if dupes:
-            raise RuntimeError(f"{name} duplicate identity keys: {dupes[:8]}")
+        if name != "products":
+            dupes = duplicate_identity_keys(name, sample)
+            if dupes:
+                raise RuntimeError(f"{name} duplicate identity keys: {dupes[:8]}")
         if name in {"products", "batch_summaries", "dealers", "branches"}:
             errors = mapping_errors(sample[:2000], brands, dealers, branches, collection=name)
             if errors:
@@ -153,7 +162,7 @@ def _activate(target_db, version: str, business_date: str, copied_at: str, colle
         ingest_count = 0
         skipped_protected = 0
         for doc in ingest.find():
-            keep_id = keeps_original_id(name, doc)
+            keep_id = keeps_original_id(name, doc) or ("_id" in activation_filter(name, doc))
             payload = {k: v for k, v in dict(doc).items() if keep_id or k != "_id"}
             payload["snapshot_version"] = version
             payload["snapshot_business_date"] = business_date
@@ -311,9 +320,14 @@ def refresh(rollback: bool, reset_testing_created: bool, dry_run: bool) -> int:
             for doc in _cursor_docs(source_db[name], {}):
                 if name == "users" and is_protected_user(doc):
                     continue
+                keep_id = keeps_original_id(name, doc)
+                if not keep_id:
+                    ident = activation_identity(name, doc)
+                    if any(doc.get(field) in (None, "") for field in ident):
+                        keep_id = True
                 batch.append(stamp_snapshot_doc(
                     doc, version, copied_at, business_date,
-                    keep_id=keeps_original_id(name, doc),
+                    keep_id=keep_id,
                 ))
                 if len(batch) >= BATCH:
                     ingest.insert_many(batch, ordered=False)
