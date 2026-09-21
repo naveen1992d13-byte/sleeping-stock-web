@@ -189,7 +189,7 @@ export function Products() {
       const params = new URLSearchParams();
       if (!isAll(scopeBrand)) params.append('brand', scopeBrand);
       if (!isAll(scopeDealer)) params.append('dealer', scopeDealer);
-      await authenticatedDownload(`${API}/product-hub/export/master?${params.toString()}`, 'ProductHub_Full_Export.zip');
+      await authenticatedDownload(`${API}/product-hub/export/master?${params.toString()}`, 'ProductHub_Full_Export.xlsx');
       toast.success('Full export downloaded');
     } catch (e) { toast.error(e.response?.data?.detail || 'Full export failed'); }
     finally { setExporting(false); }
