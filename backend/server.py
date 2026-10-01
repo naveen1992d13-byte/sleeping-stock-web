@@ -6229,6 +6229,7 @@ async def _apply_request_group_timeout(group_doc: dict, actor: UserResponse):
                 'cancellation_reason': 'Cancelled – No Response',
                 'timeout_cancelled': True,
                 'timeout_cancelled_at': now,
+                'mobile_expiry_status': 'EXPIRED – NO RESPONSE',
             }})
             # Prefer next source — exclude this source for current order attempts,
             # but do NOT write a day-wide Rejected Today freeze.
@@ -6245,6 +6246,7 @@ async def _apply_request_group_timeout(group_doc: dict, actor: UserResponse):
         **odw.freeze_response_timer(group_doc, now, 'timeout'),
         'timeout_cancelled': True,
         'timeout_cancelled_at': now,
+        'mobile_expiry_status': 'EXPIRED – NO RESPONSE',
         'updated_at': now,
     }})
     order = await db.order_headers.find_one({'id': group_doc.get('order_id')}, {'_id': 0}) or {}

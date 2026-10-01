@@ -68,6 +68,16 @@ async def _web_current_user(credentials: HTTPAuthorizationCredentials = Depends(
 PAIRING_CODE_TTL_MINUTES = 10
 DEFAULT_NOTIFICATION_INTERVAL_MINUTES = 30
 SKIP_LIMIT = 2  # first two alerts may be skipped; third cannot
+MOBILE_EXPIRED_LABEL = "EXPIRED – NO RESPONSE"
+MOBILE_TIMEOUT_REASON = "Cancelled – No Response"
+NOTIFICATION_HISTORY_HOURS = 36
+OWNERSHIP_STATUS_LABELS = {
+    "pending": "NEW",
+    "picked": "PICKED",
+    "accepted": "ACCEPTED",
+    "rejected": "REJECTED",
+    "expired": MOBILE_EXPIRED_LABEL,
+}
 
 
 def init_mobile_api(_db, _get_current_user, _UserResponse, _pwd_context, _request_center_transition=None, _notify_request_status_change=None):
@@ -363,6 +373,11 @@ class DeviceStatusUpdate(BaseModel):
 
 class NotificationActionRequest(BaseModel):
     request_group_key: str
+
+
+class NotificationRejectRequest(BaseModel):
+    request_group_key: str
+    reason: str
 
 
 class PartResponseItem(BaseModel):
@@ -1401,6 +1416,96 @@ def _group_key_for(line: dict) -> str:
     return line.get("request_group_id") or line.get("request_number")
 
 
+def _parse_iso_dt(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _lock_owner_name(lock) -> Optional[str]:
+    if not lock:
+        return None
+    name = (lock.get("device_user_name") or lock.get("accepted_by_name") or lock.get("device_name") or "").strip()
+    return name or None
+
+
+def _already_picked_detail(lock) -> dict:
+    return {
+        "message": "Already picked by another device",
+        "picked_by_name": _lock_owner_name(lock) or "another user",
+    }
+
+
+def _deadline_passed(header, now=None) -> bool:
+    dt = _parse_iso_dt((header or {}).get("response_deadline"))
+    return bool(dt and (now or _now()) >= dt)
+
+
+def _is_expired_group(lines, header, now=None) -> bool:
+    header = header or {}
+    lines = lines or []
+    if header.get("mobile_expiry_status") == MOBILE_EXPIRED_LABEL:
+        return True
+    if header.get("timeout_cancelled"):
+        return True
+    if header.get("response_status") in ("timeout", "expired"):
+        return True
+    for line in lines:
+        if line.get("mobile_expiry_status") == MOBILE_EXPIRED_LABEL:
+            return True
+        if line.get("timeout_cancelled"):
+            return True
+        if line.get("status") == "Cancelled" and line.get("cancellation_reason") == MOBILE_TIMEOUT_REASON:
+            return True
+    if lines and all(line.get("status") == "Requested" for line in lines) and _deadline_passed(header, now):
+        return True
+    return False
+
+
+def _ownership_status(lines, lock, header, now=None) -> str:
+    lines = lines or []
+    lock = lock or {}
+    if _is_expired_group(lines, header, now):
+        return "expired"
+    lock_status = str(lock.get("lock_status") or "").lower()
+    if lock_status == "rejected" or lock.get("rejected_at"):
+        return "rejected"
+    statuses = [line.get("status") for line in lines]
+    if any(status == "Requested" for status in statuses):
+        return "picked" if lock else "pending"
+    if statuses and all(status == "Rejected" for status in statuses):
+        return "rejected"
+    if lock_status == "accepted" or lock.get("accepted_at") or any(status == "Approved" for status in statuses):
+        return "accepted"
+    if statuses and all(status in ("Rejected", "Cancelled") for status in statuses):
+        return "rejected"
+    return "pending"
+
+
+def _rejection_reason(lines, lock) -> Optional[str]:
+    if lock and (lock.get("rejection_reason") or "").strip():
+        return str(lock.get("rejection_reason")).strip()
+    for line in lines or []:
+        if line.get("status") == "Rejected":
+            reason = (line.get("approval_remarks") or line.get("remarks") or "").strip()
+            if reason:
+                return reason
+    return None
+
+
+def _group_line_filter(request_group_key: str) -> dict:
+    return {"$or": [{"request_group_id": request_group_key}, {"request_number": request_group_key}]}
+
+
 def _request_line_loc(line: dict) -> str:
     """Exact uploaded supplying-branch part LOC. Never use branch name as LOC."""
     if not line:
@@ -1444,22 +1549,87 @@ async def _today_product_locs(part_numbers, brand_name, dealer_name, branch):
     return loc_map
 
 
+async def _scope_group_lines(request_group_key: str, session, statuses=None):
+    query = {
+        **_group_line_filter(request_group_key),
+        "supplying_dealer": session["dealer_name"],
+        "supplying_branch": session["branch"],
+    }
+    if statuses:
+        query["status"] = {"$in": list(statuses)}
+    return await db.order_requests.find(query, {"_id": 0}).to_list(2000)
+
+
+async def _header_for_request_number(request_number: str) -> dict:
+    if not request_number:
+        return {}
+    return await db.request_headers.find_one(
+        {"request_number": request_number},
+        {"_id": 0, "request_number": 1, "response_deadline": 1, "response_status": 1,
+         "request_sent_at": 1, "timeout_cancelled": 1, "mobile_expiry_status": 1},
+    ) or {}
+
+
+def _raise_if_not_owner(lock, session):
+    if lock and lock.get("device_id") == session["device"]["device_id"]:
+        return
+    if not lock:
+        raise HTTPException(status_code=403, detail={
+            "message": "This device did not pick this request",
+            "picked_by_name": None,
+        })
+    raise HTTPException(status_code=403, detail=_already_picked_detail(lock))
+
+
 @router.get("/notifications")
 async def list_branch_notifications(session=Depends(get_device_session)):
-    """Pending request line items for the device's bound Branch only —
-    scope is never taken from the client — grouped into one card per
-    request_number/request_group_id with aggregated totals and a parts list,
-    matching what Part 13 of the spec expects the mobile UI to show."""
+    """Branch-scoped request cards with ownership status so every logged-in
+    device sees the same Picked / Accepted / Rejected / Expired state."""
     branch = session["branch"]
     dealer = session["dealer_name"]
     mobile_user_id = session["mobile_user"]["mobile_user_id"]
+    device_id = session["device"]["device_id"]
+    now = _now()
+    cutoff = (now - timedelta(hours=NOTIFICATION_HISTORY_HOURS)).isoformat()
 
     lines = await db.order_requests.find(
-        {"supplying_dealer": dealer, "supplying_branch": branch, "status": "Requested"},
+        {
+            "supplying_dealer": dealer,
+            "supplying_branch": branch,
+            "$or": [
+                {"status": "Requested"},
+                {"status": {"$in": ["Approved", "Rejected", "Cancelled"]}, "requested_at": {"$gte": cutoff}},
+                {"timeout_cancelled_at": {"$gte": cutoff}},
+                {"decided_at": {"$gte": cutoff}},
+            ],
+        },
         {"_id": 0},
-    ).sort("requested_at", -1).to_list(2000)
+    ).sort("requested_at", -1).to_list(4000)
+
+    branch_locks = await db.mobile_request_group_locks.find(
+        {"dealer_name": dealer, "branch": branch}, {"_id": 0}
+    ).to_list(1000)
+    have = {_group_key_for(line) for line in lines}
+    missing_keys = [
+        lock.get("request_group_key") for lock in branch_locks
+        if lock.get("request_group_key") and lock.get("request_group_key") not in have
+    ]
+    if missing_keys:
+        extra = await db.order_requests.find(
+            {
+                "supplying_dealer": dealer,
+                "supplying_branch": branch,
+                "$or": [
+                    {"request_group_id": {"$in": missing_keys}},
+                    {"request_number": {"$in": missing_keys}},
+                ],
+            },
+            {"_id": 0},
+        ).to_list(2000)
+        lines.extend(extra)
 
     groups = {}
+    group_lines = {}
     for line in lines:
         key = _group_key_for(line)
         if not key:
@@ -1469,12 +1639,15 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             "request_number": line.get("request_number"),
             "requesting_dealer": line.get("requesting_dealer"),
             "requesting_branch": line.get("requesting_branch"),
+            "supplying_dealer": line.get("supplying_dealer"),
+            "supplying_branch": line.get("supplying_branch"),
             "requested_at": line.get("requested_at"),
             "total_items": 0,
             "total_quantity": 0.0,
             "total_value": 0.0,
             "parts": [],
         })
+        group_lines.setdefault(key, []).append(line)
         if line.get("requested_at") and (not group["requested_at"] or line["requested_at"] < group["requested_at"]):
             group["requested_at"] = line["requested_at"]
         group["total_items"] += 1
@@ -1486,6 +1659,9 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             "description": line.get("description"),
             "requested_qty": line.get("requested_qty"),
             "available_qty_at_request": line.get("available_qty_at_request"),
+            "accepted_qty": line.get("accepted_qty"),
+            "status": line.get("status"),
+            "remark": line.get("approval_remarks") or line.get("remarks") or "",
             "loc": _request_line_loc(line),
             "loc_at_request": _request_line_loc(line),
             "bin_location": line.get("bin_location"),
@@ -1511,8 +1687,7 @@ async def list_branch_notifications(session=Depends(get_device_session)):
                 part["loc_at_request"] = loc
 
     group_keys = list(groups.keys())
-    locks = await db.mobile_request_group_locks.find({"request_group_key": {"$in": group_keys}}, {"_id": 0}).to_list(2000)
-    lock_by_key = {l["request_group_key"]: l for l in locks}
+    lock_by_key = {lock["request_group_key"]: lock for lock in branch_locks if lock.get("request_group_key")}
     actions = await db.mobile_notification_actions.find(
         {"request_id": {"$in": group_keys}, "mobile_user_id": mobile_user_id}, {"_id": 0}
     ).to_list(2000)
@@ -1523,7 +1698,8 @@ async def list_branch_notifications(session=Depends(get_device_session)):
     if request_numbers:
         async for header in db.request_headers.find(
             {"request_number": {"$in": request_numbers}},
-            {"_id": 0, "request_number": 1, "response_deadline": 1, "response_status": 1, "request_sent_at": 1},
+            {"_id": 0, "request_number": 1, "response_deadline": 1, "response_status": 1,
+             "request_sent_at": 1, "timeout_cancelled": 1, "mobile_expiry_status": 1},
         ):
             header_by_number[header.get("request_number")] = header
 
@@ -1532,16 +1708,31 @@ async def list_branch_notifications(session=Depends(get_device_session)):
         lock = lock_by_key.get(key)
         action = action_by_key.get(key, {})
         header = header_by_number.get(group.get("request_number")) or {}
+        lines_for_group = group_lines.get(key) or []
+        status = _ownership_status(lines_for_group, lock, header, now)
+        owner_name = _lock_owner_name(lock)
+        owned_by_me = bool(lock) and lock.get("device_id") == device_id
+        skip_count = action.get("skip_count", 0)
+        skip_allowed = status == "pending" and skip_count < SKIP_LIMIT
+        rejection_reason = _rejection_reason(lines_for_group, lock) if status == "rejected" else None
         results.append({
             **group,
-            "my_skip_count": action.get("skip_count", 0),
-            "skip_allowed": action.get("skip_count", 0) < SKIP_LIMIT,
+            "status": status,
+            "status_label": OWNERSHIP_STATUS_LABELS.get(status, status),
+            "picked_by_name": owner_name if status in ("picked", "accepted", "rejected", "expired") else None,
+            "accepted_by_name": owner_name if status == "accepted" else None,
+            "rejected_by_name": owner_name if status == "rejected" else None,
+            "rejection_reason": rejection_reason,
+            "my_skip_count": skip_count,
+            "skip_allowed": skip_allowed,
             "accepted_by_mobile_user_id": lock.get("mobile_user_id") if lock else None,
-            "accepted_by_device_user_name": lock.get("device_user_name") if lock else None,
+            "accepted_by_device_user_name": owner_name,
             "accepted_by_device_user_mobile": lock.get("device_user_mobile") if lock else None,
             "accepted_by_device_name": lock.get("device_name") if lock else None,
-            "accepted_by_another": bool(lock) and lock.get("device_id") != session["device"]["device_id"],
-            "accepted_by_me": bool(lock) and lock.get("device_id") == session["device"]["device_id"],
+            "accepted_by_another": bool(lock) and not owned_by_me,
+            "accepted_by_me": owned_by_me,
+            "can_pick": status == "pending",
+            "can_edit": owned_by_me and status == "picked",
             "response_deadline": header.get("response_deadline"),
             "response_status": header.get("response_status"),
             "request_sent_at": header.get("request_sent_at") or group.get("requested_at"),
@@ -1562,18 +1753,19 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
     # Confirm at least one live "Requested" line still exists in this
     # group, in this device's scope, before claiming the lock — prevents
     # locking a stale/foreign group_key the client might send.
-    exists = await db.order_requests.find_one(
-        {"$or": [{"request_group_id": payload.request_group_key}, {"request_number": payload.request_group_key}],
-         "supplying_dealer": dealer, "supplying_branch": branch, "status": "Requested"},
-        {"_id": 0, "id": 1},
-    )
-    if not exists:
+    live_lines = await _scope_group_lines(payload.request_group_key, session, statuses=("Requested",))
+    if not live_lines:
         raise HTTPException(400, "Request is not available to accept")
+    header = await _header_for_request_number(live_lines[0].get("request_number"))
+    if _is_expired_group(live_lines, header):
+        raise HTTPException(status_code=409, detail={
+            "message": MOBILE_EXPIRED_LABEL,
+            "status": "expired",
+            "picked_by_name": None,
+        })
 
-    # Atomic group-level lock: insert_one against a unique index is the
-    # only way to atomically claim N sibling line-item documents at once —
-    # the FIRST accepter's insert succeeds, every other accepter's insert
-    # hits the unique constraint and is rejected as a clean 409.
+    # Atomic first-device claim: unique insert wins; later devices get 409
+    # with picked_by_name. Same-device retries are idempotent.
     try:
         await db.mobile_request_group_locks.insert_one({
             "request_group_key": payload.request_group_key,
@@ -1585,24 +1777,43 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
             "brand_name": session["brand_name"],
             "dealer_name": dealer,
             "branch": branch,
+            "lock_status": "picked",
+            "picked_at": _now_iso(),
             "accepted_at": _now_iso(),
         })
     except DuplicateKeyError:
-        raise HTTPException(409, "Already accepted by another user")
+        existing = await db.mobile_request_group_locks.find_one(
+            {"request_group_key": payload.request_group_key}, {"_id": 0}
+        )
+        if existing and existing.get("device_id") == device_id:
+            return {
+                "message": "Request accepted",
+                "request_group_key": payload.request_group_key,
+                "picked_by_name": _lock_owner_name(existing) or device_user_name,
+                "already_owned": True,
+            }
+        raise HTTPException(status_code=409, detail=_already_picked_detail(existing))
 
     await _audit(None, "mobile_accept_request", mobile_user_id, {"request_group_key": payload.request_group_key})
-    return {"message": "Request accepted", "request_group_key": payload.request_group_key}
+    return {
+        "message": "Request accepted",
+        "request_group_key": payload.request_group_key,
+        "picked_by_name": device_user_name,
+    }
 
 
 @router.post("/notifications/skip")
 async def skip_notification(payload: NotificationActionRequest, session=Depends(get_device_session)):
     mobile_user_id = session["mobile_user"]["mobile_user_id"]
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key}, {"_id": 0})
+    if lock and lock.get("device_id") != session["device"]["device_id"]:
+        raise HTTPException(status_code=409, detail=_already_picked_detail(lock))
     action = await db.mobile_notification_actions.find_one(
         {"request_id": payload.request_group_key, "mobile_user_id": mobile_user_id}
     )
     current_skips = action.get("skip_count", 0) if action else 0
     if current_skips >= SKIP_LIMIT:
-        raise HTTPException(400, "Skip limit reached — you must accept or reject this request")
+        raise HTTPException(400, "Skip limit reached — you must pick or reject this request")
 
     await db.mobile_notification_actions.update_one(
         {"request_id": payload.request_group_key, "mobile_user_id": mobile_user_id},
@@ -1612,7 +1823,13 @@ async def skip_notification(payload: NotificationActionRequest, session=Depends(
         },
         upsert=True,
     )
-    return {"message": "Skipped", "skip_count": current_skips + 1, "skip_allowed_remaining": max(0, SKIP_LIMIT - (current_skips + 1))}
+    remaining = max(0, SKIP_LIMIT - (current_skips + 1))
+    return {
+        "message": "Skipped",
+        "skip_count": current_skips + 1,
+        "skip_allowed_remaining": remaining,
+        "skip_allowed": remaining > 0,
+    }
 
 
 @router.post("/notifications/respond")
@@ -1621,8 +1838,14 @@ async def submit_part_response(payload: RequestPartResponse, session=Depends(get
     mobile_user_id = mobile_user["mobile_user_id"]
 
     lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
-    if not lock or lock.get("device_id") != session["device"]["device_id"]:
-        raise HTTPException(403, "This device did not pick this request")
+    _raise_if_not_owner(lock, session)
+    if str(lock.get("lock_status") or "").lower() in ("rejected", "accepted"):
+        raise HTTPException(400, "This request has already been decided")
+
+    live_lines = await _scope_group_lines(payload.request_group_key, session)
+    header = await _header_for_request_number((live_lines[0].get("request_number") if live_lines else None) or payload.request_group_key)
+    if _is_expired_group(live_lines, header):
+        raise HTTPException(status_code=409, detail={"message": MOBILE_EXPIRED_LABEL, "status": "expired", "picked_by_name": _lock_owner_name(lock)})
 
     if not payload.parts:
         raise HTTPException(400, "At least one part response is required")
@@ -1650,7 +1873,6 @@ async def submit_part_response(payload: RequestPartResponse, session=Depends(get
 
     results = []
     for part in payload.parts:
-        requested_qty = float(lines_by_id[part.order_request_id].get("requested_qty") or 0)
         target_status = "Rejected" if part.accepted_qty <= 0 else "Approved"
         remark = part.remark or ""
         updated, _changed = await request_center_transition(
@@ -1663,8 +1885,73 @@ async def submit_part_response(payload: RequestPartResponse, session=Depends(get
             "accepted_qty": part.accepted_qty,
         })
 
+    owner_name = session["device"].get("device_user_name") or mobile_user["name"]
+    await db.mobile_request_group_locks.update_one(
+        {"request_group_key": payload.request_group_key},
+        {"$set": {"lock_status": "accepted", "accepted_at": _now_iso(), "accepted_by_name": owner_name}},
+    )
     await _audit(None, "mobile_submit_response", mobile_user_id, {"request_group_key": payload.request_group_key, "results": results})
-    return {"message": "Response submitted", "results": results}
+    return {"message": "Response submitted", "results": results, "accepted_by_name": owner_name}
+
+
+@router.post("/notifications/reject")
+async def reject_notification(payload: NotificationRejectRequest, session=Depends(get_device_session)):
+    reason = (payload.reason or "").strip()
+    if not reason:
+        raise HTTPException(400, "Rejection reason is required")
+
+    mobile_user = session["mobile_user"]
+    mobile_user_id = mobile_user["mobile_user_id"]
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
+    _raise_if_not_owner(lock, session)
+    if str(lock.get("lock_status") or "").lower() in ("rejected", "accepted"):
+        raise HTTPException(400, "This request has already been decided")
+
+    live_lines = await _scope_group_lines(payload.request_group_key, session, statuses=("Requested",))
+    header = await _header_for_request_number((live_lines[0].get("request_number") if live_lines else None) or payload.request_group_key)
+    all_lines = await _scope_group_lines(payload.request_group_key, session)
+    if _is_expired_group(all_lines or live_lines, header):
+        raise HTTPException(status_code=409, detail={"message": MOBILE_EXPIRED_LABEL, "status": "expired", "picked_by_name": _lock_owner_name(lock)})
+    if not live_lines:
+        raise HTTPException(400, "Request is not available to reject")
+
+    acting_user = _MobileActingUser(
+        mobile_user_id,
+        session["device"].get("device_user_name") or mobile_user["name"],
+        session["dealer_name"],
+        session["brand_name"],
+    )
+    acting_user.phone = session["device"].get("device_user_mobile") or mobile_user.get("mobile_number", "")
+
+    results = []
+    for line in live_lines:
+        updated, _changed = await request_center_transition(line["id"], "Rejected", reason, acting_user, accepted_qty=0)
+        results.append({
+            "order_request_id": line["id"],
+            "part_number": line.get("part_number"),
+            "status": updated.get("status"),
+        })
+
+    owner_name = session["device"].get("device_user_name") or mobile_user["name"]
+    await db.mobile_request_group_locks.update_one(
+        {"request_group_key": payload.request_group_key},
+        {"$set": {
+            "lock_status": "rejected",
+            "rejected_at": _now_iso(),
+            "rejection_reason": reason,
+            "rejected_by_name": owner_name,
+        }},
+    )
+    await _audit(None, "mobile_reject_request", mobile_user_id, {
+        "request_group_key": payload.request_group_key, "reason": reason, "results": results,
+    })
+    return {
+        "message": "Request rejected",
+        "request_group_key": payload.request_group_key,
+        "rejected_by_name": owner_name,
+        "rejection_reason": reason,
+        "results": results,
+    }
 
 # ==================== STOCK VERIFICATION (MOBILE) ====================
 
