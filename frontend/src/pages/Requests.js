@@ -138,6 +138,7 @@ export function Requests() {
   const [itemDrafts, setItemDrafts] = useState({});
   const [nowMs, setNowMs] = useState(Date.now());
   const [dispatchForm, setDispatchForm] = useState(null);
+  const [ownershipLocks, setOwnershipLocks] = useState({});
   const loadRef = useRef(null);
 
   const apiView = (tab === 'outgoing' || tab === 'receipts') ? 'outgoing' : 'incoming';
@@ -150,6 +151,16 @@ export function Requests() {
         brand: scopeBrand || undefined, dealer: scopeDealer || undefined, branch: scopeBranch || undefined,
       } });
       setRows(res.data || []);
+      try {
+        const locks = await axios.get(`${API}/mobile/web/request-locks`);
+        const map = {};
+        (locks.data || []).forEach((row) => {
+          if (row.request_group_key) map[row.request_group_key] = row;
+        });
+        setOwnershipLocks(map);
+      } catch (_e) {
+        setOwnershipLocks({});
+      }
     } catch (e) {
       if (!silent) toast.error(e.response?.data?.detail || 'Unable to load Request Center');
     } finally {
@@ -363,7 +374,7 @@ export function Requests() {
                     <td className="p-3 font-semibold">{g.total_items}</td>
                     <td className="p-3 font-semibold">{nfmt(g.total_qty)}</td>
                     <td className="p-3 font-semibold">{valueCell(g.total_value)}</td>
-                    <td className="p-3"><StatusBadge status={g.status}/>{countdown && <div className="mt-1 text-xs font-semibold text-amber-800">{countdown}</div>}{transit && <div className="mt-1 text-xs font-semibold text-rose-800">In transit {transit}</div>}</td>
+                    <td className="p-3"><StatusBadge status={g.status}/>{countdown && <div className="mt-1 text-xs font-semibold text-amber-800">{countdown}</div>}{transit && <div className="mt-1 text-xs font-semibold text-rose-800">In transit {transit}</div>}{(ownershipLocks[g.request_number] || ownershipLocks[g.key]) && <div className="mt-1 text-xs font-semibold text-slate-700">Picked by {(ownershipLocks[g.request_number] || ownershipLocks[g.key]).picked_by_name}{(ownershipLocks[g.request_number] || ownershipLocks[g.key]).owner_inactive ? ' · owner inactive' : ''}</div>}</td>
                   </tr>
                   {open && (
                     <tr className="bg-slate-50 border-t">
@@ -440,6 +451,24 @@ export function Requests() {
                             )}
                             {(tab === 'outgoing' || tab === 'incoming') && g.items.some((i)=>['Requested','Approved','Partially Approved'].includes(i.status)) && (
                               <Button variant="outline" disabled={loading} onClick={()=>cancelGroup(g)}><Ban className="mr-1 h-4 w-4"/>Cancel Request</Button>
+                            )}
+                            {tab === 'incoming' && (ownershipLocks[g.request_number] || ownershipLocks[g.key]) && (ownershipLocks[g.request_number] || ownershipLocks[g.key]).lock_status === 'picked' && (
+                              <Button variant="outline" disabled={loading} onClick={async ()=>{
+                                const reason = window.prompt('Release ownership reason (WRONG_PICK, UNABLE_TO_COMPLETE, SHIFT_CHANGE, OTHER)', 'OTHER');
+                                if (!reason) return;
+                                const note = window.prompt('Optional note') || '';
+                                try {
+                                  await axios.post(`${API}/mobile/web/request-locks/release`, {
+                                    request_group_key: g.request_number || g.key,
+                                    reason,
+                                    note,
+                                  });
+                                  toast.success('Ownership released');
+                                  load();
+                                } catch (e) {
+                                  toast.error(e.response?.data?.detail?.message || e.response?.data?.detail || 'Release failed');
+                                }
+                              }}>Release ownership</Button>
                             )}
                           </div>
                         </div>

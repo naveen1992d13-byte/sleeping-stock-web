@@ -75,9 +75,15 @@ OWNERSHIP_STATUS_LABELS = {
     "pending": "NEW",
     "picked": "PICKED",
     "accepted": "ACCEPTED",
+    "picking_completed": "PICKING COMPLETED",
     "rejected": "REJECTED",
     "expired": MOBILE_EXPIRED_LABEL,
 }
+RELEASE_REASONS = ("WRONG_PICK", "UNABLE_TO_COMPLETE", "SHIFT_CHANGE", "OTHER")
+ERR_ALREADY_PICKED = "ALREADY_PICKED"
+ERR_NOT_OWNER = "NOT_OWNER"
+ERR_INVALID_STATE = "INVALID_STATE"
+ERR_TRANSFER_TARGET_INVALID = "TRANSFER_TARGET_INVALID"
 
 
 def init_mobile_api(_db, _get_current_user, _UserResponse, _pwd_context, _request_center_transition=None, _notify_request_status_change=None):
@@ -380,6 +386,21 @@ class NotificationRejectRequest(BaseModel):
     reason: str
 
 
+class NotificationCompleteRequest(BaseModel):
+    request_group_key: str
+
+
+class NotificationTransferRequest(BaseModel):
+    request_group_key: str
+    target_mobile_user_id: str
+
+
+class NotificationReleaseRequest(BaseModel):
+    request_group_key: str
+    reason: str
+    note: Optional[str] = None
+
+
 class PartResponseItem(BaseModel):
     order_request_id: str
     part_number: str
@@ -467,11 +488,14 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
     if not mobile_user or mobile_user.get("status") != "active":
         raise HTTPException(403, "Mobile user is inactive")
 
+    seen_at = _now_iso()
     await db.mobile_devices.update_one(
-        {"device_id": device["device_id"]}, {"$set": {"last_active_at": _now_iso()}}
+        {"device_id": device["device_id"]},
+        {"$set": {"last_active_at": seen_at, "last_seen_at": seen_at}},
     )
     await db.mobile_users.update_one(
-        {"mobile_user_id": mobile_user["mobile_user_id"]}, {"$set": {"last_active_at": _now_iso()}}
+        {"mobile_user_id": mobile_user["mobile_user_id"]},
+        {"$set": {"last_active_at": seen_at, "last_seen_at": seen_at}},
     )
 
     return {
@@ -797,7 +821,7 @@ async def generate_pairing_code(request: Request, payload: PairingGenerateReques
 
 
 @router.post("/pairing/verify")
-async def verify_pairing_and_register_device(payload: PairingVerifyRequest):
+async def verify_pairing_and_register_device(payload: PairingVerifyRequest, request: Request):
     now = _now()
     normalized_mobile = _normalize_mobile_number(payload.device_user_mobile)
     if not payload.device_user_name.strip():
@@ -806,6 +830,10 @@ async def verify_pairing_and_register_device(payload: PairingVerifyRequest):
     pairing_code = _normalize_pairing_code(payload.pairing_code)
     if not pairing_code:
         raise HTTPException(400, "Pairing code is required")
+    client_ip = (request.client.host if request.client else "") or "unknown"
+    attempt = await db.mobile_pairing_verify_attempts.find_one({"pairing_code": pairing_code, "ip": client_ip}, {"_id": 0})
+    if attempt and int(attempt.get("failures") or 0) >= 8 and _parse_iso_dt(attempt.get("updated_at")) and (_now() - _parse_iso_dt(attempt.get("updated_at"))) < timedelta(minutes=10):
+        raise HTTPException(429, "Too many pairing attempts. Wait and try a new code.")
 
     # QR pairing uses the high-entropy token as the primary lookup key. A short
     # 6-digit code can legitimately collide across branches, so looking up by
@@ -827,6 +855,11 @@ async def verify_pairing_and_register_device(payload: PairingVerifyRequest):
             raise HTTPException(409, "Pairing code is ambiguous. Scan the QR code instead.")
         pairing_doc = matches[0] if matches else None
     if not pairing_doc:
+        await db.mobile_pairing_verify_attempts.update_one(
+            {"pairing_code": pairing_code, "ip": client_ip},
+            {"$inc": {"failures": 1}, "$set": {"updated_at": _now_iso()}},
+            upsert=True,
+        )
         raise HTTPException(400, "Invalid or already-used pairing code")
     expires_at = pairing_doc["expires_at"]
     if expires_at.tzinfo is None:
@@ -1440,9 +1473,16 @@ def _lock_owner_name(lock) -> Optional[str]:
 
 def _already_picked_detail(lock) -> dict:
     return {
+        "code": ERR_ALREADY_PICKED,
         "message": "Already picked by another device",
         "picked_by_name": _lock_owner_name(lock) or "another user",
     }
+
+
+def _error_detail(code: str, message: str, **extra) -> dict:
+    detail = {"code": code, "message": message}
+    detail.update({k: v for k, v in extra.items() if v is not None})
+    return detail
 
 
 def _deadline_passed(header, now=None) -> bool:
@@ -1477,6 +1517,8 @@ def _ownership_status(lines, lock, header, now=None) -> str:
     if _is_expired_group(lines, header, now):
         return "expired"
     lock_status = str(lock.get("lock_status") or "").lower()
+    if lock_status == "picking_completed" or lock.get("picking_completed_at"):
+        return "picking_completed"
     if lock_status == "rejected" or lock.get("rejected_at"):
         return "rejected"
     statuses = [line.get("status") for line in lines]
@@ -1574,11 +1616,28 @@ def _raise_if_not_owner(lock, session):
     if lock and lock.get("device_id") == session["device"]["device_id"]:
         return
     if not lock:
-        raise HTTPException(status_code=403, detail={
-            "message": "This device did not pick this request",
-            "picked_by_name": None,
-        })
-    raise HTTPException(status_code=403, detail=_already_picked_detail(lock))
+        raise HTTPException(status_code=403, detail=_error_detail(ERR_NOT_OWNER, "This device did not pick this request"))
+    raise HTTPException(status_code=403, detail=_error_detail(
+        ERR_NOT_OWNER,
+        "This request is already picked by another device",
+        picked_by_name=_lock_owner_name(lock) or "another user",
+    ))
+
+
+def _raise_if_not_writable(lock, session):
+    _raise_if_not_owner(lock, session)
+    status = str(lock.get("lock_status") or "").lower()
+    if status in ("picking_completed", "accepted", "rejected"):
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "This request can no longer be changed"))
+
+
+def _is_same_owner(lock, session) -> bool:
+    return bool(lock) and lock.get("device_id") == session["device"]["device_id"]
+
+
+def _line_response_map(lock) -> dict:
+    raw = (lock or {}).get("line_responses") or {}
+    return raw if isinstance(raw, dict) else {}
 
 
 @router.get("/notifications")
@@ -1715,12 +1774,24 @@ async def list_branch_notifications(session=Depends(get_device_session)):
         skip_count = action.get("skip_count", 0)
         skip_allowed = status == "pending" and skip_count < SKIP_LIMIT
         rejection_reason = _rejection_reason(lines_for_group, lock) if status == "rejected" else None
+        responses = _line_response_map(lock)
+        if responses:
+            for part in group["parts"]:
+                saved = responses.get(part.get("order_request_id")) or {}
+                if saved:
+                    part["accepted_qty"] = saved.get("accepted_qty")
+                    part["remark"] = saved.get("remark") or ""
+                    part["response_saved"] = True
+        all_answered = bool(group["parts"]) and all(
+            (part.get("order_request_id") in responses) for part in group["parts"]
+        )
+        can_edit = owned_by_me and status == "picked"
         results.append({
             **group,
             "status": status,
             "status_label": OWNERSHIP_STATUS_LABELS.get(status, status),
-            "picked_by_name": owner_name if status in ("picked", "accepted", "rejected", "expired") else None,
-            "accepted_by_name": owner_name if status == "accepted" else None,
+            "picked_by_name": owner_name if status in ("picked", "accepted", "picking_completed", "rejected", "expired") else None,
+            "accepted_by_name": owner_name if status in ("accepted", "picking_completed") else None,
             "rejected_by_name": owner_name if status == "rejected" else None,
             "rejection_reason": rejection_reason,
             "my_skip_count": skip_count,
@@ -1732,7 +1803,14 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             "accepted_by_another": bool(lock) and not owned_by_me,
             "accepted_by_me": owned_by_me,
             "can_pick": status == "pending",
-            "can_edit": owned_by_me and status == "picked",
+            "can_snooze": skip_allowed,
+            "can_edit": can_edit,
+            "can_complete": can_edit and all_answered,
+            "can_transfer": can_edit,
+            "can_release": can_edit,
+            "all_lines_answered": all_answered,
+            "picked_at": lock.get("picked_at") if lock else None,
+            "owner_last_seen_at": lock.get("owner_last_seen_at") if lock else None,
             "response_deadline": header.get("response_deadline"),
             "response_status": header.get("response_status"),
             "request_sent_at": header.get("request_sent_at") or group.get("requested_at"),
@@ -1758,36 +1836,46 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         raise HTTPException(400, "Request is not available to accept")
     header = await _header_for_request_number(live_lines[0].get("request_number"))
     if _is_expired_group(live_lines, header):
-        raise HTTPException(status_code=409, detail={
-            "message": MOBILE_EXPIRED_LABEL,
-            "status": "expired",
-            "picked_by_name": None,
-        })
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, MOBILE_EXPIRED_LABEL, status="expired"))
 
-    # Atomic first-device claim: unique insert wins; later devices get 409
-    # with picked_by_name. Same-device retries are idempotent.
+    existing = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key}, {"_id": 0})
+    if existing:
+        if existing.get("device_id") == device_id:
+            return {
+                "message": "Request picked",
+                "request_group_key": payload.request_group_key,
+                "picked_by_name": _lock_owner_name(existing) or device_user_name,
+                "already_owned": True,
+            }
+        raise HTTPException(status_code=409, detail=_already_picked_detail(existing))
+
+    now_iso = _now_iso()
+    lock_doc = {
+        "request_group_key": payload.request_group_key,
+        "mobile_user_id": mobile_user_id,
+        "device_id": device_id,
+        "device_user_name": device_user_name,
+        "device_user_mobile": device_user_mobile,
+        "device_name": session["device"].get("device_name", ""),
+        "brand_name": session["brand_name"],
+        "dealer_name": dealer,
+        "branch": branch,
+        "lock_status": "picked",
+        "picked_at": now_iso,
+        "owner_last_seen_at": now_iso,
+        "line_responses": {},
+    }
+    # Atomic first-device claim: unique insert wins. Same-owner retry is
+    # handled above; a race with another device still hits DuplicateKeyError.
     try:
-        await db.mobile_request_group_locks.insert_one({
-            "request_group_key": payload.request_group_key,
-            "mobile_user_id": mobile_user_id,
-            "device_id": device_id,
-            "device_user_name": device_user_name,
-            "device_user_mobile": device_user_mobile,
-            "device_name": session["device"].get("device_name", ""),
-            "brand_name": session["brand_name"],
-            "dealer_name": dealer,
-            "branch": branch,
-            "lock_status": "picked",
-            "picked_at": _now_iso(),
-            "accepted_at": _now_iso(),
-        })
+        await db.mobile_request_group_locks.insert_one(dict(lock_doc))
     except DuplicateKeyError:
         existing = await db.mobile_request_group_locks.find_one(
             {"request_group_key": payload.request_group_key}, {"_id": 0}
         )
         if existing and existing.get("device_id") == device_id:
             return {
-                "message": "Request accepted",
+                "message": "Request picked",
                 "request_group_key": payload.request_group_key,
                 "picked_by_name": _lock_owner_name(existing) or device_user_name,
                 "already_owned": True,
@@ -1795,8 +1883,23 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         raise HTTPException(status_code=409, detail=_already_picked_detail(existing))
 
     await _audit(None, "mobile_accept_request", mobile_user_id, {"request_group_key": payload.request_group_key})
+    try:
+        import mobile_push
+        header_doc = header or {}
+        header_doc = {
+            **header_doc,
+            "request_number": live_lines[0].get("request_number") or header_doc.get("request_number"),
+            "id": payload.request_group_key,
+            "supplying_dealer": dealer,
+            "supplying_branch": branch,
+        }
+        await mobile_push.notify_request_picked_push(
+            db, header_doc, picked_by_name=device_user_name, exclude_device_id=device_id,
+        )
+    except Exception as exc:
+        logger.warning("request_picked push failed: %s", exc)
     return {
-        "message": "Request accepted",
+        "message": "Request picked",
         "request_group_key": payload.request_group_key,
         "picked_by_name": device_user_name,
     }
@@ -1806,7 +1909,7 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
 async def skip_notification(payload: NotificationActionRequest, session=Depends(get_device_session)):
     mobile_user_id = session["mobile_user"]["mobile_user_id"]
     lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key}, {"_id": 0})
-    if lock and lock.get("device_id") != session["device"]["device_id"]:
+    if lock:
         raise HTTPException(status_code=409, detail=_already_picked_detail(lock))
     action = await db.mobile_notification_actions.find_one(
         {"request_id": payload.request_group_key, "mobile_user_id": mobile_user_id}
@@ -1834,64 +1937,60 @@ async def skip_notification(payload: NotificationActionRequest, session=Depends(
 
 @router.post("/notifications/respond")
 async def submit_part_response(payload: RequestPartResponse, session=Depends(get_device_session)):
+    """Save accepted qty + remark drafts. Stays picked — does not reserve stock."""
     mobile_user = session["mobile_user"]
     mobile_user_id = mobile_user["mobile_user_id"]
 
     lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
-    _raise_if_not_owner(lock, session)
-    if str(lock.get("lock_status") or "").lower() in ("rejected", "accepted"):
-        raise HTTPException(400, "This request has already been decided")
+    _raise_if_not_writable(lock, session)
 
-    live_lines = await _scope_group_lines(payload.request_group_key, session)
+    live_lines = await _scope_group_lines(payload.request_group_key, session, statuses=("Requested",))
     header = await _header_for_request_number((live_lines[0].get("request_number") if live_lines else None) or payload.request_group_key)
     if _is_expired_group(live_lines, header):
-        raise HTTPException(status_code=409, detail={"message": MOBILE_EXPIRED_LABEL, "status": "expired", "picked_by_name": _lock_owner_name(lock)})
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, MOBILE_EXPIRED_LABEL, status="expired"))
 
     if not payload.parts:
         raise HTTPException(400, "At least one part response is required")
 
-    lines_by_id = {}
+    saved = dict(_line_response_map(lock))
+    results = []
     for part in payload.parts:
         line = await db.order_requests.find_one({"id": part.order_request_id}, {"_id": 0})
         if not line or _group_key_for(line) != payload.request_group_key:
             raise HTTPException(404, f"Part {part.part_number} is not part of this request")
         if line.get("status") != "Requested":
-            raise HTTPException(400, f"Part {part.part_number} has already been decided")
+            raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, f"Part {part.part_number} has already been decided"))
         requested_qty = float(line.get("requested_qty") or 0)
         if part.accepted_qty < 0:
             raise HTTPException(400, f"Accepted quantity for {part.part_number} cannot be negative")
         if part.accepted_qty > requested_qty:
             raise HTTPException(400, f"Accepted quantity for {part.part_number} cannot exceed the requested quantity")
-        # Fully accepted (accepted_qty == requested_qty): remark optional.
-        # Partially accepted or rejected: remark is mandatory (Part 14).
         if part.accepted_qty < requested_qty and not (part.remark and part.remark.strip()):
             raise HTTPException(400, f"Remark is mandatory for {part.part_number} (partial or rejected)")
-        lines_by_id[part.order_request_id] = line
-
-    acting_user = _MobileActingUser(mobile_user_id, session["device"].get("device_user_name") or mobile_user["name"], session["dealer_name"], session["brand_name"])
-    acting_user.phone = session["device"].get("device_user_mobile") or mobile_user.get("mobile_number", "")
-
-    results = []
-    for part in payload.parts:
-        target_status = "Rejected" if part.accepted_qty <= 0 else "Approved"
-        remark = part.remark or ""
-        updated, _changed = await request_center_transition(
-            part.order_request_id, target_status, remark, acting_user, accepted_qty=part.accepted_qty
-        )
+        saved[part.order_request_id] = {
+            "order_request_id": part.order_request_id,
+            "part_number": part.part_number,
+            "accepted_qty": part.accepted_qty,
+            "remark": (part.remark or "").strip(),
+            "responded_at": _now_iso(),
+        }
         results.append({
             "order_request_id": part.order_request_id,
             "part_number": part.part_number,
-            "status": updated.get("status"),
             "accepted_qty": part.accepted_qty,
+            "remark": (part.remark or "").strip(),
         })
 
-    owner_name = session["device"].get("device_user_name") or mobile_user["name"]
-    await db.mobile_request_group_locks.update_one(
-        {"request_group_key": payload.request_group_key},
-        {"$set": {"lock_status": "accepted", "accepted_at": _now_iso(), "accepted_by_name": owner_name}},
+    claimed = await db.mobile_request_group_locks.find_one_and_update(
+        {"request_group_key": payload.request_group_key, "device_id": session["device"]["device_id"], "lock_status": "picked"},
+        {"$set": {"line_responses": saved, "owner_last_seen_at": _now_iso()}},
+        return_document=ReturnDocument.AFTER,
     )
+    if not claimed:
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "This request can no longer be changed"))
+
     await _audit(None, "mobile_submit_response", mobile_user_id, {"request_group_key": payload.request_group_key, "results": results})
-    return {"message": "Response submitted", "results": results, "accepted_by_name": owner_name}
+    return {"message": "Responses saved", "results": results, "status": "picked"}
 
 
 @router.post("/notifications/reject")
@@ -1952,6 +2051,248 @@ async def reject_notification(payload: NotificationRejectRequest, session=Depend
         "rejection_reason": reason,
         "results": results,
     }
+
+
+@router.post("/notifications/complete")
+async def complete_picking(payload: NotificationCompleteRequest, session=Depends(get_device_session)):
+    """Owner-only picking-completed. Does not reserve stock or dispatch."""
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
+    _raise_if_not_writable(lock, session)
+    if str(lock.get("lock_status") or "") == "picking_completed":
+        return {"message": "Picking already completed", "request_group_key": payload.request_group_key, "status": "picking_completed"}
+
+    live_lines = await _scope_group_lines(payload.request_group_key, session, statuses=("Requested",))
+    if not live_lines:
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "Request is not available to complete"))
+    responses = _line_response_map(lock)
+    missing = [line.get("part_number") for line in live_lines if line.get("id") not in responses]
+    if missing:
+        raise HTTPException(status_code=409, detail=_error_detail(
+            ERR_INVALID_STATE, "Every line needs an explicit response before picking can be completed", missing_parts=missing,
+        ))
+
+    claimed = await db.mobile_request_group_locks.find_one_and_update(
+        {"request_group_key": payload.request_group_key, "device_id": session["device"]["device_id"], "lock_status": "picked"},
+        {"$set": {"lock_status": "picking_completed", "picking_completed_at": _now_iso(), "owner_last_seen_at": _now_iso()}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed:
+        existing = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key}, {"_id": 0})
+        if existing and str(existing.get("lock_status") or "") == "picking_completed" and _is_same_owner(existing, session):
+            return {"message": "Picking already completed", "request_group_key": payload.request_group_key, "status": "picking_completed"}
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "This request can no longer be changed"))
+
+    await _audit(None, "mobile_picking_completed", session["mobile_user"]["mobile_user_id"], {"request_group_key": payload.request_group_key})
+    return {"message": "Picking completed", "request_group_key": payload.request_group_key, "status": "picking_completed"}
+
+
+@router.get("/notifications/transfer-targets")
+async def list_transfer_targets(request_group_key: str, session=Depends(get_device_session)):
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": request_group_key}, {"_id": 0})
+    _raise_if_not_writable(lock, session)
+    users = await db.mobile_users.find(
+        {
+            "dealer_name": session["dealer_name"],
+            "branch": session["branch"],
+            "status": "active",
+            "mobile_user_id": {"$ne": session["mobile_user"]["mobile_user_id"]},
+        },
+        {"_id": 0, "mobile_user_id": 1, "name": 1, "mobile_number": 1, "last_seen_at": 1, "last_active_at": 1},
+    ).to_list(200)
+    devices = await db.mobile_devices.find(
+        {"dealer_name": session["dealer_name"], "branch": session["branch"], "status": "active"},
+        {"_id": 0, "mobile_user_id": 1, "device_id": 1, "device_user_name": 1, "last_seen_at": 1, "last_active_at": 1},
+    ).to_list(200)
+    device_by_user = {d["mobile_user_id"]: d for d in devices if d.get("mobile_user_id")}
+    results = []
+    for user in users:
+        device = device_by_user.get(user["mobile_user_id"])
+        if not device:
+            continue
+        results.append({
+            "mobile_user_id": user["mobile_user_id"],
+            "name": device.get("device_user_name") or user.get("name"),
+            "mobile_number": user.get("mobile_number"),
+            "device_id": device.get("device_id"),
+            "last_seen_at": device.get("last_seen_at") or device.get("last_active_at") or user.get("last_seen_at"),
+        })
+    return results
+
+
+@router.post("/notifications/transfer")
+async def transfer_ownership(payload: NotificationTransferRequest, session=Depends(get_device_session)):
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
+    _raise_if_not_writable(lock, session)
+    target_id = (payload.target_mobile_user_id or "").strip().upper()
+    if not target_id or target_id == session["mobile_user"]["mobile_user_id"]:
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_TRANSFER_TARGET_INVALID, "Select a different same-branch mobile user"))
+
+    target_user = await db.mobile_users.find_one({
+        "mobile_user_id": target_id, "status": "active",
+        "dealer_name": session["dealer_name"], "branch": session["branch"],
+    }, {"_id": 0})
+    target_device = await db.mobile_devices.find_one({
+        "mobile_user_id": target_id, "status": "active",
+        "dealer_name": session["dealer_name"], "branch": session["branch"],
+    }, {"_id": 0})
+    if not target_user or not target_device:
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_TRANSFER_TARGET_INVALID, "Target is not an active paired user on this branch"))
+
+    now_iso = _now_iso()
+    claimed = await db.mobile_request_group_locks.find_one_and_update(
+        {"request_group_key": payload.request_group_key, "device_id": session["device"]["device_id"], "lock_status": "picked"},
+        {"$set": {
+            "mobile_user_id": target_id,
+            "device_id": target_device["device_id"],
+            "device_user_name": target_device.get("device_user_name") or target_user.get("name"),
+            "device_user_mobile": target_device.get("device_user_mobile") or target_user.get("mobile_number"),
+            "device_name": target_device.get("device_name", ""),
+            "transferred_at": now_iso,
+            "transferred_from_device_id": session["device"]["device_id"],
+            "transferred_from_mobile_user_id": session["mobile_user"]["mobile_user_id"],
+            "owner_last_seen_at": now_iso,
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed:
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "This request can no longer be transferred"))
+
+    await _audit(None, "mobile_transfer_ownership", session["mobile_user"]["mobile_user_id"], {
+        "request_group_key": payload.request_group_key, "target_mobile_user_id": target_id,
+    })
+    try:
+        import mobile_push
+        live_lines = await _scope_group_lines(payload.request_group_key, session)
+        header = await _header_for_request_number((live_lines[0].get("request_number") if live_lines else None) or payload.request_group_key)
+        await mobile_push.notify_request_transferred_push(db, {
+            **(header or {}),
+            "id": payload.request_group_key,
+            "request_number": (live_lines[0].get("request_number") if live_lines else None) or header.get("request_number"),
+            "supplying_dealer": session["dealer_name"],
+            "supplying_branch": session["branch"],
+            "requesting_branch": (live_lines[0].get("requesting_branch") if live_lines else None) or header.get("requesting_branch"),
+            "total_items": len(live_lines),
+            "total_qty": sum(float(line.get("requested_qty") or 0) for line in live_lines),
+        }, target_device_id=target_device["device_id"])
+    except Exception as exc:
+        logger.warning("request_transferred push failed: %s", exc)
+    return {
+        "message": "Ownership transferred",
+        "request_group_key": payload.request_group_key,
+        "picked_by_name": _lock_owner_name(claimed),
+        "target_mobile_user_id": target_id,
+    }
+
+
+async def _release_lock(request_group_key: str, reason: str, note: str, actor_id: str, actor_name: str, source: str):
+    reason = (reason or "").strip().upper()
+    if reason not in RELEASE_REASONS:
+        raise HTTPException(400, "Release reason is required")
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": request_group_key})
+    if not lock:
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "Request is not picked"))
+    if str(lock.get("lock_status") or "") == "picking_completed":
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "This request can no longer be changed"))
+    removed = await db.mobile_request_group_locks.find_one_and_delete({
+        "request_group_key": request_group_key,
+        "lock_status": {"$nin": ["picking_completed", "accepted"]},
+    })
+    if not removed:
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "This request can no longer be released"))
+    await db.mobile_ownership_events.insert_one({
+        "id": str(uuid.uuid4()),
+        "request_group_key": request_group_key,
+        "event": "released",
+        "reason": reason,
+        "note": (note or "").strip(),
+        "source": source,
+        "actor_id": actor_id,
+        "actor_name": actor_name,
+        "previous_owner_name": _lock_owner_name(removed),
+        "previous_device_id": removed.get("device_id"),
+        "created_at": _now_iso(),
+    })
+    await _audit(None, "mobile_release_ownership", actor_id, {
+        "request_group_key": request_group_key, "reason": reason, "note": note, "source": source,
+    })
+    try:
+        import mobile_push
+        lines = await db.order_requests.find(_group_line_filter(request_group_key), {"_id": 0}).to_list(200)
+        header = await _header_for_request_number((lines[0].get("request_number") if lines else None) or request_group_key)
+        await mobile_push.notify_branch_request_push(db, {
+            **(header or {}),
+            "id": request_group_key,
+            "request_number": (lines[0].get("request_number") if lines else None) or header.get("request_number"),
+            "supplying_dealer": removed.get("dealer_name") or header.get("supplying_dealer"),
+            "supplying_branch": removed.get("branch") or header.get("supplying_branch"),
+            "requesting_branch": (lines[0].get("requesting_branch") if lines else None) or header.get("requesting_branch"),
+            "total_items": len(lines),
+            "total_qty": sum(float(line.get("requested_qty") or 0) for line in lines),
+        }, kind="new")
+    except Exception as exc:
+        logger.warning("release re-alert push failed: %s", exc)
+    return {"message": "Ownership released", "request_group_key": request_group_key, "status": "pending"}
+
+
+@router.post("/notifications/release")
+async def release_ownership(payload: NotificationReleaseRequest, session=Depends(get_device_session)):
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
+    _raise_if_not_writable(lock, session)
+    return await _release_lock(
+        payload.request_group_key,
+        payload.reason,
+        payload.note or "",
+        session["mobile_user"]["mobile_user_id"],
+        session["device"].get("device_user_name") or session["mobile_user"]["name"],
+        "owner",
+    )
+
+
+@router.get("/web/request-locks")
+async def list_web_request_locks(current_user=Depends(_web_current_user)):
+    query = {}
+    if current_user.role == "admin":
+        query["dealer_name"] = current_user.group
+    elif current_user.role not in ("master", "admin"):
+        query["dealer_name"] = current_user.group
+        query["branch"] = current_user.location
+    locks = await db.mobile_request_group_locks.find(query, {"_id": 0}).to_list(2000)
+    user_ids = [lock.get("mobile_user_id") for lock in locks if lock.get("mobile_user_id")]
+    seen = {}
+    if user_ids:
+        async for user in db.mobile_users.find({"mobile_user_id": {"$in": user_ids}}, {"_id": 0, "mobile_user_id": 1, "last_seen_at": 1, "last_active_at": 1}):
+            seen[user["mobile_user_id"]] = user.get("last_seen_at") or user.get("last_active_at")
+    results = []
+    now = _now()
+    for lock in locks:
+        last_seen = lock.get("owner_last_seen_at") or seen.get(lock.get("mobile_user_id"))
+        inactive = False
+        dt = _parse_iso_dt(last_seen)
+        if dt and (now - dt) > timedelta(minutes=15):
+            inactive = True
+        results.append({
+            "request_group_key": lock.get("request_group_key"),
+            "picked_by_name": _lock_owner_name(lock),
+            "lock_status": lock.get("lock_status"),
+            "picked_at": lock.get("picked_at"),
+            "last_seen_at": last_seen,
+            "owner_inactive": inactive,
+        })
+    return results
+
+
+@router.post("/web/request-locks/release")
+async def admin_release_ownership(payload: NotificationReleaseRequest, current_user=Depends(_web_current_user)):
+    if (current_user.role or "").lower() not in ("master", "admin"):
+        raise HTTPException(403, "Only Admin or Master can release stuck ownership")
+    return await _release_lock(
+        payload.request_group_key,
+        payload.reason,
+        payload.note or "",
+        current_user.id,
+        getattr(current_user, "username", "") or current_user.id,
+        "web_admin",
+    )
 
 # ==================== STOCK VERIFICATION (MOBILE) ====================
 
