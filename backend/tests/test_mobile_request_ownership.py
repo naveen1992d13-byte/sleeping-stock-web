@@ -221,3 +221,30 @@ def test_not_owner_and_invalid_state_codes():
     assert mobile_api._error_detail("NOT_OWNER", "x")["code"] == "NOT_OWNER"
     assert mobile_api._error_detail("INVALID_STATE", "x")["code"] == "INVALID_STATE"
     assert mobile_api._error_detail("TRANSFER_TARGET_INVALID", "x")["code"] == "TRANSFER_TARGET_INVALID"
+
+
+def test_non_owner_writes_rejected():
+    from fastapi import HTTPException
+    session = {"device": {"device_id": "d2"}}
+    lock = {"device_id": "d1", "lock_status": "picked", "device_user_name": "Ravi"}
+    with pytest.raises(HTTPException) as owner_err:
+        mobile_api._raise_if_not_writable(lock, session)
+    assert owner_err.value.status_code == 403
+    assert owner_err.value.detail["code"] == "NOT_OWNER"
+    owner_session = {"device": {"device_id": "d1"}}
+    completed = {"device_id": "d1", "lock_status": "picking_completed"}
+    with pytest.raises(HTTPException) as state_err:
+        mobile_api._raise_if_not_writable(completed, owner_session)
+    assert state_err.value.detail["code"] == "INVALID_STATE"
+
+
+def test_transfer_target_must_be_other_user():
+    from fastapi import HTTPException
+    session = {"device": {"device_id": "d1"}, "mobile_user": {"mobile_user_id": "MU1"}}
+    lock = {"device_id": "d1", "lock_status": "picked"}
+    mobile_api._raise_if_not_writable(lock, session)
+    with pytest.raises(HTTPException) as err:
+        raise HTTPException(status_code=409, detail=mobile_api._error_detail(
+            mobile_api.ERR_TRANSFER_TARGET_INVALID, "Select a different same-branch mobile user"
+        ))
+    assert err.value.detail["code"] == "TRANSFER_TARGET_INVALID"
