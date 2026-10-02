@@ -737,21 +737,76 @@ async def delete_product(product_id: str, current_user: UserResponse = Depends(g
 
 # ==================== UPLOAD ROUTES ====================
 
+async def _admin_allowed_branch_names(current_user: UserResponse) -> list:
+    """Active branches this Admin may view or upload into.
+
+    Allowed set is the Admin's own brand + dealer branches, always including
+    the assigned/default branch. It is never "all branches".
+    """
+    dealer_value = (current_user.group or "").strip()
+    brand_value = (current_user.brand or "").strip()
+    assigned = (current_user.location or "").strip()
+    names = []
+    seen = set()
+
+    def _add(name: str):
+        text = str(name or "").strip()
+        key = text.casefold()
+        if not text or key in seen:
+            return
+        seen.add(key)
+        names.append(text)
+
+    if dealer_value and brand_value:
+        dealer_rx = {"$regex": f"^{re.escape(dealer_value)}$", "$options": "i"}
+        brand_rx = {"$regex": f"^{re.escape(brand_value)}$", "$options": "i"}
+        rows = await db.branches.find(
+            {
+                "status": "active",
+                "$and": [
+                    {"$or": [{"dealer": dealer_rx}, {"dealer_name": dealer_rx}]},
+                    {"$or": [{"brand": brand_rx}, {"brand_name": brand_rx}]},
+                ],
+            },
+            {"_id": 0, "name": 1},
+        ).to_list(1000)
+        for row in rows:
+            _add(row.get("name"))
+    _add(assigned)
+    return names
+
+
 async def _apply_selected_upload_scope(ctx: dict, current_user: UserResponse, brand: str, dealer: str, branch: str) -> dict:
-    """Stamp selected Brand/Dealer/Branch onto an upload context after the guard."""
+    """Stamp the upload destination from the selected scope, then enforce it.
+
+    Admin stock is stored on the selected branch only when that branch is in
+    the Admin's allowed list. A different selection must not fall back to the
+    assigned branch.
+    """
     upload_scope.require_specific_upload_scope(brand, dealer, branch)
-    role = (current_user.role or "").lower()
+    role = (current_user.role or "").strip().lower()
+    if role == "admin":
+        user_brand = (current_user.brand or "").strip()
+        user_dealer = (current_user.group or "").strip()
+        if user_brand and brand.strip().casefold() != user_brand.casefold():
+            raise HTTPException(status_code=403, detail="Selected brand is outside your allowed scope")
+        if user_dealer and dealer.strip().casefold() != user_dealer.casefold():
+            raise HTTPException(status_code=403, detail="Selected dealer is outside your allowed scope")
+    allowed = await _admin_allowed_branch_names(current_user) if role == "admin" else []
+    resolved_branch = upload_scope.resolve_actor_upload_branch(
+        role=role,
+        assigned_branch=current_user.location or "",
+        selected_branch=branch,
+        allowed_branches=allowed,
+    )
     if role == "master":
         ctx["brand_name"] = brand
         ctx["brand"] = brand
         ctx["dealer_name"] = dealer
         ctx["dealer_code"] = dealer or ctx.get("dealer_code")
-        ctx["branch"] = branch
-        ctx["location"] = branch
         ctx["brand_code"] = await resolve_brand_code_for_upload(brand)
-    elif role == "admin":
-        ctx["branch"] = branch
-        ctx["location"] = branch
+    ctx["branch"] = resolved_branch
+    ctx["location"] = resolved_branch
     return ctx
 
 
@@ -3391,8 +3446,9 @@ def _apply_role_scope_v2(query: dict, current_user: UserResponse, brand=None, de
     elif current_user.role == "admin":
         query["brand_name"] = current_user.brand
         query["dealer_name"] = current_user.group
-        if not _is_all_scope(branch):
-            query["branch"] = branch
+        # Admin has no All Branches view. An omitted selection stays on the
+        # assigned branch; an explicit selection is the branch being viewed.
+        query["branch"] = branch if not _is_all_scope(branch) else (current_user.location or "")
     else:
         query["brand_name"] = current_user.brand
         query["dealer_name"] = current_user.group
@@ -4119,7 +4175,7 @@ async def product_hub_summary(
             batch_query["dealer_name"] = current_user.group
         if not _is_all_scope(branch):
             batch_query["branch"] = branch
-        elif current_user.role == "user":
+        elif current_user.role != "master":
             batch_query["branch"] = current_user.location
 
         rows = await db.batch_summaries.find(batch_query, {"_id": 0}).to_list(10000)

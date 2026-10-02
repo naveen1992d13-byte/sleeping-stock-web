@@ -87,9 +87,9 @@ export function DashboardLayout() {
     } else {
       setScopeBrand(getUserBrand());
       setScopeDealer(getUserDealer());
-      // Admin can switch between every branch under the assigned dealer.
-      // Normal users stay locked to their assigned branch.
-      setScopeBranch(isAdmin ? "" : getUserBranch());
+      // Admin and User both start on the assigned branch. Admin may later
+      // switch to another individually allowed branch; there is no All Branches.
+      setScopeBranch(getUserBranch());
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.role, user?.brand, user?.dealer, user?.group, user?.branch, user?.location]);
@@ -192,7 +192,16 @@ export function DashboardLayout() {
       const brandMatches = Boolean(branchBrand) && branchBrand === adminBrand;
       return dealerMatches && brandMatches;
     });
-    setBranchOptions(uniqueNames(adminBranches, (b) => b.name));
+    const names = uniqueNames(adminBranches, (b) => b.name);
+    const assigned = getUserBranch();
+    if (assigned && assigned !== "N/A" && !names.includes(assigned)) names.push(assigned);
+    names.sort((a, b) => String(a).localeCompare(String(b)));
+    setBranchOptions(names);
+    setScopeBranch((current) => {
+      if (current && names.includes(current) && !String(current).startsWith("All ")) return current;
+      if (assigned && names.includes(assigned)) return assigned;
+      return names[0] || assigned || "";
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAdmin, scopeMasters, user?.group, user?.dealer, user?.location, user?.branch]);
 
@@ -562,6 +571,7 @@ export function DashboardLayout() {
                   onChange={setScopeBranch}
                   options={isMaster || isAdmin ? branchOptions : [scopeBranch].filter(Boolean)}
                   disabled={isMaster ? !isSpecificScope(scopeDealer) : (!isMaster && !isAdmin)}
+                  allowEmpty={isMaster}
                 />
               </div>
 
@@ -697,9 +707,9 @@ export function DashboardLayout() {
   );
 }
 
-function HeaderScopeSelect({ label, value, onChange, options, disabled, placeholder }) {
-  const safeOptions = (options || []).filter(Boolean);
-  const selectValue = safeOptions.includes(value) ? value : "";
+function HeaderScopeSelect({ label, value, onChange, options, disabled, placeholder, allowEmpty = true }) {
+  const safeOptions = (options || []).filter((item) => item && !String(item).startsWith("All "));
+  const selectValue = safeOptions.includes(value) ? value : (allowEmpty ? "" : (safeOptions[0] || ""));
   return (
     <label className="nmts-header-scope-field">
       <span className="nmts-header-scope-label">{label}</span>
@@ -710,7 +720,7 @@ function HeaderScopeSelect({ label, value, onChange, options, disabled, placehol
         className="nmts-header-scope-select"
         title={label}
       >
-        <option value="">{placeholder || `Select ${label}`}</option>
+        {allowEmpty ? <option value="">{placeholder || `Select ${label}`}</option> : null}
         {safeOptions.map((item) => (
           <option key={item} value={item}>
             {item}

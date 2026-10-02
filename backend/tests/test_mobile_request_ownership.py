@@ -238,6 +238,36 @@ def test_non_owner_writes_rejected():
     assert state_err.value.detail["code"] == "INVALID_STATE"
 
 
+def test_transfer_moves_device_and_removes_previous_owner_edit_rights():
+    asyncio.run(_test_transfer_moves_device_and_removes_previous_owner_edit_rights())
+
+
+async def _test_transfer_moves_device_and_removes_previous_owner_edit_rights():
+    from fastapi import HTTPException
+    locks = FakeLocks()
+    await locks.insert_one({
+        "request_group_key": "G",
+        "device_id": "d1",
+        "lock_status": "picked",
+        "mobile_user_id": "MU1",
+    })
+    claimed = await locks.find_one_and_update(
+        {"request_group_key": "G", "device_id": "d1", "lock_status": "picked"},
+        {"$set": {"device_id": "d2", "mobile_user_id": "MU2", "lock_status": "picked"}},
+    )
+    assert claimed["device_id"] == "d2"
+    assert claimed["mobile_user_id"] == "MU2"
+    lost = await locks.find_one_and_update(
+        {"request_group_key": "G", "device_id": "d1", "lock_status": "picked"},
+        {"$set": {"device_id": "d3"}},
+    )
+    assert lost is None
+    with pytest.raises(HTTPException) as err:
+        mobile_api._raise_if_not_writable(claimed, {"device": {"device_id": "d1"}})
+    assert err.value.detail["code"] == "NOT_OWNER"
+    mobile_api._raise_if_not_writable(claimed, {"device": {"device_id": "d2"}})
+
+
 def test_transfer_target_must_be_other_user():
     from fastapi import HTTPException
     session = {"device": {"device_id": "d1"}, "mobile_user": {"mobile_user_id": "MU1"}}

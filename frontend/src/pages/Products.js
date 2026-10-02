@@ -62,9 +62,9 @@ async function authenticatedDownload(url, fallbackFileName, onProgress) {
 export function Products() {
   const { user } = useAuth();
   const outletScope = useOutletContext() || {};
-  const scopeBrand = outletScope.scopeBrand || 'All Brands';
-  const scopeDealer = outletScope.scopeDealer || 'All Dealers';
-  const scopeBranch = outletScope.scopeBranch || 'All Branches';
+  const scopeBrand = outletScope.scopeBrand || (user?.role === 'master' ? 'All Brands' : (user?.brand || ''));
+  const scopeDealer = outletScope.scopeDealer || (user?.role === 'master' ? 'All Dealers' : (user?.dealer || user?.group || ''));
+  const scopeBranch = outletScope.scopeBranch || (user?.role === 'master' ? 'All Branches' : (user?.branch || user?.location || ''));
   const isMaster = user?.role === 'master';
   const canExport = user?.role === 'master' || user?.role === 'admin';
 
