@@ -12,6 +12,7 @@ export function TestingBanner() {
   const [meta, setMeta] = useState(() => ({
     pr_number: process.env.REACT_APP_TESTING_PR || '',
     git_branch: process.env.REACT_APP_TESTING_BRANCH || '',
+    commit: process.env.REACT_APP_TESTING_COMMIT || '',
     commit_short: process.env.REACT_APP_TESTING_COMMIT || '',
     deployed_at_ist: process.env.REACT_APP_TESTING_DEPLOYED_AT || '',
   }));
@@ -28,6 +29,7 @@ export function TestingBanner() {
         setMeta({
           pr_number: data.pr_number || '',
           git_branch: data.git_branch || '',
+          commit: data.commit || '',
           commit_short: data.commit_short || shortSha(data.commit),
           deployed_at_ist: data.deployed_at_ist || data.deployed_at || '',
         });
@@ -61,9 +63,9 @@ export function TestingBanner() {
       }}
     >
       <strong>TESTING ENVIRONMENT</strong>
-      <span>PR {meta.pr_number || 'n/a'}</span>
+      <span>PR #72 + PR #73</span>
       <span>{meta.git_branch || 'unknown-branch'}</span>
-      <span>{meta.commit_short || 'unknown-sha'}</span>
+      <span>{meta.commit || meta.commit_short || 'unknown-sha'}</span>
       <span>{meta.deployed_at_ist || 'unknown time'}</span>
     </div>
   );
