@@ -29,6 +29,50 @@ def is_expo_push_token(token: str) -> bool:
     return bool(_EXPO_TOKEN_RE.match((token or "").strip()))
 
 
+def request_push_scope(group_doc: Optional[dict]) -> tuple:
+    """Brand + Dealer + Branch for request push. All three are required."""
+    doc = group_doc or {}
+    brand = (doc.get("supplying_brand") or doc.get("requesting_brand") or doc.get("brand_name") or "").strip()
+    dealer = (doc.get("supplying_dealer") or doc.get("dealer_name") or "").strip()
+    branch = (doc.get("supplying_branch") or doc.get("branch") or "").strip()
+    return brand, dealer, branch
+
+
+def eligible_request_device_query(brand: str, dealer: str, branch: str) -> dict:
+    """Logged-in, push-enabled, admin-active devices on this Brand/Dealer/Branch."""
+    return {
+        **_ci_exact("brand_name", brand),
+        **_ci_exact("dealer_name", dealer),
+        **_ci_exact("branch", branch),
+        "status": "active",
+        "session_active": True,
+        "push_enabled": True,
+        "push_token": {"$exists": True, "$ne": ""},
+    }
+
+
+def is_eligible_request_device(dev: Optional[dict], brand: str, dealer: str, branch: str) -> bool:
+    if not dev:
+        return False
+    if (dev.get("status") or "") != "active":
+        return False
+    if dev.get("session_active") is not True:
+        return False
+    if dev.get("push_enabled") is not True:
+        return False
+    if not is_expo_push_token(dev.get("push_token") or ""):
+        return False
+
+    def _same(left, right):
+        return (left or "").strip().casefold() == (right or "").strip().casefold()
+
+    return (
+        _same(dev.get("brand_name"), brand)
+        and _same(dev.get("dealer_name"), dealer)
+        and _same(dev.get("branch"), branch)
+    )
+
+
 def _now():
     return datetime.now(timezone.utc)
 
@@ -205,26 +249,20 @@ def build_branch_request_push_message(token: str, group_doc: dict, kind: str = "
 async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
     """High-priority request push to supplying-branch mobile devices. Never raises."""
     try:
-        dealer = (group_doc or {}).get("supplying_dealer") or ""
-        branch = (group_doc or {}).get("supplying_branch") or ""
+        brand, dealer, branch = request_push_scope(group_doc)
         request_number = (group_doc or {}).get("request_number") or ""
         request_group_key = (group_doc or {}).get("id") or request_number
-        if not dealer or not branch or not request_number:
+        if not brand or not dealer or not branch or not request_number:
             return {"ok": False, "error": "missing_scope"}
         preview = build_branch_request_push_message("ExponentPushToken[preview]", group_doc, kind)
         data = preview["data"]
         title = data.get("requestNumber") or request_number
         body = f"round={data.get('round')} {data.get('branchName') or ''} items={data.get('totalItems')} qty={data.get('totalQuantity')}"
         devices = await db.mobile_devices.find(
-            {
-                **_ci_exact("dealer_name", dealer),
-                **_ci_exact("branch", branch),
-                "status": "active",
-                "push_token": {"$exists": True, "$ne": ""},
-            },
-            {"_id": 0, "device_id": 1, "push_token": 1, "mobile_user_id": 1},
+            eligible_request_device_query(brand, dealer, branch),
+            {"_id": 0, "device_id": 1, "push_token": 1, "mobile_user_id": 1, "brand_name": 1, "dealer_name": 1, "branch": 1, "session_active": 1, "push_enabled": 1, "status": 1},
         ).to_list(100)
-        devices = [dev for dev in devices if is_expo_push_token(dev.get("push_token") or "")]
+        devices = [dev for dev in devices if is_eligible_request_device(dev, brand, dealer, branch)]
         if not devices:
             await log_push_attempt(
                 db,
@@ -261,4 +299,109 @@ async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
         return {"ok": result.get("ok"), "sent": len(batch), "kind": kind}
     except Exception as exc:
         logger.warning("branch request push failed: %s", exc)
+        return {"ok": False, "error": str(exc)[:300]}
+
+
+def build_request_picked_push_message(token: str, group_doc: dict, picked_by_name: str) -> dict:
+    request_number = (group_doc or {}).get("request_number") or ""
+    request_group_key = (group_doc or {}).get("id") or request_number
+    return {
+        "to": token,
+        "priority": "high",
+        "_contentAvailable": True,
+        "data": {
+            "type": "request_picked",
+            "requestId": request_group_key,
+            "request_group_key": request_group_key,
+            "request_number": request_number,
+            "picked_by_name": picked_by_name or "",
+        },
+    }
+
+
+def build_request_transferred_push_message(token: str, group_doc: dict) -> dict:
+    request_number = (group_doc or {}).get("request_number") or ""
+    requesting_branch = (group_doc or {}).get("requesting_branch") or ""
+    total_items = (group_doc or {}).get("total_items")
+    total_qty = (group_doc or {}).get("total_qty") or (group_doc or {}).get("total_quantity") or 0
+    if total_items in (None, ""):
+        total_items = len((group_doc or {}).get("items") or [])
+    request_group_key = (group_doc or {}).get("id") or request_number
+    return {
+        "to": token,
+        "priority": "high",
+        "_contentAvailable": True,
+        "data": {
+            "type": "request_transferred",
+            "screen": "request",
+            "requestId": request_group_key,
+            "requestNumber": request_number,
+            "branchName": requesting_branch,
+            "totalItems": total_items,
+            "totalQuantity": total_qty,
+            "request_group_key": request_group_key,
+            "request_number": request_number,
+            "requesting_branch": requesting_branch,
+            "requested_branch": requesting_branch,
+            "total_items": total_items,
+            "total_qty": total_qty,
+            "actions": "none",
+        },
+    }
+
+
+async def _active_branch_devices(db, brand: str, dealer: str, branch: str):
+    devices = await db.mobile_devices.find(
+        eligible_request_device_query(brand, dealer, branch),
+        {"_id": 0, "device_id": 1, "push_token": 1, "mobile_user_id": 1, "brand_name": 1, "dealer_name": 1, "branch": 1, "session_active": 1, "push_enabled": 1, "status": 1},
+    ).to_list(100)
+    return [
+        dev for dev in devices
+        if is_eligible_request_device(dev, brand, dealer, branch)
+    ]
+
+
+async def notify_request_picked_push(db, group_doc: dict, *, picked_by_name: str, exclude_device_id: str):
+    """Data-only high-priority push to other same-branch devices. Never raises."""
+    try:
+        brand, dealer, branch = request_push_scope(group_doc)
+        if not brand or not dealer or not branch:
+            return {"ok": False, "error": "missing_scope"}
+        devices = [
+            dev for dev in await _active_branch_devices(db, brand, dealer, branch)
+            if dev.get("device_id") != exclude_device_id
+        ]
+        batch = [
+            build_request_picked_push_message(dev.get("push_token"), group_doc, picked_by_name)
+            for dev in devices if dev.get("push_token")
+        ]
+        if not batch:
+            return {"ok": True, "sent": 0, "skipped": True}
+        result = send_expo_push_messages(batch)
+        return {"ok": result.get("ok"), "sent": len(batch)}
+    except Exception as exc:
+        logger.warning("request_picked push failed: %s", exc)
+        return {"ok": False, "error": str(exc)[:300]}
+
+
+async def notify_request_transferred_push(db, group_doc: dict, *, target_device_id: str):
+    """Ringing-style push to the new owner only. Never raises."""
+    try:
+        brand, dealer, branch = request_push_scope(group_doc)
+        if not brand or not dealer or not branch:
+            return {"ok": False, "error": "missing_scope"}
+        devices = [
+            dev for dev in await _active_branch_devices(db, brand, dealer, branch)
+            if dev.get("device_id") == target_device_id
+        ]
+        batch = [
+            build_request_transferred_push_message(dev.get("push_token"), group_doc)
+            for dev in devices if dev.get("push_token")
+        ]
+        if not batch:
+            return {"ok": True, "sent": 0, "skipped": True}
+        result = send_expo_push_messages(batch)
+        return {"ok": result.get("ok"), "sent": len(batch)}
+    except Exception as exc:
+        logger.warning("request_transferred push failed: %s", exc)
         return {"ok": False, "error": str(exc)[:300]}

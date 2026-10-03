@@ -64,6 +64,20 @@ def is_timeout_due(header: dict, now: datetime = None) -> bool:
     return bool(timer.get('cancel_allowed'))
 
 
+async def request_is_no_longer_new(db, header: dict) -> bool:
+    """Picked / completed ownership must not receive SLA reminder rings."""
+    keys = [key for key in (header.get("id"), header.get("request_number")) if key]
+    if not keys:
+        return False
+    lock = await db.mobile_request_group_locks.find_one(
+        {"request_group_key": {"$in": keys}},
+        {"_id": 0, "lock_status": 1},
+    )
+    if not lock:
+        return False
+    return str(lock.get("lock_status") or "picked").lower() not in ("new", "")
+
+
 async def claim_push(db, header: dict, kind: str) -> bool:
     """Atomically claim one push kind for a request group. False if already sent."""
     key = header.get('id') or header.get('request_number')
@@ -94,6 +108,8 @@ async def run_sla_cycle(db, apply_timeout: ApplyTimeout, send_reminder: SendRemi
             if is_timeout_due(header, now):
                 await apply_timeout(header)
                 timed_out += 1
+                continue
+            if await request_is_no_longer_new(db, header):
                 continue
             for kind in reminder_due_kinds(header, now):
                 if await claim_push(db, header, kind):

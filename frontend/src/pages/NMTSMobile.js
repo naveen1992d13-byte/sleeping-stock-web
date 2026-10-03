@@ -135,6 +135,13 @@ export default function NMTSMobile({ variant = 'mobile' }){
     /* eslint-disable-next-line */
   },[scopeBrand,scopeDealer,scopeBranch,user?.id, showAuditSections]);
 
+  useEffect(()=>{
+    if (!showMobileSections) return undefined;
+    const id = setInterval(()=>{ loadMobileUsers(); }, 30000);
+    return ()=>clearInterval(id);
+    /* eslint-disable-next-line */
+  },[scopeBrand,scopeDealer,scopeBranch,user?.id, showMobileSections]);
+
   const generateNewPairing=async()=>{
     if(!scopeReady) return toast.error('Select an exact Brand, Dealer and Branch in the Dashboard filter first');
     setCreatingUser(true);
@@ -340,16 +347,21 @@ export default function NMTSMobile({ variant = 'mobile' }){
       </div>}
 
       <Card title="Mobile Users">
-        <p className="text-xs text-gray-500 mb-3">Mark <b>Today (Auto)</b> Active/Inactive before Generate Auto Perpetual. Account Active/Inactive controls login access.</p>
-        <div className="overflow-x-auto"><table className="w-full text-sm min-w-[1200px]"><thead><tr>{['Mobile User ID','Name','Mobile','Brand','Dealer','Branch','Account','Today (Auto)','Last Active','Actions'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>
+        <p className="text-xs text-gray-500 mb-3">Admin Status is the website Active/Inactive control. Session is Logged In after pair and Logged Out after Logout. Presence is Online while the app sends heartbeats; Offline covers phone-off and network-off. Mark <b>Today (Auto)</b> before Generate Auto Perpetual.</p>
+        <div className="overflow-x-auto"><table className="w-full text-sm min-w-[1500px]"><thead><tr>{['Mobile User ID','Name','Mobile','Brand','Dealer','Branch','Admin Status','Session','Presence','Last Seen','Today (Auto)','Actions'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>
         {mobileUsers.map(mu=>{
           const att=todayAttendance[mu.mobile_user_id];
           const attLabel=att==='active'?'Active':att==='inactive'?'Inactive':'Not set';
+          const adminStatus = mu.admin_status || mu.status;
+          const sessionLabel = mu.session_state === 'logged_in' ? 'Logged In' : 'Logged Out';
+          const presenceLabel = mu.presence === 'online' ? 'Online' : 'Offline';
           return <tr className="border-t" key={mu.mobile_user_id}>
           <td className="p-3 font-mono">{mu.mobile_user_id}</td><td>{mu.name}</td><td>{mu.mobile_number}</td><td>{mu.brand_name}</td><td>{mu.dealer_name}</td><td>{mu.branch}</td>
-          <td><span className={`px-2 py-1 rounded text-xs ${mu.status==='active'?'bg-green-100 text-green-700':'bg-gray-200 text-gray-600'}`}>{mu.status}</span></td>
+          <td><span className={`px-2 py-1 rounded text-xs ${adminStatus==='active'?'bg-green-100 text-green-700':'bg-gray-200 text-gray-600'}`}>{adminStatus==='active'?'Active':'Inactive'}</span></td>
+          <td><span className={`px-2 py-1 rounded text-xs ${mu.session_state==='logged_in'?'bg-sky-100 text-sky-800':'bg-gray-100 text-gray-600'}`}>{sessionLabel}</span></td>
+          <td><span className={`px-2 py-1 rounded text-xs ${mu.presence==='online'?'bg-emerald-100 text-emerald-800':'bg-gray-100 text-gray-600'}`}>{presenceLabel}</span></td>
+          <td>{mu.last_seen_at?fmt(mu.last_seen_at):(mu.last_active_at?fmt(mu.last_active_at):'-')}</td>
           <td><span className={`px-2 py-1 rounded text-xs ${att==='active'?'bg-emerald-100 text-emerald-800':att==='inactive'?'bg-amber-100 text-amber-800':'bg-gray-100 text-gray-600'}`}>{attLabel}</span></td>
-          <td>{mu.last_active_at?fmt(mu.last_active_at):'-'}</td>
           <td><div className="flex gap-2 flex-wrap">
             {canManage && <Button size="sm" variant="outline" title="Re-pair QR" onClick={()=>generatePairing(mu)} disabled={pairingFor===mu.mobile_user_id || mu.status!=='active'}><RefreshCw className="h-4 w-4"/></Button>}
             {canManage && <Button size="sm" variant="outline" title="Change branch" onClick={()=>changeBranch(mu)} disabled={!scopeReady}><ArrowRightLeft className="h-4 w-4"/></Button>}
@@ -361,7 +373,7 @@ export default function NMTSMobile({ variant = 'mobile' }){
             {isMaster && mu.status!=='deleted' && <Button size="sm" variant="outline" title="Delete (archive)" onClick={()=>setDeleteTarget(mu)}><Trash2 className="h-4 w-4 text-red-600"/></Button>}
           </div></td>
         </tr>})}
-        {!mobileUsers.length && <tr><td colSpan={10} className="text-center py-8 text-gray-500">No mobile users yet for this scope.</td></tr>}
+        {!mobileUsers.length && <tr><td colSpan={12} className="text-center py-8 text-gray-500">No mobile users yet for this scope.</td></tr>}
       </tbody></table></div></Card>
     </div>}
 
