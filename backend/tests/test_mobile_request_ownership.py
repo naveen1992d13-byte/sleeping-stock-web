@@ -60,6 +60,17 @@ class FakeLocks:
         return self.docs.pop(doc["request_group_key"])
 
 
+def test_lock_alias_matches_header_id_or_request_number():
+    lock_by_key = {"header-uuid": {"device_id": "d1", "lock_status": "picked", "device_user_name": "Ravi"}}
+    group = {"request_group_key": "RQ1", "request_number": "RQ1"}
+    lines = [{"request_group_id": "header-uuid", "request_number": "RQ1"}]
+    lock = mobile_api._lock_for_group(lock_by_key, group, lines)
+    assert lock["device_id"] == "d1"
+    aliases = mobile_api._group_aliases("header-uuid", group, *lines)
+    assert "header-uuid" in aliases
+    assert "RQ1" in aliases
+
+
 def test_already_picked_code():
     detail = mobile_api._already_picked_detail({"device_user_name": "Ravi"})
     assert detail["code"] == "ALREADY_PICKED"

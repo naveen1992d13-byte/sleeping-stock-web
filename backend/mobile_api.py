@@ -1521,6 +1521,51 @@ def _group_key_for(line: dict) -> str:
     return line.get("request_group_id") or line.get("request_number")
 
 
+def _group_aliases(*parts) -> list:
+    """Every id a request might be stored or claimed under (header id, group id, number)."""
+    keys = []
+    seen = set()
+
+    def add(value):
+        text = str(value or "").strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        keys.append(text)
+
+    for part in parts:
+        if isinstance(part, dict):
+            for field in ("request_group_key", "request_group_id", "request_number", "id"):
+                add(part.get(field))
+        else:
+            add(part)
+    return keys
+
+
+def _lock_for_group(lock_by_key: dict, group: dict, lines=None):
+    aliases = _group_aliases(group, *((lines or [])))
+    for key in aliases:
+        lock = lock_by_key.get(key)
+        if lock:
+            return lock
+    return None
+
+
+def _supplying_brand_clause(session) -> Optional[dict]:
+    brand = (session.get("brand_name") or "").strip()
+    if not brand:
+        return None
+    return {
+        "$or": [
+            {"supplying_brand": _scope_ci(brand)},
+            {"brand_name": _scope_ci(brand)},
+            {"supplying_brand": {"$exists": False}},
+            {"supplying_brand": None},
+            {"supplying_brand": ""},
+        ]
+    }
+
+
 def _parse_iso_dt(value):
     if not value:
         return None
@@ -1728,14 +1773,17 @@ async def _today_product_locs(part_numbers, brand_name, dealer_name, branch):
 
 
 async def _scope_group_lines(request_group_key: str, session, statuses=None):
-    query = {
-        **_group_line_filter(request_group_key),
-        "supplying_dealer": session["dealer_name"],
-        "supplying_branch": session["branch"],
-    }
+    clauses = [
+        _group_line_filter(request_group_key),
+        {"supplying_dealer": _scope_ci(session["dealer_name"])},
+        {"supplying_branch": _scope_ci(session["branch"])},
+    ]
+    brand_clause = _supplying_brand_clause(session)
+    if brand_clause:
+        clauses.append(brand_clause)
     if statuses:
-        query["status"] = {"$in": list(statuses)}
-    return await db.order_requests.find(query, {"_id": 0}).to_list(2000)
+        clauses.append({"status": {"$in": list(statuses)}})
+    return await db.order_requests.find({"$and": clauses}, {"_id": 0}).to_list(2000)
 
 
 async def _header_for_request_number(request_number: str) -> dict:
@@ -1787,22 +1835,26 @@ async def list_branch_notifications(session=Depends(get_device_session)):
     now = _now()
     cutoff = (now - timedelta(hours=NOTIFICATION_HISTORY_HOURS)).isoformat()
 
+    list_clauses = [
+        {"supplying_dealer": _scope_ci(dealer)},
+        {"supplying_branch": _scope_ci(branch)},
+        {"$or": [
+            {"status": "Requested"},
+            {"status": {"$in": ["Approved", "Rejected", "Cancelled"]}, "requested_at": {"$gte": cutoff}},
+            {"timeout_cancelled_at": {"$gte": cutoff}},
+            {"decided_at": {"$gte": cutoff}},
+        ]},
+    ]
+    brand_clause = _supplying_brand_clause(session)
+    if brand_clause:
+        list_clauses.append(brand_clause)
     lines = await db.order_requests.find(
-        {
-            "supplying_dealer": dealer,
-            "supplying_branch": branch,
-            "$or": [
-                {"status": "Requested"},
-                {"status": {"$in": ["Approved", "Rejected", "Cancelled"]}, "requested_at": {"$gte": cutoff}},
-                {"timeout_cancelled_at": {"$gte": cutoff}},
-                {"decided_at": {"$gte": cutoff}},
-            ],
-        },
+        {"$and": list_clauses},
         {"_id": 0},
     ).sort("requested_at", -1).to_list(4000)
 
     branch_locks = await db.mobile_request_group_locks.find(
-        {"dealer_name": dealer, "branch": branch}, {"_id": 0}
+        {"dealer_name": _scope_ci(dealer), "branch": _scope_ci(branch)}, {"_id": 0}
     ).to_list(1000)
     have = {_group_key_for(line) for line in lines}
     missing_keys = [
@@ -1810,15 +1862,18 @@ async def list_branch_notifications(session=Depends(get_device_session)):
         if lock.get("request_group_key") and lock.get("request_group_key") not in have
     ]
     if missing_keys:
+        extra_clauses = [
+            {"supplying_dealer": _scope_ci(dealer)},
+            {"supplying_branch": _scope_ci(branch)},
+            {"$or": [
+                {"request_group_id": {"$in": missing_keys}},
+                {"request_number": {"$in": missing_keys}},
+            ]},
+        ]
+        if brand_clause:
+            extra_clauses.append(brand_clause)
         extra = await db.order_requests.find(
-            {
-                "supplying_dealer": dealer,
-                "supplying_branch": branch,
-                "$or": [
-                    {"request_group_id": {"$in": missing_keys}},
-                    {"request_number": {"$in": missing_keys}},
-                ],
-            },
+            {"$and": extra_clauses},
             {"_id": 0},
         ).to_list(2000)
         lines.extend(extra)
@@ -1831,6 +1886,7 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             continue
         group = groups.setdefault(key, {
             "request_group_key": key,
+            "request_group_id": line.get("request_group_id") or key,
             "request_number": line.get("request_number"),
             "requesting_dealer": line.get("requesting_dealer"),
             "requesting_branch": line.get("requesting_branch"),
@@ -1883,6 +1939,16 @@ async def list_branch_notifications(session=Depends(get_device_session)):
 
     group_keys = list(groups.keys())
     lock_by_key = {lock["request_group_key"]: lock for lock in branch_locks if lock.get("request_group_key")}
+    alias_keys = []
+    for key, group in groups.items():
+        alias_keys.extend(_group_aliases(key, group, *(group_lines.get(key) or [])))
+    missing_lock_keys = [key for key in dict.fromkeys(alias_keys) if key not in lock_by_key]
+    if missing_lock_keys:
+        async for lock in db.mobile_request_group_locks.find(
+            {"request_group_key": {"$in": missing_lock_keys}}, {"_id": 0}
+        ):
+            if lock.get("request_group_key"):
+                lock_by_key[lock["request_group_key"]] = lock
     actions = await db.mobile_notification_actions.find(
         {"request_id": {"$in": group_keys}, "mobile_user_id": mobile_user_id}, {"_id": 0}
     ).to_list(2000)
@@ -1900,10 +1966,15 @@ async def list_branch_notifications(session=Depends(get_device_session)):
 
     results = []
     for key, group in groups.items():
-        lock = lock_by_key.get(key)
-        action = action_by_key.get(key, {})
-        header = header_by_number.get(group.get("request_number")) or {}
         lines_for_group = group_lines.get(key) or []
+        lock = _lock_for_group(lock_by_key, {**group, "request_group_key": key}, lines_for_group)
+        action = action_by_key.get(key, {})
+        if not action:
+            for alias in _group_aliases(key, group, *lines_for_group):
+                action = action_by_key.get(alias) or {}
+                if action:
+                    break
+        header = header_by_number.get(group.get("request_number")) or {}
         status = _ownership_status(lines_for_group, lock, header, now)
         owner_name = _lock_owner_name(lock)
         owned_by_me = bool(lock) and lock.get("device_id") == device_id
@@ -1974,20 +2045,26 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
     if _is_expired_group(live_lines, header):
         raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, MOBILE_EXPIRED_LABEL, status="expired"))
 
-    existing = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key}, {"_id": 0})
+    canonical_key = _group_key_for(live_lines[0]) or payload.request_group_key
+    aliases = _group_aliases(payload.request_group_key, canonical_key, live_lines[0])
+    existing = await db.mobile_request_group_locks.find_one({"request_group_key": {"$in": aliases}}, {"_id": 0})
     if existing:
         if existing.get("device_id") == device_id:
             return {
                 "message": "Request picked",
-                "request_group_key": payload.request_group_key,
+                "request_group_key": existing.get("request_group_key") or canonical_key,
                 "picked_by_name": _lock_owner_name(existing) or device_user_name,
                 "already_owned": True,
+                "status": "picked",
+                "accepted_by_me": True,
+                "can_edit": True,
+                "can_pick": False,
             }
         raise HTTPException(status_code=409, detail=_already_picked_detail(existing))
 
     now_iso = _now_iso()
     lock_doc = {
-        "request_group_key": payload.request_group_key,
+        "request_group_key": canonical_key,
         "mobile_user_id": mobile_user_id,
         "device_id": device_id,
         "device_user_name": device_user_name,
@@ -2007,18 +2084,22 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         await db.mobile_request_group_locks.insert_one(dict(lock_doc))
     except DuplicateKeyError:
         existing = await db.mobile_request_group_locks.find_one(
-            {"request_group_key": payload.request_group_key}, {"_id": 0}
+            {"request_group_key": {"$in": aliases}}, {"_id": 0}
         )
         if existing and existing.get("device_id") == device_id:
             return {
                 "message": "Request picked",
-                "request_group_key": payload.request_group_key,
+                "request_group_key": existing.get("request_group_key") or canonical_key,
                 "picked_by_name": _lock_owner_name(existing) or device_user_name,
                 "already_owned": True,
+                "status": "picked",
+                "accepted_by_me": True,
+                "can_edit": True,
+                "can_pick": False,
             }
         raise HTTPException(status_code=409, detail=_already_picked_detail(existing))
 
-    await _audit(None, "mobile_accept_request", mobile_user_id, {"request_group_key": payload.request_group_key})
+    await _audit(None, "mobile_accept_request", mobile_user_id, {"request_group_key": canonical_key})
     try:
         import mobile_push
         header_doc = header or {}
@@ -2037,8 +2118,12 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         logger.warning("request_picked push failed: %s", exc)
     return {
         "message": "Request picked",
-        "request_group_key": payload.request_group_key,
+        "request_group_key": canonical_key,
         "picked_by_name": device_user_name,
+        "status": "picked",
+        "accepted_by_me": True,
+        "can_edit": True,
+        "can_pick": False,
     }
 
 
