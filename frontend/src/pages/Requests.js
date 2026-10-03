@@ -126,7 +126,8 @@ function inTransitLevel(group) {
 }
 
 export function Requests() {
-  const { scopeBrand, scopeDealer, scopeBranch } = useOutletContext() || {};
+  const { scopeBrand, scopeDealer, scopeBranch, isMaster, isAdmin } = useOutletContext() || {};
+  const canManageOwnership = Boolean(isMaster || isAdmin);
   const [searchParams] = useSearchParams();
   const highlightRequest = String(searchParams.get('highlight') || '').trim();
   const [tab, setTab] = useState('outgoing');
@@ -139,6 +140,7 @@ export function Requests() {
   const [nowMs, setNowMs] = useState(Date.now());
   const [dispatchForm, setDispatchForm] = useState(null);
   const [ownershipLocks, setOwnershipLocks] = useState({});
+  const [transferPanel, setTransferPanel] = useState(null);
   const loadRef = useRef(null);
 
   const apiView = (tab === 'outgoing' || tab === 'receipts') ? 'outgoing' : 'incoming';
@@ -374,7 +376,17 @@ export function Requests() {
                     <td className="p-3 font-semibold">{g.total_items}</td>
                     <td className="p-3 font-semibold">{nfmt(g.total_qty)}</td>
                     <td className="p-3 font-semibold">{valueCell(g.total_value)}</td>
-                    <td className="p-3"><StatusBadge status={g.status}/>{countdown && <div className="mt-1 text-xs font-semibold text-amber-800">{countdown}</div>}{transit && <div className="mt-1 text-xs font-semibold text-rose-800">In transit {transit}</div>}{(ownershipLocks[g.request_number] || ownershipLocks[g.key]) && <div className="mt-1 text-xs font-semibold text-slate-700">Picked by {(ownershipLocks[g.request_number] || ownershipLocks[g.key]).picked_by_name}{(ownershipLocks[g.request_number] || ownershipLocks[g.key]).owner_inactive ? ' · owner inactive' : ''}</div>}</td>
+                    <td className="p-3"><StatusBadge status={g.status}/>{countdown && <div className="mt-1 text-xs font-semibold text-amber-800">{countdown}</div>}{transit && <div className="mt-1 text-xs font-semibold text-rose-800">In transit {transit}</div>}{(ownershipLocks[g.request_number] || ownershipLocks[g.key]) && (() => {
+                      const lock = ownershipLocks[g.request_number] || ownershipLocks[g.key];
+                      const sessionLabel = lock.owner_session_state === 'logged_in' ? 'Logged In' : 'Logged Out';
+                      const presenceLabel = lock.owner_presence === 'online' ? 'Online' : 'Offline';
+                      return (
+                        <div className="mt-1 text-xs font-semibold text-slate-700">
+                          <div>Picked by {lock.picked_by_name || 'mobile user'}</div>
+                          <div className="font-medium text-slate-500">Session: {sessionLabel} · Presence: {presenceLabel}{lock.last_seen_at ? ` · Last seen ${dtfmt(lock.last_seen_at)}` : ''}</div>
+                        </div>
+                      );
+                    })()}</td>
                   </tr>
                   {open && (
                     <tr className="bg-slate-50 border-t">
@@ -452,23 +464,66 @@ export function Requests() {
                             {(tab === 'outgoing' || tab === 'incoming') && g.items.some((i)=>['Requested','Approved','Partially Approved'].includes(i.status)) && (
                               <Button variant="outline" disabled={loading} onClick={()=>cancelGroup(g)}><Ban className="mr-1 h-4 w-4"/>Cancel Request</Button>
                             )}
-                            {tab === 'incoming' && (ownershipLocks[g.request_number] || ownershipLocks[g.key]) && (ownershipLocks[g.request_number] || ownershipLocks[g.key]).lock_status === 'picked' && (
-                              <Button variant="outline" disabled={loading} onClick={async ()=>{
-                                const reason = window.prompt('Release ownership reason (WRONG_PICK, UNABLE_TO_COMPLETE, SHIFT_CHANGE, OTHER)', 'OTHER');
-                                if (!reason) return;
-                                const note = window.prompt('Optional note') || '';
-                                try {
-                                  await axios.post(`${API}/mobile/web/request-locks/release`, {
-                                    request_group_key: g.request_number || g.key,
-                                    reason,
-                                    note,
-                                  });
-                                  toast.success('Ownership released');
-                                  load();
-                                } catch (e) {
-                                  toast.error(e.response?.data?.detail?.message || e.response?.data?.detail || 'Release failed');
-                                }
-                              }}>Release ownership</Button>
+                            {canManageOwnership && tab === 'incoming' && (ownershipLocks[g.request_number] || ownershipLocks[g.key]) && (ownershipLocks[g.request_number] || ownershipLocks[g.key]).lock_status === 'picked' && (
+                              <>
+                                <Button variant="outline" disabled={loading} onClick={async ()=>{
+                                  const requestGroupKey = (ownershipLocks[g.request_number] || ownershipLocks[g.key]).request_group_key || g.request_number || g.key;
+                                  try {
+                                    const res = await axios.get(`${API}/mobile/web/request-locks/transfer-targets`, { params: { request_group_key: requestGroupKey } });
+                                    const targets = res.data || [];
+                                    if (!targets.length) {
+                                      toast.error('No other active logged-in mobile user on this Brand + Dealer + Branch');
+                                      return;
+                                    }
+                                    setTransferPanel({ key: g.key, requestGroupKey, targets, selected: targets[0].mobile_user_id });
+                                  } catch (e) {
+                                    toast.error(e.response?.data?.detail?.message || e.response?.data?.detail || 'Unable to load transfer targets');
+                                  }
+                                }}>Transfer Picking</Button>
+                                <Button variant="outline" disabled={loading} onClick={async ()=>{
+                                  const reason = window.prompt('Release ownership reason (WRONG_PICK, UNABLE_TO_COMPLETE, SHIFT_CHANGE, OTHER)', 'OTHER');
+                                  if (!reason) return;
+                                  const note = window.prompt('Optional note') || '';
+                                  try {
+                                    await axios.post(`${API}/mobile/web/request-locks/release`, {
+                                      request_group_key: g.request_number || g.key,
+                                      reason,
+                                      note,
+                                    });
+                                    toast.success('Ownership released');
+                                    load();
+                                  } catch (e) {
+                                    toast.error(e.response?.data?.detail?.message || e.response?.data?.detail || 'Release failed');
+                                  }
+                                }}>Release ownership</Button>
+                              </>
+                            )}
+                            {transferPanel?.key === g.key && (
+                              <div className="flex flex-wrap items-end gap-2 rounded-lg border bg-slate-50 p-3">
+                                <label className="text-xs">Transfer to
+                                  <select className="mt-1 block h-9 min-w-56 rounded border px-2" value={transferPanel.selected} onChange={(e)=>setTransferPanel((p)=>({...p, selected:e.target.value}))}>
+                                    {transferPanel.targets.map((target)=>(
+                                      <option key={target.mobile_user_id} value={target.mobile_user_id}>
+                                        {target.name} · {target.presence === 'online' ? 'Online' : 'Offline'} · {target.session_state === 'logged_in' ? 'Logged In' : 'Logged Out'}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </label>
+                                <Button disabled={loading} onClick={async ()=>{
+                                  try {
+                                    await axios.post(`${API}/mobile/web/request-locks/transfer`, {
+                                      request_group_key: transferPanel.requestGroupKey,
+                                      target_mobile_user_id: transferPanel.selected,
+                                    });
+                                    toast.success('Picking transferred. Entered quantities were kept.');
+                                    setTransferPanel(null);
+                                    load();
+                                  } catch (e) {
+                                    toast.error(e.response?.data?.detail?.message || e.response?.data?.detail || 'Transfer failed');
+                                  }
+                                }}>Confirm Transfer</Button>
+                                <Button variant="outline" onClick={()=>setTransferPanel(null)}>Cancel</Button>
+                              </div>
                             )}
                           </div>
                         </div>

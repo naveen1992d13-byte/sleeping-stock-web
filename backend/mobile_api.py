@@ -89,6 +89,7 @@ ERR_ALREADY_PICKED = "ALREADY_PICKED"
 ERR_NOT_OWNER = "NOT_OWNER"
 ERR_INVALID_STATE = "INVALID_STATE"
 ERR_TRANSFER_TARGET_INVALID = "TRANSFER_TARGET_INVALID"
+PRESENCE_ONLINE_SECONDS = 90
 
 
 def init_mobile_api(_db, _get_current_user, _UserResponse, _pwd_context, _request_center_transition=None, _notify_request_status_change=None):
@@ -350,6 +351,10 @@ class MobileUserResponse(BaseModel):
     paired_device_count: int = 0
     active_device_count: int = 0
     last_active_at: Optional[str] = None
+    last_seen_at: Optional[str] = None
+    session_state: Optional[str] = None
+    presence: Optional[str] = None
+    admin_status: Optional[str] = None
 
 
 class PairingGenerateRequest(BaseModel):
@@ -489,6 +494,8 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
     device = await db.mobile_devices.find_one({"device_id": session["device_id"]}, {"_id": 0})
     if not device or device.get("status") != "active":
         raise HTTPException(403, "Device is inactive or removed — please re-pair")
+    if device.get("session_active") is False:
+        raise HTTPException(401, "Device session is logged out — please pair this device again")
 
     mobile_user = await db.mobile_users.find_one({"mobile_user_id": device["mobile_user_id"]}, {"_id": 0})
     if not mobile_user or mobile_user.get("status") != "active":
@@ -497,12 +504,22 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
     seen_at = _now_iso()
     await db.mobile_devices.update_one(
         {"device_id": device["device_id"]},
-        {"$set": {"last_active_at": seen_at, "last_seen_at": seen_at}},
+        {"$set": {
+            "last_active_at": seen_at,
+            "last_seen_at": seen_at,
+            "last_heartbeat_at": seen_at,
+            "session_active": True,
+            "push_enabled": True,
+        }},
     )
     await db.mobile_users.update_one(
         {"mobile_user_id": mobile_user["mobile_user_id"]},
         {"$set": {"last_active_at": seen_at, "last_seen_at": seen_at}},
     )
+    device["session_active"] = True
+    device["push_enabled"] = True
+    device["last_seen_at"] = seen_at
+    device["last_heartbeat_at"] = seen_at
 
     return {
         "device": device,
@@ -576,7 +593,7 @@ async def list_mobile_users(
     q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
     q["deleted_at"] = {"$exists": False}
     rows = await db.mobile_users.find(q, {"_id": 0, "password_hash": 0}).sort("created_at", -1).to_list(5000)
-    return rows
+    return await _enrich_mobile_user_presence(rows)
 
 
 @router.get("/users/{mobile_user_id}", response_model=MobileUserResponse)
@@ -584,7 +601,8 @@ async def get_mobile_user(mobile_user_id: str, current_user: UserResponse = Depe
     row = await db.mobile_users.find_one({"mobile_user_id": mobile_user_id}, {"_id": 0, "password_hash": 0})
     if not row:
         raise HTTPException(404, "Mobile user not found")
-    return row
+    enriched = await _enrich_mobile_user_presence([row])
+    return enriched[0]
 
 
 @router.put("/users/{mobile_user_id}/status")
@@ -949,7 +967,28 @@ async def verify_pairing_and_register_device(payload: PairingVerifyRequest, requ
 
         device_id = str(uuid.uuid4())
         raw_session_token = _new_raw_token()
-        device_doc = {"device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "device_user_name": payload.device_user_name.strip(), "device_user_mobile": normalized_mobile, "device_name": payload.device_name, "device_info": payload.device_info or "", "push_token": payload.push_token or "", "paired_at": now.isoformat(), "last_active_at": now.isoformat(), "app_version": payload.app_version or "", "status": "active", "brand_name": pairing_doc["brand_name"], "dealer_name": pairing_doc["dealer_name"], "branch": pairing_doc["branch"], "session_token_hash": _hash_token(raw_session_token)}
+        device_doc = {
+            "device_id": device_id,
+            "mobile_user_id": mobile_user["mobile_user_id"],
+            "device_user_name": payload.device_user_name.strip(),
+            "device_user_mobile": normalized_mobile,
+            "device_name": payload.device_name,
+            "device_info": payload.device_info or "",
+            "push_token": payload.push_token or "",
+            "paired_at": now.isoformat(),
+            "last_active_at": now.isoformat(),
+            "last_seen_at": now.isoformat(),
+            "last_heartbeat_at": now.isoformat(),
+            "app_version": payload.app_version or "",
+            "status": "active",
+            "session_active": True,
+            "push_enabled": True,
+            "logged_out_at": None,
+            "brand_name": pairing_doc["brand_name"],
+            "dealer_name": pairing_doc["dealer_name"],
+            "branch": pairing_doc["branch"],
+            "session_token_hash": _hash_token(raw_session_token),
+        }
         await db.mobile_devices.insert_one(dict(device_doc))
         await db.mobile_sessions.insert_one({"session_token_hash": device_doc["session_token_hash"], "device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "created_at": now.isoformat()})
         await db.mobile_users.update_one({"mobile_user_id": mobile_user["mobile_user_id"]}, {"$inc": {"paired_device_count": 1}, "$set": {"active_device_count": 1, "last_active_at": now.isoformat(), "updated_at": now.isoformat()}})
@@ -981,7 +1020,40 @@ async def validate_session(session=Depends(get_device_session)):
         "dealer_name": session["dealer_name"],
         "branch": session["branch"],
         "device_status": session["device"]["status"],
+        "session_active": True,
+        "presence": "online",
     }
+
+
+@router.post("/session/heartbeat")
+async def session_heartbeat(session=Depends(get_device_session)):
+    return {
+        "ok": True,
+        "session_active": True,
+        "presence": "online",
+        "last_seen_at": session["device"].get("last_seen_at") or _now_iso(),
+    }
+
+
+@router.post("/session/logout")
+async def logout_device_session(session=Depends(get_device_session)):
+    """Invalidate this device session without changing Admin-controlled status."""
+    device_id = session["device"]["device_id"]
+    token_hash = session["device"].get("session_token_hash")
+    now_iso = _now_iso()
+    await db.mobile_sessions.delete_many({"device_id": device_id})
+    if token_hash:
+        await db.mobile_sessions.delete_many({"session_token_hash": token_hash})
+    await db.mobile_devices.update_one(
+        {"device_id": device_id},
+        {"$set": {
+            "session_active": False,
+            "push_enabled": False,
+            "logged_out_at": now_iso,
+        }},
+    )
+    await _audit(None, "mobile_session_logout", session["mobile_user"]["mobile_user_id"], {"device_id": device_id})
+    return {"message": "Logged out", "session_active": False, "push_enabled": False}
 
 
 class PushTokenRegisterRequest(BaseModel):
@@ -1019,7 +1091,7 @@ async def list_devices(
     else:
         q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
     rows = await db.mobile_devices.find(q, {"_id": 0, "session_token_hash": 0}).sort("paired_at", -1).to_list(5000)
-    return rows
+    return _enrich_device_presence(rows)
 
 
 @router.put("/devices/{device_id}/status")
@@ -1455,6 +1527,51 @@ def _group_key_for(line: dict) -> str:
     return line.get("request_group_id") or line.get("request_number")
 
 
+def _group_aliases(*parts) -> list:
+    """Every id a request might be stored or claimed under (header id, group id, number)."""
+    keys = []
+    seen = set()
+
+    def add(value):
+        text = str(value or "").strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        keys.append(text)
+
+    for part in parts:
+        if isinstance(part, dict):
+            for field in ("request_group_key", "request_group_id", "request_number", "id"):
+                add(part.get(field))
+        else:
+            add(part)
+    return keys
+
+
+def _lock_for_group(lock_by_key: dict, group: dict, lines=None):
+    aliases = _group_aliases(group, *((lines or [])))
+    for key in aliases:
+        lock = lock_by_key.get(key)
+        if lock:
+            return lock
+    return None
+
+
+def _supplying_brand_clause(session) -> Optional[dict]:
+    brand = (session.get("brand_name") or "").strip()
+    if not brand:
+        return None
+    return {
+        "$or": [
+            {"supplying_brand": _scope_ci(brand)},
+            {"brand_name": _scope_ci(brand)},
+            {"supplying_brand": {"$exists": False}},
+            {"supplying_brand": None},
+            {"supplying_brand": ""},
+        ]
+    }
+
+
 def _parse_iso_dt(value):
     if not value:
         return None
@@ -1489,6 +1606,70 @@ def _error_detail(code: str, message: str, **extra) -> dict:
     detail = {"code": code, "message": message}
     detail.update({k: v for k, v in extra.items() if v is not None})
     return detail
+
+
+def _presence_label(last_seen, now=None) -> str:
+    dt = _parse_iso_dt(last_seen)
+    if not dt:
+        return "offline"
+    return "online" if ((now or _now()) - dt) <= timedelta(seconds=PRESENCE_ONLINE_SECONDS) else "offline"
+
+
+def _session_state(device) -> str:
+    if device and device.get("session_active") is True:
+        return "logged_in"
+    return "logged_out"
+
+
+def _enrich_device_presence(rows, now=None):
+    now = now or _now()
+    enriched = []
+    for row in rows or []:
+        last_seen = row.get("last_seen_at") or row.get("last_heartbeat_at") or row.get("last_active_at")
+        session_state = _session_state(row)
+        presence = _presence_label(last_seen, now) if session_state == "logged_in" else "offline"
+        enriched.append({
+            **row,
+            "admin_status": row.get("status"),
+            "session_state": session_state,
+            "presence": presence,
+            "last_seen_at": last_seen,
+        })
+    return enriched
+
+
+async def _enrich_mobile_user_presence(rows):
+    if not rows:
+        return rows
+    user_ids = [row.get("mobile_user_id") for row in rows if row.get("mobile_user_id")]
+    devices = await db.mobile_devices.find(
+        {"mobile_user_id": {"$in": user_ids}},
+        {"_id": 0, "mobile_user_id": 1, "session_active": 1, "push_enabled": 1, "last_seen_at": 1, "last_active_at": 1, "last_heartbeat_at": 1, "paired_at": 1, "status": 1},
+    ).to_list(5000)
+    latest = {}
+    for device in devices:
+        uid = device.get("mobile_user_id")
+        if uid not in latest:
+            latest[uid] = device
+            continue
+        current = latest[uid]
+        if (device.get("session_active") is True) and (current.get("session_active") is not True):
+            latest[uid] = device
+    now = _now()
+    enriched = []
+    for row in rows:
+        device = latest.get(row.get("mobile_user_id"))
+        last_seen = (device or {}).get("last_seen_at") or (device or {}).get("last_heartbeat_at") or (device or {}).get("last_active_at") or row.get("last_seen_at") or row.get("last_active_at")
+        session_state = _session_state(device)
+        presence = _presence_label(last_seen, now) if session_state == "logged_in" else "offline"
+        enriched.append({
+            **row,
+            "admin_status": row.get("status"),
+            "session_state": session_state,
+            "presence": presence,
+            "last_seen_at": last_seen,
+        })
+    return enriched
 
 
 def _deadline_passed(header, now=None) -> bool:
@@ -1598,14 +1779,17 @@ async def _today_product_locs(part_numbers, brand_name, dealer_name, branch):
 
 
 async def _scope_group_lines(request_group_key: str, session, statuses=None):
-    query = {
-        **_group_line_filter(request_group_key),
-        "supplying_dealer": session["dealer_name"],
-        "supplying_branch": session["branch"],
-    }
+    clauses = [
+        _group_line_filter(request_group_key),
+        {"supplying_dealer": _scope_ci(session["dealer_name"])},
+        {"supplying_branch": _scope_ci(session["branch"])},
+    ]
+    brand_clause = _supplying_brand_clause(session)
+    if brand_clause:
+        clauses.append(brand_clause)
     if statuses:
-        query["status"] = {"$in": list(statuses)}
-    return await db.order_requests.find(query, {"_id": 0}).to_list(2000)
+        clauses.append({"status": {"$in": list(statuses)}})
+    return await db.order_requests.find({"$and": clauses}, {"_id": 0}).to_list(2000)
 
 
 async def _header_for_request_number(request_number: str) -> dict:
@@ -1657,22 +1841,26 @@ async def list_branch_notifications(session=Depends(get_device_session)):
     now = _now()
     cutoff = (now - timedelta(hours=NOTIFICATION_HISTORY_HOURS)).isoformat()
 
+    list_clauses = [
+        {"supplying_dealer": _scope_ci(dealer)},
+        {"supplying_branch": _scope_ci(branch)},
+        {"$or": [
+            {"status": "Requested"},
+            {"status": {"$in": ["Approved", "Rejected", "Cancelled"]}, "requested_at": {"$gte": cutoff}},
+            {"timeout_cancelled_at": {"$gte": cutoff}},
+            {"decided_at": {"$gte": cutoff}},
+        ]},
+    ]
+    brand_clause = _supplying_brand_clause(session)
+    if brand_clause:
+        list_clauses.append(brand_clause)
     lines = await db.order_requests.find(
-        {
-            "supplying_dealer": dealer,
-            "supplying_branch": branch,
-            "$or": [
-                {"status": "Requested"},
-                {"status": {"$in": ["Approved", "Rejected", "Cancelled"]}, "requested_at": {"$gte": cutoff}},
-                {"timeout_cancelled_at": {"$gte": cutoff}},
-                {"decided_at": {"$gte": cutoff}},
-            ],
-        },
+        {"$and": list_clauses},
         {"_id": 0},
     ).sort("requested_at", -1).to_list(4000)
 
     branch_locks = await db.mobile_request_group_locks.find(
-        {"dealer_name": dealer, "branch": branch}, {"_id": 0}
+        {"dealer_name": _scope_ci(dealer), "branch": _scope_ci(branch)}, {"_id": 0}
     ).to_list(1000)
     have = {_group_key_for(line) for line in lines}
     missing_keys = [
@@ -1680,15 +1868,18 @@ async def list_branch_notifications(session=Depends(get_device_session)):
         if lock.get("request_group_key") and lock.get("request_group_key") not in have
     ]
     if missing_keys:
+        extra_clauses = [
+            {"supplying_dealer": _scope_ci(dealer)},
+            {"supplying_branch": _scope_ci(branch)},
+            {"$or": [
+                {"request_group_id": {"$in": missing_keys}},
+                {"request_number": {"$in": missing_keys}},
+            ]},
+        ]
+        if brand_clause:
+            extra_clauses.append(brand_clause)
         extra = await db.order_requests.find(
-            {
-                "supplying_dealer": dealer,
-                "supplying_branch": branch,
-                "$or": [
-                    {"request_group_id": {"$in": missing_keys}},
-                    {"request_number": {"$in": missing_keys}},
-                ],
-            },
+            {"$and": extra_clauses},
             {"_id": 0},
         ).to_list(2000)
         lines.extend(extra)
@@ -1701,6 +1892,7 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             continue
         group = groups.setdefault(key, {
             "request_group_key": key,
+            "request_group_id": line.get("request_group_id") or key,
             "request_number": line.get("request_number"),
             "requesting_dealer": line.get("requesting_dealer"),
             "requesting_branch": line.get("requesting_branch"),
@@ -1753,6 +1945,16 @@ async def list_branch_notifications(session=Depends(get_device_session)):
 
     group_keys = list(groups.keys())
     lock_by_key = {lock["request_group_key"]: lock for lock in branch_locks if lock.get("request_group_key")}
+    alias_keys = []
+    for key, group in groups.items():
+        alias_keys.extend(_group_aliases(key, group, *(group_lines.get(key) or [])))
+    missing_lock_keys = [key for key in dict.fromkeys(alias_keys) if key not in lock_by_key]
+    if missing_lock_keys:
+        async for lock in db.mobile_request_group_locks.find(
+            {"request_group_key": {"$in": missing_lock_keys}}, {"_id": 0}
+        ):
+            if lock.get("request_group_key"):
+                lock_by_key[lock["request_group_key"]] = lock
     actions = await db.mobile_notification_actions.find(
         {"request_id": {"$in": group_keys}, "mobile_user_id": mobile_user_id}, {"_id": 0}
     ).to_list(2000)
@@ -1770,10 +1972,15 @@ async def list_branch_notifications(session=Depends(get_device_session)):
 
     results = []
     for key, group in groups.items():
-        lock = lock_by_key.get(key)
-        action = action_by_key.get(key, {})
-        header = header_by_number.get(group.get("request_number")) or {}
         lines_for_group = group_lines.get(key) or []
+        lock = _lock_for_group(lock_by_key, {**group, "request_group_key": key}, lines_for_group)
+        action = action_by_key.get(key, {})
+        if not action:
+            for alias in _group_aliases(key, group, *lines_for_group):
+                action = action_by_key.get(alias) or {}
+                if action:
+                    break
+        header = header_by_number.get(group.get("request_number")) or {}
         status = _ownership_status(lines_for_group, lock, header, now)
         owner_name = _lock_owner_name(lock)
         owned_by_me = bool(lock) and lock.get("device_id") == device_id
@@ -1844,20 +2051,26 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
     if _is_expired_group(live_lines, header):
         raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, MOBILE_EXPIRED_LABEL, status="expired"))
 
-    existing = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key}, {"_id": 0})
+    canonical_key = _group_key_for(live_lines[0]) or payload.request_group_key
+    aliases = _group_aliases(payload.request_group_key, canonical_key, live_lines[0])
+    existing = await db.mobile_request_group_locks.find_one({"request_group_key": {"$in": aliases}}, {"_id": 0})
     if existing:
         if existing.get("device_id") == device_id:
             return {
                 "message": "Request picked",
-                "request_group_key": payload.request_group_key,
+                "request_group_key": existing.get("request_group_key") or canonical_key,
                 "picked_by_name": _lock_owner_name(existing) or device_user_name,
                 "already_owned": True,
+                "status": "picked",
+                "accepted_by_me": True,
+                "can_edit": True,
+                "can_pick": False,
             }
         raise HTTPException(status_code=409, detail=_already_picked_detail(existing))
 
     now_iso = _now_iso()
     lock_doc = {
-        "request_group_key": payload.request_group_key,
+        "request_group_key": canonical_key,
         "mobile_user_id": mobile_user_id,
         "device_id": device_id,
         "device_user_name": device_user_name,
@@ -1877,18 +2090,22 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         await db.mobile_request_group_locks.insert_one(dict(lock_doc))
     except DuplicateKeyError:
         existing = await db.mobile_request_group_locks.find_one(
-            {"request_group_key": payload.request_group_key}, {"_id": 0}
+            {"request_group_key": {"$in": aliases}}, {"_id": 0}
         )
         if existing and existing.get("device_id") == device_id:
             return {
                 "message": "Request picked",
-                "request_group_key": payload.request_group_key,
+                "request_group_key": existing.get("request_group_key") or canonical_key,
                 "picked_by_name": _lock_owner_name(existing) or device_user_name,
                 "already_owned": True,
+                "status": "picked",
+                "accepted_by_me": True,
+                "can_edit": True,
+                "can_pick": False,
             }
         raise HTTPException(status_code=409, detail=_already_picked_detail(existing))
 
-    await _audit(None, "mobile_accept_request", mobile_user_id, {"request_group_key": payload.request_group_key})
+    await _audit(None, "mobile_accept_request", mobile_user_id, {"request_group_key": canonical_key})
     try:
         import mobile_push
         header_doc = header or {}
@@ -1896,6 +2113,7 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
             **header_doc,
             "request_number": live_lines[0].get("request_number") or header_doc.get("request_number"),
             "id": payload.request_group_key,
+            "supplying_brand": session["brand_name"],
             "supplying_dealer": dealer,
             "supplying_branch": branch,
         }
@@ -1906,8 +2124,12 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         logger.warning("request_picked push failed: %s", exc)
     return {
         "message": "Request picked",
-        "request_group_key": payload.request_group_key,
+        "request_group_key": canonical_key,
         "picked_by_name": device_user_name,
+        "status": "picked",
+        "accepted_by_me": True,
+        "can_edit": True,
+        "can_pick": False,
     }
 
 
@@ -2092,101 +2314,162 @@ async def complete_picking(payload: NotificationCompleteRequest, session=Depends
     return {"message": "Picking completed", "request_group_key": payload.request_group_key, "status": "picking_completed"}
 
 
-@router.get("/notifications/transfer-targets")
-async def list_transfer_targets(request_group_key: str, session=Depends(get_device_session)):
-    lock = await db.mobile_request_group_locks.find_one({"request_group_key": request_group_key}, {"_id": 0})
-    _raise_if_not_writable(lock, session)
+async def _eligible_transfer_targets(brand: str, dealer: str, branch: str, exclude_mobile_user_id: Optional[str] = None):
+    """Active + logged-in same Brand/Dealer/Branch devices that can receive a pick."""
+    if not (brand and dealer and branch):
+        return []
+    user_q = {"brand_name": brand, "dealer_name": dealer, "branch": branch, "status": "active"}
+    if exclude_mobile_user_id:
+        user_q["mobile_user_id"] = {"$ne": exclude_mobile_user_id}
     users = await db.mobile_users.find(
-        {
-            "dealer_name": session["dealer_name"],
-            "branch": session["branch"],
-            "status": "active",
-            "mobile_user_id": {"$ne": session["mobile_user"]["mobile_user_id"]},
-        },
-        {"_id": 0, "mobile_user_id": 1, "name": 1, "mobile_number": 1, "last_seen_at": 1, "last_active_at": 1},
+        user_q,
+        {"_id": 0, "mobile_user_id": 1, "name": 1, "mobile_number": 1, "last_seen_at": 1, "last_active_at": 1, "status": 1},
     ).to_list(200)
     devices = await db.mobile_devices.find(
-        {"dealer_name": session["dealer_name"], "branch": session["branch"], "status": "active"},
-        {"_id": 0, "mobile_user_id": 1, "device_id": 1, "device_user_name": 1, "last_seen_at": 1, "last_active_at": 1},
+        {
+            "brand_name": brand,
+            "dealer_name": dealer,
+            "branch": branch,
+            "status": "active",
+            "session_active": True,
+        },
+        {"_id": 0, "mobile_user_id": 1, "device_id": 1, "device_user_name": 1, "device_user_mobile": 1,
+         "device_name": 1, "last_seen_at": 1, "last_heartbeat_at": 1, "last_active_at": 1, "session_active": 1, "status": 1},
     ).to_list(200)
-    device_by_user = {d["mobile_user_id"]: d for d in devices if d.get("mobile_user_id")}
+    device_by_user = {}
+    for device in devices:
+        uid = device.get("mobile_user_id")
+        if uid and uid not in device_by_user:
+            device_by_user[uid] = device
+    now = _now()
     results = []
     for user in users:
         device = device_by_user.get(user["mobile_user_id"])
         if not device:
             continue
+        last_seen = device.get("last_seen_at") or device.get("last_heartbeat_at") or device.get("last_active_at") or user.get("last_seen_at")
+        session_state = _session_state(device)
+        presence = _presence_label(last_seen, now) if session_state == "logged_in" else "offline"
         results.append({
             "mobile_user_id": user["mobile_user_id"],
             "name": device.get("device_user_name") or user.get("name"),
             "mobile_number": user.get("mobile_number"),
             "device_id": device.get("device_id"),
-            "last_seen_at": device.get("last_seen_at") or device.get("last_active_at") or user.get("last_seen_at"),
+            "last_seen_at": last_seen,
+            "session_state": session_state,
+            "presence": presence,
+            "admin_status": device.get("status") or user.get("status"),
         })
     return results
 
 
-@router.post("/notifications/transfer")
-async def transfer_ownership(payload: NotificationTransferRequest, session=Depends(get_device_session)):
-    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
-    _raise_if_not_writable(lock, session)
-    target_id = (payload.target_mobile_user_id or "").strip().upper()
-    if not target_id or target_id == session["mobile_user"]["mobile_user_id"]:
+async def _resolve_transfer_target(target_id: str, brand: str, dealer: str, branch: str, exclude_mobile_user_id: Optional[str] = None):
+    target_id = (target_id or "").strip().upper()
+    if not target_id or target_id == (exclude_mobile_user_id or ""):
         raise HTTPException(status_code=409, detail=_error_detail(ERR_TRANSFER_TARGET_INVALID, "Select a different same-branch mobile user"))
-
     target_user = await db.mobile_users.find_one({
         "mobile_user_id": target_id, "status": "active",
-        "dealer_name": session["dealer_name"], "branch": session["branch"],
+        "brand_name": brand, "dealer_name": dealer, "branch": branch,
     }, {"_id": 0})
     target_device = await db.mobile_devices.find_one({
-        "mobile_user_id": target_id, "status": "active",
-        "dealer_name": session["dealer_name"], "branch": session["branch"],
+        "mobile_user_id": target_id, "status": "active", "session_active": True,
+        "brand_name": brand, "dealer_name": dealer, "branch": branch,
     }, {"_id": 0})
     if not target_user or not target_device:
-        raise HTTPException(status_code=409, detail=_error_detail(ERR_TRANSFER_TARGET_INVALID, "Target is not an active paired user on this branch"))
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_TRANSFER_TARGET_INVALID, "Target is not an active logged-in user on this Brand + Dealer + Branch"))
+    return target_user, target_device
 
+
+async def _apply_lock_transfer(lock, target_user, target_device, *, extra_query=None, actor_id: str, actor_name: str, source: str):
+    """Reassign ownership. line_responses / SLA / skip counts are not touched."""
     now_iso = _now_iso()
+    query = {"request_group_key": lock["request_group_key"], "lock_status": "picked"}
+    if extra_query:
+        query.update(extra_query)
     claimed = await db.mobile_request_group_locks.find_one_and_update(
-        {"request_group_key": payload.request_group_key, "device_id": session["device"]["device_id"], "lock_status": "picked"},
+        query,
         {"$set": {
-            "mobile_user_id": target_id,
+            "mobile_user_id": target_user["mobile_user_id"],
             "device_id": target_device["device_id"],
             "device_user_name": target_device.get("device_user_name") or target_user.get("name"),
             "device_user_mobile": target_device.get("device_user_mobile") or target_user.get("mobile_number"),
             "device_name": target_device.get("device_name", ""),
             "transferred_at": now_iso,
-            "transferred_from_device_id": session["device"]["device_id"],
-            "transferred_from_mobile_user_id": session["mobile_user"]["mobile_user_id"],
+            "transferred_from_device_id": lock.get("device_id"),
+            "transferred_from_mobile_user_id": lock.get("mobile_user_id"),
+            "transferred_by": actor_id,
+            "transferred_by_name": actor_name,
+            "transfer_source": source,
             "owner_last_seen_at": now_iso,
         }},
         return_document=ReturnDocument.AFTER,
     )
     if not claimed:
         raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "This request can no longer be transferred"))
+    return claimed
 
-    await _audit(None, "mobile_transfer_ownership", session["mobile_user"]["mobile_user_id"], {
-        "request_group_key": payload.request_group_key, "target_mobile_user_id": target_id,
-    })
+
+async def _notify_lock_transferred(request_group_key: str, brand: str, dealer: str, branch: str, target_device_id: str, session=None):
     try:
         import mobile_push
-        live_lines = await _scope_group_lines(payload.request_group_key, session)
-        header = await _header_for_request_number((live_lines[0].get("request_number") if live_lines else None) or payload.request_group_key)
+        if session:
+            live_lines = await _scope_group_lines(request_group_key, session)
+        else:
+            live_lines = await db.order_requests.find(_group_line_filter(request_group_key), {"_id": 0}).to_list(200)
+        header = await _header_for_request_number((live_lines[0].get("request_number") if live_lines else None) or request_group_key)
         await mobile_push.notify_request_transferred_push(db, {
             **(header or {}),
-            "id": payload.request_group_key,
-            "request_number": (live_lines[0].get("request_number") if live_lines else None) or header.get("request_number"),
-            "supplying_dealer": session["dealer_name"],
-            "supplying_branch": session["branch"],
-            "requesting_branch": (live_lines[0].get("requesting_branch") if live_lines else None) or header.get("requesting_branch"),
+            "id": request_group_key,
+            "request_number": (live_lines[0].get("request_number") if live_lines else None) or (header or {}).get("request_number"),
+            "supplying_brand": brand,
+            "supplying_dealer": dealer,
+            "supplying_branch": branch,
+            "requesting_branch": (live_lines[0].get("requesting_branch") if live_lines else None) or (header or {}).get("requesting_branch"),
             "total_items": len(live_lines),
             "total_qty": sum(float(line.get("requested_qty") or 0) for line in live_lines),
-        }, target_device_id=target_device["device_id"])
+        }, target_device_id=target_device_id)
     except Exception as exc:
         logger.warning("request_transferred push failed: %s", exc)
+
+
+@router.get("/notifications/transfer-targets")
+async def list_transfer_targets(request_group_key: str, session=Depends(get_device_session)):
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": request_group_key}, {"_id": 0})
+    _raise_if_not_writable(lock, session)
+    return await _eligible_transfer_targets(
+        session["brand_name"], session["dealer_name"], session["branch"],
+        exclude_mobile_user_id=session["mobile_user"]["mobile_user_id"],
+    )
+
+
+@router.post("/notifications/transfer")
+async def transfer_ownership(payload: NotificationTransferRequest, session=Depends(get_device_session)):
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
+    _raise_if_not_writable(lock, session)
+    target_user, target_device = await _resolve_transfer_target(
+        payload.target_mobile_user_id,
+        session["brand_name"], session["dealer_name"], session["branch"],
+        exclude_mobile_user_id=session["mobile_user"]["mobile_user_id"],
+    )
+    claimed = await _apply_lock_transfer(
+        lock, target_user, target_device,
+        extra_query={"device_id": session["device"]["device_id"]},
+        actor_id=session["mobile_user"]["mobile_user_id"],
+        actor_name=session["device"].get("device_user_name") or session["mobile_user"]["name"],
+        source="owner",
+    )
+    await _audit(None, "mobile_transfer_ownership", session["mobile_user"]["mobile_user_id"], {
+        "request_group_key": payload.request_group_key, "target_mobile_user_id": target_user["mobile_user_id"],
+    })
+    await _notify_lock_transferred(
+        payload.request_group_key, session["brand_name"], session["dealer_name"], session["branch"],
+        target_device["device_id"], session=session,
+    )
     return {
         "message": "Ownership transferred",
         "request_group_key": payload.request_group_key,
         "picked_by_name": _lock_owner_name(claimed),
-        "target_mobile_user_id": target_id,
+        "target_mobile_user_id": target_user["mobile_user_id"],
     }
 
 
@@ -2229,6 +2512,7 @@ async def _release_lock(request_group_key: str, reason: str, note: str, actor_id
             **(header or {}),
             "id": request_group_key,
             "request_number": (lines[0].get("request_number") if lines else None) or header.get("request_number"),
+            "supplying_brand": removed.get("brand_name") or header.get("supplying_brand") or header.get("requesting_brand") or header.get("brand_name"),
             "supplying_dealer": removed.get("dealer_name") or header.get("supplying_dealer"),
             "supplying_branch": removed.get("branch") or header.get("supplying_branch"),
             "requesting_branch": (lines[0].get("requesting_branch") if lines else None) or header.get("requesting_branch"),
@@ -2254,6 +2538,20 @@ async def release_ownership(payload: NotificationReleaseRequest, session=Depends
     )
 
 
+def _assert_web_can_manage_lock(current_user, lock):
+    role = (getattr(current_user, "role", "") or "").lower()
+    if role == "master":
+        return
+    if role == "admin" and (lock.get("dealer_name") or "") == (getattr(current_user, "group", "") or ""):
+        return
+    raise HTTPException(403, "This request is outside your scope")
+
+
+def _assert_web_can_transfer(current_user):
+    if (getattr(current_user, "role", "") or "").lower() not in ("master", "admin"):
+        raise HTTPException(403, "Only Admin or Master can transfer or release picking")
+
+
 @router.get("/web/request-locks")
 async def list_web_request_locks(current_user=Depends(_web_current_user)):
     query = {}
@@ -2263,34 +2561,96 @@ async def list_web_request_locks(current_user=Depends(_web_current_user)):
         query["dealer_name"] = current_user.group
         query["branch"] = current_user.location
     locks = await db.mobile_request_group_locks.find(query, {"_id": 0}).to_list(2000)
-    user_ids = [lock.get("mobile_user_id") for lock in locks if lock.get("mobile_user_id")]
-    seen = {}
-    if user_ids:
-        async for user in db.mobile_users.find({"mobile_user_id": {"$in": user_ids}}, {"_id": 0, "mobile_user_id": 1, "last_seen_at": 1, "last_active_at": 1}):
-            seen[user["mobile_user_id"]] = user.get("last_seen_at") or user.get("last_active_at")
+    device_ids = [lock.get("device_id") for lock in locks if lock.get("device_id")]
+    devices = {}
+    if device_ids:
+        async for device in db.mobile_devices.find(
+            {"device_id": {"$in": device_ids}},
+            {"_id": 0, "device_id": 1, "session_active": 1, "push_enabled": 1, "last_seen_at": 1,
+             "last_heartbeat_at": 1, "last_active_at": 1, "status": 1, "device_user_name": 1},
+        ):
+            devices[device["device_id"]] = device
     results = []
     now = _now()
     for lock in locks:
-        last_seen = lock.get("owner_last_seen_at") or seen.get(lock.get("mobile_user_id"))
-        inactive = False
-        dt = _parse_iso_dt(last_seen)
-        if dt and (now - dt) > timedelta(minutes=15):
-            inactive = True
+        device = devices.get(lock.get("device_id")) or {}
+        last_seen = device.get("last_seen_at") or device.get("last_heartbeat_at") or lock.get("owner_last_seen_at") or device.get("last_active_at")
+        session_state = _session_state(device)
+        presence = _presence_label(last_seen, now) if session_state == "logged_in" else "offline"
         results.append({
             "request_group_key": lock.get("request_group_key"),
             "picked_by_name": _lock_owner_name(lock),
             "lock_status": lock.get("lock_status"),
             "picked_at": lock.get("picked_at"),
             "last_seen_at": last_seen,
-            "owner_inactive": inactive,
+            "owner_session_state": session_state,
+            "owner_presence": presence,
+            "owner_admin_status": device.get("status"),
+            "owner_inactive": presence == "offline",
+            "mobile_user_id": lock.get("mobile_user_id"),
+            "device_id": lock.get("device_id"),
+            "brand_name": lock.get("brand_name"),
+            "dealer_name": lock.get("dealer_name"),
+            "branch": lock.get("branch"),
         })
     return results
 
 
+@router.get("/web/request-locks/transfer-targets")
+async def list_web_transfer_targets(request_group_key: str, current_user=Depends(_web_current_user)):
+    _assert_web_can_transfer(current_user)
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": request_group_key}, {"_id": 0})
+    if not lock:
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "Request is not picked"))
+    _assert_web_can_manage_lock(current_user, lock)
+    return await _eligible_transfer_targets(
+        lock.get("brand_name"), lock.get("dealer_name"), lock.get("branch"),
+        exclude_mobile_user_id=lock.get("mobile_user_id"),
+    )
+
+
+@router.post("/web/request-locks/transfer")
+async def admin_transfer_ownership(payload: NotificationTransferRequest, current_user=Depends(_web_current_user)):
+    _assert_web_can_transfer(current_user)
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
+    if not lock:
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "Request is not picked"))
+    if str(lock.get("lock_status") or "") != "picked":
+        raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "This request can no longer be transferred"))
+    _assert_web_can_manage_lock(current_user, lock)
+    brand = lock.get("brand_name")
+    dealer = lock.get("dealer_name")
+    branch = lock.get("branch")
+    target_user, target_device = await _resolve_transfer_target(
+        payload.target_mobile_user_id, brand, dealer, branch,
+        exclude_mobile_user_id=lock.get("mobile_user_id"),
+    )
+    claimed = await _apply_lock_transfer(
+        lock, target_user, target_device,
+        actor_id=current_user.id,
+        actor_name=getattr(current_user, "username", "") or current_user.id,
+        source="web_admin",
+    )
+    await _audit(current_user, "web_transfer_ownership", target_user["mobile_user_id"], {
+        "request_group_key": payload.request_group_key, "target_mobile_user_id": target_user["mobile_user_id"],
+    })
+    await _notify_lock_transferred(
+        payload.request_group_key, brand, dealer, branch, target_device["device_id"],
+    )
+    return {
+        "message": "Ownership transferred",
+        "request_group_key": payload.request_group_key,
+        "picked_by_name": _lock_owner_name(claimed),
+        "target_mobile_user_id": target_user["mobile_user_id"],
+    }
+
+
 @router.post("/web/request-locks/release")
 async def admin_release_ownership(payload: NotificationReleaseRequest, current_user=Depends(_web_current_user)):
-    if (current_user.role or "").lower() not in ("master", "admin"):
-        raise HTTPException(403, "Only Admin or Master can release stuck ownership")
+    _assert_web_can_transfer(current_user)
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key}, {"_id": 0})
+    if lock:
+        _assert_web_can_manage_lock(current_user, lock)
     return await _release_lock(
         payload.request_group_key,
         payload.reason,
@@ -3250,6 +3610,27 @@ async def cleanup_duplicate_daily_verification_sessions(database=None) -> dict:
     return stats
 
 
+async def _backfill_device_session_flags():
+    """Heal session/push flags without changing Admin-controlled device status.
+
+    Devices that still have a mobile_sessions row are treated as logged in.
+    Devices missing the new flags (stale tokens after a local-only logout)
+    are marked logged out so they stop receiving request push.
+    """
+    await db.mobile_devices.update_many(
+        {"session_active": {"$exists": False}},
+        {"$set": {"session_active": False, "push_enabled": False}},
+    )
+    session_device_ids = [
+        device_id for device_id in (await db.mobile_sessions.distinct("device_id") or []) if device_id
+    ]
+    if session_device_ids:
+        await db.mobile_devices.update_many(
+            {"device_id": {"$in": session_device_ids}},
+            {"$set": {"session_active": True, "push_enabled": True}},
+        )
+
+
 # ==================== INDEXES ====================
 
 async def ensure_mobile_indexes():
@@ -3296,6 +3677,11 @@ async def ensure_mobile_indexes():
         [("session_token_hash", 1)], unique=True, partialFilterExpression={"session_token_hash": {"$type": "string"}}
     )
     await db.mobile_devices.create_index([("push_token", 1)])
+    await db.mobile_devices.create_index([("status", 1), ("session_active", 1), ("push_enabled", 1)])
+    try:
+        await _backfill_device_session_flags()
+    except Exception as exc:
+        logger.warning("Device session flag backfill failed: %s", exc)
 
     await db.mobile_sessions.create_index([("session_token_hash", 1)], unique=True)
     await db.mobile_sessions.create_index([("device_id", 1)])

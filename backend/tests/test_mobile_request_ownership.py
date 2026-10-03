@@ -60,6 +60,17 @@ class FakeLocks:
         return self.docs.pop(doc["request_group_key"])
 
 
+def test_lock_alias_matches_header_id_or_request_number():
+    lock_by_key = {"header-uuid": {"device_id": "d1", "lock_status": "picked", "device_user_name": "Ravi"}}
+    group = {"request_group_key": "RQ1", "request_number": "RQ1"}
+    lines = [{"request_group_id": "header-uuid", "request_number": "RQ1"}]
+    lock = mobile_api._lock_for_group(lock_by_key, group, lines)
+    assert lock["device_id"] == "d1"
+    aliases = mobile_api._group_aliases("header-uuid", group, *lines)
+    assert "header-uuid" in aliases
+    assert "RQ1" in aliases
+
+
 def test_already_picked_code():
     detail = mobile_api._already_picked_detail({"device_user_name": "Ravi"})
     assert detail["code"] == "ALREADY_PICKED"
@@ -161,6 +172,22 @@ def test_request_picked_excludes_picker(monkeypatch):
     asyncio.run(_test_request_picked_excludes_picker(monkeypatch))
 
 
+def _eligible_dev(device_id, token, uid, brand="Honda", dealer="D", branch="B", **extra):
+    row = {
+        "device_id": device_id,
+        "push_token": token,
+        "mobile_user_id": uid,
+        "status": "active",
+        "session_active": True,
+        "push_enabled": True,
+        "brand_name": brand,
+        "dealer_name": dealer,
+        "branch": branch,
+    }
+    row.update(extra)
+    return row
+
+
 async def _test_request_picked_excludes_picker(monkeypatch):
     sent = []
 
@@ -169,8 +196,8 @@ async def _test_request_picked_excludes_picker(monkeypatch):
             class Cursor:
                 async def to_list(self, n):
                     return [
-                        {"device_id": "winner", "push_token": "ExponentPushToken[w]", "mobile_user_id": "u1"},
-                        {"device_id": "other", "push_token": "ExponentPushToken[o]", "mobile_user_id": "u2"},
+                        _eligible_dev("winner", "ExponentPushToken[w]", "u1"),
+                        _eligible_dev("other", "ExponentPushToken[o]", "u2"),
                     ]
             return Cursor()
 
@@ -184,7 +211,7 @@ async def _test_request_picked_excludes_picker(monkeypatch):
     monkeypatch.setattr(mobile_push, "send_expo_push_messages", capture)
     result = await mobile_push.notify_request_picked_push(
         FakeDB(),
-        {"id": "G", "request_number": "RQ1", "supplying_dealer": "D", "supplying_branch": "B"},
+        {"id": "G", "request_number": "RQ1", "supplying_brand": "Honda", "supplying_dealer": "D", "supplying_branch": "B"},
         picked_by_name="Ravi",
         exclude_device_id="winner",
     )
@@ -278,3 +305,139 @@ def test_transfer_target_must_be_other_user():
             mobile_api.ERR_TRANSFER_TARGET_INVALID, "Select a different same-branch mobile user"
         ))
     assert err.value.detail["code"] == "TRANSFER_TARGET_INVALID"
+
+
+def test_request_push_scope_requires_brand_dealer_branch():
+    assert mobile_push.request_push_scope({
+        "supplying_brand": "Honda", "supplying_dealer": "D", "supplying_branch": "B",
+    }) == ("Honda", "D", "B")
+    assert mobile_push.request_push_scope({"supplying_dealer": "D", "supplying_branch": "B"}) == ("", "D", "B")
+    query = mobile_push.eligible_request_device_query("Honda", "D", "B")
+    assert query["status"] == "active"
+    assert query["session_active"] is True
+    assert query["push_enabled"] is True
+
+
+def test_is_eligible_request_device_scope_and_session():
+    good = _eligible_dev("d1", "ExponentPushToken[x]", "u1")
+    assert mobile_push.is_eligible_request_device(good, "Honda", "D", "B") is True
+    assert mobile_push.is_eligible_request_device({**good, "session_active": False}, "Honda", "D", "B") is False
+    assert mobile_push.is_eligible_request_device({**good, "push_enabled": False}, "Honda", "D", "B") is False
+    assert mobile_push.is_eligible_request_device({**good, "status": "inactive"}, "Honda", "D", "B") is False
+    assert mobile_push.is_eligible_request_device(good, "Yamaha", "D", "B") is False
+    assert mobile_push.is_eligible_request_device(good, "Honda", "Other", "B") is False
+    assert mobile_push.is_eligible_request_device(good, "Honda", "D", "Other") is False
+
+
+def test_notify_skips_logged_out_wrong_brand_and_missing_scope(monkeypatch):
+    asyncio.run(_test_notify_skips_logged_out_wrong_brand_and_missing_scope(monkeypatch))
+
+
+async def _test_notify_skips_logged_out_wrong_brand_and_missing_scope(monkeypatch):
+    sent = []
+
+    class Devices:
+        def find(self, query, proj=None):
+            class Cursor:
+                async def to_list(self, n):
+                    return [
+                        _eligible_dev("ok", "ExponentPushToken[ok]", "u1"),
+                        _eligible_dev("out", "ExponentPushToken[out]", "u2", session_active=False, push_enabled=False),
+                        _eligible_dev("other", "ExponentPushToken[ob]", "u3", brand="Yamaha"),
+                    ]
+            return Cursor()
+
+        async def insert_one(self, doc):
+            return None
+
+    class Logs:
+        async def insert_one(self, doc):
+            return None
+
+    class FakeDB:
+        mobile_devices = Devices()
+        mobile_push_delivery_logs = Logs()
+
+    monkeypatch.setattr(mobile_push, "send_expo_push_messages", lambda messages: sent.extend(messages) or {"ok": True})
+    missing = await mobile_push.notify_branch_request_push(
+        FakeDB(), {"id": "G", "request_number": "RQ1", "supplying_dealer": "D", "supplying_branch": "B"}, "new",
+    )
+    assert missing["error"] == "missing_scope"
+    assert sent == []
+    result = await mobile_push.notify_branch_request_push(
+        FakeDB(),
+        {"id": "G", "request_number": "RQ1", "supplying_brand": "Honda", "supplying_dealer": "D", "supplying_branch": "B"},
+        "new",
+    )
+    assert result["sent"] == 1
+    assert sent[0]["to"] == "ExponentPushToken[ok]"
+
+
+def test_presence_and_session_labels():
+    now = datetime.now(timezone.utc)
+    assert mobile_api._presence_label((now - timedelta(seconds=30)).isoformat(), now) == "online"
+    assert mobile_api._presence_label((now - timedelta(seconds=91)).isoformat(), now) == "offline"
+    assert mobile_api._presence_label(None, now) == "offline"
+    assert mobile_api._session_state({"session_active": True}) == "logged_in"
+    assert mobile_api._session_state({"session_active": False}) == "logged_out"
+    assert mobile_api._session_state({}) == "logged_out"
+    rows = mobile_api._enrich_device_presence([{
+        "status": "active",
+        "session_active": True,
+        "last_seen_at": (now - timedelta(seconds=10)).isoformat(),
+    }], now)
+    assert rows[0]["admin_status"] == "active"
+    assert rows[0]["session_state"] == "logged_in"
+    assert rows[0]["presence"] == "online"
+
+
+def test_logout_does_not_change_admin_status():
+    src = Path(BACKEND_DIR / "mobile_api.py").read_text()
+    start = src.index("async def logout_device_session")
+    chunk = src[start:start + 900]
+    assert '"session_active": False' in chunk
+    assert '"push_enabled": False' in chunk
+    assert '"logged_out_at"' in chunk
+    assert '"status":' not in chunk
+    assert "POST /mobile/session/logout" in src or '@router.post("/session/logout")' in src
+    assert '@router.post("/session/heartbeat")' in src
+
+
+def test_transfer_preserves_line_responses():
+    asyncio.run(_test_transfer_preserves_line_responses())
+
+
+async def _test_transfer_preserves_line_responses():
+    locks = FakeLocks()
+    await locks.insert_one({
+        "request_group_key": "G",
+        "device_id": "d1",
+        "mobile_user_id": "U1",
+        "lock_status": "picked",
+        "line_responses": {"line1": {"accepted_qty": 3, "remark": "partial"}},
+        "brand_name": "Honda",
+        "dealer_name": "D",
+        "branch": "B",
+    })
+    updated = await locks.find_one_and_update(
+        {"request_group_key": "G", "lock_status": "picked"},
+        {"$set": {
+            "device_id": "d2",
+            "mobile_user_id": "U2",
+            "device_user_name": "New Owner",
+            "transferred_at": "now",
+        }},
+    )
+    assert updated["line_responses"]["line1"]["accepted_qty"] == 3
+    assert updated["line_responses"]["line1"]["remark"] == "partial"
+    assert updated["device_id"] == "d2"
+    assert updated["lock_status"] == "picked"
+
+
+def test_pairing_and_logout_session_flags_in_source():
+    src = Path(BACKEND_DIR / "mobile_api.py").read_text()
+    assert '"session_active": True' in src
+    assert '"push_enabled": True' in src
+    assert "PRESENCE_ONLINE_SECONDS = 90" in src
+    assert "web/request-locks/transfer" in src
+    assert "_backfill_device_session_flags" in src
