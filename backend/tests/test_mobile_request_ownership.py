@@ -441,3 +441,299 @@ def test_pairing_and_logout_session_flags_in_source():
     assert "PRESENCE_ONLINE_SECONDS = 90" in src
     assert "web/request-locks/transfer" in src
     assert "_backfill_device_session_flags" in src
+
+
+class _FakeOrderRequests:
+    def __init__(self, lines):
+        self.lines = {line["id"]: line for line in lines}
+
+    async def update_one(self, query, update):
+        doc = self.lines.get(query.get("id"))
+        if doc:
+            doc.update((update or {}).get("$set") or {})
+
+
+class _FakeHeaders:
+    def __init__(self, header):
+        self.docs = {header["request_number"]: header}
+
+    async def find_one(self, query, proj=None):
+        return self.docs.get(query.get("request_number"))
+
+    async def update_one(self, query, update):
+        key = query.get("request_number")
+        doc = self.docs.get(key)
+        if doc is None:
+            doc = {"request_number": key}
+            self.docs[key] = doc
+        doc.update((update or {}).get("$set") or {})
+
+
+class _FakeAudit:
+    def __init__(self):
+        self.docs = []
+
+    async def insert_one(self, doc):
+        self.docs.append(doc)
+
+
+class _CompleteDB:
+    def __init__(self, locks, lines, header):
+        self.mobile_request_group_locks = locks
+        self.order_requests = _FakeOrderRequests(lines)
+        self.request_headers = _FakeHeaders(header)
+        self.mobile_audit_logs = _FakeAudit()
+        self.order_items = {}
+        self.reservations = {}
+
+
+def _complete_session():
+    return {
+        "device": {"device_id": "d1", "device_user_name": "Ravi", "device_user_mobile": "999"},
+        "mobile_user": {"mobile_user_id": "MU1", "name": "Ravi", "mobile_number": "999"},
+        "brand_name": "Honda",
+        "dealer_name": "Dealer A",
+        "branch": "Vanagaram",
+    }
+
+
+def _complete_line(line_id, part, requested_qty, request_number="RQ1"):
+    return {
+        "id": line_id,
+        "part_number": part,
+        "status": "Requested",
+        "requested_qty": requested_qty,
+        "accepted_qty": 0,
+        "request_number": request_number,
+        "request_group_id": request_number,
+        "order_item_id": f"OI-{line_id}",
+        "order_id": "ORD1",
+        "supplying_dealer": "Dealer A",
+        "supplying_branch": "Vanagaram",
+    }
+
+
+async def _prepare_complete(monkeypatch, lines, responses, header=None, lock_status="picked"):
+    import order_desk_workflow as odw
+    import request_fulfillment as rff
+
+    locks = FakeLocks()
+    await locks.insert_one({
+        "request_group_key": "RQ1",
+        "device_id": "d1",
+        "mobile_user_id": "MU1",
+        "device_user_name": "Ravi",
+        "lock_status": lock_status,
+        "line_responses": responses,
+    })
+    header = header or {
+        "request_number": "RQ1",
+        "status": "Requested",
+        "response_status": "awaiting",
+        "response_deadline": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+        "timer_frozen": False,
+    }
+    fake_db = _CompleteDB(locks, lines, header)
+    calls = []
+
+    async def fake_transition(request_id, new_status, remarks, acting_user, accepted_qty=None):
+        line = fake_db.order_requests.lines[request_id]
+        if line.get("status") == new_status:
+            return dict(line), False
+        requested = float(line.get("requested_qty") or 0)
+        accepted = 0.0 if new_status != "Approved" else float(accepted_qty)
+        line.update({
+            "status": new_status,
+            "accepted_qty": accepted,
+            "approved_qty": accepted,
+            "approval_remarks": remarks,
+            "decided_by": acting_user.id,
+        })
+        remaining = max(0.0, requested - accepted)
+        fake_db.order_items[line.get("order_item_id")] = {
+            "id": line.get("order_item_id"),
+            "accepted_qty": accepted,
+            "remaining_qty": remaining,
+            "retry_required": remaining > 0,
+        }
+        reservation = fake_db.reservations.setdefault(request_id, {"apply_count": 0, "qty": requested, "status": "active"})
+        reservation["apply_count"] += 1
+        if new_status == "Rejected":
+            reservation.update({"status": "released", "qty": 0, "released_qty": requested})
+        else:
+            reservation.update({"status": "active", "qty": accepted, "accepted_qty": accepted, "released_qty": remaining})
+        stored_header = fake_db.request_headers.docs[line["request_number"]]
+        if not stored_header.get("timer_frozen"):
+            stored_header.update(odw.freeze_response_timer(stored_header, mobile_api._now_iso(), "responded"))
+            stored_header["status"] = "Approved" if new_status == "Approved" else stored_header.get("status")
+        calls.append({
+            "request_id": request_id,
+            "new_status": new_status,
+            "remarks": remarks,
+            "accepted_qty": accepted_qty,
+            "acting_user_id": acting_user.id,
+        })
+        return dict(line), True
+
+    async def fake_scope(request_group_key, session, statuses=None):
+        rows = list(fake_db.order_requests.lines.values())
+        if statuses:
+            rows = [row for row in rows if row.get("status") in statuses]
+        return [dict(row) for row in rows]
+
+    monkeypatch.setattr(mobile_api, "db", fake_db)
+    monkeypatch.setattr(mobile_api, "request_center_transition", fake_transition)
+    monkeypatch.setattr(mobile_api, "_scope_group_lines", fake_scope)
+    payload = mobile_api.NotificationCompleteRequest(request_group_key="RQ1")
+    return payload, fake_db, calls, rff
+
+
+async def _run_complete(monkeypatch, lines, responses, header=None, lock_status="picked"):
+    payload, fake_db, calls, rff = await _prepare_complete(
+        monkeypatch, lines, responses, header=header, lock_status=lock_status,
+    )
+    result = await mobile_api.complete_picking(payload, session=_complete_session())
+    return result, fake_db, calls, rff
+
+
+def test_complete_qty_full_approves_and_freezes_timer(monkeypatch):
+    asyncio.run(_test_complete_qty_full_approves_and_freezes_timer(monkeypatch))
+
+
+async def _test_complete_qty_full_approves_and_freezes_timer(monkeypatch):
+    line = _complete_line("L1", "P1", 1)
+    result, fake_db, calls, rff = await _run_complete(
+        monkeypatch, [line], {"L1": {"accepted_qty": 1, "remark": ""}},
+    )
+    assert result["status"] == "picking_completed"
+    assert calls == [{
+        "request_id": "L1",
+        "new_status": "Approved",
+        "remarks": "",
+        "accepted_qty": 1.0,
+        "acting_user_id": "mobile:MU1",
+    }]
+    updated = fake_db.order_requests.lines["L1"]
+    assert updated["status"] == "Approved"
+    assert updated["accepted_qty"] == 1
+    assert updated["picking_finished_at"]
+    assert updated["picking_finished_by"] == "mobile:MU1"
+    assert updated["picking_finished_user_name"]
+    header = fake_db.request_headers.docs["RQ1"]
+    assert header["timer_frozen"] is True
+    assert header["response_status"] == "responded"
+    assert header["picking_finished_at"]
+    assert rff.fulfillment_stage(updated) == "picking_finished"
+    assert fake_db.mobile_request_group_locks.docs["RQ1"]["lock_status"] == "picking_completed"
+
+
+def test_complete_qty_zero_rejects_and_is_not_dispatchable(monkeypatch):
+    asyncio.run(_test_complete_qty_zero_rejects_and_is_not_dispatchable(monkeypatch))
+
+
+async def _test_complete_qty_zero_rejects_and_is_not_dispatchable(monkeypatch):
+    line = _complete_line("L1", "P1", 1)
+    result, fake_db, calls, rff = await _run_complete(
+        monkeypatch, [line], {"L1": {"accepted_qty": 0, "remark": "not available"}},
+    )
+    assert result["status"] == "picking_completed"
+    assert calls[0]["new_status"] == "Rejected"
+    assert calls[0]["accepted_qty"] == 0
+    assert calls[0]["remarks"] == "not available"
+    updated = fake_db.order_requests.lines["L1"]
+    assert updated["status"] == "Rejected"
+    assert updated["accepted_qty"] == 0
+    assert not updated.get("picking_finished_at")
+    assert rff.fulfillment_stage(updated) is None
+    assert fake_db.reservations["L1"]["status"] == "released"
+
+
+def test_complete_partial_qty_freezes_accepted_and_returns_balance(monkeypatch):
+    asyncio.run(_test_complete_partial_qty_freezes_accepted_and_returns_balance(monkeypatch))
+
+
+async def _test_complete_partial_qty_freezes_accepted_and_returns_balance(monkeypatch):
+    line = _complete_line("L1", "P1", 5)
+    result, fake_db, calls, rff = await _run_complete(
+        monkeypatch, [line], {"L1": {"accepted_qty": 2, "remark": "only two"}},
+    )
+    assert result["status"] == "picking_completed"
+    assert calls[0]["new_status"] == "Approved"
+    assert calls[0]["accepted_qty"] == 2.0
+    updated = fake_db.order_requests.lines["L1"]
+    assert updated["accepted_qty"] == 2
+    assert updated["picking_finished_at"]
+    assert rff.part_status(updated) == "Partial"
+    item = fake_db.order_items["OI-L1"]
+    assert item["accepted_qty"] == 2
+    assert item["remaining_qty"] == 3
+    assert item["retry_required"] is True
+    assert fake_db.reservations["L1"]["qty"] == 2
+    assert fake_db.reservations["L1"]["released_qty"] == 3
+
+
+def test_complete_mixed_lines_ready_and_rejected(monkeypatch):
+    asyncio.run(_test_complete_mixed_lines_ready_and_rejected(monkeypatch))
+
+
+async def _test_complete_mixed_lines_ready_and_rejected(monkeypatch):
+    lines = [_complete_line("L1", "P1", 1), _complete_line("L2", "P2", 1)]
+    result, fake_db, calls, rff = await _run_complete(
+        monkeypatch,
+        lines,
+        {
+            "L1": {"accepted_qty": 1, "remark": ""},
+            "L2": {"accepted_qty": 0, "remark": "zero"},
+        },
+    )
+    assert result["status"] == "picking_completed"
+    assert [call["new_status"] for call in calls] == ["Approved", "Rejected"]
+    accepted = fake_db.order_requests.lines["L1"]
+    rejected = fake_db.order_requests.lines["L2"]
+    assert rff.fulfillment_stage(accepted) == "picking_finished"
+    assert rff.fulfillment_stage(rejected) is None
+    assert accepted["picking_finished_at"]
+    assert not rejected.get("picking_finished_at")
+
+
+def test_complete_blocked_when_unanswered_lines(monkeypatch):
+    asyncio.run(_test_complete_blocked_when_unanswered_lines(monkeypatch))
+
+
+async def _test_complete_blocked_when_unanswered_lines(monkeypatch):
+    from fastapi import HTTPException
+
+    lines = [_complete_line("L1", "P1", 1), _complete_line("L2", "P2", 1)]
+    payload, fake_db, calls, _rff = await _prepare_complete(
+        monkeypatch, lines, {"L1": {"accepted_qty": 1, "remark": ""}},
+    )
+    with pytest.raises(HTTPException) as err:
+        await mobile_api.complete_picking(payload, session=_complete_session())
+    assert err.value.status_code == 409
+    assert err.value.detail["code"] == "INVALID_STATE"
+    assert "P2" in (err.value.detail.get("missing_parts") or [])
+    assert calls == []
+    assert fake_db.order_requests.lines["L1"]["status"] == "Requested"
+    assert fake_db.order_requests.lines["L2"]["status"] == "Requested"
+    assert fake_db.mobile_request_group_locks.docs["RQ1"]["lock_status"] == "picked"
+    assert fake_db.request_headers.docs["RQ1"].get("timer_frozen") is False
+
+
+def test_complete_repeated_is_idempotent(monkeypatch):
+    asyncio.run(_test_complete_repeated_is_idempotent(monkeypatch))
+
+
+async def _test_complete_repeated_is_idempotent(monkeypatch):
+    line = _complete_line("L1", "P1", 1)
+    first, fake_db, calls, _rff = await _run_complete(
+        monkeypatch, [line], {"L1": {"accepted_qty": 1, "remark": ""}},
+    )
+    assert first["status"] == "picking_completed"
+    assert len(calls) == 1
+    assert fake_db.reservations["L1"]["apply_count"] == 1
+    payload = mobile_api.NotificationCompleteRequest(request_group_key="RQ1")
+    second = await mobile_api.complete_picking(payload, session=_complete_session())
+    assert second["status"] == "picking_completed"
+    assert len(calls) == 1
+    assert fake_db.reservations["L1"]["apply_count"] == 1
+    assert fake_db.order_requests.lines["L1"]["accepted_qty"] == 1
