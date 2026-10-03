@@ -17,6 +17,11 @@ from pymongo import ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError
 from zoneinfo import ZoneInfo
 
+try:
+    from . import testing_runtime
+except ImportError:
+    import testing_runtime
+
 IST = ZoneInfo("Asia/Kolkata")
 
 
@@ -114,7 +119,8 @@ async def _next_aops_session_id(db, branch_name: str) -> str:
     seq = int(counter.get("seq", 1))
     if seq > 9999:
         raise HTTPException(status_code=500, detail="Daily AOPS session serial exhausted")
-    return f"AOPS{code}{date_key}{seq:04d}"
+    return testing_runtime.prefix_business_id(f"AOPS{code}{date_key}{seq:04d}")
+
 
 
 async def get_or_create_auto_daily_session(

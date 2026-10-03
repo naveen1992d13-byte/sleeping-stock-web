@@ -7,8 +7,12 @@
  * Any non-local page (GitHub Codespaces, EC2 public IP, sleepingstock.in)
  * must use the hosted HTTPS API. A production bundle that baked
  * http://127.0.0.1:8000 would otherwise POST login to the visitor's machine.
+ *
+ * testing.sleepingstock.in always uses the isolated testing API host so a
+ * stale production URL cannot leak testing browsers onto production data.
  */
 const HOSTED_API_BASE = 'https://api.sleepingstock.in';
+const TESTING_API_BASE = 'https://testing.sleepingstock.in';
 const LOCAL_API_BASE = 'http://127.0.0.1:8000';
 
 function trimBase(url) {
@@ -37,6 +41,10 @@ export function resolveBackendUrl() {
 
   if (isGithubHostedFrontend(host)) {
     return HOSTED_API_BASE;
+  }
+
+  if (host === 'testing.sleepingstock.in') {
+    return TESTING_API_BASE;
   }
 
   const fromEnv = trimBase(process.env.REACT_APP_BACKEND_URL);

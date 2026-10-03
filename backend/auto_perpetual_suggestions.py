@@ -10,6 +10,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from fastapi import HTTPException
 from pymongo.errors import DuplicateKeyError
 
+try:
+    from . import testing_runtime
+except ImportError:
+    import testing_runtime
+
 from auto_perpetual import (
     IST,
     _attendance_active_users,
@@ -86,7 +91,8 @@ async def _next_aps_number(db) -> str:
     seq = int(counter.get("seq", 1))
     if seq > 9999:
         raise HTTPException(status_code=500, detail="Daily APS serial exhausted")
-    return f"APS{date_key}{seq:04d}"
+    return testing_runtime.prefix_business_id(f"APS{date_key}{seq:04d}")
+
 
 
 async def _get_planner(db, *, month: str, brand_name: str, dealer_name: str, branch: str) -> dict:

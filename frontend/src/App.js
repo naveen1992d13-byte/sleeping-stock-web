@@ -33,6 +33,7 @@ import {
 } from './utils/sessionActivity';
 import { resolveApiUrl, resolveBackendUrl } from '@/backendUrl';
 import { getFirstAllowedMenuItem } from './config/menuConfig';
+import { TestingBanner } from './components/TestingBanner';
 
 const AuthContext = createContext(null);
 
@@ -231,6 +232,7 @@ function App() {
     <ProcessingProvider>
     <AuthProvider>
       <BrowserRouter>
+        <TestingBanner />
         <SessionInactivityGuard />
         <Toaster position="top-right" richColors />
         <Routes>

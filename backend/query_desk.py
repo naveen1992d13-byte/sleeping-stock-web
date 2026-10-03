@@ -16,6 +16,11 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
+try:
+    from . import testing_runtime
+except ImportError:
+    import testing_runtime
+
 router = APIRouter(prefix="/queries", tags=["Query Desk"])
 QUERY_STORAGE = Path(os.getenv("QUERY_DESK_STORAGE_DIR", Path(__file__).parent / "query_attachments"))
 QUERY_STORAGE.mkdir(parents=True, exist_ok=True)
@@ -168,7 +173,8 @@ async def _next_query_number() -> str:
     seq = int(counter.get("seq", 1))
     if seq > 9999:
         raise HTTPException(status_code=500, detail="Daily query serial exhausted")
-    return f"QRY{date_key}{seq:04d}"
+    return testing_runtime.prefix_business_id(f"QRY{date_key}{seq:04d}")
+
 
 
 async def _save_attachment(file: UploadFile, prefix: str) -> dict:
