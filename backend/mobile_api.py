@@ -2275,27 +2275,108 @@ async def reject_notification(payload: NotificationRejectRequest, session=Depend
     }
 
 
+def _mobile_acting_user(session) -> _MobileActingUser:
+    mobile_user = session["mobile_user"]
+    acting_user = _MobileActingUser(
+        mobile_user["mobile_user_id"],
+        session["device"].get("device_user_name") or mobile_user["name"],
+        session["dealer_name"],
+        session["brand_name"],
+    )
+    acting_user.phone = session["device"].get("device_user_mobile") or mobile_user.get("mobile_number", "")
+    return acting_user
+
+
+async def _mark_accepted_lines_picking_finished(lines, acting_user, now_iso: str) -> Optional[str]:
+    """Stamp web-equivalent Picking Finished fields on accepted lines + header."""
+    request_number = None
+    for line in lines or []:
+        request_number = request_number or line.get("request_number")
+        status = line.get("status")
+        try:
+            accepted = float(line.get("accepted_qty") or line.get("approved_qty") or 0)
+        except (TypeError, ValueError):
+            accepted = 0.0
+        if status not in ("Approved", "Partially Approved") or accepted <= 0:
+            continue
+        if line.get("picking_finished_at"):
+            continue
+        await db.order_requests.update_one({"id": line["id"]}, {"$set": {
+            "picking_finished_at": now_iso,
+            "picking_finished_by": acting_user.id,
+            "picking_finished_user_name": acting_user.username,
+            "updated_at": now_iso,
+        }})
+        line["picking_finished_at"] = now_iso
+        line["picking_finished_by"] = acting_user.id
+        line["picking_finished_user_name"] = acting_user.username
+    if request_number:
+        await db.request_headers.update_one(
+            {"request_number": request_number},
+            {"$set": {"picking_finished_at": now_iso, "updated_at": now_iso}},
+        )
+    return request_number
+
+
 @router.post("/notifications/complete")
 async def complete_picking(payload: NotificationCompleteRequest, session=Depends(get_device_session)):
-    """Owner-only picking-completed. Does not reserve stock or dispatch."""
+    """Commit saved mobile drafts through request_center_transition, then mark picking finished."""
     lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
+    if lock and str(lock.get("lock_status") or "").lower() == "picking_completed":
+        if _is_same_owner(lock, session):
+            return {
+                "message": "Picking already completed",
+                "request_group_key": payload.request_group_key,
+                "status": "picking_completed",
+            }
+        raise HTTPException(status_code=403, detail=_error_detail(
+            ERR_NOT_OWNER, "This request is already picked by another device",
+            picked_by_name=_lock_owner_name(lock) or "another user",
+        ))
     _raise_if_not_writable(lock, session)
-    if str(lock.get("lock_status") or "") == "picking_completed":
-        return {"message": "Picking already completed", "request_group_key": payload.request_group_key, "status": "picking_completed"}
 
-    live_lines = await _scope_group_lines(payload.request_group_key, session, statuses=("Requested",))
-    if not live_lines:
+    all_lines = await _scope_group_lines(payload.request_group_key, session)
+    if not all_lines:
         raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "Request is not available to complete"))
+    requested_lines = [line for line in all_lines if line.get("status") == "Requested"]
     responses = _line_response_map(lock)
-    missing = [line.get("part_number") for line in live_lines if line.get("id") not in responses]
+    missing = [line.get("part_number") for line in requested_lines if line.get("id") not in responses]
     if missing:
         raise HTTPException(status_code=409, detail=_error_detail(
             ERR_INVALID_STATE, "Every line needs an explicit response before picking can be completed", missing_parts=missing,
         ))
 
+    acting_user = _mobile_acting_user(session)
+    results = []
+    for line in requested_lines:
+        saved = responses.get(line["id"]) or {}
+        try:
+            accepted_qty = float(saved.get("accepted_qty") or 0)
+        except (TypeError, ValueError):
+            accepted_qty = 0.0
+        remark = (saved.get("remark") or "").strip()
+        if accepted_qty > 0:
+            updated, _changed = await request_center_transition(
+                line["id"], "Approved", remark, acting_user, accepted_qty=accepted_qty,
+            )
+        else:
+            updated, _changed = await request_center_transition(
+                line["id"], "Rejected", remark, acting_user, accepted_qty=0,
+            )
+        results.append({
+            "order_request_id": line["id"],
+            "part_number": line.get("part_number"),
+            "status": (updated or {}).get("status"),
+            "accepted_qty": (updated or {}).get("accepted_qty"),
+        })
+
+    now_iso = _now_iso()
+    finished_lines = await _scope_group_lines(payload.request_group_key, session) or all_lines
+    await _mark_accepted_lines_picking_finished(finished_lines, acting_user, now_iso)
+
     claimed = await db.mobile_request_group_locks.find_one_and_update(
         {"request_group_key": payload.request_group_key, "device_id": session["device"]["device_id"], "lock_status": "picked"},
-        {"$set": {"lock_status": "picking_completed", "picking_completed_at": _now_iso(), "owner_last_seen_at": _now_iso()}},
+        {"$set": {"lock_status": "picking_completed", "picking_completed_at": now_iso, "owner_last_seen_at": now_iso}},
         return_document=ReturnDocument.AFTER,
     )
     if not claimed:
@@ -2304,7 +2385,9 @@ async def complete_picking(payload: NotificationCompleteRequest, session=Depends
             return {"message": "Picking already completed", "request_group_key": payload.request_group_key, "status": "picking_completed"}
         raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "This request can no longer be changed"))
 
-    await _audit(None, "mobile_picking_completed", session["mobile_user"]["mobile_user_id"], {"request_group_key": payload.request_group_key})
+    await _audit(None, "mobile_picking_completed", session["mobile_user"]["mobile_user_id"], {
+        "request_group_key": payload.request_group_key, "results": results,
+    })
     return {"message": "Picking completed", "request_group_key": payload.request_group_key, "status": "picking_completed"}
 
 
