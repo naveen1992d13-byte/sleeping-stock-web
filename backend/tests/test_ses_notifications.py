@@ -38,6 +38,7 @@ def _enable_gmail(monkeypatch):
     monkeypatch.setenv("GMAIL_OAUTH_REFRESH_TOKEN", "test-refresh-token")
     monkeypatch.delenv("GMAIL_FROM_EMAIL", raising=False)
     monkeypatch.delenv("GMAIL_FROM_NAME", raising=False)
+    monkeypatch.delenv("GMAIL_OAUTH_USER", raising=False)
     monkeypatch.delenv("EMAIL_TEST_MODE", raising=False)
     monkeypatch.delenv("EMAIL_TEST_RECIPIENT", raising=False)
 
@@ -47,10 +48,30 @@ def test_gmail_defaults_to_plural_notifications_sender(monkeypatch):
     settings = notifications.gmail_settings()
     assert settings["from_email"] == "notifications@sleepingstock.in"
     assert settings["from_name"] == "Sleeping Stock"
+    assert settings["oauth_user"] == "naveen@sleepingstock.in"
+    assert settings["oauth_user"] != settings["from_email"]
     assert notifications._gmail_from_header(settings) == "Sleeping Stock <notifications@sleepingstock.in>"
     assert not hasattr(notifications, "smtplib")
     assert not hasattr(notifications, "_ses_client")
     assert not hasattr(notifications, "_send_ses_raw")
+
+
+def test_oauth_mailbox_is_naveen_send_as_is_notifications_alias(monkeypatch):
+    """OAuth identity is the real mailbox; From is the Send-as alias only."""
+    _enable_gmail(monkeypatch)
+    fake = _FakeGmail()
+    monkeypatch.setattr(notifications, "_send_gmail_mime", fake)
+    result = notifications.send_request_pdf_email(
+        "koyambedu.user@example.com",
+        GROUP,
+        b"%PDF-1.4 test",
+        cc_email="vanagaram.user@example.com",
+    )
+    assert result["status"] == "sent"
+    raw = fake.raw_messages[0]
+    assert b"From: Sleeping Stock <notifications@sleepingstock.in>" in raw
+    assert b"naveen@sleepingstock.in" not in raw
+    assert notifications.gmail_settings()["oauth_user"] == "naveen@sleepingstock.in"
 
 
 def test_simple_notification_uses_gmail_mime_not_smtp(monkeypatch):

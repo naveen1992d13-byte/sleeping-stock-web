@@ -2,8 +2,12 @@
 Notification service for NMTS / Sleeping Stock — Gmail API + WhatsApp Cloud API.
 
 Design rules:
-- Email is sent with the Gmail API (OAuth 2.0 refresh token) as
-  Sleeping Stock <notifications@sleepingstock.in>. No Gmail password, no SMTP
+- Gmail API OAuth is authorized as the real Workspace mailbox
+  naveen@sleepingstock.in. notifications@sleepingstock.in is only a Send-as /
+  alternate-email alias of that mailbox — not a separate Workspace user and
+  not an OAuth login identity.
+- RFC822 From is Sleeping Stock <notifications@sleepingstock.in>. Mail appears
+  in the Sent folder of naveen@sleepingstock.in. No Gmail password, no SMTP
   app password, and no Amazon SES send path.
 - Every send is wrapped so a delivery failure NEVER raises out to the caller.
   The request/approval/rejection is always saved first; notifications are a
@@ -48,14 +52,20 @@ def _first_env(*keys: str, default: str = "") -> str:
 
 DEFAULT_GMAIL_FROM_EMAIL = "notifications@sleepingstock.in"
 DEFAULT_GMAIL_FROM_NAME = "Sleeping Stock"
+DEFAULT_GMAIL_OAUTH_USER = "naveen@sleepingstock.in"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 
 def gmail_settings() -> dict:
-    """Gmail API OAuth send config. Never reads a Gmail password or SMTP secret."""
+    """Gmail API OAuth send config. Never reads a Gmail password or SMTP secret.
+
+    oauth_user is the real mailbox that grants the refresh token
+    (naveen@sleepingstock.in). from_email is the Send-as alias only.
+    """
     return {
         "from_email": _first_env("GMAIL_FROM_EMAIL", default=DEFAULT_GMAIL_FROM_EMAIL).strip(),
         "from_name": _first_env("GMAIL_FROM_NAME", default=DEFAULT_GMAIL_FROM_NAME).strip(),
+        "oauth_user": _first_env("GMAIL_OAUTH_USER", default=DEFAULT_GMAIL_OAUTH_USER).strip(),
         "client_id": _env("GMAIL_OAUTH_CLIENT_ID").strip(),
         "client_secret": _env("GMAIL_OAUTH_CLIENT_SECRET").strip(),
         "refresh_token": _env("GMAIL_OAUTH_REFRESH_TOKEN").strip(),
@@ -147,7 +157,12 @@ def _build_rfc822_message(
 
 
 def _send_gmail_mime(raw_message: bytes) -> dict:
-    """users.messages.send of a raw RFC822 message. Appears in Gmail Sent. Never raises."""
+    """users.messages.send of a raw RFC822 message. Never raises.
+
+    userId=me is the OAuth mailbox (naveen@sleepingstock.in), so the message
+    lands in that mailbox Sent folder. The RFC822 From header is the Send-as
+    alias Sleeping Stock <notifications@sleepingstock.in>.
+    """
     if not gmail_configured():
         return {"status": "skipped", "error": "gmail_not_configured"}
     try:
