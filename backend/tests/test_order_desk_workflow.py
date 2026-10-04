@@ -204,6 +204,6 @@ class TestOrderDeskApiSmoke:
         pdf = notifications.build_request_pdf(group)
         assert pdf[:4] == b'%PDF'
         assert len(pdf) > 500
-        # send_request_pdf_email never raises; without SMTP it returns skipped/failed
+        # send_request_pdf_email never raises; invalid recipients return skipped/failed
         result = notifications.send_request_pdf_email('invalid', group, pdf)
         assert result.get('status') in ('skipped', 'failed')

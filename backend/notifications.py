@@ -1,21 +1,20 @@
 """
-Notification service for NMTS / Sleeping Stock — Gmail SMTP + WhatsApp Cloud API.
+Notification service for NMTS / Sleeping Stock — Amazon SES + WhatsApp Cloud API.
 
 Design rules (see UPDATE_NOTES.txt for the full explanation):
-- Credentials are read only from environment variables (backend/.env). Nothing
-  here ever hardcodes a password, token, or phone number.
+- Email is sent with Amazon SES (SESv2) in ap-south-1 using the default AWS
+  credential chain (EC2 instance role). No SMTP password or long-lived access
+  keys are used.
 - Every send is wrapped so a delivery failure NEVER raises out to the caller.
   The request/approval/rejection is always saved first; notifications are a
   best-effort side effect logged to db.notification_logs.
 - WhatsApp test mode (WHATSAPP_TEST_MODE=true) always overrides the recipient
   with WHATSAPP_TEST_RECIPIENT_NUMBER and ignores database numbers.
-- Email test mode (EMAIL_TEST_MODE=true) always overrides Gmail recipients
+- Email test mode (EMAIL_TEST_MODE=true) always overrides recipients
   with EMAIL_TEST_RECIPIENT and drops CC. Unset in production.
 """
 import os
 import re
-import smtplib
-import ssl
 import uuid
 import asyncio
 import logging
@@ -24,6 +23,8 @@ from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from datetime import datetime, timezone
 
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 import requests
 
 from request_print import build_request_pdf as build_request_print_pdf
@@ -46,21 +47,99 @@ def _first_env(*keys: str, default: str = "") -> str:
     return default
 
 
+DEFAULT_SES_REGION = "ap-south-1"
+DEFAULT_SES_FROM_EMAIL = "notification@sleepingstock.in"
+DEFAULT_SES_FROM_NAME = "Sleeping Stock - NMTS"
+
+
+def ses_settings() -> dict:
+    """SES send config. Credentials come from the instance role, not env keys."""
+    return {
+        "region": _first_env("SES_REGION", "AWS_REGION", "AWS_DEFAULT_REGION", default=DEFAULT_SES_REGION),
+        "from_email": _first_env("SES_FROM_EMAIL", default=DEFAULT_SES_FROM_EMAIL).strip(),
+        "from_name": _first_env("SES_FROM_NAME", "GMAIL_SENDER_NAME", "SMTP_FROM_NAME", default=DEFAULT_SES_FROM_NAME),
+        "configuration_set": _env("SES_CONFIGURATION_SET").strip(),
+    }
+
+
+def ses_configured() -> bool:
+    settings = ses_settings()
+    return bool(settings["from_email"] and settings["region"] and is_valid_email(settings["from_email"]))
+
+
 def gmail_settings() -> dict:
-    """Resolve Gmail SMTP config, accepting either the GMAIL_SMTP_* names or
-    the project's existing SMTP_* names — whichever is present in .env."""
+    """Deprecated SMTP settings. Sending uses SES; kept for env compatibility."""
+    ses = ses_settings()
     return {
         "host": _first_env("GMAIL_SMTP_HOST", "SMTP_HOST", default="smtp.gmail.com"),
         "port": int(_first_env("GMAIL_SMTP_PORT", "SMTP_PORT", default="587") or "587"),
-        "username": _first_env("GMAIL_SMTP_USERNAME", "SMTP_EMAIL"),
-        "password": _first_env("GMAIL_SMTP_APP_PASSWORD", "SMTP_PASSWORD"),
-        "sender_name": _first_env("GMAIL_SENDER_NAME", "SMTP_FROM_NAME", default="Sleeping Stock - NMTS"),
+        "username": ses["from_email"],
+        "password": "",
+        "sender_name": ses["from_name"],
     }
 
 
 def gmail_configured() -> bool:
-    settings = gmail_settings()
-    return bool(settings["username"] and settings["password"])
+    return ses_configured()
+
+
+def _ses_from_header(settings=None) -> str:
+    settings = settings or ses_settings()
+    name = sanitize_text(settings.get("from_name") or DEFAULT_SES_FROM_NAME, 80)
+    return f"{name} <{settings['from_email']}>"
+
+
+def _ses_client(region: str):
+    return boto3.client("sesv2", region_name=region)
+
+
+def _ses_send_kwargs(settings: dict) -> dict:
+    extra = {}
+    if settings.get("configuration_set"):
+        extra["ConfigurationSetName"] = settings["configuration_set"]
+    return extra
+
+
+def _send_ses_simple(to_list, cc_list, subject: str, text_body: str, html_body: str) -> dict:
+    settings = ses_settings()
+    if not ses_configured():
+        return {"status": "skipped", "error": "ses_not_configured"}
+    try:
+        response = _ses_client(settings["region"]).send_email(
+            FromEmailAddress=_ses_from_header(settings),
+            Destination={"ToAddresses": list(to_list), "CcAddresses": list(cc_list or [])},
+            Content={
+                "Simple": {
+                    "Subject": {"Data": sanitize_text(subject, 200), "Charset": "UTF-8"},
+                    "Body": {
+                        "Text": {"Data": text_body or "", "Charset": "UTF-8"},
+                        "Html": {"Data": html_body or "", "Charset": "UTF-8"},
+                    },
+                }
+            },
+            **_ses_send_kwargs(settings),
+        )
+        return {"status": "sent", "provider_response": response.get("MessageId") or "ses_ok"}
+    except (BotoCoreError, ClientError, Exception) as exc:  # noqa: BLE001
+        logger.warning("SES send failed: %s", str(exc)[:300])
+        return {"status": "failed", "error": str(exc)[:300]}
+
+
+def _send_ses_raw(to_list, cc_list, raw_message: bytes) -> dict:
+    settings = ses_settings()
+    if not ses_configured():
+        return {"status": "skipped", "error": "ses_not_configured"}
+    try:
+        response = _ses_client(settings["region"]).send_email(
+            FromEmailAddress=_ses_from_header(settings),
+            Destination={"ToAddresses": list(to_list), "CcAddresses": list(cc_list or [])},
+            Content={"Raw": {"Data": raw_message}},
+            **_ses_send_kwargs(settings),
+        )
+        return {"status": "sent", "provider_response": response.get("MessageId") or "ses_ok"}
+    except (BotoCoreError, ClientError, Exception) as exc:  # noqa: BLE001
+        logger.warning("SES raw send failed: %s", str(exc)[:300])
+        return {"status": "failed", "error": str(exc)[:300]}
 
 
 def whatsapp_configured() -> bool:
@@ -219,7 +298,7 @@ def sanitize_text(value: str, max_len: int = 500) -> str:
 
 
 # --------------------------------------------------------------------------
-# Gmail SMTP
+# Amazon SES (transactional)
 # --------------------------------------------------------------------------
 def _build_email_html(context: dict) -> str:
     rows = "".join(
@@ -250,47 +329,21 @@ def _build_email_text(context: dict) -> str:
 
 
 def send_gmail_email(to_email: str, subject: str, context: dict, cc_email: str = "") -> dict:
+    """Compatibility wrapper. Sends through Amazon SES. Never raises."""
+    return send_notification_email(to_email, subject, context, cc_email=cc_email)
+
+
+def send_notification_email(to_email: str, subject: str, context: dict, cc_email: str = "") -> dict:
     """Returns a result dict; never raises."""
     to_email, cc_email = _email_test_redirect((to_email or "").strip(), (cc_email or "").strip())
-    to_email = (to_email or "").strip()
-    cc_email = (cc_email or "").strip()
-    if cc_email and not is_valid_email(cc_email):
-        cc_email = ""
-    if not is_valid_email(to_email):
+    to_list = _email_list(to_email)
+    to_keys = {email.lower() for email in to_list}
+    cc_list = [email for email in _email_list(cc_email) if email.lower() not in to_keys]
+    if not to_list:
         return {"status": "skipped", "error": "invalid_or_missing_email"}
-    if not gmail_configured():
-        return {"status": "skipped", "error": "gmail_not_configured"}
-
-    settings = gmail_settings()
-    username = settings["username"]
-    app_password = settings["password"]
-    host = settings["host"]
-    port = settings["port"]
-    sender_name = settings["sender_name"]
-
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = sanitize_text(subject, 200)
-        msg["From"] = f"{sender_name} <{username}>"
-        msg["To"] = to_email
-        recipients = [to_email]
-        if cc_email:
-            msg["Cc"] = cc_email
-            recipients.append(cc_email)
-        msg.attach(MIMEText(_build_email_text(context), "plain"))
-        msg.attach(MIMEText(_build_email_html(context), "html"))
-
-        context_ssl = ssl.create_default_context()
-        with smtplib.SMTP(host, port, timeout=15) as server:
-            server.starttls(context=context_ssl)
-            server.login(username, app_password)
-            server.sendmail(username, recipients, msg.as_string())
-        return {"status": "sent", "provider_response": "smtp_ok"}
-    except Exception as exc:  # noqa: BLE001 — a delivery failure must never propagate
-        # Never log the credentials themselves, only the (safe) error message.
-        safe_error = str(exc).replace(app_password, "***") if app_password else str(exc)
-        logger.warning("Gmail send failed: %s", safe_error)
-        return {"status": "failed", "error": safe_error[:300]}
+    if not ses_configured():
+        return {"status": "skipped", "error": "ses_not_configured"}
+    return _send_ses_simple(to_list, cc_list, subject, _build_email_text(context), _build_email_html(context))
 
 
 # --------------------------------------------------------------------------
@@ -442,7 +495,7 @@ def build_request_pdf(group: dict) -> bytes:
 
 
 # --------------------------------------------------------------------------
-# Parts Transfer Request email (Gmail SMTP, PDF attachment)
+# Parts Transfer Request email (Amazon SES, PDF attachment)
 # --------------------------------------------------------------------------
 def build_request_email_subject(group: dict, subject_prefix: str = "") -> str:
     """Finalized request-email subject line:
@@ -460,7 +513,7 @@ def build_request_email_subject(group: dict, subject_prefix: str = "") -> str:
 
 
 def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_email: str = "", subject_prefix: str = "") -> dict:
-    """Sends the Parts Transfer Request PDF as a Gmail SMTP attachment.
+    """Sends the Parts Transfer Request PDF through Amazon SES.
     Returns a result dict; never raises — a delivery failure must never
     roll back the already-saved request."""
     to_email, cc_email = _email_test_redirect(to_email, cc_email)
@@ -470,9 +523,9 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
     if not to_list:
         return {"status": "skipped", "error": "invalid_or_missing_email"}
 
-    settings = gmail_settings()
-    if not (settings["username"] and settings["password"]):
-        return {"status": "skipped", "error": "gmail_not_configured"}
+    settings = ses_settings()
+    if not ses_configured():
+        return {"status": "skipped", "error": "ses_not_configured"}
 
     request_number = group.get("request_number", "-")
     prefix = (subject_prefix or "").strip()
@@ -532,7 +585,7 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
     try:
         msg = MIMEMultipart("mixed")
         msg["Subject"] = sanitize_text(subject, 200)
-        msg["From"] = f"{settings['sender_name']} <{settings['username']}>"
+        msg["From"] = _ses_from_header(settings)
         msg["To"] = ", ".join(to_list)
         if cc_list:
             msg["Cc"] = ", ".join(cc_list)
@@ -542,18 +595,10 @@ def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_emai
         alt.attach(MIMEText(html_body, "html"))
         msg.attach(alt)
 
-        attachment = MIMEApplication(pdf_bytes, _subtype="pdf")
+        attachment = MIMEApplication(pdf_bytes or b"", _subtype="pdf")
         attachment.add_header("Content-Disposition", "attachment", filename=filename)
         msg.attach(attachment)
-
-        context_ssl = ssl.create_default_context()
-        with smtplib.SMTP(settings["host"], settings["port"], timeout=20) as server:
-            server.starttls(context=context_ssl)
-            server.login(settings["username"], settings["password"])
-            server.sendmail(settings["username"], to_list + cc_list, msg.as_string())
-        return {"status": "sent", "provider_response": "smtp_ok"}
+        return _send_ses_raw(to_list, cc_list, msg.as_bytes())
     except Exception as exc:  # noqa: BLE001 — a delivery failure must never propagate
-        password = settings.get("password") or ""
-        safe_error = str(exc).replace(password, "***") if password else str(exc)
-        logger.warning("Gmail Parts Transfer Request send failed: %s", safe_error)
-        return {"status": "failed", "error": safe_error[:300]}
+        logger.warning("SES Parts Transfer Request send failed: %s", str(exc)[:300])
+        return {"status": "failed", "error": str(exc)[:300]}
