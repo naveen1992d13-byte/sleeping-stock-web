@@ -1,4 +1,4 @@
-"""Focused tests for Amazon SES sending. No live SES calls."""
+"""Focused tests for Gmail API sending. No live Gmail calls."""
 import sys
 from pathlib import Path
 
@@ -23,29 +23,40 @@ GROUP = {
 }
 
 
-class _FakeSES:
+class _FakeGmail:
     def __init__(self):
-        self.calls = []
+        self.raw_messages = []
 
-    def send_email(self, **kwargs):
-        self.calls.append(kwargs)
-        return {"MessageId": "ses-message-1"}
-
-
-def test_ses_settings_default_to_mumbai_notification_address(monkeypatch):
-    monkeypatch.delenv("SES_REGION", raising=False)
-    monkeypatch.delenv("SES_FROM_EMAIL", raising=False)
-    monkeypatch.delenv("AWS_REGION", raising=False)
-    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
-    settings = notifications.ses_settings()
-    assert settings["region"] == "ap-south-1"
-    assert settings["from_email"] == "notification@sleepingstock.in"
+    def __call__(self, raw_message: bytes):
+        self.raw_messages.append(raw_message)
+        return {"status": "sent", "provider_response": "gmail-message-1"}
 
 
-def test_simple_notification_uses_ses_not_smtp(monkeypatch):
-    fake = _FakeSES()
-    monkeypatch.setattr(notifications, "_ses_client", lambda region: fake)
+def _enable_gmail(monkeypatch):
+    monkeypatch.setenv("GMAIL_OAUTH_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("GMAIL_OAUTH_CLIENT_SECRET", "test-client-secret")
+    monkeypatch.setenv("GMAIL_OAUTH_REFRESH_TOKEN", "test-refresh-token")
+    monkeypatch.delenv("GMAIL_FROM_EMAIL", raising=False)
+    monkeypatch.delenv("GMAIL_FROM_NAME", raising=False)
+    monkeypatch.delenv("EMAIL_TEST_MODE", raising=False)
+    monkeypatch.delenv("EMAIL_TEST_RECIPIENT", raising=False)
+
+
+def test_gmail_defaults_to_plural_notifications_sender(monkeypatch):
+    _enable_gmail(monkeypatch)
+    settings = notifications.gmail_settings()
+    assert settings["from_email"] == "notifications@sleepingstock.in"
+    assert settings["from_name"] == "Sleeping Stock"
+    assert notifications._gmail_from_header(settings) == "Sleeping Stock <notifications@sleepingstock.in>"
     assert not hasattr(notifications, "smtplib")
+    assert not hasattr(notifications, "_ses_client")
+    assert not hasattr(notifications, "_send_ses_raw")
+
+
+def test_simple_notification_uses_gmail_mime_not_smtp(monkeypatch):
+    _enable_gmail(monkeypatch)
+    fake = _FakeGmail()
+    monkeypatch.setattr(notifications, "_send_gmail_mime", fake)
     result = notifications.send_notification_email(
         "dealer.user@example.com",
         "NMTS — Request Accepted",
@@ -53,18 +64,18 @@ def test_simple_notification_uses_ses_not_smtp(monkeypatch):
         cc_email="dealer.admin@example.com",
     )
     assert result["status"] == "sent"
-    assert result["provider_response"] == "ses-message-1"
-    assert len(fake.calls) == 1
-    call = fake.calls[0]
-    assert call["FromEmailAddress"].endswith("<notification@sleepingstock.in>")
-    assert call["Destination"]["ToAddresses"] == ["dealer.user@example.com"]
-    assert call["Destination"]["CcAddresses"] == ["dealer.admin@example.com"]
-    assert "Simple" in call["Content"]
+    assert result["provider_response"] == "gmail-message-1"
+    raw = fake.raw_messages[0]
+    assert b"From: Sleeping Stock <notifications@sleepingstock.in>" in raw
+    assert b"To: dealer.user@example.com" in raw
+    assert b"Cc: dealer.admin@example.com" in raw
+    assert b"application/pdf" not in raw
 
 
-def test_pdf_request_email_sends_raw_attachment(monkeypatch):
-    fake = _FakeSES()
-    monkeypatch.setattr(notifications, "_ses_client", lambda region: fake)
+def test_pdf_request_email_attaches_pdf(monkeypatch):
+    _enable_gmail(monkeypatch)
+    fake = _FakeGmail()
+    monkeypatch.setattr(notifications, "_send_gmail_mime", fake)
     result = notifications.send_request_pdf_email(
         "koyambedu.user@example.com",
         GROUP,
@@ -72,18 +83,19 @@ def test_pdf_request_email_sends_raw_attachment(monkeypatch):
         cc_email="vanagaram.user@example.com",
     )
     assert result["status"] == "sent"
-    call = fake.calls[0]
-    assert call["FromEmailAddress"].endswith("<notification@sleepingstock.in>")
-    raw = call["Content"]["Raw"]["Data"]
+    raw = fake.raw_messages[0]
+    assert b"From: Sleeping Stock <notifications@sleepingstock.in>" in raw
+    assert b"To: koyambedu.user@example.com" in raw
+    assert b"Cc: vanagaram.user@example.com" in raw
     assert b"application/pdf" in raw
     assert b"RQHY2609080001.pdf" in raw
-    assert b"JVBERi0xLjQgdGVzdA==" in raw  # base64 of %PDF-1.4 test
-    assert call["Destination"]["ToAddresses"] == ["koyambedu.user@example.com"]
+    assert b"JVBERi0xLjQgdGVzdA==" in raw
 
 
 def test_email_test_mode_redirects_and_drops_cc(monkeypatch):
-    fake = _FakeSES()
-    monkeypatch.setattr(notifications, "_ses_client", lambda region: fake)
+    _enable_gmail(monkeypatch)
+    fake = _FakeGmail()
+    monkeypatch.setattr(notifications, "_send_gmail_mime", fake)
     monkeypatch.setenv("EMAIL_TEST_MODE", "true")
     monkeypatch.setenv("EMAIL_TEST_RECIPIENT", "verified.sandbox@example.com")
     result = notifications.send_request_pdf_email(
@@ -93,55 +105,49 @@ def test_email_test_mode_redirects_and_drops_cc(monkeypatch):
         cc_email="vanagaram.user@example.com",
     )
     assert result["status"] == "sent"
-    call = fake.calls[0]
-    assert call["Destination"]["ToAddresses"] == ["verified.sandbox@example.com"]
-    assert call["Destination"]["CcAddresses"] == []
+    raw = fake.raw_messages[0]
+    assert b"To: verified.sandbox@example.com" in raw
+    assert b"Cc:" not in raw
+    assert b"koyambedu.user@example.com" not in raw
 
 
-def test_invalid_recipient_skips_without_ses_call(monkeypatch):
-    fake = _FakeSES()
-    monkeypatch.setattr(notifications, "_ses_client", lambda region: fake)
+def test_invalid_recipient_skips_without_gmail_call(monkeypatch):
+    _enable_gmail(monkeypatch)
+    fake = _FakeGmail()
+    monkeypatch.setattr(notifications, "_send_gmail_mime", fake)
     result = notifications.send_request_pdf_email("invalid", GROUP, b"%PDF")
     assert result["status"] == "skipped"
-    assert fake.calls == []
+    assert fake.raw_messages == []
 
 
-def test_raw_access_denied_falls_back_to_simple_without_raising(monkeypatch):
-    class RawDenied:
-        def __init__(self):
-            self.calls = []
-
-        def send_email(self, **kwargs):
-            self.calls.append(kwargs)
-            if "Raw" in (kwargs.get("Content") or {}):
-                raise RuntimeError("An error occurred (AccessDeniedException) SendRawEmail")
-            return {"MessageId": "simple-fallback"}
-
-    fake = RawDenied()
-    monkeypatch.setattr(notifications, "_ses_client", lambda region: fake)
-    result = notifications.send_request_workflow_email(
-        "koyambedu.user@example.com", GROUP, pdf_bytes=b"%PDF-1.4 test",
-        kind=notifications.WORKFLOW_EMAIL_SENT,
+def test_missing_oauth_skips_without_raising(monkeypatch):
+    monkeypatch.delenv("GMAIL_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GMAIL_OAUTH_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("GMAIL_OAUTH_REFRESH_TOKEN", raising=False)
+    result = notifications.send_notification_email(
+        "dealer.user@example.com",
+        "NMTS — Request",
+        {"headline": "Request", "fields": []},
     )
-    assert result["status"] == "sent"
-    assert result["provider_response"] == "simple-fallback"
-    assert any("Raw" in (call.get("Content") or {}) for call in fake.calls)
-    assert any("Simple" in (call.get("Content") or {}) for call in fake.calls)
+    assert result["status"] == "skipped"
+    assert result["error"] == "gmail_not_configured"
 
 
-def test_ses_client_error_does_not_raise(monkeypatch):
+def test_gmail_api_error_does_not_raise(monkeypatch):
+    _enable_gmail(monkeypatch)
+
     class Boom:
-        def send_email(self, **kwargs):
-            raise RuntimeError("sandbox recipient not verified")
+        def users(self):
+            raise RuntimeError("invalid_grant")
 
-    monkeypatch.setattr(notifications, "_ses_client", lambda region: Boom())
+    monkeypatch.setattr(notifications, "_gmail_service", lambda: Boom())
     result = notifications.send_notification_email(
         "dealer.user@example.com",
         "NMTS — Request",
         {"headline": "Request", "fields": []},
     )
     assert result["status"] == "failed"
-    assert "sandbox" in result["error"]
+    assert "invalid_grant" in result["error"]
 
 
 def test_sent_email_includes_summary_and_pdf():
@@ -167,8 +173,9 @@ def test_completed_email_has_no_pdf_and_confirms_finish():
 
 
 def test_completed_send_does_not_attach_pdf(monkeypatch):
-    fake = _FakeSES()
-    monkeypatch.setattr(notifications, "_ses_client", lambda region: fake)
+    _enable_gmail(monkeypatch)
+    fake = _FakeGmail()
+    monkeypatch.setattr(notifications, "_send_gmail_mime", fake)
     result = notifications.send_request_workflow_email(
         "koyambedu.user@example.com",
         dict(GROUP, status="Completed"),
@@ -176,12 +183,10 @@ def test_completed_send_does_not_attach_pdf(monkeypatch):
         kind=notifications.WORKFLOW_EMAIL_COMPLETED,
     )
     assert result["status"] == "sent"
-    content = fake.calls[0]["Content"]
-    assert "Simple" in content
-    assert "Raw" not in content
-    simple = content["Simple"]
-    assert b"%PDF-should-not-attach" not in str(simple).encode()
-    assert "application/pdf" not in str(simple)
+    raw = fake.raw_messages[0]
+    assert b"application/pdf" not in raw
+    assert b"%PDF-should-not-attach" not in raw
+    assert b"From: Sleeping Stock <notifications@sleepingstock.in>" in raw
 
 
 def test_completion_email_only_for_finished_statuses():

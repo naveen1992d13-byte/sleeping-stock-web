@@ -1,10 +1,10 @@
 """
-Notification service for NMTS / Sleeping Stock — Amazon SES + WhatsApp Cloud API.
+Notification service for NMTS / Sleeping Stock — Gmail API + WhatsApp Cloud API.
 
-Design rules (see UPDATE_NOTES.txt for the full explanation):
-- Email is sent with Amazon SES (SESv2) in ap-south-1 using the default AWS
-  credential chain (EC2 instance role). No SMTP password or long-lived access
-  keys are used.
+Design rules:
+- Email is sent with the Gmail API (OAuth 2.0 refresh token) as
+  Sleeping Stock <notifications@sleepingstock.in>. No Gmail password, no SMTP
+  app password, and no Amazon SES send path.
 - Every send is wrapped so a delivery failure NEVER raises out to the caller.
   The request/approval/rejection is always saved first; notifications are a
   best-effort side effect logged to db.notification_logs.
@@ -18,13 +18,12 @@ import re
 import uuid
 import asyncio
 import logging
+import base64
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from datetime import datetime, timezone
 
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
 import requests
 
 from request_print import build_request_pdf as build_request_print_pdf
@@ -47,98 +46,119 @@ def _first_env(*keys: str, default: str = "") -> str:
     return default
 
 
-DEFAULT_SES_REGION = "ap-south-1"
-DEFAULT_SES_FROM_EMAIL = "notification@sleepingstock.in"
-DEFAULT_SES_FROM_NAME = "Sleeping Stock - NMTS"
-
-
-def ses_settings() -> dict:
-    """SES send config. Credentials come from the instance role, not env keys."""
-    return {
-        "region": _first_env("SES_REGION", "AWS_REGION", "AWS_DEFAULT_REGION", default=DEFAULT_SES_REGION),
-        "from_email": _first_env("SES_FROM_EMAIL", default=DEFAULT_SES_FROM_EMAIL).strip(),
-        "from_name": _first_env("SES_FROM_NAME", "GMAIL_SENDER_NAME", "SMTP_FROM_NAME", default=DEFAULT_SES_FROM_NAME),
-        "configuration_set": _env("SES_CONFIGURATION_SET").strip(),
-    }
-
-
-def ses_configured() -> bool:
-    settings = ses_settings()
-    return bool(settings["from_email"] and settings["region"] and is_valid_email(settings["from_email"]))
+DEFAULT_GMAIL_FROM_EMAIL = "notifications@sleepingstock.in"
+DEFAULT_GMAIL_FROM_NAME = "Sleeping Stock"
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 
 def gmail_settings() -> dict:
-    """Deprecated SMTP settings. Sending uses SES; kept for env compatibility."""
-    ses = ses_settings()
+    """Gmail API OAuth send config. Never reads a Gmail password or SMTP secret."""
     return {
-        "host": _first_env("GMAIL_SMTP_HOST", "SMTP_HOST", default="smtp.gmail.com"),
-        "port": int(_first_env("GMAIL_SMTP_PORT", "SMTP_PORT", default="587") or "587"),
-        "username": ses["from_email"],
-        "password": "",
-        "sender_name": ses["from_name"],
+        "from_email": _first_env("GMAIL_FROM_EMAIL", default=DEFAULT_GMAIL_FROM_EMAIL).strip(),
+        "from_name": _first_env("GMAIL_FROM_NAME", default=DEFAULT_GMAIL_FROM_NAME).strip(),
+        "client_id": _env("GMAIL_OAUTH_CLIENT_ID").strip(),
+        "client_secret": _env("GMAIL_OAUTH_CLIENT_SECRET").strip(),
+        "refresh_token": _env("GMAIL_OAUTH_REFRESH_TOKEN").strip(),
+        "token_uri": _first_env("GMAIL_OAUTH_TOKEN_URI", default="https://oauth2.googleapis.com/token").strip(),
     }
 
 
 def gmail_configured() -> bool:
-    return ses_configured()
+    settings = gmail_settings()
+    return bool(
+        is_valid_email(settings["from_email"])
+        and settings["client_id"]
+        and settings["client_secret"]
+        and settings["refresh_token"]
+    )
 
 
-def _ses_from_header(settings=None) -> str:
-    settings = settings or ses_settings()
-    name = sanitize_text(settings.get("from_name") or DEFAULT_SES_FROM_NAME, 80)
+def ses_settings() -> dict:
+    """Compatibility alias. Email transport is Gmail API, not SES."""
+    settings = gmail_settings()
+    return {
+        "from_email": settings["from_email"],
+        "from_name": settings["from_name"],
+        "region": "",
+        "configuration_set": "",
+    }
+
+
+def ses_configured() -> bool:
+    return gmail_configured()
+
+
+def _gmail_from_header(settings=None) -> str:
+    settings = settings or gmail_settings()
+    name = sanitize_text(settings.get("from_name") or DEFAULT_GMAIL_FROM_NAME, 80)
     return f"{name} <{settings['from_email']}>"
 
 
-def _ses_client(region: str):
-    return boto3.client("sesv2", region_name=region)
+def _gmail_credentials():
+    settings = gmail_settings()
+    from google.oauth2.credentials import Credentials
+    return Credentials(
+        token=None,
+        refresh_token=settings["refresh_token"],
+        token_uri=settings["token_uri"],
+        client_id=settings["client_id"],
+        client_secret=settings["client_secret"],
+        scopes=[GMAIL_SEND_SCOPE],
+    )
 
 
-def _ses_send_kwargs(settings: dict) -> dict:
-    extra = {}
-    if settings.get("configuration_set"):
-        extra["ConfigurationSetName"] = settings["configuration_set"]
-    return extra
+def _gmail_service():
+    from googleapiclient.discovery import build
+    return build("gmail", "v1", credentials=_gmail_credentials(), cache_discovery=False)
 
 
-def _send_ses_simple(to_list, cc_list, subject: str, text_body: str, html_body: str) -> dict:
-    settings = ses_settings()
-    if not ses_configured():
-        return {"status": "skipped", "error": "ses_not_configured"}
+def _build_rfc822_message(
+    *,
+    to_list,
+    cc_list,
+    subject: str,
+    text_body: str,
+    html_body: str,
+    pdf_bytes: bytes = None,
+    filename: str = "",
+):
+    """Reuse the existing MIME/PDF layout. Gmail API sends this RFC822 blob."""
+    if pdf_bytes:
+        msg = MIMEMultipart("mixed")
+    else:
+        msg = MIMEMultipart("alternative")
+    msg["Subject"] = sanitize_text(subject, 200)
+    msg["From"] = _gmail_from_header()
+    msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+    if pdf_bytes:
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(text_body or "", "plain"))
+        alt.attach(MIMEText(html_body or "", "html"))
+        msg.attach(alt)
+        attachment = MIMEApplication(pdf_bytes, _subtype="pdf")
+        attachment.add_header("Content-Disposition", "attachment", filename=filename or "request.pdf")
+        msg.attach(attachment)
+    else:
+        msg.attach(MIMEText(text_body or "", "plain"))
+        msg.attach(MIMEText(html_body or "", "html"))
+    return msg
+
+
+def _send_gmail_mime(raw_message: bytes) -> dict:
+    """users.messages.send of a raw RFC822 message. Appears in Gmail Sent. Never raises."""
+    if not gmail_configured():
+        return {"status": "skipped", "error": "gmail_not_configured"}
     try:
-        response = _ses_client(settings["region"]).send_email(
-            FromEmailAddress=_ses_from_header(settings),
-            Destination={"ToAddresses": list(to_list), "CcAddresses": list(cc_list or [])},
-            Content={
-                "Simple": {
-                    "Subject": {"Data": sanitize_text(subject, 200), "Charset": "UTF-8"},
-                    "Body": {
-                        "Text": {"Data": text_body or "", "Charset": "UTF-8"},
-                        "Html": {"Data": html_body or "", "Charset": "UTF-8"},
-                    },
-                }
-            },
-            **_ses_send_kwargs(settings),
-        )
-        return {"status": "sent", "provider_response": response.get("MessageId") or "ses_ok"}
-    except (BotoCoreError, ClientError, Exception) as exc:  # noqa: BLE001
-        logger.warning("SES send failed: %s", str(exc)[:300])
-        return {"status": "failed", "error": str(exc)[:300]}
-
-
-def _send_ses_raw(to_list, cc_list, raw_message: bytes) -> dict:
-    settings = ses_settings()
-    if not ses_configured():
-        return {"status": "skipped", "error": "ses_not_configured"}
-    try:
-        response = _ses_client(settings["region"]).send_email(
-            FromEmailAddress=_ses_from_header(settings),
-            Destination={"ToAddresses": list(to_list), "CcAddresses": list(cc_list or [])},
-            Content={"Raw": {"Data": raw_message}},
-            **_ses_send_kwargs(settings),
-        )
-        return {"status": "sent", "provider_response": response.get("MessageId") or "ses_ok"}
-    except (BotoCoreError, ClientError, Exception) as exc:  # noqa: BLE001
-        logger.warning("SES raw send failed: %s", str(exc)[:300])
+        encoded = base64.urlsafe_b64encode(raw_message).decode("ascii")
+        sent = _gmail_service().users().messages().send(
+            userId="me",
+            body={"raw": encoded},
+        ).execute()
+        return {"status": "sent", "provider_response": sent.get("id") or "gmail_ok"}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Gmail API send failed: %s", str(exc)[:300])
         return {"status": "failed", "error": str(exc)[:300]}
 
 
@@ -298,7 +318,7 @@ def sanitize_text(value: str, max_len: int = 500) -> str:
 
 
 # --------------------------------------------------------------------------
-# Amazon SES (transactional)
+# Transactional HTML helpers (unchanged templates)
 # --------------------------------------------------------------------------
 def _build_email_html(context: dict) -> str:
     rows = "".join(
@@ -329,7 +349,7 @@ def _build_email_text(context: dict) -> str:
 
 
 def send_gmail_email(to_email: str, subject: str, context: dict, cc_email: str = "") -> dict:
-    """Compatibility wrapper. Sends through Amazon SES. Never raises."""
+    """Compatibility wrapper. Sends through Gmail API. Never raises."""
     return send_notification_email(to_email, subject, context, cc_email=cc_email)
 
 
@@ -341,9 +361,20 @@ def send_notification_email(to_email: str, subject: str, context: dict, cc_email
     cc_list = [email for email in _email_list(cc_email) if email.lower() not in to_keys]
     if not to_list:
         return {"status": "skipped", "error": "invalid_or_missing_email"}
-    if not ses_configured():
-        return {"status": "skipped", "error": "ses_not_configured"}
-    return _send_ses_simple(to_list, cc_list, subject, _build_email_text(context), _build_email_html(context))
+    if not gmail_configured():
+        return {"status": "skipped", "error": "gmail_not_configured"}
+    try:
+        msg = _build_rfc822_message(
+            to_list=to_list,
+            cc_list=cc_list,
+            subject=subject,
+            text_body=_build_email_text(context),
+            html_body=_build_email_html(context),
+        )
+        return _send_gmail_mime(msg.as_bytes())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Gmail notification email failed: %s", str(exc)[:300])
+        return {"status": "failed", "error": str(exc)[:300]}
 
 
 # --------------------------------------------------------------------------
@@ -701,48 +732,30 @@ def send_request_workflow_email(
     subject_prefix: str = "",
     kind: str = WORKFLOW_EMAIL_SENT,
 ) -> dict:
-    """Send one of the two allowed request emails through Amazon SES. Never raises."""
+    """Send one of the two allowed request emails through Gmail API. Never raises."""
     to_email, cc_email = _email_test_redirect(to_email, cc_email)
     to_list = _email_list(to_email)
     to_keys = {email.lower() for email in to_list}
     cc_list = [email for email in _email_list(cc_email) if email.lower() not in to_keys]
     if not to_list:
         return {"status": "skipped", "error": "invalid_or_missing_email"}
-    if not ses_configured():
-        return {"status": "skipped", "error": "ses_not_configured"}
+    if not gmail_configured():
+        return {"status": "skipped", "error": "gmail_not_configured"}
 
     content = build_request_workflow_content(group, kind=kind, subject_prefix=subject_prefix)
-    settings = ses_settings()
     try:
-        if content["attach_pdf"] and pdf_bytes:
-            msg = MIMEMultipart("mixed")
-            msg["Subject"] = sanitize_text(content["subject"], 200)
-            msg["From"] = _ses_from_header(settings)
-            msg["To"] = ", ".join(to_list)
-            if cc_list:
-                msg["Cc"] = ", ".join(cc_list)
-            alt = MIMEMultipart("alternative")
-            alt.attach(MIMEText(content["text_body"], "plain"))
-            alt.attach(MIMEText(content["html_body"], "html"))
-            msg.attach(alt)
-            filename = group.get("pdf_filename") or f"{group.get('request_number') or 'request'}.pdf"
-            attachment = MIMEApplication(pdf_bytes, _subtype="pdf")
-            attachment.add_header("Content-Disposition", "attachment", filename=filename)
-            msg.attach(attachment)
-            raw_result = _send_ses_raw(to_list, cc_list, msg.as_bytes())
-            if raw_result.get("status") == "sent":
-                return raw_result
-            if "SendRawEmail" in str(raw_result.get("error") or ""):
-                logger.warning(
-                    "SES raw/PDF send denied; sending %s email without attachment: %s",
-                    kind, raw_result.get("error"),
-                )
-                simple = _send_ses_simple(to_list, cc_list, content["subject"], content["text_body"], content["html_body"])
-                if simple.get("status") == "sent":
-                    simple["error"] = "sent_without_pdf: ses:SendRawEmail denied"
-                return simple
-            return raw_result
-        return _send_ses_simple(to_list, cc_list, content["subject"], content["text_body"], content["html_body"])
+        attach = bool(content["attach_pdf"] and pdf_bytes)
+        filename = group.get("pdf_filename") or f"{group.get('request_number') or 'request'}.pdf"
+        msg = _build_rfc822_message(
+            to_list=to_list,
+            cc_list=cc_list,
+            subject=content["subject"],
+            text_body=content["text_body"],
+            html_body=content["html_body"],
+            pdf_bytes=pdf_bytes if attach else None,
+            filename=filename,
+        )
+        return _send_gmail_mime(msg.as_bytes())
     except Exception as exc:  # noqa: BLE001
-        logger.warning("SES request %s email failed: %s", kind, str(exc)[:300])
+        logger.warning("Gmail request %s email failed: %s", kind, str(exc)[:300])
         return {"status": "failed", "error": str(exc)[:300]}

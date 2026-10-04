@@ -19,3 +19,7 @@ reportlab==4.4.10
 
 qrcode[pil]==8.2
 boto3==1.40.4
+google-api-python-client==2.179.0
+google-auth==2.40.3
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.2
