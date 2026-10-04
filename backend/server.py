@@ -4854,31 +4854,54 @@ async def _print_group_for_email(group_doc: dict) -> dict:
     return request_print.assemble_print_group(group_doc, items, receivers)
 
 
-async def _send_request_group_email(group_doc: dict, *, result: bool = False):
-    """Best-effort PDF + Gmail dispatch for one Requested-To destination
-    group. Never raises — the request/request number/items are already
-    saved before this runs, so any failure here only updates email_* status
-    and notification_logs, and never rolls back the saved request."""
+async def _claim_request_workflow_email(group_doc: dict, *, result: bool = False, force: bool = False):
+    """Atomically claim one sent/completed email so retries cannot double-send."""
+    if not group_doc or not group_doc.get('id'):
+        return None
+    query = notifications.request_email_claim_filter(group_doc['id'], result=result)
+    if force:
+        sent_field = 'result_email_sent' if result else 'email_sent'
+        query = {'id': group_doc['id'], sent_field: {'$ne': True}}
+    claimed_field = 'result_email_claimed_at' if result else 'email_claimed_at'
+    return await db.request_headers.find_one_and_update(
+        query,
+        {'$set': {claimed_field: datetime.now(timezone.utc).isoformat()}},
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def _send_request_group_email(group_doc: dict, *, result: bool = False, force: bool = False):
+    """Best-effort SES dispatch for request-sent or request-completed only.
+    Never raises — the request is already saved before this runs."""
+    kind = notifications.WORKFLOW_EMAIL_COMPLETED if result else notifications.WORKFLOW_EMAIL_SENT
+    claimed = await _claim_request_workflow_email(group_doc, result=result, force=force)
+    if not claimed:
+        logging.getLogger('nmts.notifications').info(
+            'Skipping duplicate %s email for request %s', kind, (group_doc or {}).get('request_number'),
+        )
+        return
+    group_doc = claimed
     now = datetime.now(timezone.utc).isoformat()
     to_emails, cc_emails = await _resolve_request_email_routing(group_doc)
     receiver_email = ', '.join(to_emails)
     log_id = str(uuid.uuid4())
-    subject = notifications.build_request_email_subject(group_doc)
+    subject = notifications.build_request_email_subject(group_doc, kind=kind)
     sent_field = 'result_email_sent' if result else 'email_sent'
     status_field = 'result_email_status' if result else 'email_status'
     error_field = 'result_email_error' if result else 'email_error'
     sent_at_field = 'result_email_sent_at' if result else 'email_sent_at'
     base_log = {
         'id': log_id, 'request_id': group_doc['id'], 'request_number': group_doc['request_number'],
-        'order_id': group_doc['order_id'], 'receiver_user_id': '', 'receiver_email': receiver_email or '',
-        'notification_type': 'parts_transfer_request_result' if result else 'parts_transfer_request',
+        'order_id': group_doc.get('order_id'), 'receiver_user_id': '', 'receiver_email': receiver_email or '',
+        'notification_type': 'request_completed' if result else 'request_sent',
         'channel': 'email', 'subject': subject,
-        'attachment_filename': group_doc.get('pdf_filename') or f"{group_doc.get('request_number')}.pdf",
+        'attachment_filename': (group_doc.get('pdf_filename') or f"{group_doc.get('request_number')}.pdf") if not result else '',
         'retry_count': group_doc.get('retry_count', 0),
         'created_at': now,
     }
 
     if not to_emails:
+        logging.getLogger('nmts.notifications').warning('Request %s email skipped: receiver email not configured', group_doc.get('request_number'))
         await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {
             sent_field: False, status_field: 'failed', error_field: 'Receiver email not configured',
             'receiver_email': receiver_email or '', 'updated_at': now,
@@ -4887,23 +4910,26 @@ async def _send_request_group_email(group_doc: dict, *, result: bool = False):
                                                 'failed_at': now, 'error_message': 'Receiver email not configured'})
         return
 
-    try:
-        print_group = await _print_group_for_email(group_doc)
-        pdf_bytes = notifications.build_request_pdf(print_group)
-    except Exception as exc:  # noqa: BLE001 — a PDF failure must never break the saved request
-        safe_error = f'PDF generation failed: {str(exc)[:250]}'
-        await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {
-            sent_field: False, status_field: 'failed', error_field: safe_error,
-            'receiver_email': receiver_email, 'updated_at': now,
-        }})
-        await db.notification_logs.insert_one({**base_log, 'status': 'failed', 'attempted_at': now, 'sent_at': None,
-                                                'failed_at': now, 'error_message': safe_error})
-        return
+    pdf_bytes = None
+    if kind == notifications.WORKFLOW_EMAIL_SENT:
+        try:
+            print_group = await _print_group_for_email(group_doc)
+            pdf_bytes = notifications.build_request_pdf(print_group)
+        except Exception as exc:  # noqa: BLE001 — keep the transactional notice even if PDF fails
+            logging.getLogger('nmts.notifications').warning(
+                'Request sent email PDF failed for %s; sending without attachment: %s',
+                group_doc.get('request_number'), str(exc)[:250],
+            )
+            pdf_bytes = None
 
     send_result = await asyncio.get_event_loop().run_in_executor(
-        None, notifications.send_request_pdf_email, to_emails, group_doc, pdf_bytes, cc_emails,
+        None, notifications.send_request_workflow_email, to_emails, group_doc, pdf_bytes, cc_emails, '', kind,
     )
     sent = send_result.get('status') == 'sent'
+    if not sent:
+        logging.getLogger('nmts.notifications').warning(
+            'Request %s %s email failed: %s', group_doc.get('request_number'), kind, send_result.get('error'),
+        )
     await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {
         sent_field: sent, status_field: send_result.get('status'),
         error_field: (send_result.get('error') or None) if not sent else None,
@@ -6334,7 +6360,7 @@ async def resend_request_group_email(request_number: str, current_user: UserResp
 
     await db.request_headers.update_one({'id': group_doc['id']}, {'$set': {'retry_count': int(group_doc.get('retry_count', 0)) + 1}})
     refreshed = await db.request_headers.find_one({'id': group_doc['id']}, {'_id': 0})
-    await _send_request_group_email(refreshed)
+    await _send_request_group_email(refreshed, force=True)
     updated = await db.request_headers.find_one({'id': group_doc['id']}, {'_id': 0})
     order = await db.order_headers.find_one({'id': updated.get('order_id')}, {'_id': 0}) or {}
     await odw.append_order_audit(
@@ -7171,6 +7197,11 @@ async def _sync_request_header_after_item_decision(req: dict, now: str):
             else:
                 freeze_status = 'responded'
             header_update.update(odw.freeze_response_timer(existing, now, freeze_status))
+        if header_status in ('Completed', 'Received'):
+            if not existing.get('completed_at'):
+                header_update['completed_at'] = now
+            if header_status == 'Received' and not existing.get('received_at'):
+                header_update['received_at'] = now
     await db.request_headers.update_one(
         {'request_number': request_number},
         {'$set': header_update},
@@ -7290,21 +7321,11 @@ async def _notify_request_group_outcome(request_number: str, actor_id: str = "")
             await ua.alert_request_event(header, event, actor_id=actor_id or "", stage=stage)
         except Exception as exc:  # noqa: BLE001
             logging.getLogger('nmts.user_alerts').warning('request in-app alert failed: %s', str(exc)[:300])
-    if status in ('Completed', 'Rejected') and not header.get('result_email_sent') and not header.get('result_email_claimed_at'):
-        claimed = await db.request_headers.find_one_and_update(
-            {
-                'request_number': request_number,
-                'status': {'$in': ['Completed', 'Rejected']},
-                'result_email_sent': {'$ne': True},
-                'result_email_claimed_at': {'$exists': False},
-            },
-            {'$set': {'result_email_claimed_at': datetime.now(timezone.utc).isoformat()}},
-        )
-        if claimed:
-            try:
-                await _send_request_group_email(header, result=True)
-            except Exception as exc:  # noqa: BLE001
-                logging.getLogger('nmts.notifications').warning('request result email failed: %s', str(exc)[:300])
+    if notifications.should_send_request_completion_email(status):
+        try:
+            await _send_request_group_email(header, result=True)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger('nmts.notifications').warning('request completed email failed: %s', str(exc)[:300])
 
 
 async def _notify_request_status_change(req: dict, event: str, actor_id: str = ""):

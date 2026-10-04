@@ -122,7 +122,7 @@ def test_neither_branch_user_nor_admin_keeps_empty_to():
 
 def test_subject_uses_finalized_sleeping_stock_request_format():
     subject = build_request_email_subject(GROUP)
-    assert subject == 'Sleeping Stock Request – FPL Automobiles PVT LTD Koyambedu – RQHY2609080001'
+    assert subject == 'Sleeping Stock – New stock request received – FPL Automobiles PVT LTD Koyambedu – RQHY2609080001'
 
 
 def test_invalid_to_skips_without_raising():

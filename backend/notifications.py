@@ -497,108 +497,252 @@ def build_request_pdf(group: dict) -> bytes:
 # --------------------------------------------------------------------------
 # Parts Transfer Request email (Amazon SES, PDF attachment)
 # --------------------------------------------------------------------------
-def build_request_email_subject(group: dict, subject_prefix: str = "") -> str:
-    """Finalized request-email subject line:
-        '<prefix>Sleeping Stock Request - <Supplying Dealer> <Supplying Branch> - <Ref No>'
-    (using en dashes). The supplying dealer/branch is the recipient (TO). Kept
-    here so the email body and the notification_logs audit record stay in sync."""
+WORKFLOW_EMAIL_SENT = "sent"
+WORKFLOW_EMAIL_COMPLETED = "completed"
+COMPLETED_HEADER_STATUSES = frozenset({"Completed", "Received"})
+NO_WORKFLOW_EMAIL_STATUSES = frozenset({
+    "Requested", "Approved", "Partially Approved", "Rejected", "Cancelled",
+    "Dispatched", "Picking", "picking_finished", "In Transit", "Receive Pending",
+    "Snooze",
+})
+
+
+def public_app_url() -> str:
+    return _first_env("PUBLIC_APP_BASE_URL", default="https://sleepingstock.in").rstrip("/")
+
+
+def should_send_request_completion_email(header_status: str) -> bool:
+    """True only for Received Confirmed / Finished. No intermediate or reject email."""
+    return str(header_status or "").strip() in COMPLETED_HEADER_STATUSES
+
+
+def workflow_email_kind_for_event(*, created: bool = False, header_status: str = "") -> str:
+    """Map a durable request event to the only allowed SES email kind, or empty."""
+    if created:
+        return WORKFLOW_EMAIL_SENT
+    if should_send_request_completion_email(header_status):
+        return WORKFLOW_EMAIL_COMPLETED
+    return ""
+
+
+def request_email_claim_filter(header_id: str, *, result: bool = False) -> dict:
+    """Durable Mongo claim: one in-flight/success send per request event."""
+    sent_field = "result_email_sent" if result else "email_sent"
+    claimed_field = "result_email_claimed_at" if result else "email_claimed_at"
+    return {
+        "id": header_id,
+        sent_field: {"$ne": True},
+        claimed_field: {"$exists": False},
+    }
+
+
+def _dealer_branch(dealer: str, branch: str) -> str:
+    return " ".join(p for p in ((dealer or "").strip(), (branch or "").strip()) if p) or "-"
+
+
+def build_request_email_subject(group: dict, subject_prefix: str = "", kind: str = WORKFLOW_EMAIL_SENT) -> str:
     prefix = (subject_prefix or "").strip()
     if prefix and not prefix.endswith(" "):
         prefix = prefix + " "
     request_number = str(group.get("request_number", "-") or "-").strip() or "-"
-    supplying_dealer = str(group.get("supplying_dealer") or "").strip()
-    supplying_branch = str(group.get("supplying_branch") or "").strip()
-    dealer_branch = " ".join(p for p in (supplying_dealer, supplying_branch) if p) or "-"
-    return f"{prefix}Sleeping Stock Request \u2013 {dealer_branch} \u2013 {request_number}"
+    dealer_branch = _dealer_branch(group.get("supplying_dealer"), group.get("supplying_branch"))
+    if kind == WORKFLOW_EMAIL_COMPLETED:
+        purpose = "Stock request completed"
+    else:
+        purpose = "New stock request received"
+    return f"{prefix}Sleeping Stock \u2013 {purpose} \u2013 {dealer_branch} \u2013 {request_number}"
+
+
+def _workflow_totals(group: dict, kind: str) -> dict:
+    items = list(group.get("items") or [])
+    total_items = group.get("total_items")
+    if total_items in (None, ""):
+        total_items = len(items)
+    if kind == WORKFLOW_EMAIL_COMPLETED:
+        finished = [
+            item for item in items
+            if str(item.get("status") or "") in ("Completed", "Received")
+        ]
+        qty = 0.0
+        value = 0.0
+        for item in finished or items:
+            try:
+                qty += float(item.get("accepted_qty") or item.get("approved_qty") or item.get("requested_qty") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                value += float(item.get("value") or item.get("value_at_request") or 0)
+            except (TypeError, ValueError):
+                pass
+        if group.get("accepted_total_qty") not in (None, ""):
+            qty = float(group.get("accepted_total_qty") or qty)
+        if group.get("total_value") not in (None, "") and not finished:
+            value = float(group.get("total_value") or value)
+        return {
+            "items": len(finished) or total_items,
+            "qty": _pdf_format_number(qty if qty else group.get("total_qty")),
+            "value": _pdf_format_number(value if value else group.get("total_value")),
+        }
+    return {
+        "items": total_items,
+        "qty": _pdf_format_number(group.get("total_qty")),
+        "value": _pdf_format_number(group.get("total_value")),
+    }
+
+
+def build_request_workflow_content(group: dict, kind: str = WORKFLOW_EMAIL_SENT, subject_prefix: str = "") -> dict:
+    """Customer-facing subject/text/html for the two allowed request emails."""
+    group = group or {}
+    subject = build_request_email_subject(group, subject_prefix, kind=kind)
+    totals = _workflow_totals(group, kind)
+    request_number = str(group.get("request_number") or "-")
+    order_number = str(group.get("order_number") or "-")
+    requesting = _dealer_branch(group.get("requesting_dealer"), group.get("requesting_branch"))
+    receiving = _dealer_branch(group.get("supplying_dealer"), group.get("supplying_branch"))
+    status = str(group.get("status") or ("Completed" if kind == WORKFLOW_EMAIL_COMPLETED else "Requested"))
+    completed_at = str(
+        group.get("completed_at")
+        or group.get("received_at")
+        or group.get("updated_at")
+        or ""
+    ).strip() or "-"
+    app_url = public_app_url()
+    test_note = "THIS IS A TEST EMAIL. Ignore for operations.\n\n" if (subject_prefix or "").upper().startswith("[TEST]") else ""
+    test_html = (
+        '<p style="color:#9F1239;font-weight:700;">THIS IS A TEST EMAIL. Ignore for operations.</p>'
+        if test_note else ""
+    )
+    if kind == WORKFLOW_EMAIL_COMPLETED:
+        headline = "Stock request completed"
+        intro = (
+            "This Sleeping Stock request is completed. "
+            "The receiving branch has confirmed receipt and the request workflow is finished."
+        )
+        extra_rows = (("Completed at", completed_at),)
+        footer = "No further action is required on this request."
+        attach_pdf = False
+    else:
+        headline = "New stock request received"
+        intro = (
+            "A new Sleeping Stock request has been sent to your dealer/branch. "
+            "Please review it in Request Center. The detailed part list is in the attached PDF."
+        )
+        extra_rows = (("Review in Sleeping Stock", app_url),)
+        footer = f"Open Request Center in Sleeping Stock to accept or reject this request: {app_url}"
+        attach_pdf = True
+    rows = [
+        ("Request number", request_number),
+        ("Order number", order_number),
+        ("From (requesting)", requesting),
+        ("To (receiving)", receiving),
+        ("Items", totals["items"]),
+        ("Quantity", totals["qty"]),
+        ("Value", totals["value"]),
+        ("Status", status),
+        *extra_rows,
+    ]
+    text_lines = [
+        "Dear Team,",
+        "",
+        test_note.rstrip(),
+        intro,
+        "",
+        *[f"{label}: {value}" for label, value in rows],
+        "",
+        footer,
+        "",
+        "Regards,",
+        "Sleeping Stock Team",
+    ]
+    text_body = "\n".join(line for line in text_lines if line is not None)
+    html_rows = "".join(
+        f'<tr><td style="padding:4px 16px 4px 0;font-weight:700;">{sanitize_text(str(label), 40)}</td>'
+        f'<td style="padding:4px 0;">{sanitize_text(str(value), 160)}</td></tr>'
+        for label, value in rows
+    )
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;border:1px solid #D1D5DB;border-radius:10px;overflow:hidden;">
+      <div style="background:#047857;color:#fff;padding:16px;">
+        <div style="font-size:16px;font-weight:800;">Sleeping Stock</div>
+        <div style="font-size:13px;opacity:0.9;">{sanitize_text(headline, 80)}</div>
+      </div>
+      <div style="padding:16px;font-size:13px;line-height:1.5;color:#111827;">
+        <p>Dear Team,</p>
+        {test_html}
+        <p>{sanitize_text(intro, 400)}</p>
+        <table style="border-collapse:collapse;margin:10px 0;">{html_rows}</table>
+        <p style="font-size:12px;color:#6B7280;">{sanitize_text(footer, 240)}</p>
+        <p>Regards,<br/>Sleeping Stock Team</p>
+      </div>
+    </div>
+    """
+    return {
+        "subject": subject,
+        "text_body": text_body,
+        "html_body": html_body,
+        "attach_pdf": attach_pdf,
+        "headline": headline,
+    }
 
 
 def send_request_pdf_email(to_email: str, group: dict, pdf_bytes: bytes, cc_email: str = "", subject_prefix: str = "") -> dict:
-    """Sends the Parts Transfer Request PDF through Amazon SES.
-    Returns a result dict; never raises — a delivery failure must never
-    roll back the already-saved request."""
+    """Sent-request email with PDF. Compatibility wrapper around the workflow sender."""
+    return send_request_workflow_email(
+        to_email, group, pdf_bytes=pdf_bytes, cc_email=cc_email,
+        subject_prefix=subject_prefix, kind=WORKFLOW_EMAIL_SENT,
+    )
+
+
+def send_request_workflow_email(
+    to_email: str,
+    group: dict,
+    pdf_bytes: bytes = None,
+    cc_email: str = "",
+    subject_prefix: str = "",
+    kind: str = WORKFLOW_EMAIL_SENT,
+) -> dict:
+    """Send one of the two allowed request emails through Amazon SES. Never raises."""
     to_email, cc_email = _email_test_redirect(to_email, cc_email)
     to_list = _email_list(to_email)
     to_keys = {email.lower() for email in to_list}
     cc_list = [email for email in _email_list(cc_email) if email.lower() not in to_keys]
     if not to_list:
         return {"status": "skipped", "error": "invalid_or_missing_email"}
-
-    settings = ses_settings()
     if not ses_configured():
         return {"status": "skipped", "error": "ses_not_configured"}
 
-    request_number = group.get("request_number", "-")
-    prefix = (subject_prefix or "").strip()
-    if prefix and not prefix.endswith(" "):
-        prefix = prefix + " "
-    subject = build_request_email_subject(group, subject_prefix)
-    filename = group.get("pdf_filename") or f"{request_number}.pdf"
-    test_note = "THIS IS A TEST EMAIL. Ignore for operations.\n\n" if prefix.upper().startswith("[TEST]") else ""
-    test_html = (
-        '<p style="color:#9F1239;font-weight:700;">THIS IS A TEST EMAIL. Ignore for operations.</p>'
-        if test_note else ""
-    )
-
-    # Summary-only body. Detailed parts (Part Number / Part Name) live ONLY in the
-    # attached Stock Transfer PDF — the email body must never list them.
-    total_items = group.get("total_items")
-    if total_items in (None, ""):
-        total_items = len(group.get("items") or [])
-    total_qty = _pdf_format_number(group.get("total_qty"))
-    total_value = _pdf_format_number(group.get("total_value"))
-    request_message = (
-        "Please review and action the following Sleeping Stock request. "
-        "The detailed part list is in the attached Parts Transfer Request PDF."
-    )
-
-    text_body = (
-        "Dear Team,\n\n"
-        f"{test_note}"
-        f"{request_message}\n\n"
-        f"Items: {total_items}\n"
-        f"Quantity: {total_qty}\n"
-        f"Value: {total_value}\n\n"
-        "Regards,\n"
-        "Sleeping Stock Team"
-    )
-    html_body = f"""
-    <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;border:1px solid #D1D5DB;border-radius:10px;overflow:hidden;">
-      <div style="background:#047857;color:#fff;padding:16px;">
-        <div style="font-size:16px;font-weight:800;">Sleeping Stock · NMTS</div>
-        <div style="font-size:13px;opacity:0.9;">{sanitize_text(subject, 120)}</div>
-      </div>
-      <div style="padding:16px;font-size:13px;line-height:1.5;color:#111827;">
-        <p>Dear Team,</p>
-        {test_html}
-        <p>{request_message}</p>
-        <table style="border-collapse:collapse;margin:10px 0;">
-          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Items</td><td style="padding:4px 0;">{total_items}</td></tr>
-          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Quantity</td><td style="padding:4px 0;">{total_qty}</td></tr>
-          <tr><td style="padding:4px 16px 4px 0;font-weight:700;">Value</td><td style="padding:4px 0;">{total_value}</td></tr>
-        </table>
-        <p style="font-size:12px;color:#6B7280;">Detailed parts are in the attached Parts Transfer Request PDF.</p>
-        <p>Regards,<br/>Sleeping Stock Team</p>
-      </div>
-    </div>
-    """
-
+    content = build_request_workflow_content(group, kind=kind, subject_prefix=subject_prefix)
+    settings = ses_settings()
     try:
-        msg = MIMEMultipart("mixed")
-        msg["Subject"] = sanitize_text(subject, 200)
-        msg["From"] = _ses_from_header(settings)
-        msg["To"] = ", ".join(to_list)
-        if cc_list:
-            msg["Cc"] = ", ".join(cc_list)
-
-        alt = MIMEMultipart("alternative")
-        alt.attach(MIMEText(text_body, "plain"))
-        alt.attach(MIMEText(html_body, "html"))
-        msg.attach(alt)
-
-        attachment = MIMEApplication(pdf_bytes or b"", _subtype="pdf")
-        attachment.add_header("Content-Disposition", "attachment", filename=filename)
-        msg.attach(attachment)
-        return _send_ses_raw(to_list, cc_list, msg.as_bytes())
-    except Exception as exc:  # noqa: BLE001 — a delivery failure must never propagate
-        logger.warning("SES Parts Transfer Request send failed: %s", str(exc)[:300])
+        if content["attach_pdf"] and pdf_bytes:
+            msg = MIMEMultipart("mixed")
+            msg["Subject"] = sanitize_text(content["subject"], 200)
+            msg["From"] = _ses_from_header(settings)
+            msg["To"] = ", ".join(to_list)
+            if cc_list:
+                msg["Cc"] = ", ".join(cc_list)
+            alt = MIMEMultipart("alternative")
+            alt.attach(MIMEText(content["text_body"], "plain"))
+            alt.attach(MIMEText(content["html_body"], "html"))
+            msg.attach(alt)
+            filename = group.get("pdf_filename") or f"{group.get('request_number') or 'request'}.pdf"
+            attachment = MIMEApplication(pdf_bytes, _subtype="pdf")
+            attachment.add_header("Content-Disposition", "attachment", filename=filename)
+            msg.attach(attachment)
+            raw_result = _send_ses_raw(to_list, cc_list, msg.as_bytes())
+            if raw_result.get("status") == "sent":
+                return raw_result
+            if "SendRawEmail" in str(raw_result.get("error") or ""):
+                logger.warning(
+                    "SES raw/PDF send denied; sending %s email without attachment: %s",
+                    kind, raw_result.get("error"),
+                )
+                simple = _send_ses_simple(to_list, cc_list, content["subject"], content["text_body"], content["html_body"])
+                if simple.get("status") == "sent":
+                    simple["error"] = "sent_without_pdf: ses:SendRawEmail denied"
+                return simple
+            return raw_result
+        return _send_ses_simple(to_list, cc_list, content["subject"], content["text_body"], content["html_body"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("SES request %s email failed: %s", kind, str(exc)[:300])
         return {"status": "failed", "error": str(exc)[:300]}
