@@ -117,6 +117,10 @@ def _finish_auth(client_config: dict, pending_path: Path, auth_response: str) ->
     flow.redirect_uri = pending.get("redirect_uri") or _redirect_uri(client_config)
     if pending.get("code_verifier"):
         flow.code_verifier = pending["code_verifier"]
+    # Desktop clients must use http://localhost. This only relaxes HTTPS for
+    # that loopback redirect; it does not skip Google consent.
+    if str(flow.redirect_uri).startswith(("http://localhost", "http://127.0.0.1")):
+        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
     flow.fetch_token(authorization_response=auth_response.strip())
     creds = flow.credentials
     if not creds.refresh_token:
