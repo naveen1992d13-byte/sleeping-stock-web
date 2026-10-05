@@ -1,5 +1,5 @@
 import React, { createContext, useState, useContext, useEffect } from 'react';
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useLocation, Link } from 'react-router-dom';
 import axios from 'axios';
 import { Toaster } from 'sonner';
 import './App.css';
@@ -34,6 +34,12 @@ import {
 import { resolveApiUrl, resolveBackendUrl } from '@/backendUrl';
 import { getFirstAllowedMenuItem } from './config/menuConfig';
 import { TestingBanner } from './components/TestingBanner';
+import {
+  HOMEPAGE_DESCRIPTION,
+  HOMEPAGE_SIGN_IN_LABEL,
+  HOMEPAGE_TAGLINE,
+  HOMEPAGE_TITLE,
+} from './seoCopy';
 
 const AuthContext = createContext(null);
 
@@ -204,12 +210,12 @@ function ProtectedRoute({ children, permission, masterOnly = false }) {
   return children;
 }
 
-/** Default home: Analytics/Dashboard when allowed; otherwise first permitted module. */
+/** Logged-in home: Analytics when allowed; otherwise first permitted module. */
 function HomeEntry() {
   const { user, loading } = useAuth();
 
   if (loading) return null;
-  if (!user) return <Navigate to="/login" replace />;
+  if (!user) return <PublicLanding />;
 
   if (canAccessPermission(user, 'Analytics')) {
     return <Navigate to="/analytics" replace />;
@@ -227,6 +233,32 @@ function HomeEntry() {
   );
 }
 
+function PublicLanding() {
+  return (
+    <main style={{ fontFamily: 'Arial,sans-serif', maxWidth: 720, margin: '48px auto', padding: '0 20px', color: '#17211b', lineHeight: 1.6 }}>
+      <p>
+        <img src="/android-chrome-192x192.png" width="96" height="96" alt="Sleeping Stock logo" />
+      </p>
+      <h1>{HOMEPAGE_TITLE}</h1>
+      <p>{HOMEPAGE_TAGLINE}</p>
+      <p>{HOMEPAGE_DESCRIPTION}</p>
+      <p>
+        <Link to="/login">{HOMEPAGE_SIGN_IN_LABEL}</Link>
+      </p>
+    </main>
+  );
+}
+
+/** Public indexable homepage for logged-out visitors and crawlers. */
+function PublicHome() {
+  const { user, loading } = useAuth();
+  if (user) return <HomeEntry />;
+  if (loading && typeof localStorage !== 'undefined' && localStorage.getItem('token')) {
+    return null;
+  }
+  return <PublicLanding />;
+}
+
 function App() {
   return (
     <ProcessingProvider>
@@ -237,12 +269,12 @@ function App() {
         <Toaster position="top-right" richColors />
         <Routes>
           <Route path="/login" element={<LoginPage />} />
-          <Route path="/" element={
+          <Route path="/" element={<PublicHome />} />
+          <Route element={
             <ProtectedRoute>
               <DashboardLayout />
             </ProtectedRoute>
           }>
-            <Route index element={<HomeEntry />} />
             <Route path="dashboard" element={
               <ProtectedRoute permission="Analytics">
                 <Analytics />
