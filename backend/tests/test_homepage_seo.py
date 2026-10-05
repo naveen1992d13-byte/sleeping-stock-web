@@ -44,6 +44,18 @@ def test_title_and_meta_description():
     assert 'rel="canonical" href="https://sleepingstock.in/"' in html
 
 
+def _ico_sizes(data: bytes):
+    assert data[:4] == b"\x00\x00\x01\x00"
+    count = int.from_bytes(data[4:6], "little")
+    sizes = []
+    for i in range(count):
+        off = 6 + i * 16
+        width = data[off] or 256
+        height = data[off + 1] or 256
+        sizes.append((width, height))
+    return sizes
+
+
 def test_favicon_links_and_files_exist():
     html = _html()
     assert 'href="/favicon.ico"' in html
@@ -53,6 +65,9 @@ def test_favicon_links_and_files_exist():
     png48 = (PUBLIC / "favicon-48x48.png").read_bytes()
     png192 = (PUBLIC / "android-chrome-192x192.png").read_bytes()
     assert ico[:4] == b"\x00\x00\x01\x00"
+    assert (48, 48) in _ico_sizes(ico)
+    assert (16, 16) in _ico_sizes(ico)
+    assert (32, 32) in _ico_sizes(ico)
     assert png48[:8] == b"\x89PNG\r\n\x1a\n"
     assert png192[:8] == b"\x89PNG\r\n\x1a\n"
     assert png48[16:24] == b"\x00\x00\x00\x30\x00\x00\x00\x30"  # 48x48
@@ -90,15 +105,19 @@ def test_crawlable_homepage_text_is_visible_not_hidden():
     parser = _TextExtractor()
     parser.feed(html)
     text = " ".join(parser.parts)
-    assert "Sleeping Stock NMTS is a Non-Moving Tracking System designed for automobile dealer networks." in text
-    assert "Sign in to Sleeping Stock" in text
-    assert '<div id="root">' in html
+    assert HOMEPAGE_DESCRIPTION in text
+    assert '<div id="root"></div>' in html
 
 
 def test_robots_and_sitemap_allow_homepage():
     robots = (PUBLIC / "robots.txt").read_text(encoding="utf-8")
     assert "Disallow: /" not in robots
     assert "Allow: /" in robots
+    assert "User-agent: Googlebot" in robots
+    assert "User-agent: Googlebot-Image" in robots
+    assert "Allow: /favicon.ico" in robots
+    assert "Allow: /favicon-48x48.png" in robots
+    assert "Allow: /android-chrome-192x192.png" in robots
     assert "Sitemap: https://sleepingstock.in/sitemap.xml" in robots
     sitemap = (PUBLIC / "sitemap.xml").read_text(encoding="utf-8")
     assert "<loc>https://sleepingstock.in/</loc>" in sitemap
@@ -127,12 +146,9 @@ def test_rendered_homepage_copy_matches_static_html():
     app = APP_JS.read_text(encoding="utf-8")
     html = _html()
     assert HOMEPAGE_DESCRIPTION in seo
-    assert "HOMEPAGE_DESCRIPTION" in app
-    assert "HOMEPAGE_SIGN_IN_LABEL" in app
     assert HOMEPAGE_DESCRIPTION in html
-    assert "Sign in to Sleeping Stock" in seo
-    assert "Sign in to Sleeping Stock" in html
-    assert 'to="/login"' in app
+    assert "function PublicLanding" not in app
+    assert "<LoginPage />" in app
     assert "Googlebot" not in app
     assert "user-agent" not in app.lower()
 
@@ -143,13 +159,17 @@ def test_root_route_is_public_not_protected():
     assert '<Route path="/login" element={<LoginPage />} />' in app
     assert "function PublicHome()" in app
     assert "function ProtectedRoute" in app
-    # Logged-out visitors must not be bounced to /login from the homepage.
+    assert "function PublicLanding" not in app
     public_home = app.split("function PublicHome()", 1)[1].split("function App()", 1)[0]
+    # Logged-out / must render LoginPage on / — not a JS redirect to /login.
+    assert "return <LoginPage />;" in public_home
     assert 'Navigate to="/login"' not in public_home
     # Authenticated app routes stay behind ProtectedRoute + DashboardLayout.
     assert "<DashboardLayout />" in app
     assert 'path="analytics"' in app
     assert 'path="orders"' in app
+    assert "function HomeEntry()" in app
+    assert 'to="/analytics"' in app
 
 
 def test_https_sleepingstock_vhost_serves_crawler_files_without_duplicate_type():
@@ -165,7 +185,13 @@ def test_https_sleepingstock_vhost_serves_crawler_files_without_duplicate_type()
             https_public = block
             break
     assert https_public, "HTTPS sleepingstock.in vhost missing"
-    for path in ("/robots.txt", "/sitemap.xml", "/favicon.ico"):
+    for path in (
+        "/robots.txt",
+        "/sitemap.xml",
+        "/favicon.ico",
+        "/favicon-48x48.png",
+        "/android-chrome-192x192.png",
+    ):
         assert f"location = {path}" in https_public
         assert "try_files" in https_public
     http_public = None
