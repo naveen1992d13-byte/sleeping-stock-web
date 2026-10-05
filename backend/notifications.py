@@ -30,7 +30,10 @@ from datetime import datetime, timezone
 
 import requests
 
-from request_print import build_request_pdf as build_request_print_pdf
+from request_print import (
+    build_receive_receipt_pdf as build_receive_receipt_print_pdf,
+    build_request_pdf as build_request_print_pdf,
+)
 
 logger = logging.getLogger("nmts.notifications")
 
@@ -267,8 +270,21 @@ def _scope_emails(users, *, dealer: str, branch: str = None, roles=()) -> list:
     return out
 
 
+def _dedupe_cc(to_emails: list, cc_emails: list) -> list:
+    to_keys = {email.lower() for email in to_emails}
+    seen_cc = set()
+    deduped_cc = []
+    for email in cc_emails:
+        key = email.lower()
+        if key in to_keys or key in seen_cc:
+            continue
+        seen_cc.add(key)
+        deduped_cc.append(email)
+    return deduped_cc
+
+
 def resolve_request_email_routing(users, group: dict) -> tuple:
-    """TO = supplying Dealer/Branch user when present.
+    """Request Sent routing. TO = supplying / request-receiving branch.
 
     If that branch has no valid role=user email, the responsible Admin
     (supplying-dealer admin, else requesting-dealer admin) is promoted
@@ -301,16 +317,44 @@ def resolve_request_email_routing(users, group: dict) -> tuple:
     cc_emails.extend(requesting_user_cc)
     cc_emails.extend(requesting_admin)
     cc_emails.extend(supplying_admin)
-    to_keys = {email.lower() for email in to_emails}
-    seen_cc = set()
-    deduped_cc = []
-    for email in cc_emails:
-        key = email.lower()
-        if key in to_keys or key in seen_cc:
-            continue
-        seen_cc.add(key)
-        deduped_cc.append(email)
-    return to_emails, deduped_cc
+    return to_emails, _dedupe_cc(to_emails, cc_emails)
+
+
+def resolve_receive_confirmed_email_routing(users, group: dict) -> tuple:
+    """Receive Confirmed routing. TO = receiving / requesting branch.
+
+    If that branch has no valid role=user email, the responsible Admin
+    (requesting-dealer admin, else supplying-dealer admin) is promoted
+    from CC to TO. CC is supplying / sending branch user + remaining
+    Admins. Master Admin is never included. Addresses are deduplicated.
+    Empty TO still means 'Receiver email not configured'.
+    """
+    group = group or {}
+    to_emails = _scope_emails(
+        users,
+        dealer=group.get("requesting_dealer"),
+        branch=group.get("requesting_branch"),
+        roles=("user",),
+    )
+    supplying_user_cc = _scope_emails(
+        users,
+        dealer=group.get("supplying_dealer"),
+        branch=group.get("supplying_branch"),
+        roles=("user",),
+    )
+    requesting_admin = _scope_emails(
+        users, dealer=group.get("requesting_dealer"), roles=("admin",),
+    )
+    supplying_admin = _scope_emails(
+        users, dealer=group.get("supplying_dealer"), roles=("admin",),
+    )
+    if not to_emails:
+        to_emails = list(requesting_admin) or list(supplying_admin)
+    cc_emails = []
+    cc_emails.extend(supplying_user_cc)
+    cc_emails.extend(requesting_admin)
+    cc_emails.extend(supplying_admin)
+    return to_emails, _dedupe_cc(to_emails, cc_emails)
 
 
 def normalize_phone_number(value: str, default_country_code: str = "91") -> str:
@@ -540,16 +584,23 @@ def build_request_pdf(group: dict) -> bytes:
     return build_request_print_pdf(group)
 
 
+def build_receive_receipt_pdf(group: dict) -> bytes:
+    """Receive Confirmed attachment: same request data as a final receipt."""
+    return build_receive_receipt_print_pdf(group)
+
+
 # --------------------------------------------------------------------------
-# Parts Transfer Request email (Amazon SES, PDF attachment)
+# Parts Transfer Request email (Gmail API, PDF attachment)
 # --------------------------------------------------------------------------
 WORKFLOW_EMAIL_SENT = "sent"
-WORKFLOW_EMAIL_COMPLETED = "completed"
-COMPLETED_HEADER_STATUSES = frozenset({"Completed", "Received"})
+WORKFLOW_EMAIL_RECEIVED = "received"
+WORKFLOW_EMAIL_COMPLETED = WORKFLOW_EMAIL_RECEIVED  # alias; Completed never emails
+RECEIVED_HEADER_STATUSES = frozenset({"Received"})
+COMPLETED_HEADER_STATUSES = RECEIVED_HEADER_STATUSES
 NO_WORKFLOW_EMAIL_STATUSES = frozenset({
     "Requested", "Approved", "Partially Approved", "Rejected", "Cancelled",
     "Dispatched", "Picking", "picking_finished", "In Transit", "Receive Pending",
-    "Snooze",
+    "Snooze", "Completed",
 })
 
 
@@ -557,17 +608,21 @@ def public_app_url() -> str:
     return _first_env("PUBLIC_APP_BASE_URL", default="https://sleepingstock.in").rstrip("/")
 
 
+def _is_receive_kind(kind: str) -> bool:
+    return str(kind or "").strip() in {WORKFLOW_EMAIL_RECEIVED, "completed", "receive_confirmed"}
+
+
 def should_send_request_completion_email(header_status: str) -> bool:
-    """True only for Received Confirmed / Finished. No intermediate or reject email."""
-    return str(header_status or "").strip() in COMPLETED_HEADER_STATUSES
+    """True only after explicit Receive Confirm. Internal Completed does not email."""
+    return str(header_status or "").strip() in RECEIVED_HEADER_STATUSES
 
 
 def workflow_email_kind_for_event(*, created: bool = False, header_status: str = "") -> str:
-    """Map a durable request event to the only allowed SES email kind, or empty."""
+    """Map a durable request event to the only allowed Gmail email kind, or empty."""
     if created:
         return WORKFLOW_EMAIL_SENT
     if should_send_request_completion_email(header_status):
-        return WORKFLOW_EMAIL_COMPLETED
+        return WORKFLOW_EMAIL_RECEIVED
     return ""
 
 
@@ -592,8 +647,9 @@ def build_request_email_subject(group: dict, subject_prefix: str = "", kind: str
         prefix = prefix + " "
     request_number = str(group.get("request_number", "-") or "-").strip() or "-"
     dealer_branch = _dealer_branch(group.get("supplying_dealer"), group.get("supplying_branch"))
-    if kind == WORKFLOW_EMAIL_COMPLETED:
-        purpose = "Stock request completed"
+    if _is_receive_kind(kind):
+        purpose = "Receive confirmed"
+        dealer_branch = _dealer_branch(group.get("requesting_dealer"), group.get("requesting_branch"))
     else:
         purpose = "New stock request received"
     return f"{prefix}Sleeping Stock \u2013 {purpose} \u2013 {dealer_branch} \u2013 {request_number}"
@@ -644,12 +700,19 @@ def build_request_workflow_content(group: dict, kind: str = WORKFLOW_EMAIL_SENT,
     request_number = str(group.get("request_number") or "-")
     order_number = str(group.get("order_number") or "-")
     requesting = _dealer_branch(group.get("requesting_dealer"), group.get("requesting_branch"))
-    receiving = _dealer_branch(group.get("supplying_dealer"), group.get("supplying_branch"))
-    status = str(group.get("status") or ("Completed" if kind == WORKFLOW_EMAIL_COMPLETED else "Requested"))
-    completed_at = str(
-        group.get("completed_at")
-        or group.get("received_at")
+    supplying = _dealer_branch(group.get("supplying_dealer"), group.get("supplying_branch"))
+    status = str(group.get("status") or ("Received" if _is_receive_kind(kind) else "Requested"))
+    if _is_receive_kind(kind) and status == "Completed":
+        status = "Received"
+    received_at = str(
+        group.get("received_at")
+        or group.get("completed_at")
         or group.get("updated_at")
+        or ""
+    ).strip() or "-"
+    confirmed_by = str(
+        group.get("received_user_name")
+        or group.get("completed_user_name")
         or ""
     ).strip() or "-"
     app_url = public_app_url()
@@ -658,15 +721,30 @@ def build_request_workflow_content(group: dict, kind: str = WORKFLOW_EMAIL_SENT,
         '<p style="color:#9F1239;font-weight:700;">THIS IS A TEST EMAIL. Ignore for operations.</p>'
         if test_note else ""
     )
-    if kind == WORKFLOW_EMAIL_COMPLETED:
-        headline = "Stock request completed"
+    if _is_receive_kind(kind):
+        headline = "Receive confirmed"
         intro = (
-            "This Sleeping Stock request is completed. "
-            "The receiving branch has confirmed receipt and the request workflow is finished."
+            "The receiving branch has confirmed physical receipt of this Sleeping Stock "
+            "transfer. The attached receipt is proof that the material was received and "
+            "the request lifecycle is finished."
         )
-        extra_rows = (("Completed at", completed_at),)
+        extra_rows = (
+            ("Sending branch/dealer", supplying),
+            ("Receiving branch/dealer", requesting),
+            ("Received/confirmed by", confirmed_by),
+            ("Receive confirmation date/time", received_at),
+        )
         footer = "No further action is required on this request."
-        attach_pdf = False
+        attach_pdf = True
+        rows = [
+            ("Request number", request_number),
+            ("Order number", order_number),
+            *extra_rows,
+            ("Total items", totals["items"]),
+            ("Total quantity", totals["qty"]),
+            ("Total value", totals["value"]),
+            ("Final received status", status),
+        ]
     else:
         headline = "New stock request received"
         intro = (
@@ -676,17 +754,17 @@ def build_request_workflow_content(group: dict, kind: str = WORKFLOW_EMAIL_SENT,
         extra_rows = (("Review in Sleeping Stock", app_url),)
         footer = f"Open Request Center in Sleeping Stock to accept or reject this request: {app_url}"
         attach_pdf = True
-    rows = [
-        ("Request number", request_number),
-        ("Order number", order_number),
-        ("From (requesting)", requesting),
-        ("To (receiving)", receiving),
-        ("Items", totals["items"]),
-        ("Quantity", totals["qty"]),
-        ("Value", totals["value"]),
-        ("Status", status),
-        *extra_rows,
-    ]
+        rows = [
+            ("Request number", request_number),
+            ("Order number", order_number),
+            ("From (requesting)", requesting),
+            ("To (receiving)", supplying),
+            ("Items", totals["items"]),
+            ("Quantity", totals["qty"]),
+            ("Value", totals["value"]),
+            ("Status", status),
+            *extra_rows,
+        ]
     text_lines = [
         "Dear Team,",
         "",

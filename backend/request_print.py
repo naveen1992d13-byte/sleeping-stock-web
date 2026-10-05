@@ -1,7 +1,8 @@
-"""Request Center Print layout — the single source used for Print and email PDF.
+"""Request Center Print layout — the source used for Print and email PDFs.
 
-The email attachment is this Print content/layout converted to PDF.
-Do not add a separate PDF template.
+The Request Sent attachment is this Print content/layout converted to PDF.
+The Receive Confirmed attachment uses the same request data presented as a
+final receipt (title, confirmer, receive date, finished note).
 """
 from __future__ import annotations
 
@@ -32,6 +33,19 @@ GREEN_TEXT = colors.HexColor("#166534")
 INK = colors.HexColor("#17211b")
 RULE = colors.HexColor("#d5ddd8")
 PRINT_NOTES = "Please verify part number, accepted quantity and LOC before dispatch."
+RECEIPT_NOTES = (
+    "Material received and confirmed. This receipt proves the request lifecycle is finished."
+)
+
+
+def _document_title(variant: str = "request") -> str:
+    if str(variant or "").strip().lower() == "receipt":
+        return "PARTS TRANSFER RECEIPT"
+    return "PARTS TRANSFER REQUEST"
+
+
+def _is_receipt(variant: str) -> bool:
+    return str(variant or "").strip().lower() == "receipt"
 
 _LOGO_CANDIDATES = [
     Path(__file__).resolve().parents[1] / "frontend" / "public" / "sleeping-stock-logo.png",
@@ -299,14 +313,35 @@ def _p(text, style):
     return Paragraph(html_escape("" if text is None else str(text)).replace("\n", "<br/>"), style)
 
 
-def build_request_pdf(group: dict) -> bytes:
-    """Convert Request Center Print content/layout to PDF (no separate template)."""
+def build_receive_receipt_pdf(group: dict) -> bytes:
+    """Same request data as Request Center Print, presented as a final receipt."""
+    return build_request_pdf(group, variant="receipt")
+
+
+def build_request_pdf(group: dict, variant: str = "request") -> bytes:
+    """Convert Request Center Print content/layout to PDF.
+
+    variant='request' is the Request Sent document.
+    variant='receipt' is the Receive Confirmed receipt from the same data.
+    """
     items = list(group.get("items") or [])
     total_accepted = sum(_item_accepted(item) for item in items)
     total_items = group.get("total_items", len(items))
     total_qty = group.get("total_qty", sum(float(i.get("requested_qty") or 0) for i in items))
     total_value = group.get("total_value", 0)
+    receipt = _is_receipt(variant)
     status = _display_status(group.get("status"))
+    if receipt and status in ("Completed", "-", ""):
+        status = "Received"
+    title_text = _document_title(variant)
+    notes_text = RECEIPT_NOTES if receipt else PRINT_NOTES
+    confirmed_by = _text(
+        group.get("received_user_name") or group.get("completed_user_name"),
+        "-",
+    )
+    received_at = _dtfmt(
+        group.get("received_at") or group.get("completed_at") or group.get("updated_at")
+    )
 
     buffer = BytesIO()
     doc = BaseDocTemplate(
@@ -361,11 +396,11 @@ def build_request_pdf(group: dict) -> bytes:
         header_row = [[
             logo,
             brand_block,
-            Paragraph("PARTS TRANSFER REQUEST", title),
+            Paragraph(title_text, title),
         ]]
         col_widths = [20 * mm, doc.width - 72 * mm, 52 * mm]
     else:
-        header_row = [[brand_block, Paragraph("PARTS TRANSFER REQUEST", title)]]
+        header_row = [[brand_block, Paragraph(title_text, title)]]
         col_widths = [doc.width - 52 * mm, 52 * mm]
     header_table = Table(header_row, colWidths=col_widths)
     header_table.setStyle(TableStyle([
@@ -377,14 +412,15 @@ def build_request_pdf(group: dict) -> bytes:
     story.append(header_table)
     story.append(Spacer(1, 4))
 
-    meta = Table(
-        [
-            [Paragraph("<b>REQUEST NO</b>", small), Paragraph(f": {_text(group.get('request_number'))}", small)],
-            [Paragraph("<b>REFERENCE NO (ORDER NO)</b>", small), Paragraph(f": {_text(group.get('order_number'))}", small)],
-            [Paragraph("<b>REQUEST DATE</b>", small), Paragraph(f": {_dtfmt(group.get('requested_at') or group.get('created_at'))}", small)],
-        ],
-        colWidths=[42 * mm, 48 * mm],
-    )
+    meta_rows = [
+        [Paragraph("<b>REQUEST NO</b>", small), Paragraph(f": {_text(group.get('request_number'))}", small)],
+        [Paragraph("<b>REFERENCE NO (ORDER NO)</b>", small), Paragraph(f": {_text(group.get('order_number'))}", small)],
+        [Paragraph("<b>REQUEST DATE</b>", small), Paragraph(f": {_dtfmt(group.get('requested_at') or group.get('created_at'))}", small)],
+    ]
+    if receipt:
+        meta_rows.append([Paragraph("<b>RECEIVE DATE</b>", small), Paragraph(f": {received_at}", small)])
+        meta_rows.append([Paragraph("<b>CONFIRMED BY</b>", small), Paragraph(f": {confirmed_by}", small)])
+    meta = Table(meta_rows, colWidths=[42 * mm, 48 * mm])
     def _metric(label, value):
         return Paragraph(
             f"<font size='6'>{html_escape(str(label))}</font><br/>"
@@ -516,7 +552,7 @@ def build_request_pdf(group: dict) -> bytes:
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
     notes = Table(
-        [[Paragraph(f"<b>Notes:</b> {PRINT_NOTES}", small)]],
+        [[Paragraph(f"<b>Notes:</b> {notes_text}", small)]],
         colWidths=[doc.width],
     )
     notes.setStyle(TableStyle([

@@ -69,12 +69,12 @@ class _FakeHeaders:
 
 def test_only_two_workflow_email_kinds():
     assert notifications.workflow_email_kind_for_event(created=True) == "sent"
-    assert notifications.workflow_email_kind_for_event(header_status="Received") == "completed"
-    assert notifications.workflow_email_kind_for_event(header_status="Completed") == "completed"
+    assert notifications.workflow_email_kind_for_event(header_status="Received") == "received"
+    assert notifications.workflow_email_kind_for_event(header_status="Completed") == ""
     for status in (
         "Requested", "Approved", "Partially Approved", "Rejected", "Cancelled",
         "Dispatched", "Picking", "picking_finished", "In Transit",
-        "Receive Pending", "Snooze",
+        "Receive Pending", "Snooze", "Completed",
     ):
         assert notifications.workflow_email_kind_for_event(header_status=status) == ""
 
@@ -96,21 +96,26 @@ def test_sent_email_summary_fields_and_review_link():
     assert "DEBUG" not in html
 
 
-def test_completed_email_summary_fields_no_pdf():
+def test_receive_confirmed_email_summary_fields_with_pdf():
     group = dict(
-        GROUP, status="Completed", completed_at="2026-10-04T08:15:00+00:00",
-        accepted_total_qty=5,
+        GROUP, status="Received", received_at="2026-10-04T08:15:00+00:00",
+        received_user_name="Priya Receiver", accepted_total_qty=5,
     )
-    content = notifications.build_request_workflow_content(group, kind=notifications.WORKFLOW_EMAIL_COMPLETED)
+    content = notifications.build_request_workflow_content(group, kind=notifications.WORKFLOW_EMAIL_RECEIVED)
     body = content["text_body"]
-    assert content["attach_pdf"] is False
-    assert "Stock request completed" in content["subject"]
-    assert "workflow is finished" in body
+    assert content["attach_pdf"] is True
+    assert "Receive confirmed" in content["subject"]
+    assert "Priya Receiver" in body
     assert "2026-10-04T08:15:00+00:00" in body
     assert "No further action is required" in body
     assert "RQHY2610030001" in body
-    assert "Koyambedu" in body
-    assert "Vanagaram" in body
+    assert "ORHY2610030001" in body
+    assert "Sending branch/dealer: FPL Automobiles PVT LTD Koyambedu" in body
+    assert "Receiving branch/dealer: FPL Automobiles PVT LTD Vanagaram" in body
+    assert "Final received status: Received" in body
+    assert "Total items: 2" in body
+    assert "Total quantity: 5" in body
+    assert "Total value: 2,500" in body
 
 
 def test_claim_prevents_duplicate_sent_and_completed_emails():
@@ -140,7 +145,7 @@ def test_force_resend_only_when_sent_flag_is_not_true():
     assert headers.claim(result=False, force=True) is None
 
 
-def test_routing_preserved_for_both_emails():
+def test_routing_preserved_for_sent_and_swapped_for_receive():
     users = [
         {"email": "koyambedu.user@gmail.com", "role": "user", "group": "FPL Automobiles PVT LTD",
          "location": "Koyambedu", "status": "active"},
@@ -155,3 +160,9 @@ def test_routing_preserved_for_both_emails():
     assert "vanagaram.user@gmail.com" in cc_emails
     assert "dealer.admin@gmail.com" in cc_emails
     assert "admin@sleepingstock.in" not in to_emails + cc_emails
+
+    recv_to, recv_cc = notifications.resolve_receive_confirmed_email_routing(users, GROUP)
+    assert recv_to == ["vanagaram.user@gmail.com"]
+    assert "koyambedu.user@gmail.com" in recv_cc
+    assert "dealer.admin@gmail.com" in recv_cc
+    assert "admin@sleepingstock.in" not in recv_to + recv_cc

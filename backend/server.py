@@ -4823,6 +4823,13 @@ async def _resolve_request_email_routing(group_doc: dict) -> tuple:
     return notifications.resolve_request_email_routing(users, group_doc)
 
 
+async def _resolve_receive_confirmed_email_routing(group_doc: dict) -> tuple:
+    """TO = requesting / receiving branch user, else responsible Admin.
+    CC = supplying / sending branch + remaining dealer admins. Master never."""
+    users = await _load_request_email_users(group_doc)
+    return notifications.resolve_receive_confirmed_email_routing(users, group_doc)
+
+
 async def _receiver_users_for_group(group_doc: dict) -> list:
     """Same supplying-branch user list Request Center Print shows as Requested To."""
     brand = str(group_doc.get('supplying_brand') or group_doc.get('requesting_brand') or '').strip()
@@ -4871,9 +4878,9 @@ async def _claim_request_workflow_email(group_doc: dict, *, result: bool = False
 
 
 async def _send_request_group_email(group_doc: dict, *, result: bool = False, force: bool = False):
-    """Best-effort SES dispatch for request-sent or request-completed only.
+    """Best-effort Gmail dispatch for request-sent or receive-confirmed only.
     Never raises — the request is already saved before this runs."""
-    kind = notifications.WORKFLOW_EMAIL_COMPLETED if result else notifications.WORKFLOW_EMAIL_SENT
+    kind = notifications.WORKFLOW_EMAIL_RECEIVED if result else notifications.WORKFLOW_EMAIL_SENT
     claimed = await _claim_request_workflow_email(group_doc, result=result, force=force)
     if not claimed:
         logging.getLogger('nmts.notifications').info(
@@ -4882,7 +4889,17 @@ async def _send_request_group_email(group_doc: dict, *, result: bool = False, fo
         return
     group_doc = claimed
     now = datetime.now(timezone.utc).isoformat()
-    to_emails, cc_emails = await _resolve_request_email_routing(group_doc)
+    if result:
+        to_emails, cc_emails = await _resolve_receive_confirmed_email_routing(group_doc)
+        attachment_filename = (
+            group_doc.get('receipt_pdf_filename')
+            or f"{group_doc.get('request_number')}-receipt.pdf"
+        )
+        notification_type = 'request_receive_confirmed'
+    else:
+        to_emails, cc_emails = await _resolve_request_email_routing(group_doc)
+        attachment_filename = group_doc.get('pdf_filename') or f"{group_doc.get('request_number')}.pdf"
+        notification_type = 'request_sent'
     receiver_email = ', '.join(to_emails)
     log_id = str(uuid.uuid4())
     subject = notifications.build_request_email_subject(group_doc, kind=kind)
@@ -4893,9 +4910,9 @@ async def _send_request_group_email(group_doc: dict, *, result: bool = False, fo
     base_log = {
         'id': log_id, 'request_id': group_doc['id'], 'request_number': group_doc['request_number'],
         'order_id': group_doc.get('order_id'), 'receiver_user_id': '', 'receiver_email': receiver_email or '',
-        'notification_type': 'request_completed' if result else 'request_sent',
+        'notification_type': notification_type,
         'channel': 'email', 'subject': subject,
-        'attachment_filename': (group_doc.get('pdf_filename') or f"{group_doc.get('request_number')}.pdf") if not result else '',
+        'attachment_filename': attachment_filename,
         'retry_count': group_doc.get('retry_count', 0),
         'created_at': now,
     }
@@ -4911,19 +4928,27 @@ async def _send_request_group_email(group_doc: dict, *, result: bool = False, fo
         return
 
     pdf_bytes = None
-    if kind == notifications.WORKFLOW_EMAIL_SENT:
-        try:
-            print_group = await _print_group_for_email(group_doc)
+    email_group = dict(group_doc)
+    email_group['pdf_filename'] = attachment_filename
+    try:
+        print_group = await _print_group_for_email(group_doc)
+        email_group.setdefault('received_user_name', print_group.get('received_user_name'))
+        email_group.setdefault('received_at', print_group.get('received_at'))
+        email_group.setdefault('completed_user_name', print_group.get('completed_user_name'))
+        email_group.setdefault('completed_at', print_group.get('completed_at'))
+        if result:
+            pdf_bytes = notifications.build_receive_receipt_pdf(print_group)
+        else:
             pdf_bytes = notifications.build_request_pdf(print_group)
-        except Exception as exc:  # noqa: BLE001 — keep the transactional notice even if PDF fails
-            logging.getLogger('nmts.notifications').warning(
-                'Request sent email PDF failed for %s; sending without attachment: %s',
-                group_doc.get('request_number'), str(exc)[:250],
-            )
-            pdf_bytes = None
+    except Exception as exc:  # noqa: BLE001 — keep the transactional notice even if PDF fails
+        logging.getLogger('nmts.notifications').warning(
+            'Request %s email PDF failed for %s; sending without attachment: %s',
+            kind, group_doc.get('request_number'), str(exc)[:250],
+        )
+        pdf_bytes = None
 
     send_result = await asyncio.get_event_loop().run_in_executor(
-        None, notifications.send_request_workflow_email, to_emails, group_doc, pdf_bytes, cc_emails, '', kind,
+        None, notifications.send_request_workflow_email, to_emails, email_group, pdf_bytes, cc_emails, '', kind,
     )
     sent = send_result.get('status') == 'sent'
     if not sent:
@@ -7325,7 +7350,7 @@ async def _notify_request_group_outcome(request_number: str, actor_id: str = "")
         try:
             await _send_request_group_email(header, result=True)
         except Exception as exc:  # noqa: BLE001
-            logging.getLogger('nmts.notifications').warning('request completed email failed: %s', str(exc)[:300])
+            logging.getLogger('nmts.notifications').warning('request receive-confirmed email failed: %s', str(exc)[:300])
 
 
 async def _notify_request_status_change(req: dict, event: str, actor_id: str = ""):

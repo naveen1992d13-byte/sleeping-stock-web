@@ -7,7 +7,9 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from notifications import (
+    WORKFLOW_EMAIL_RECEIVED,
     build_request_email_subject,
+    resolve_receive_confirmed_email_routing,
     resolve_request_email_routing,
     send_request_pdf_email,
 )
@@ -128,3 +130,31 @@ def test_subject_uses_finalized_sleeping_stock_request_format():
 def test_invalid_to_skips_without_raising():
     result = send_request_pdf_email('invalid', GROUP, b'%PDF')
     assert result.get('status') in ('skipped', 'failed')
+
+
+def test_receive_confirmed_to_is_requesting_branch_user():
+    to_emails, cc_emails = resolve_receive_confirmed_email_routing(USERS, GROUP)
+    assert to_emails == ['vanagaram.user@gmail.com']
+    assert 'vanagaram.user@gmail.com' not in cc_emails
+    assert 'koyambedu.user@gmail.com' in cc_emails
+    assert 'dealer.admin@gmail.com' in cc_emails
+    assert 'admin@sleepingstock.in' not in to_emails
+    assert 'admin@sleepingstock.in' not in cc_emails
+
+
+def test_receive_confirmed_missing_requesting_user_promotes_admin():
+    to_emails, cc_emails = resolve_receive_confirmed_email_routing(
+        USERS,
+        dict(GROUP, requesting_branch='Unknown Branch'),
+    )
+    assert to_emails == ['dealer.admin@gmail.com']
+    assert 'dealer.admin@gmail.com' not in cc_emails
+    assert 'koyambedu.user@gmail.com' in cc_emails
+    assert 'admin@sleepingstock.in' not in to_emails + cc_emails
+
+
+def test_receive_confirmed_subject_uses_receiving_branch():
+    subject = build_request_email_subject(GROUP, kind=WORKFLOW_EMAIL_RECEIVED)
+    assert subject == (
+        'Sleeping Stock – Receive confirmed – FPL Automobiles PVT LTD Vanagaram – RQHY2609080001'
+    )

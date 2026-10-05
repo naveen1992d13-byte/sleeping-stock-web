@@ -119,6 +119,37 @@ def test_print_columns_match_request_center():
     ]
 
 
+def test_receive_receipt_pdf_is_same_data_as_final_receipt():
+    group = dict(
+        GROUP,
+        status='Received',
+        received_at='2026-10-04T11:30:00+00:00',
+        received_user_name='Priya Receiver',
+        items=[{
+            **GROUP['items'][0],
+            'accepted_qty': 2,
+            'status': 'Received',
+        }],
+    )
+    pdf = request_print.build_receive_receipt_pdf(group)
+    assert pdf[:4] == b'%PDF'
+    hay = _pdf_haystack(pdf)
+    assert 'PARTS TRANSFER RECEIPT' in hay
+    assert 'PARTS TRANSFER REQUEST' not in hay
+    assert 'RQHY2609110001' in hay
+    assert 'ORHY2609110001' in hay
+    assert 'Priya Receiver' in hay
+    assert 'RECEIVE DATE' in hay
+    assert 'CONFIRMED BY' in hay
+    assert 'Material received and confirmed' in hay
+    assert 'request lifecycle is finished' in hay
+    assert 'P-PRINT-1' in hay
+    assert 'Please verify part number, accepted quantity and LOC before dispatch.' not in hay
+    via_notifications = notifications.build_receive_receipt_pdf(group)
+    assert via_notifications[:4] == b'%PDF'
+    assert 'PARTS TRANSFER RECEIPT' in _pdf_haystack(via_notifications)
+
+
 def test_assemble_print_group_keeps_uploaded_loc():
     header = {'request_number': 'RQ-LOC', 'requested_user_name': 'A'}
     items = [{'part_number': 'P1', 'loc_at_request': '', 'loc': 'RACK-9', 'requested_qty': 1}]
