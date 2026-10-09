@@ -1468,25 +1468,52 @@ async def prune_product_history_date(db, archive_date: str, *, force: bool = Fal
     sum_res = await db.batch_summaries.delete_many(sum_q)
     summaries_deleted = int(getattr(sum_res, "deleted_count", 0) or 0)
 
+    # Published staging rows for the same date only. Never delete `uploads`
+    # metadata (Upload History list / original Excel pointers).
+    items_q = {
+        "publish_status": "Published",
+        "$or": [
+            {"active_date_key": {"$in": [date_key, date_iso]}},
+            {"date_key": {"$in": [date_key, date_iso]}},
+        ],
+    }
+    items_before = await db.upload_items.count_documents(items_q)
+    items_res = await db.upload_items.delete_many(items_q)
+    items_deleted = int(getattr(items_res, "deleted_count", 0) or 0)
+
+    s3_keys = [m.get("storage_key") for m in verified if m.get("storage_key")]
+    pruned_at = _ist_now().astimezone(timezone.utc).isoformat()
     for manifest in verified:
         await am.mark_status(
             db,
             manifest["archive_id"],
             am.STATUS_PRUNED,
-            pruned_at=_ist_now().astimezone(timezone.utc).isoformat(),
+            pruned_at=pruned_at,
             pruned_product_count=deleted,
             pruned_summary_count=summaries_deleted,
+            pruned_upload_items=items_deleted,
             eligible_for_prune=False,
         )
-    return {
-        "status": "pruned",
+    receipt = {
         "archive_date": date_iso,
+        "status": "pruned",
+        "s3_keys": s3_keys,
+        "archived_count": sum(int(m.get("record_count") or 0) for m in verified),
         "deleted": deleted,
-        "summaries_deleted": summaries_deleted,
         "counted_before": before,
+        "summaries_deleted": summaries_deleted,
+        "upload_items_deleted": items_deleted,
+        "upload_items_counted_before": items_before,
+        "uploads_metadata_deleted": 0,
         "manifest_id": verified[0].get("archive_id"),
         "manifests_pruned": len(verified),
+        "pruned_at": pruned_at,
     }
+    try:
+        await db.archive_prune_receipts.insert_one(dict(receipt))
+    except Exception as exc:
+        logger.warning("Could not persist prune receipt for %s: %s", date_iso, exc)
+    return receipt
 
 
 async def prune_eligible_mongo_history(db, module: str = MODULE_PRODUCT_HISTORY) -> Dict[str, Any]:

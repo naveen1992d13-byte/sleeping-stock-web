@@ -70,6 +70,7 @@ def test_snapshot_date_and_origin_query(monkeypatch, tmp_path):
         "business_date_key": "20260919",
     }), encoding="utf-8")
     monkeypatch.setenv("APP_ENV", "testing")
+    monkeypatch.setenv("TESTING_OVERLAY_MODE", "false")
     monkeypatch.setenv("NMTS_SNAPSHOT_META_JSON", str(meta))
     assert tr.snapshot_business_date_key() == "20260919"
     query = tr.origin_query("all")
@@ -78,6 +79,16 @@ def test_snapshot_date_and_origin_query(monkeypatch, tmp_path):
     assert snapshot_only["data_origin"] == "snapshot"
     assert snapshot_only["snapshot_version"] == "20260920T010000Z"
     assert tr.origin_query("testing") == {"data_origin": "testing"}
+
+
+def test_overlay_origin_query_does_not_use_snapshot_copy(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "testing")
+    monkeypatch.setenv("TESTING_OVERLAY_MODE", "true")
+    assert tr.origin_query("all") == {}
+    assert tr.origin_query("testing").get("_nmts_testing_only") is True
+    assert tr.origin_query("snapshot").get("_nmts_base_only") is True
+    status = tr.public_runtime_status()
+    assert status["overlay_mode"] is True
 
 
 def test_stamp_origin_noop_in_production(monkeypatch):

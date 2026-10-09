@@ -189,7 +189,16 @@ def whatsapp_test_mode() -> bool:
 
 
 def email_test_mode() -> bool:
-    return _env("EMAIL_TEST_MODE", "").strip().lower() in ("1", "true", "yes")
+    raw = _env("EMAIL_TEST_MODE", "").strip().lower()
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("0", "false", "no"):
+        return False
+    try:
+        from . import testing_runtime
+    except ImportError:
+        import testing_runtime
+    return testing_runtime.is_testing_env()
 
 
 def _email_test_redirect(to_email: str, cc_email: str = "") -> tuple:

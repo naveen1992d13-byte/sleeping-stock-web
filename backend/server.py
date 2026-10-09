@@ -110,7 +110,17 @@ testing_runtime.assert_env_isolation()
 mongo_url = resolve_mongo_url()
 _mongo_url, _mongo_kwargs = build_mongo_client_args(mongo_url)
 client = AsyncIOMotorClient(_mongo_url, **_mongo_kwargs)
-db = client[os.environ['DB_NAME']]
+_raw_db = client[os.environ['DB_NAME']]
+if testing_runtime.is_testing_env() and testing_runtime.overlay_mode_enabled():
+    try:
+        from . import testing_overlay as _testing_overlay
+    except ImportError:
+        import testing_overlay as _testing_overlay
+    db = _testing_overlay.wrap_testing_database(client, _raw_db, _mongo_url, _mongo_kwargs)
+    testing_db_raw = _raw_db
+else:
+    db = _raw_db
+    testing_db_raw = _raw_db if testing_runtime.is_testing_env() else None
 
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -546,10 +556,18 @@ async def login(login_data: LoginRequest):
         )
 
     now = datetime.now(timezone.utc).isoformat()
-    await db.users.update_one(
-        {"id": user["id"]},
-        {"$set": {"last_login": now, "lastLogin": now}}
-    )
+    stamp_login = True
+    if testing_runtime.is_testing_env() and testing_runtime.overlay_mode_enabled():
+        try:
+            from . import testing_overlay as _login_overlay
+        except ImportError:
+            import testing_overlay as _login_overlay
+        stamp_login = _login_overlay.is_testing_created_doc(user)
+    if stamp_login:
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$set": {"last_login": now, "lastLogin": now}}
+        )
     user["last_login"] = now
     user["permissions"] = normalize_permissions(user.get("permissions"))
     _apply_testing_master_permissions(user)
@@ -8785,6 +8803,155 @@ async def testing_deployment_metadata():
     return testing_runtime.load_deployment_metadata()
 
 
+def _require_testing_master(current_user: UserResponse):
+    if not testing_runtime.is_testing_env():
+        raise HTTPException(status_code=404, detail="Not a testing environment")
+    if str(current_user.role or "").lower() != "master":
+        raise HTTPException(status_code=403, detail="Testing Master / Master Admin only")
+
+
+@api_router.get("/testing/github/status")
+async def testing_github_status():
+    """Public-in-testing PR banner payload. Never includes GitHub tokens."""
+    if not testing_runtime.is_testing_env():
+        raise HTTPException(status_code=404, detail="Not a testing environment")
+    try:
+        from . import testing_github as tg
+    except ImportError:
+        import testing_github as tg
+    return await tg.fetch_pr_status()
+
+
+@api_router.post("/testing/github/merge")
+async def testing_github_merge(payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    _require_testing_master(current_user)
+    try:
+        from . import testing_github as tg
+        from . import testing_overlay as ov
+    except ImportError:
+        import testing_github as tg
+        import testing_overlay as ov
+    body = payload or {}
+    operation_id = str(body.get("operation_id") or "").strip() or tg.operation_id_for(
+        f"{current_user.id}:{body.get('confirm_text')}"
+    )
+    existing = await (testing_db_raw or db)[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
+    if existing:
+        return {"ok": True, "status": "idempotent_replay", "receipt": existing.get("receipt") or existing}
+    result = await tg.merge_pull_request(
+        confirm_text=str(body.get("confirm_text") or ""),
+        operation_id=operation_id,
+        actor={"id": current_user.id, "role": current_user.role},
+    )
+    if result.get("status") == "merged":
+        expected_sha = (
+            (result.get("receipt") or {}).get("merge_sha")
+            or (result.get("receipt") or {}).get("head_sha")
+            or ""
+        )
+        verification = await tg.verify_production_deployment(expected_sha)
+        result["production_verification"] = verification
+        if verification.get("ok"):
+            try:
+                from . import testing_cleanup as tc
+            except ImportError:
+                import testing_cleanup as tc
+            if tc.live_cleanup_enabled():
+                result["cleanup"] = await tc.cleanup_testing_data(
+                    testing_db_raw or db,
+                    confirm_text=str(body.get("confirm_text") or ""),
+                    actor={"id": current_user.id, "role": current_user.role},
+                    operation_id=f"{operation_id}:cleanup",
+                    reason="post_merge",
+                )
+            else:
+                result["cleanup"] = {
+                    "ok": True,
+                    "status": "deferred",
+                    "message": "Production verified. Live Testing cleanup is disabled until TESTING_LIVE_CLEANUP=true and operator approval.",
+                }
+        else:
+            result["ok"] = False
+            result["status"] = "merged_unverified"
+            result["cleanup"] = {
+                "ok": False,
+                "status": "retained",
+                "message": "Production verification failed. All Testing data was retained.",
+            }
+    await (testing_db_raw or db)[ov.OPERATION_COLLECTION].insert_one({
+        "operation_id": operation_id,
+        "kind": "github_merge",
+        "user_id": current_user.id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "result_status": result.get("status"),
+        "receipt": result.get("receipt") or {},
+        "production_verification": result.get("production_verification") or {},
+        "cleanup": result.get("cleanup") or {},
+    })
+    return result
+
+
+@api_router.get("/testing/cleanup/inventory")
+async def testing_cleanup_inventory(current_user: UserResponse = Depends(get_current_user)):
+    _require_testing_master(current_user)
+    try:
+        from . import testing_cleanup as tc
+    except ImportError:
+        import testing_cleanup as tc
+    return await tc.inventory(testing_db_raw or db)
+
+
+@api_router.post("/testing/cleanup")
+async def testing_cleanup_run(payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    _require_testing_master(current_user)
+    try:
+        from . import testing_cleanup as tc
+        from . import testing_github as tg
+        from . import testing_overlay as ov
+    except ImportError:
+        import testing_cleanup as tc
+        import testing_github as tg
+        import testing_overlay as ov
+    body = payload or {}
+    operation_id = str(body.get("operation_id") or "").strip() or tg.operation_id_for(
+        f"cleanup:{current_user.id}"
+    )
+    existing = await (testing_db_raw or db)[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
+    if existing:
+        return {"ok": True, "status": "idempotent_replay", "receipt": existing.get("receipt") or existing}
+    result = await tc.cleanup_testing_data(
+        testing_db_raw or db,
+        confirm_text=str(body.get("confirm_text") or ""),
+        actor={"id": current_user.id, "role": current_user.role},
+        operation_id=operation_id,
+        reason=str(body.get("reason") or "manual"),
+    )
+    await (testing_db_raw or db)[ov.OPERATION_COLLECTION].insert_one({
+        "operation_id": operation_id,
+        "kind": "testing_cleanup",
+        "user_id": current_user.id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "result_status": result.get("status"),
+        "receipt": result.get("receipt") or {},
+    })
+    return result
+
+
+@api_router.post("/testing/overlay/reset")
+async def testing_overlay_reset(payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    _require_testing_master(current_user)
+    try:
+        from . import testing_overlay as ov
+    except ImportError:
+        import testing_overlay as ov
+    body = payload or {}
+    return await ov.reset_overlay(
+        testing_db_raw or db,
+        str(body.get("production_id") or body.get("id") or ""),
+        str(body.get("collection") or ""),
+    )
+
+
 app.include_router(api_router)
 
 @app.middleware("http")
@@ -8809,6 +8976,8 @@ async def maintenance_guard(request: Request, call_next):
     if path.endswith("/testing/runtime") or path.endswith("/api/testing/runtime"):
         return await call_next(request)
     if path.endswith("/testing/deployment") or path.endswith("/api/testing/deployment"):
+        return await call_next(request)
+    if path.endswith("/testing/github/status") or path.endswith("/api/testing/github/status"):
         return await call_next(request)
 
     # Identify caller (best-effort)
@@ -8968,13 +9137,21 @@ async def seed_master_user_on_startup():
         logger.info("Archive manifest indexes verified")
         await archive_runs.ensure_run_indexes(db)
         logger.info("Archive run ledger indexes verified")
+        if testing_runtime.is_testing_env() and testing_db_raw is not None:
+            try:
+                from . import testing_overlay as _testing_overlay
+            except ImportError:
+                import testing_overlay as _testing_overlay
+            await _testing_overlay.ensure_overlay_indexes(testing_db_raw)
+            logger.info("Testing overlay indexes verified")
         try:
             import storage_usage as su
             await su.ensure_usage_indexes(db)
             logger.info("Storage usage indexes verified")
         except Exception as exc:
             logger.warning("Storage usage index creation failed: %s", exc)
-        archive_scheduler.start_archive_scheduler(db)
+        archive_target = testing_db_raw if testing_runtime.is_testing_env() and testing_db_raw is not None else db
+        archive_scheduler.start_archive_scheduler(archive_target)
         logger.info("Archive scheduler started (ARCHIVE_PRUNE_ENABLED=%s)", s3_storage.archive_prune_enabled())
 
         async def _sla_apply_timeout(header):
