@@ -317,6 +317,14 @@ def test_sorted_pagination_merges_deltas_without_truncation():
     assert grouped[0]["qty"] == 1 + 4 + 1 + 9
     assert prod.rows[1]["qty"] == 1
 
+    async def _async_for():
+        ids = []
+        async for row in col.find({}).sort("part_number", 1):
+            ids.append(row["id"])
+        return ids
+
+    assert asyncio.run(_async_for()) == ["a", "TS-1", "b", "d"]
+
 
 def test_ops_db_does_not_bool_motor_database():
     import testing_verify as tv

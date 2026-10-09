@@ -358,6 +358,26 @@ class OverlayCursor:
                 break
         return rows
 
+    async def __aiter__(self):
+        await self._ensure()
+        if self._inner is not None:
+            async for doc in _aiter(self._inner):
+                yield self._project(doc)
+            return
+        skipped = 0
+        taken = 0
+        stream = self._stream
+        if stream is None:
+            return
+        async for doc in stream():
+            if skipped < self._skip:
+                skipped += 1
+                continue
+            yield self._project(doc)
+            taken += 1
+            if self._limit is not None and taken >= int(self._limit):
+                return
+
 
 _MISSING = object()
 
