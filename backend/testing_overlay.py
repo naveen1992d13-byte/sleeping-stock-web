@@ -359,6 +359,132 @@ class OverlayCursor:
         return rows
 
 
+_MISSING = object()
+
+
+class _Peek:
+    def __init__(self, source, kind: str = ""):
+        self.kind = kind
+        self._source = source
+        self._aiter = None
+        self._cur = _MISSING
+
+    async def _ensure(self):
+        if self._aiter is None:
+            self._aiter = _aiter(self._source).__aiter__()
+
+    async def peek(self):
+        await self._ensure()
+        if self._cur is _MISSING:
+            try:
+                self._cur = await self._aiter.__anext__()
+            except StopAsyncIteration:
+                self._cur = None
+        return self._cur
+
+    async def pop(self):
+        value = await self.peek()
+        self._cur = _MISSING
+        return value
+
+
+def _sort_pairs(spec) -> List[tuple[str, int]]:
+    if spec is None:
+        return []
+    if isinstance(spec, Mapping):
+        return [(str(key), int(val)) for key, val in spec.items()]
+    if isinstance(spec, (list, tuple)):
+        if spec and isinstance(spec[0], (list, tuple)):
+            return [(str(key), int(direction)) for key, direction in spec]
+        if len(spec) == 2 and isinstance(spec[0], str):
+            return [(spec[0], int(spec[1]))]
+    if isinstance(spec, str):
+        return [(spec, 1)]
+    return []
+
+
+def _apply_sort(cursor, spec):
+    pairs = _sort_pairs(spec)
+    if not pairs or cursor is None or not hasattr(cursor, "sort"):
+        return cursor
+    if len(pairs) == 1:
+        cursor.sort(pairs[0][0], pairs[0][1])
+    else:
+        cursor.sort(pairs)
+    return cursor
+
+
+def _sort_key_tuple(doc: Mapping[str, Any], pairs: Sequence[tuple[str, int]]):
+    keys = []
+    for field, direction in pairs:
+        val = doc.get(field)
+        missing = val is None
+        keyed = val if not missing else ""
+        if int(direction) < 0:
+            keys.append((not missing, keyed))
+        else:
+            keys.append((missing, keyed))
+    return tuple(keys)
+
+
+def _doc_sort_before(left: Mapping[str, Any], right: Mapping[str, Any], pairs) -> bool:
+    lkey = _sort_key_tuple(left, pairs)
+    rkey = _sort_key_tuple(right, pairs)
+    try:
+        return lkey < rkey
+    except TypeError:
+        return str(lkey) < str(rkey)
+
+
+def _extract_sort_limit(stages: Sequence[Mapping[str, Any]]):
+    core: List[Mapping[str, Any]] = []
+    sort_spec = None
+    skip_n = 0
+    limit_n = None
+    for stage in stages or []:
+        if not isinstance(stage, Mapping) or len(stage) != 1:
+            core.append(stage)
+            continue
+        op, spec = next(iter(stage.items()))
+        if op == "$sort":
+            sort_spec = spec
+        elif op == "$skip":
+            skip_n = spec
+        elif op == "$limit":
+            limit_n = spec
+        else:
+            core.append(stage)
+    return core, sort_spec, skip_n, limit_n
+
+
+def _merge_group_results(rows: Sequence[Mapping[str, Any]], group_spec: Mapping[str, Any]) -> List[dict]:
+    acc_specs = {key: val for key, val in group_spec.items() if key != "_id"}
+    grouped: Dict[Any, dict] = {}
+    for row in rows:
+        ident = row.get("_id")
+        slot_key = ident if not isinstance(ident, dict) else tuple(sorted(ident.items()))
+        slot = grouped.get(slot_key)
+        if slot is None:
+            grouped[slot_key] = dict(row)
+            continue
+        for field, expr in acc_specs.items():
+            if isinstance(expr, Mapping) and "$sum" in expr:
+                try:
+                    slot[field] = (slot.get(field) or 0) + (row.get(field) or 0)
+                except TypeError:
+                    slot[field] = row.get(field, slot.get(field))
+            elif isinstance(expr, Mapping) and "$max" in expr:
+                cur, nxt = slot.get(field), row.get(field)
+                slot[field] = nxt if cur is None else (cur if nxt is None else max(cur, nxt))
+            elif isinstance(expr, Mapping) and "$min" in expr:
+                cur, nxt = slot.get(field), row.get(field)
+                slot[field] = nxt if cur is None else (cur if nxt is None else min(cur, nxt))
+            else:
+                if field not in slot or slot.get(field) is None:
+                    slot[field] = row.get(field)
+    return list(grouped.values())
+
+
 _WRITE_METHOD_PREFIXES = (
     "insert", "update", "replace", "delete", "remove", "bulk", "drop", "rename",
     "create_index", "create_indexes", "drop_index", "find_one_and", "save",
@@ -443,6 +569,9 @@ class ReadOnlyCollection:
     def find_one_and_delete(self, *args, **kwargs):
         self._blocked("find_one_and_delete")
 
+    def find_one_and_modify(self, *args, **kwargs):
+        self._blocked("find_one_and_modify")
+
     def create_index(self, *args, **kwargs):
         self._blocked("create_index")
 
@@ -519,15 +648,21 @@ class OverlayCollection:
         out.setdefault("data_origin", "production")
         return out
 
-    async def _stream_merged(self, query=None):
+    async def _stream_merged(self, query=None, sort=None):
         raw, base_only, testing_only = _strip_overlay_flags(query)
         if self._local_only():
             cursor = self._test.find(raw, {"_id": 0})
+            cursor = _apply_sort(cursor, sort)
             async for row in _aiter(cursor):
                 yield dict(row)
             return
         hidden = set() if testing_only else await self._tombstone_ids()
         overlays = {} if (base_only or testing_only) else await self._overlay_map()
+        pairs = _sort_pairs(sort)
+        if pairs and not testing_only:
+            async for row in self._sorted_merge(raw, hidden, overlays, base_only, pairs):
+                yield row
+            return
         created_by_id: Dict[str, dict] = {}
         if not base_only:
             try:
@@ -569,22 +704,99 @@ class OverlayCollection:
                 if _doc_matches(payload, raw):
                     yield payload
 
+    async def _sorted_merge(self, raw, hidden, overlays, base_only, pairs):
+        """Merge production + overlay-applied + testing-created without loading all rows."""
+        overlay_ids = set(overlays)
+        exclude = set(hidden) | overlay_ids
+        prod_query = raw
+        if exclude:
+            nin = {"id": {"$nin": list(exclude)}}
+            prod_query = {"$and": [raw, nin]} if raw else nin
+        overlay_docs = []
+        for ident, overlay in overlays.items():
+            if ident in hidden:
+                continue
+            try:
+                orig = await self._prod.find_one({"id": ident}, {"_id": 0})
+            except Exception:
+                orig = None
+            if not orig:
+                continue
+            merged = self._apply_overlay_row(orig, overlay)
+            if _doc_matches(merged, raw):
+                overlay_docs.append(merged)
+        overlay_docs.sort(key=lambda d: _sort_key_tuple(d, pairs))
+        streams = []
+        try:
+            prod_cursor = _apply_sort(self._prod.find(prod_query, {"_id": 0}), pairs)
+            streams.append(_Peek(prod_cursor, "prod"))
+        except Exception as exc:
+            logger.warning("Production sorted read failed for %s: %s", self.name, exc)
+        if overlay_docs:
+            streams.append(_Peek(overlay_docs, "overlay"))
+        if not base_only:
+            try:
+                created_cursor = _apply_sort(
+                    self._test.find(self._testing_created_query(raw), {"_id": 0}),
+                    pairs,
+                )
+                streams.append(_Peek(created_cursor, "created"))
+            except Exception as exc:
+                logger.warning("Testing-created sorted read failed for %s: %s", self.name, exc)
+        seen = set()
+        while True:
+            best_idx = -1
+            best_doc = None
+            for i, peek in enumerate(streams):
+                nxt = await peek.peek()
+                if nxt is None:
+                    continue
+                payload = dict(nxt)
+                payload.pop("_id", None)
+                if peek.kind == "created" and not is_testing_created_doc(payload):
+                    await peek.pop()
+                    continue
+                if best_doc is None or _doc_sort_before(payload, best_doc, pairs):
+                    best_idx = i
+                    best_doc = payload
+            if best_idx < 0 or best_doc is None:
+                return
+            kind = streams[best_idx].kind
+            await streams[best_idx].pop()
+            ident = doc_id(best_doc)
+            if ident and ident in seen:
+                continue
+            if ident and ident in hidden:
+                continue
+            if ident in overlay_ids and kind == "prod":
+                continue
+            if not _doc_matches(best_doc, raw):
+                continue
+            if ident:
+                seen.add(ident)
+            if is_testing_created_doc(best_doc):
+                best_doc.setdefault("data_origin", DATA_ORIGIN_TESTING)
+            yield best_doc
+
     def find(self, query=None, projection=None, *args, **kwargs):
         raw, base_only, testing_only = _strip_overlay_flags(query)
         if self._local_only():
             return OverlayCursor(inner=self._test.find(raw, projection or {"_id": 0}), projection=projection)
+
+        cursor = OverlayCursor(prepare=None, projection=projection)
 
         async def prepare():
             if not testing_only and not base_only and not await self._has_any_deltas():
                 return "inner", self._prod.find(raw, projection or {"_id": 0})
 
             async def stream():
-                async for row in self._stream_merged(query):
+                async for row in self._stream_merged(query, sort=cursor._sort):
                     yield row
 
             return "stream", stream
 
-        return OverlayCursor(prepare=prepare, projection=projection)
+        cursor._prepare = prepare
+        return cursor
 
     async def find_one(self, query=None, projection=None, *args, **kwargs):
         rows = await self.find(query, projection).to_list(1)
@@ -654,11 +866,11 @@ class OverlayCollection:
         return rows
 
     async def _has_any_deltas(self) -> bool:
-        if await self._tombstone_ids():
-            return True
-        if await self._overlay_map():
-            return True
         try:
+            if int(await self._tombstones.count_documents({"collection": self.name})) > 0:
+                return True
+            if int(await self._overlays.count_documents({"collection": self.name})) > 0:
+                return True
             return int(await self._test.count_documents(self._testing_created_query({}))) > 0
         except Exception:
             return False
@@ -780,29 +992,96 @@ class OverlayCollection:
             f"bulk_write is not supported on overlay collection {self.name!r}"
         )
 
-    async def aggregate(self, pipeline, *args, **kwargs):
+    def aggregate(self, pipeline, *args, **kwargs):
         if self._local_only():
             return OverlayCursor(inner=self._test.aggregate(pipeline, *args, **kwargs))
-        if not await self._has_any_deltas():
-            return OverlayCursor(inner=self._prod.aggregate(pipeline, *args, **kwargs))
-        stages = list(pipeline or [])
-        match = {}
-        rest = stages
-        if stages and isinstance(stages[0], Mapping) and "$match" in stages[0]:
-            match = dict(stages[0]["$match"] or {})
-            rest = stages[1:]
-        docs = await self._collect_merged(match)
+        cursor = OverlayCursor(prepare=None)
+
+        async def prepare():
+            if not await self._has_any_deltas():
+                return "inner", self._prod.aggregate(pipeline, *args, **kwargs)
+            stages = list(pipeline or [])
+            match = {}
+            rest = stages
+            if stages and isinstance(stages[0], Mapping) and "$match" in stages[0]:
+                match = dict(stages[0]["$match"] or {})
+                rest = stages[1:]
+            try:
+                out = await self._split_aggregate(match, rest, *args, **kwargs)
+            except Exception as exc:
+                logger.warning("Split overlay aggregate failed for %s: %s", self.name, exc)
+                return "inner", self._prod.aggregate(pipeline, *args, **kwargs)
+
+            async def stream():
+                for row in out:
+                    yield row
+
+            return "stream", stream
+
+        cursor._prepare = prepare
+        return cursor
+
+    async def _split_aggregate(self, match, rest, *args, **kwargs) -> List[dict]:
+        """Keep large Production aggregates on the server; merge small Testing deltas."""
+        hidden = await self._tombstone_ids()
+        overlays = await self._overlay_map()
+        exclude = set(hidden) | set(overlays)
+        group_stage = rest[0] if rest and isinstance(rest[0], Mapping) and "$group" in rest[0] else None
+        tail = rest[1:] if group_stage is not None else rest
+        core, sort_spec, skip_n, limit_n = _extract_sort_limit(tail if group_stage is None else tail)
+
+        prod_match = dict(match)
+        if exclude:
+            nin = {"id": {"$nin": list(exclude)}}
+            prod_match = {"$and": [match, nin]} if match else nin
+        created_match = self._testing_created_query(match)
+
+        async def run_coll(coll, query, extra):
+            pipe = ([{"$match": query}] if query else []) + list(extra)
+            if not pipe:
+                pipe = [{"$match": {}}]
+            return await _as_list(coll.aggregate(pipe, *args, **kwargs))
+
+        extra = [group_stage] if group_stage is not None else list(core)
+        prod_rows = []
+        created_rows = []
         try:
-            out = _memory_aggregate(docs, rest)
+            prod_rows = await run_coll(self._prod, prod_match, extra)
         except Exception as exc:
-            logger.warning("In-memory overlay aggregate fallback to production-only for %s: %s", self.name, exc)
-            return OverlayCursor(inner=self._prod.aggregate(pipeline, *args, **kwargs))
+            logger.warning("Production aggregate failed for %s: %s", self.name, exc)
+        try:
+            created_rows = await run_coll(self._test, created_match, extra)
+        except Exception as exc:
+            logger.warning("Testing-created aggregate failed for %s: %s", self.name, exc)
 
-        async def stream():
-            for row in out:
-                yield row
+        overlay_docs = []
+        for ident, overlay in overlays.items():
+            if ident in hidden:
+                continue
+            try:
+                orig = await self._prod.find_one({"id": ident}, {"_id": 0})
+            except Exception:
+                orig = None
+            if not orig:
+                continue
+            merged = self._apply_overlay_row(orig, overlay)
+            if _doc_matches(merged, match):
+                overlay_docs.append(merged)
+        overlay_extra = [group_stage] if group_stage is not None else list(core)
+        overlay_rows = _memory_aggregate(overlay_docs, overlay_extra) if overlay_docs else []
 
-        return OverlayCursor(stream=stream)
+        if group_stage is not None:
+            merged = _merge_group_results(list(prod_rows) + list(overlay_rows) + list(created_rows), group_stage["$group"])
+            out = _memory_aggregate(merged, core) if core else merged
+        else:
+            out = list(prod_rows) + list(overlay_rows) + list(created_rows)
+        if sort_spec:
+            out = _memory_aggregate(out, [{"$sort": sort_spec}])
+        if skip_n:
+            out = out[int(skip_n):]
+        if limit_n is not None:
+            out = out[: int(limit_n)]
+        return out
 
     async def create_index(self, *args, **kwargs):
         return await self._test.create_index(*args, **kwargs)

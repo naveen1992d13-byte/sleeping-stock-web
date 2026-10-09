@@ -54,6 +54,15 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def ops_db(testing_raw, fallback):
+    """Return the Testing write database without boolean-testing Motor objects.
+
+    PyMongo/Motor Database.__bool__ raises NotImplementedError, so
+    `testing_db_raw or db` crashes the Testing header and merge/cleanup routes.
+    """
+    return testing_raw if testing_raw is not None else fallback
+
+
 def public_label(status: Optional[str]) -> str:
     return {
         STATUS_MERGE_SUBMITTED: "Merge submitted",

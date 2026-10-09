@@ -8810,6 +8810,14 @@ def _require_testing_master(current_user: UserResponse):
         raise HTTPException(status_code=403, detail="Testing Master / Master Admin only")
 
 
+def _testing_ops_db():
+    """Testing-local Motor handle for merge/cleanup/overlay operations.
+
+    Motor Database objects are not boolean; never use `testing_db_raw or db`.
+    """
+    return testing_db_raw if testing_db_raw is not None else db
+
+
 @api_router.get("/testing/github/status")
 async def testing_github_status():
     """Public-in-testing PR banner payload. Never includes GitHub tokens."""
@@ -8822,7 +8830,11 @@ async def testing_github_status():
         import testing_github as tg
         import testing_verify as tv
     status = await tg.fetch_pr_status()
-    operation = await tv.latest_operation(testing_db_raw or db)
+    try:
+        operation = await tv.latest_operation(_testing_ops_db())
+    except Exception as exc:
+        logging.getLogger(__name__).warning("testing operation status unavailable: %s", exc)
+        operation = None
     status["operation"] = operation
     status["operation_status"] = (operation or {}).get("result_status")
     status["operation_label"] = tv.public_label((operation or {}).get("result_status"))
@@ -8842,7 +8854,7 @@ async def testing_github_merge(payload: dict = None, current_user: UserResponse 
     operation_id = str(body.get("operation_id") or "").strip() or tg.operation_id_for(
         f"{current_user.id}:{body.get('confirm_text')}"
     )
-    existing = await (testing_db_raw or db)[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
+    existing = await _testing_ops_db()[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
     if existing:
         return {"ok": True, "status": "idempotent_replay", "receipt": existing.get("receipt") or existing}
     try:
@@ -8865,7 +8877,7 @@ async def testing_github_merge(payload: dict = None, current_user: UserResponse 
         result["status"] = stored_status
         result["ok"] = True
         result["message"] = "Merge submitted. Waiting for Production deployment."
-        await tv.save_operation(testing_db_raw or db, operation_id, {
+        await tv.save_operation(_testing_ops_db(), operation_id, {
             "kind": "github_merge",
             "user_id": current_user.id,
             "result_status": tv.STATUS_WAITING,
@@ -8874,14 +8886,14 @@ async def testing_github_merge(payload: dict = None, current_user: UserResponse 
             "actor": {"id": current_user.id, "role": current_user.role},
         })
         tv.start_verification(
-            testing_db_raw or db,
+            _testing_ops_db(),
             operation_id,
             expected_sha,
             {"id": current_user.id, "role": current_user.role},
             str(body.get("confirm_text") or ""),
         )
     else:
-        await tv.save_operation(testing_db_raw or db, operation_id, {
+        await tv.save_operation(_testing_ops_db(), operation_id, {
             "kind": "github_merge",
             "user_id": current_user.id,
             "result_status": stored_status,
@@ -8907,15 +8919,15 @@ async def testing_github_verify_retry(payload: dict = None, current_user: UserRe
     body = payload or {}
     operation_id = str(body.get("operation_id") or "").strip()
     if not operation_id:
-        latest = await tv.latest_operation(testing_db_raw or db)
+        latest = await tv.latest_operation(_testing_ops_db())
         operation_id = str((latest or {}).get("operation_id") or "")
     if not operation_id:
         raise HTTPException(status_code=400, detail="operation_id is required")
-    existing = await (testing_db_raw or db)[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
+    existing = await _testing_ops_db()[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Unknown operation")
     return await tv.retry_verification(
-        testing_db_raw or db,
+        _testing_ops_db(),
         operation_id,
         {"id": current_user.id, "role": current_user.role},
     )
@@ -8928,7 +8940,7 @@ async def testing_cleanup_inventory(current_user: UserResponse = Depends(get_cur
         from . import testing_cleanup as tc
     except ImportError:
         import testing_cleanup as tc
-    return await tc.inventory(testing_db_raw or db)
+    return await tc.inventory(_testing_ops_db())
 
 
 @api_router.post("/testing/cleanup")
@@ -8946,17 +8958,17 @@ async def testing_cleanup_run(payload: dict = None, current_user: UserResponse =
     operation_id = str(body.get("operation_id") or "").strip() or tg.operation_id_for(
         f"cleanup:{current_user.id}"
     )
-    existing = await (testing_db_raw or db)[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
+    existing = await _testing_ops_db()[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
     if existing:
         return {"ok": True, "status": "idempotent_replay", "receipt": existing.get("receipt") or existing}
     result = await tc.cleanup_testing_data(
-        testing_db_raw or db,
+        _testing_ops_db(),
         confirm_text=str(body.get("confirm_text") or ""),
         actor={"id": current_user.id, "role": current_user.role},
         operation_id=operation_id,
         reason=str(body.get("reason") or "manual"),
     )
-    await (testing_db_raw or db)[ov.OPERATION_COLLECTION].insert_one({
+    await _testing_ops_db()[ov.OPERATION_COLLECTION].insert_one({
         "operation_id": operation_id,
         "kind": "testing_cleanup",
         "user_id": current_user.id,
@@ -8976,7 +8988,7 @@ async def testing_overlay_reset(payload: dict = None, current_user: UserResponse
         import testing_overlay as ov
     body = payload or {}
     return await ov.reset_overlay(
-        testing_db_raw or db,
+        _testing_ops_db(),
         str(body.get("production_id") or body.get("id") or ""),
         str(body.get("collection") or ""),
     )

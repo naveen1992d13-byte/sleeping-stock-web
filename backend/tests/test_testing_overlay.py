@@ -14,8 +14,28 @@ class FakeCursor:
     def __init__(self, rows):
         self._rows = list(rows)
 
+    def sort(self, key_or_list, direction=None):
+        spec = [(key_or_list, direction)] if direction is not None else key_or_list
+        pairs = ov._sort_pairs(spec)
+        if pairs:
+            self._rows.sort(key=lambda row: ov._sort_key_tuple(row, pairs))
+        return self
+
+    def skip(self, count):
+        self._rows = self._rows[int(count or 0):]
+        return self
+
+    def limit(self, count):
+        if count is not None:
+            self._rows = self._rows[: int(count)]
+        return self
+
     async def to_list(self, n):
         return self._rows[: int(n)] if n is not None else list(self._rows)
+
+    async def __aiter__(self):
+        for row in self._rows:
+            yield row
 
 
 class FakeCollection:
@@ -71,6 +91,9 @@ class FakeCollection:
 
     async def count_documents(self, query=None):
         return len([r for r in self.rows if ov._doc_matches(r, query or {})])
+
+    def aggregate(self, pipeline, *args, **kwargs):
+        return FakeCursor(ov._memory_aggregate(list(self.rows), list(pipeline or [])))
 
     async def create_index(self, *args, **kwargs):
         return "ok"
@@ -139,7 +162,8 @@ def test_readonly_blocks_writes():
     for method in (
         "insert_one", "insert_many", "update_one", "update_many", "replace_one",
         "delete_one", "delete_many", "bulk_write", "find_one_and_update",
-        "find_one_and_replace", "find_one_and_delete", "create_index",
+        "find_one_and_replace", "find_one_and_delete", "find_one_and_modify",
+        "create_index",
     ):
         try:
             getattr(ro, method)({"id": "x"})
@@ -149,6 +173,11 @@ def test_readonly_blocks_writes():
     try:
         ro.drop()
         assert False, "expected ProductionWriteBlocked for drop via getattr"
+    except ov.ProductionWriteBlocked:
+        pass
+    try:
+        ro.insert_something({"id": "x"})
+        assert False, "expected ProductionWriteBlocked for getattr insert fallback"
     except ov.ProductionWriteBlocked:
         pass
 
@@ -254,3 +283,54 @@ def test_reset_overlay_restores_production_value():
     assert result["tombstone_deleted"] == 1
     assert overlays.rows == []
     assert tombs.rows == []
+
+
+def test_sorted_pagination_merges_deltas_without_truncation():
+    prod = FakeCollection([
+        {"id": "a", "part_number": "P1", "qty": 1},
+        {"id": "b", "part_number": "P2", "qty": 1},
+        {"id": "c", "part_number": "P3", "qty": 1},
+        {"id": "d", "part_number": "P4", "qty": 1},
+    ])
+    created = FakeCollection([
+        {"id": "TS-1", "part_number": "P15", "qty": 9, "data_origin": "testing"},
+    ])
+    overlays = FakeCollection([
+        {"collection": "products", "production_id": "b", "payload": {"id": "b", "part_number": "P25", "qty": 4}},
+    ])
+    tombs = FakeCollection([{"collection": "products", "production_id": "c"}])
+    col = ov.OverlayCollection("products", prod, created, overlays, tombs)
+
+    async def _go():
+        total = await col.count_documents({})
+        page = await col.find({}).sort("part_number", 1).skip(1).limit(2).to_list(2)
+        grouped = await col.aggregate([
+            {"$match": {}},
+            {"$group": {"_id": None, "n": {"$sum": 1}, "qty": {"$sum": "$qty"}}},
+        ]).to_list(10)
+        return total, page, grouped
+
+    total, page, grouped = asyncio.run(_go())
+    assert total == 4
+    assert [row["id"] for row in page] == ["TS-1", "b"]
+    assert grouped[0]["n"] == 4
+    assert grouped[0]["qty"] == 1 + 4 + 1 + 9
+    assert prod.rows[1]["qty"] == 1
+
+
+def test_ops_db_does_not_bool_motor_database():
+    import testing_verify as tv
+
+    class MotorLike:
+        def __bool__(self):
+            raise NotImplementedError("Database objects do not implement truth value testing")
+
+    raw = MotorLike()
+    fallback = object()
+    try:
+        _ = raw or fallback
+        assert False, "Motor-like bool should raise"
+    except NotImplementedError:
+        pass
+    assert tv.ops_db(raw, fallback) is raw
+    assert tv.ops_db(None, fallback) is fallback
