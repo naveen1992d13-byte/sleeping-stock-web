@@ -136,11 +136,95 @@ def test_memory_aggregate_group_sum():
 def test_readonly_blocks_writes():
     inner = FakeCollection([{"id": "1"}])
     ro = ov.ReadOnlyCollection(inner, "products")
+    for method in (
+        "insert_one", "insert_many", "update_one", "update_many", "replace_one",
+        "delete_one", "delete_many", "bulk_write", "find_one_and_update",
+        "find_one_and_replace", "find_one_and_delete", "create_index",
+    ):
+        try:
+            getattr(ro, method)({"id": "x"})
+            assert False, f"expected ProductionWriteBlocked for {method}"
+        except ov.ProductionWriteBlocked:
+            pass
     try:
-        ro.insert_one({"id": "x"})
-        assert False, "expected ProductionWriteBlocked"
+        ro.drop()
+        assert False, "expected ProductionWriteBlocked for drop via getattr"
     except ov.ProductionWriteBlocked:
         pass
+
+
+def test_wrap_requires_readonly_url(monkeypatch):
+    monkeypatch.delenv("MONGO_READONLY_URL", raising=False)
+    monkeypatch.delenv("DOCDB_READONLY_SECRET_ID", raising=False)
+    monkeypatch.delenv("SNAPSHOT_SOURCE_DOCDB_SECRET_ID", raising=False)
+    try:
+        ov.resolve_production_readonly_url()
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "MONGO_READONLY_URL" in str(exc)
+
+
+class RangeCursor:
+    def __init__(self, n, skip=0, limit=None):
+        self.n = n
+        self._skip = skip
+        self._limit = limit
+
+    def sort(self, *args, **kwargs):
+        return self
+
+    def skip(self, count):
+        self._skip = int(count or 0)
+        return self
+
+    def limit(self, count):
+        self._limit = int(count) if count is not None else None
+        return self
+
+    async def to_list(self, n):
+        start = self._skip
+        end = self.n
+        if self._limit is not None:
+            end = min(end, start + self._limit)
+        if n is not None:
+            end = min(end, start + int(n))
+        return [{"id": str(i), "qty": 1} for i in range(start, end)]
+
+    async def __aiter__(self):
+        start = self._skip
+        end = self.n
+        if self._limit is not None:
+            end = min(end, start + self._limit)
+        for i in range(start, end):
+            yield {"id": str(i), "qty": 1}
+
+
+class RangeCollection:
+    def __init__(self, n):
+        self.n = n
+
+    def find(self, query=None, projection=None):
+        return RangeCursor(self.n)
+
+    async def count_documents(self, query=None):
+        return self.n
+
+    async def find_one(self, query=None, projection=None):
+        return {"id": "0", "qty": 1} if self.n else None
+
+
+def test_overlay_count_and_pagination_beyond_previous_cap():
+    prod = RangeCollection(200010)
+    col = ov.OverlayCollection("products", prod, FakeCollection(), FakeCollection(), FakeCollection())
+
+    async def _go():
+        total = await col.count_documents({})
+        page = await col.find({}).skip(200000).limit(10).to_list(10)
+        return total, page
+
+    total, page = asyncio.run(_go())
+    assert total == 200010
+    assert [row["id"] for row in page] == [str(i) for i in range(200000, 200010)]
 
 
 def test_local_only_insert_many_does_not_stamp_origin():

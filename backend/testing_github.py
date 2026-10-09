@@ -111,33 +111,60 @@ def deployed_pr_number() -> Optional[int]:
         return None
 
 
-def _check_rollup(check_runs: list) -> Dict[str, Any]:
-    conclusions = []
+def _check_rollup(check_runs: list, commit_statuses: Optional[list] = None) -> Dict[str, Any]:
     pending = 0
     failed = 0
     passed = 0
     names = []
-    for run in check_runs:
+    failed_conclusions = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale", "error"}
+    for run in check_runs or []:
         name = str(run.get("name") or "")
         status = str(run.get("status") or "")
         conclusion = str(run.get("conclusion") or "")
-        names.append({"name": name, "status": status, "conclusion": conclusion})
+        names.append({"name": name, "status": status, "conclusion": conclusion, "kind": "check_run"})
         if status != "completed":
             pending += 1
             continue
-        conclusions.append(conclusion)
         if conclusion in {"success", "skipped", "neutral"}:
             passed += 1
-        else:
+        elif conclusion in failed_conclusions or conclusion:
             failed += 1
-    ok = pending == 0 and failed == 0 and (passed > 0 or not check_runs)
+    for st in commit_statuses or []:
+        name = str(st.get("context") or st.get("name") or "")
+        state = str(st.get("state") or "")
+        names.append({"name": name, "status": state, "conclusion": state, "kind": "status"})
+        if state in {"pending", "expected"}:
+            pending += 1
+        elif state in {"success"}:
+            passed += 1
+        elif state:
+            failed += 1
+    missing = (not check_runs) and (not commit_statuses)
+    ok = (not missing) and pending == 0 and failed == 0 and passed > 0
+    if missing:
+        label = "missing"
+        reason = "checks_missing"
+    elif pending:
+        label = "pending"
+        reason = "checks_pending"
+    elif failed:
+        label = "failing"
+        reason = "checks_failed"
+    elif passed == 0:
+        label = "missing"
+        reason = "checks_missing"
+    else:
+        label = "passing"
+        reason = ""
     return {
         "ok": ok,
         "pending": pending,
         "failed": failed,
         "passed": passed,
+        "missing": missing,
+        "reason": reason,
         "checks": names[:40],
-        "label": "passing" if ok else ("pending" if pending else "failing"),
+        "label": label,
     }
 
 
@@ -167,7 +194,14 @@ async def fetch_pr_status(pr_number: Optional[int] = None) -> Dict[str, Any]:
         f"/repos/{repo}/commits/{quote(head_sha)}/check-runs"
     )
     check_runs = (checks or {}).get("check_runs") if isinstance(checks, dict) else []
-    rollup = _check_rollup(check_runs if isinstance(check_runs, list) else [])
+    _status_code, combined = await _get_json(
+        f"/repos/{repo}/commits/{quote(head_sha)}/status"
+    )
+    commit_statuses = (combined or {}).get("statuses") if isinstance(combined, dict) else []
+    rollup = _check_rollup(
+        check_runs if isinstance(check_runs, list) else [],
+        commit_statuses if isinstance(commit_statuses, list) else [],
+    )
     tested_sha = deployed_sha()
     mergeable = pr.get("mergeable")
     draft = bool(pr.get("draft"))
@@ -187,7 +221,7 @@ async def fetch_pr_status(pr_number: Optional[int] = None) -> Dict[str, Any]:
     if mergeable is None:
         blockers.append("mergeable_unknown")
     if not rollup["ok"]:
-        blockers.append("checks_not_green")
+        blockers.append(str(rollup.get("reason") or "checks_not_green"))
     if not sha_match:
         blockers.append("sha_mismatch")
     if base_ref != production_base_branch():
@@ -231,6 +265,7 @@ def testing_environment_health() -> Dict[str, Any]:
         {"name": "testing_storage", "ok": testing_runtime.storage_env_name() == testing_runtime.TESTING_STORAGE_ENV},
         {"name": "overlay_mode", "ok": testing_runtime.overlay_mode_enabled()},
         {"name": "deployed_sha", "ok": bool(deployed_sha())},
+        {"name": "mongo_readonly", "ok": bool((os.getenv("MONGO_READONLY_URL") or os.getenv("DOCDB_READONLY_SECRET_ID") or "").strip())},
     ]
     failed = [c["name"] for c in checks if not c["ok"]]
     return {

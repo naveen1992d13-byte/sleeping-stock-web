@@ -31,6 +31,30 @@ def test_check_rollup_passing_and_failing():
     assert pending["ok"] is False
 
 
+def test_empty_checks_are_missing():
+    empty = tg._check_rollup([], [])
+    assert empty["ok"] is False
+    assert empty["reason"] == "checks_missing"
+    assert empty["missing"] is True
+
+
+def test_cancelled_and_timed_out_checks_block():
+    cancelled = tg._check_rollup([
+        {"name": "ci", "status": "completed", "conclusion": "cancelled"},
+    ])
+    assert cancelled["ok"] is False
+    timed = tg._check_rollup([
+        {"name": "ci", "status": "completed", "conclusion": "timed_out"},
+    ])
+    assert timed["ok"] is False
+
+
+def test_commit_status_pending_blocks():
+    pending = tg._check_rollup([], [{"context": "ci", "state": "pending"}])
+    assert pending["ok"] is False
+    assert pending["reason"] == "checks_pending"
+
+
 def test_live_merge_default_off(monkeypatch):
     monkeypatch.delenv("TESTING_LIVE_GITHUB_MERGE", raising=False)
     assert tg.live_merge_enabled() is False
@@ -117,6 +141,72 @@ def test_merge_dry_run_when_live_disabled(monkeypatch):
     assert result["ok"] is True
     assert result["status"] == "dry_run"
     assert result["receipt"]["dry_run"] is True
+
+
+def test_fetch_pr_status_required_blockers(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "testing")
+    monkeypatch.setenv("DB_NAME", "nmts_testing")
+    monkeypatch.setenv("NMTS_STORAGE_ENV", "testing")
+    monkeypatch.setenv("MONGO_READONLY_URL", "mongodb://readonly-user@127.0.0.1/nmts")
+    monkeypatch.setenv("NMTS_GITHUB_TOKEN", "token")
+    pr = {
+        "title": "x",
+        "state": "open",
+        "draft": True,
+        "mergeable": False,
+        "merged": False,
+        "html_url": "",
+        "head": {"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        "base": {"ref": "develop"},
+    }
+
+    async def fake_get(path, timeout=20.0):
+        if "/pulls/" in path:
+            return 200, pr
+        if "/check-runs" in path:
+            return 200, {"check_runs": []}
+        if path.endswith("/status"):
+            return 200, {"statuses": []}
+        return 404, {}
+
+    monkeypatch.setattr(tg, "_get_json", fake_get)
+    monkeypatch.setattr(tg, "deployed_sha", lambda: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    result = __import__("asyncio").run(tg.fetch_pr_status(12))
+    for expected in ("pr_is_draft", "merge_conflict", "sha_mismatch", "base_not_production", "checks_missing"):
+        assert expected in result["blockers"], result["blockers"]
+    assert result["eligible"] is False
+
+
+def test_mergeable_unknown_blocks(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "testing")
+    monkeypatch.setenv("DB_NAME", "nmts_testing")
+    monkeypatch.setenv("NMTS_STORAGE_ENV", "testing")
+    monkeypatch.setenv("MONGO_READONLY_URL", "mongodb://readonly-user@127.0.0.1/nmts")
+    monkeypatch.setenv("NMTS_GITHUB_TOKEN", "token")
+    pr = {
+        "title": "x",
+        "state": "open",
+        "draft": False,
+        "mergeable": None,
+        "merged": False,
+        "html_url": "",
+        "head": {"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        "base": {"ref": "main"},
+    }
+
+    async def fake_get(path, timeout=20.0):
+        if "/pulls/" in path:
+            return 200, pr
+        if "/check-runs" in path:
+            return 200, {"check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}]}
+        if path.endswith("/status"):
+            return 200, {"statuses": []}
+        return 404, {}
+
+    monkeypatch.setattr(tg, "_get_json", fake_get)
+    monkeypatch.setattr(tg, "deployed_sha", lambda: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    result = __import__("asyncio").run(tg.fetch_pr_status(12))
+    assert "mergeable_unknown" in result["blockers"]
 
 
 def test_wrong_confirm_phrase_rejected():

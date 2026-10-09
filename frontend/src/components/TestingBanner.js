@@ -82,12 +82,13 @@ export function TestingBanner({ user = null }) {
       }
     };
     load();
-    const timer = setInterval(load, 60000);
+    const waiting = String(pr?.operation_status || '').includes('waiting');
+    const timer = setInterval(load, waiting ? 8000 : 30000);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [enabled, api]);
+  }, [enabled, api, pr?.operation_status]);
 
   const eligible = Boolean(pr?.eligible);
   const liveMerge = Boolean(pr?.live_merge_enabled);
@@ -158,18 +159,49 @@ export function TestingBanner({ user = null }) {
         return;
       }
       const status = data.status || (res.ok ? 'ok' : 'failed');
+      const label = data.operation_label || status;
       if (status === 'dry_run' || status === 'deferred') {
         setMessage({ kind: 'success', text: data.receipt?.message || data.cleanup?.message || 'Eligibility passed. Live merge is disabled until approval.' });
       } else if (status === 'idempotent_replay') {
         setMessage({ kind: 'success', text: 'This merge operation was already submitted. Showing the stored receipt.' });
-      } else if (status === 'merged_unverified') {
-        setMessage({ kind: 'error', text: data.cleanup?.message || data.production_verification?.message || 'Merged, but Production verification failed. Testing data retained.' });
+      } else if (status === 'waiting_for_production') {
+        setMessage({ kind: 'progress', text: label || 'Merge submitted. Waiting for Production deployment.' });
+      } else if (status === 'production_failed' || status === 'production_timeout') {
+        setMessage({ kind: 'error', text: data.cleanup?.message || label });
       } else if (data.ok) {
-        setMessage({ kind: 'success', text: `Merge ${status}. ${data.cleanup?.message || data.receipt?.message || ''}` });
+        setMessage({ kind: 'success', text: label });
       } else {
         setMessage({ kind: 'error', text: data.error || data.detail || `Merge blocked (${status})` });
       }
       setMergeOpen(false);
+    } catch (err) {
+      setMessage({ kind: 'error', text: String(err.message || err) });
+    } finally {
+      inFlight.current = false;
+      setBusy('');
+    }
+  };
+
+  const retryVerification = async () => {
+    if (!isMaster || busy || inFlight.current) return;
+    inFlight.current = true;
+    setBusy('retry');
+    setMessage({ kind: 'progress', text: 'Retrying Production verification…' });
+    try {
+      const res = await fetch(`${api}/testing/github/verify-retry`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ operation_id: pr?.operation?.operation_id || '' }),
+      });
+      const data = await res.json();
+      if (res.status === 403) {
+        setMessage({ kind: 'error', text: 'Retry is limited to Testing Master / Master Admin.' });
+        return;
+      }
+      setMessage({
+        kind: data.ok ? 'progress' : 'error',
+        text: data.operation_label || data.status || data.error || 'Retry submitted',
+      });
     } catch (err) {
       setMessage({ kind: 'error', text: String(err.message || err) });
     } finally {
@@ -246,6 +278,7 @@ export function TestingBanner({ user = null }) {
       <span data-testid="testing-commit-sha">{shortSha(testedSha) || meta.commit_short || 'unknown-sha'}</span>
       <span data-testid="testing-pr-status">PR {pr?.state || 'unknown'}{pr?.draft ? ' (draft)' : ''}{pr?.merged ? ' / merged' : ''}</span>
       <span data-testid="testing-ci-status">CI {ciLabel}</span>
+      <span data-testid="testing-operation-status">{pr?.operation_label || 'No merge operation'}</span>
       {pr?.blockers?.length ? <span title={pr.blockers.join(', ')}>Blocked: {pr.blockers.join(', ')}</span> : null}
       {isMaster ? (
         <>
@@ -267,6 +300,24 @@ export function TestingBanner({ user = null }) {
           >
             Merge to Production
           </button>
+          {['waiting_for_production', 'production_failed', 'production_timeout', 'cleanup_retained'].includes(String(pr?.operation_status || '')) ? (
+            <button
+              type="button"
+              data-testid="testing-retry-verify-button"
+              disabled={Boolean(busy)}
+              onClick={retryVerification}
+              style={{
+                background: 'transparent',
+                color: '#FFFBEB',
+                border: '1px solid #FDE68A',
+                borderRadius: 6,
+                padding: '3px 8px',
+                cursor: busy ? 'not-allowed' : 'pointer',
+              }}
+            >
+              Retry Verification
+            </button>
+          ) : null}
           <button
             type="button"
             data-testid="testing-clear-button"
@@ -333,8 +384,10 @@ export function TestingBanner({ user = null }) {
         onConfirm={submitClear}
       >
         <p className="nmts-confirm-message">
-          This deletes Testing-only database records, overlays, tombstones and objects
-          under the Testing S3 prefix. Production data is not touched.
+          This deletes Testing-created records, overlays, tombstones, old snapshot
+          copies in nmts_testing, and objects under the Testing S3 prefix.
+          Production nmts and S3 prefix dev/ are not touched. Live delete stays
+          disabled until operator approval.
         </p>
         <ul style={{ maxHeight: 180, overflow: 'auto', fontSize: 12, margin: '8px 0' }}>
           {inventorySummary.length ? inventorySummary.map((row) => (

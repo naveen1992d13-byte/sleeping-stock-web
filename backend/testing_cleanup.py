@@ -147,11 +147,13 @@ async def inventory(test_db) -> Dict[str, Any]:
         "collections": collections,
         "s3": s3_info,
         "preserve": list(PRESERVE_COLLECTIONS),
-        "retain_snapshot_copies": True,
+        "retain_snapshot_copies": False,
         "note": (
-            "Cleanup deletes testing-created records, overlays and tombstones only. "
-            "Copied snapshot rows stay until an approved migration removes them. "
-            "Production nmts and non-testing S3 prefixes are never touched."
+            "Approved cleanup deletes Testing-created rows, overlays, tombstones, "
+            "old Production snapshot copies stored in nmts_testing, unlabelled leftover "
+            "copies, and objects under the exact testing/ S3 prefix. "
+            "Audit receipts and operation records are preserved without business payloads. "
+            "Production nmts and S3 prefix dev/ are never touched."
         ),
         "live_cleanup_enabled": live_cleanup_enabled(),
         "confirm_phrase": CLEAR_PHRASE,
@@ -198,15 +200,16 @@ async def cleanup_testing_data(
         await test_db[overlay.AUDIT_COLLECTION].insert_one(dict(receipt))
         return {"ok": True, "status": "dry_run", "receipt": receipt}
 
-    created_filter = _testing_created_filter()
     deleted: Dict[str, int] = {}
     for name in TESTING_CREATED_COLLECTIONS:
-        result = await test_db[name].delete_many(created_filter)
+        result = await test_db[name].delete_many({})
         deleted[name] = int(getattr(result, "deleted_count", 0) or 0)
     ov = await test_db[overlay.OVERLAY_COLLECTION].delete_many({})
     tb = await test_db[overlay.TOMBSTONE_COLLECTION].delete_many({})
+    snap = await test_db["testing_snapshot_meta"].delete_many({})
     deleted[overlay.OVERLAY_COLLECTION] = int(getattr(ov, "deleted_count", 0) or 0)
     deleted[overlay.TOMBSTONE_COLLECTION] = int(getattr(tb, "deleted_count", 0) or 0)
+    deleted["testing_snapshot_meta"] = int(getattr(snap, "deleted_count", 0) or 0)
 
     s3_info = list_testing_s3_objects()
     storage = s3_storage.get_storage()

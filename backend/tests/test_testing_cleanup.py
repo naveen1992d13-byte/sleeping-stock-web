@@ -53,7 +53,7 @@ def test_cleanup_dry_run_does_not_delete(monkeypatch):
     assert result["status"] == "dry_run"
     assert db["order_headers"].rows[0]["order_number"] == "TS-OR1"
     assert db["order_headers"].rows[1]["data_origin"] == "snapshot"
-    assert result["receipt"]["inventory"]["retain_snapshot_copies"] is True
+    assert result["receipt"]["inventory"]["retain_snapshot_copies"] is False
 
 
 def test_cleanup_live_deletes_testing_created_only(monkeypatch):
@@ -81,7 +81,7 @@ def test_cleanup_live_deletes_testing_created_only(monkeypatch):
     ))
     assert result["status"] == "cleaned"
     remaining = {r["id"] for r in db["order_headers"].rows}
-    assert remaining == {"2"}
+    assert remaining == set()
     assert db["testing_overlays"].rows == []
     assert db["testing_tombstones"].rows == []
     assert db["testing_audit_receipts"].rows

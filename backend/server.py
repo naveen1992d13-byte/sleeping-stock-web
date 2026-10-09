@@ -8817,9 +8817,16 @@ async def testing_github_status():
         raise HTTPException(status_code=404, detail="Not a testing environment")
     try:
         from . import testing_github as tg
+        from . import testing_verify as tv
     except ImportError:
         import testing_github as tg
-    return await tg.fetch_pr_status()
+        import testing_verify as tv
+    status = await tg.fetch_pr_status()
+    operation = await tv.latest_operation(testing_db_raw or db)
+    status["operation"] = operation
+    status["operation_status"] = (operation or {}).get("result_status")
+    status["operation_label"] = tv.public_label((operation or {}).get("result_status"))
+    return status
 
 
 @api_router.post("/testing/github/merge")
@@ -8838,57 +8845,80 @@ async def testing_github_merge(payload: dict = None, current_user: UserResponse 
     existing = await (testing_db_raw or db)[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
     if existing:
         return {"ok": True, "status": "idempotent_replay", "receipt": existing.get("receipt") or existing}
+    try:
+        from . import testing_verify as tv
+    except ImportError:
+        import testing_verify as tv
     result = await tg.merge_pull_request(
         confirm_text=str(body.get("confirm_text") or ""),
         operation_id=operation_id,
         actor={"id": current_user.id, "role": current_user.role},
     )
-    if result.get("status") == "merged":
-        expected_sha = (
-            (result.get("receipt") or {}).get("merge_sha")
-            or (result.get("receipt") or {}).get("head_sha")
-            or ""
+    stored_status = result.get("status")
+    expected_sha = (
+        (result.get("receipt") or {}).get("merge_sha")
+        or (result.get("receipt") or {}).get("head_sha")
+        or ""
+    )
+    if stored_status == "merged":
+        stored_status = tv.STATUS_WAITING
+        result["status"] = stored_status
+        result["ok"] = True
+        result["message"] = "Merge submitted. Waiting for Production deployment."
+        await tv.save_operation(testing_db_raw or db, operation_id, {
+            "kind": "github_merge",
+            "user_id": current_user.id,
+            "result_status": tv.STATUS_WAITING,
+            "receipt": result.get("receipt") or {},
+            "expected_sha": expected_sha,
+            "actor": {"id": current_user.id, "role": current_user.role},
+        })
+        tv.start_verification(
+            testing_db_raw or db,
+            operation_id,
+            expected_sha,
+            {"id": current_user.id, "role": current_user.role},
+            str(body.get("confirm_text") or ""),
         )
-        verification = await tg.verify_production_deployment(expected_sha)
-        result["production_verification"] = verification
-        if verification.get("ok"):
-            try:
-                from . import testing_cleanup as tc
-            except ImportError:
-                import testing_cleanup as tc
-            if tc.live_cleanup_enabled():
-                result["cleanup"] = await tc.cleanup_testing_data(
-                    testing_db_raw or db,
-                    confirm_text=str(body.get("confirm_text") or ""),
-                    actor={"id": current_user.id, "role": current_user.role},
-                    operation_id=f"{operation_id}:cleanup",
-                    reason="post_merge",
-                )
-            else:
-                result["cleanup"] = {
-                    "ok": True,
-                    "status": "deferred",
-                    "message": "Production verified. Live Testing cleanup is disabled until TESTING_LIVE_CLEANUP=true and operator approval.",
-                }
-        else:
-            result["ok"] = False
-            result["status"] = "merged_unverified"
-            result["cleanup"] = {
-                "ok": False,
-                "status": "retained",
-                "message": "Production verification failed. All Testing data was retained.",
-            }
-    await (testing_db_raw or db)[ov.OPERATION_COLLECTION].insert_one({
-        "operation_id": operation_id,
-        "kind": "github_merge",
-        "user_id": current_user.id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "result_status": result.get("status"),
-        "receipt": result.get("receipt") or {},
-        "production_verification": result.get("production_verification") or {},
-        "cleanup": result.get("cleanup") or {},
-    })
+    else:
+        await tv.save_operation(testing_db_raw or db, operation_id, {
+            "kind": "github_merge",
+            "user_id": current_user.id,
+            "result_status": stored_status,
+            "receipt": result.get("receipt") or {},
+            "expected_sha": expected_sha,
+            "actor": {"id": current_user.id, "role": current_user.role},
+            "blockers": result.get("blockers") or [],
+        })
+    result["operation_id"] = operation_id
+    result["operation_label"] = tv.public_label(stored_status)
     return result
+
+
+@api_router.post("/testing/github/verify-retry")
+async def testing_github_verify_retry(payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    _require_testing_master(current_user)
+    try:
+        from . import testing_verify as tv
+        from . import testing_overlay as ov
+    except ImportError:
+        import testing_verify as tv
+        import testing_overlay as ov
+    body = payload or {}
+    operation_id = str(body.get("operation_id") or "").strip()
+    if not operation_id:
+        latest = await tv.latest_operation(testing_db_raw or db)
+        operation_id = str((latest or {}).get("operation_id") or "")
+    if not operation_id:
+        raise HTTPException(status_code=400, detail="operation_id is required")
+    existing = await (testing_db_raw or db)[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Unknown operation")
+    return await tv.retry_verification(
+        testing_db_raw or db,
+        operation_id,
+        {"id": current_user.id, "role": current_user.role},
+    )
 
 
 @api_router.get("/testing/cleanup/inventory")
@@ -9144,6 +9174,13 @@ async def seed_master_user_on_startup():
                 import testing_overlay as _testing_overlay
             await _testing_overlay.ensure_overlay_indexes(testing_db_raw)
             logger.info("Testing overlay indexes verified")
+            try:
+                from . import testing_verify as _testing_verify
+            except ImportError:
+                import testing_verify as _testing_verify
+            resumed = await _testing_verify.resume_pending(testing_db_raw)
+            if resumed:
+                logger.info("Resumed %s Production verification loop(s)", resumed)
         try:
             import storage_usage as su
             await su.ensure_usage_indexes(db)

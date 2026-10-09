@@ -243,9 +243,28 @@ class _WriteResult:
         self.raw_result = kwargs
 
 
+async def _aiter(cursor):
+    if cursor is None:
+        return
+        yield  # pragma: no cover
+    if hasattr(cursor, "__aiter__"):
+        async for item in cursor:
+            yield item
+        return
+    if hasattr(cursor, "to_list"):
+        rows = await cursor.to_list(None)
+        for item in rows:
+            yield item
+        return
+    for item in cursor:
+        yield item
+
+
 class OverlayCursor:
-    def __init__(self, fetch, projection=None):
-        self._fetch = fetch
+    def __init__(self, stream=None, inner=None, prepare=None, projection=None):
+        self._stream = stream
+        self._inner = inner
+        self._prepare = prepare
         self._projection = projection
         self._sort = None
         self._skip = 0
@@ -256,17 +275,28 @@ class OverlayCursor:
             self._sort = key_or_list
         else:
             self._sort = [(key_or_list, direction)]
+        if self._inner is not None and hasattr(self._inner, "sort"):
+            if direction is None:
+                self._inner.sort(key_or_list)
+            else:
+                self._inner.sort(key_or_list, direction)
         return self
 
     def skip(self, count):
         self._skip = int(count or 0)
+        if self._inner is not None and hasattr(self._inner, "skip"):
+            self._inner.skip(count)
         return self
 
     def limit(self, count):
         self._limit = int(count) if count is not None else None
+        if self._inner is not None and hasattr(self._inner, "limit") and count is not None:
+            self._inner.limit(count)
         return self
 
     def allow_disk_use(self, _value=True):
+        if self._inner is not None and hasattr(self._inner, "allow_disk_use"):
+            self._inner.allow_disk_use(_value)
         return self
 
     def _project(self, doc: dict) -> dict:
@@ -286,21 +316,64 @@ class OverlayCursor:
                 out.pop(key, None)
         return out
 
+    async def _ensure(self):
+        if self._prepare is None:
+            return
+        prepare = self._prepare
+        self._prepare = None
+        kind, obj = await prepare()
+        if kind == "inner":
+            self._inner = obj
+            if self._sort is not None and hasattr(self._inner, "sort"):
+                spec = self._sort
+                if isinstance(spec, list) and len(spec) == 1:
+                    self._inner.sort(spec[0][0], spec[0][1])
+                else:
+                    self._inner.sort(spec)
+            if self._skip and hasattr(self._inner, "skip"):
+                self._inner.skip(self._skip)
+            if self._limit is not None and hasattr(self._inner, "limit"):
+                self._inner.limit(self._limit)
+        else:
+            self._stream = obj
+
     async def to_list(self, length):
-        rows = await self._fetch()
-        if self._sort:
-            keys = self._sort if isinstance(self._sort, list) else [(self._sort, 1)]
-            for field, direction in reversed(keys):
-                reverse = int(direction or 1) < 0
-                rows.sort(key=lambda r: (r.get(field) is None, r.get(field)), reverse=reverse)
-        if self._skip:
-            rows = rows[self._skip:]
+        await self._ensure()
         cap = length if length is not None else self._limit
-        if self._limit is not None:
-            rows = rows[: self._limit]
-        if cap is not None:
-            rows = rows[: int(cap)]
-        return [self._project(r) for r in rows]
+        if self._inner is not None:
+            inner = self._inner
+            if cap is None:
+                rows = await inner.to_list(None)
+            else:
+                rows = await inner.to_list(int(cap))
+            return [self._project(r) for r in rows]
+        rows = []
+        skipped = 0
+        async for doc in self._stream():
+            if skipped < self._skip:
+                skipped += 1
+                continue
+            rows.append(self._project(doc))
+            if cap is not None and len(rows) >= int(cap):
+                break
+        return rows
+
+
+_WRITE_METHOD_PREFIXES = (
+    "insert", "update", "replace", "delete", "remove", "bulk", "drop", "rename",
+    "create_index", "create_indexes", "drop_index", "find_one_and", "save",
+)
+_WRITE_METHODS = frozenset({
+    "insert_one", "insert_many", "insert",
+    "update_one", "update_many", "update",
+    "replace_one", "replace",
+    "delete_one", "delete_many", "remove",
+    "bulk_write", "bulk_write_with_session",
+    "find_one_and_update", "find_one_and_replace", "find_one_and_delete",
+    "find_one_and_modify",
+    "drop", "drop_index", "drop_indexes", "create_index", "create_indexes",
+    "rename", "save",
+})
 
 
 class ReadOnlyCollection:
@@ -313,6 +386,11 @@ class ReadOnlyCollection:
             f"Refusing production write {op} on collection {self.name!r} from the testing overlay"
         )
 
+    def _is_write(self, name: str) -> bool:
+        if name in _WRITE_METHODS:
+            return True
+        return name.startswith(_WRITE_METHOD_PREFIXES)
+
     def find(self, *args, **kwargs):
         return self._inner.find(*args, **kwargs)
 
@@ -320,6 +398,10 @@ class ReadOnlyCollection:
         return self._inner.find_one(*args, **kwargs)
 
     def aggregate(self, *args, **kwargs):
+        pipeline = args[0] if args else kwargs.get("pipeline") or []
+        for stage in pipeline:
+            if isinstance(stage, Mapping) and any(k in stage for k in ("$out", "$merge", "$changeStream")):
+                self._blocked("aggregate_write")
         return self._inner.aggregate(*args, **kwargs)
 
     def count_documents(self, *args, **kwargs):
@@ -355,10 +437,20 @@ class ReadOnlyCollection:
     def find_one_and_update(self, *args, **kwargs):
         self._blocked("find_one_and_update")
 
+    def find_one_and_replace(self, *args, **kwargs):
+        self._blocked("find_one_and_replace")
+
+    def find_one_and_delete(self, *args, **kwargs):
+        self._blocked("find_one_and_delete")
+
     def create_index(self, *args, **kwargs):
-        return self._inner.create_index(*args, **kwargs)
+        self._blocked("create_index")
 
     def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if self._is_write(name):
+            self._blocked(name)
         return getattr(self._inner, name)
 
 
@@ -387,11 +479,22 @@ class OverlayCollection:
         return self.name in LOCAL_ONLY_COLLECTIONS or self.name not in OVERLAY_COLLECTIONS
 
     async def _tombstone_ids(self) -> set[str]:
-        rows = await self._tombstones.find({"collection": self.name}, {"_id": 0, "production_id": 1}).to_list(20000)
-        return {str(r.get("production_id")) for r in rows if r.get("production_id")}
+        hidden = set()
+        cursor = self._tombstones.find({"collection": self.name}, {"_id": 0, "production_id": 1})
+        async for row in _aiter(cursor):
+            ident = row.get("production_id")
+            if ident:
+                hidden.add(str(ident))
+        return hidden
 
-    async def _overlay_rows(self) -> List[dict]:
-        return await self._overlays.find({"collection": self.name}, {"_id": 0}).to_list(20000)
+    async def _overlay_map(self) -> Dict[str, dict]:
+        overlay_by_id: Dict[str, dict] = {}
+        cursor = self._overlays.find({"collection": self.name}, {"_id": 0})
+        async for row in _aiter(cursor):
+            oid = str(row.get("production_id") or "")
+            if oid:
+                overlay_by_id[oid] = row
+        return overlay_by_id
 
     def _testing_created_query(self, query: dict) -> dict:
         created = {
@@ -407,51 +510,158 @@ class OverlayCollection:
             return created
         return {"$and": [query, created]}
 
-    async def _merged(self, query=None, projection=None) -> List[dict]:
+    def _apply_overlay_row(self, payload: dict, overlay: Optional[Mapping[str, Any]]) -> dict:
+        out = dict(payload)
+        out.pop("_id", None)
+        if overlay and overlay.get("payload"):
+            out.update(dict(overlay["payload"]))
+            out["_overlay"] = True
+        out.setdefault("data_origin", "production")
+        return out
+
+    async def _stream_merged(self, query=None):
         raw, base_only, testing_only = _strip_overlay_flags(query)
         if self._local_only():
-            cursor = self._test.find(raw, projection or {"_id": 0})
-            return await cursor.to_list(200000)
-        hidden = await self._tombstone_ids()
-        overlays = [] if (base_only or testing_only) else await self._overlay_rows()
-        prod_docs: List[dict] = []
-        if not testing_only:
-            try:
-                prod_docs = await self._prod.find(raw, {"_id": 0}).to_list(200000)
-            except Exception as exc:
-                logger.warning("Production read failed for %s: %s", self.name, exc)
-                prod_docs = []
-        created: List[dict] = []
+            cursor = self._test.find(raw, {"_id": 0})
+            async for row in _aiter(cursor):
+                yield dict(row)
+            return
+        hidden = set() if testing_only else await self._tombstone_ids()
+        overlays = {} if (base_only or testing_only) else await self._overlay_map()
+        created_by_id: Dict[str, dict] = {}
         if not base_only:
             try:
-                created = await self._test.find(self._testing_created_query(raw), {"_id": 0}).to_list(200000)
+                created_cursor = self._test.find(self._testing_created_query(raw), {"_id": 0})
+                async for row in _aiter(created_cursor):
+                    payload = dict(row)
+                    payload.pop("_id", None)
+                    if not is_testing_created_doc(payload):
+                        continue
+                    ident = doc_id(payload)
+                    if ident and ident not in hidden:
+                        payload.setdefault("data_origin", DATA_ORIGIN_TESTING)
+                        created_by_id[ident] = payload
             except Exception as exc:
                 logger.warning("Testing-created read failed for %s: %s", self.name, exc)
-                created = []
-        if testing_only:
-            prod_docs = []
-            overlays = []
-        if base_only:
-            created = []
-            overlays = []
-        merged = merge_documents(prod_docs, created, overlays, hidden)
-        return [row for row in merged if _doc_matches(row, raw)]
+        seen = set()
+        if not testing_only:
+            try:
+                prod_cursor = self._prod.find(raw, {"_id": 0})
+                async for row in _aiter(prod_cursor):
+                    payload = dict(row)
+                    ident = doc_id(payload)
+                    if not ident or ident in hidden:
+                        continue
+                    if ident in created_by_id:
+                        merged = created_by_id[ident]
+                    else:
+                        merged = self._apply_overlay_row(payload, overlays.get(ident))
+                    if not _doc_matches(merged, raw):
+                        continue
+                    seen.add(ident)
+                    yield merged
+            except Exception as exc:
+                logger.warning("Production read failed for %s: %s", self.name, exc)
+        if not base_only:
+            for ident, payload in created_by_id.items():
+                if ident in seen or ident in hidden:
+                    continue
+                if _doc_matches(payload, raw):
+                    yield payload
 
     def find(self, query=None, projection=None, *args, **kwargs):
-        async def fetch():
-            return await self._merged(query, projection)
-        return OverlayCursor(fetch, projection)
+        raw, base_only, testing_only = _strip_overlay_flags(query)
+        if self._local_only():
+            return OverlayCursor(inner=self._test.find(raw, projection or {"_id": 0}), projection=projection)
+
+        async def prepare():
+            if not testing_only and not base_only and not await self._has_any_deltas():
+                return "inner", self._prod.find(raw, projection or {"_id": 0})
+
+            async def stream():
+                async for row in self._stream_merged(query):
+                    yield row
+
+            return "stream", stream
+
+        return OverlayCursor(prepare=prepare, projection=projection)
 
     async def find_one(self, query=None, projection=None, *args, **kwargs):
         rows = await self.find(query, projection).to_list(1)
         return rows[0] if rows else None
 
     async def count_documents(self, query=None, *args, **kwargs):
-        rows = await self._merged(query)
-        return len(rows)
+        raw, base_only, testing_only = _strip_overlay_flags(query)
+        if self._local_only():
+            return int(await self._test.count_documents(raw))
+        if not testing_only and not base_only and not await self._has_any_deltas():
+            return int(await self._prod.count_documents(raw))
+        hidden = set() if testing_only else await self._tombstone_ids()
+        overlays = {} if (base_only or testing_only) else await self._overlay_map()
+        created_n = 0
+        created_ids: List[str] = []
+        if not base_only:
+            created_q = self._testing_created_query(raw)
+            created_n = int(await self._test.count_documents(created_q))
+            if created_n:
+                async for row in _aiter(self._test.find(created_q, {"_id": 0, "id": 1, "user_id": 1, "order_id": 1, "request_id": 1, "upload_id": 1, "order_number": 1, "request_number": 1, "upload_no": 1, "data_origin": 1})):
+                    ident = doc_id(row)
+                    if ident and ident not in hidden:
+                        created_ids.append(ident)
+        if testing_only:
+            return created_n
+        prod_query: dict = raw
+        if hidden:
+            prod_query = {"$and": [raw, {"id": {"$nin": list(hidden)}}]} if raw else {"id": {"$nin": list(hidden)}}
+        try:
+            prod_n = int(await self._prod.count_documents(prod_query))
+        except Exception as exc:
+            logger.warning("Production count failed for %s: %s", self.name, exc)
+            prod_n = 0
+        overlap = 0
+        if created_ids:
+            try:
+                overlap = int(await self._prod.count_documents(
+                    {"$and": [prod_query, {"id": {"$in": created_ids}}]} if prod_query else {"id": {"$in": created_ids}}
+                ))
+            except Exception:
+                overlap = 0
+        overlay_delta = 0
+        for ident, overlay in overlays.items():
+            if ident in hidden:
+                continue
+            try:
+                orig = await self._prod.find_one({"id": ident}, {"_id": 0})
+            except Exception:
+                orig = None
+            if not orig:
+                continue
+            orig_match = _doc_matches(orig, raw)
+            new_match = _doc_matches(self._apply_overlay_row(orig, overlay), raw)
+            if orig_match and not new_match:
+                overlay_delta -= 1
+            elif not orig_match and new_match:
+                overlay_delta += 1
+        return prod_n - overlap + len(created_ids) + overlay_delta
 
     async def estimated_document_count(self, *args, **kwargs):
         return await self.count_documents({})
+
+    async def _collect_merged(self, query=None) -> List[dict]:
+        rows: List[dict] = []
+        async for row in self._stream_merged(query):
+            rows.append(row)
+        return rows
+
+    async def _has_any_deltas(self) -> bool:
+        if await self._tombstone_ids():
+            return True
+        if await self._overlay_map():
+            return True
+        try:
+            return int(await self._test.count_documents(self._testing_created_query({}))) > 0
+        except Exception:
+            return False
 
     async def insert_one(self, doc, *args, **kwargs):
         if self._local_only():
@@ -512,7 +722,7 @@ class OverlayCollection:
     async def update_many(self, query, update, *args, **kwargs):
         if self._local_only():
             return await self._test.update_many(query, update, *args, **kwargs)
-        rows = await self._merged(query)
+        rows = await self._collect_merged(query)
         modified = 0
         for row in rows:
             result = await self.update_one({"id": doc_id(row)}, update)
@@ -556,7 +766,7 @@ class OverlayCollection:
     async def delete_many(self, query, *args, **kwargs):
         if self._local_only():
             return await self._test.delete_many(query)
-        rows = await self._merged(query)
+        rows = await self._collect_merged(query)
         deleted = 0
         for row in rows:
             result = await self.delete_one({"id": doc_id(row)})
@@ -571,31 +781,28 @@ class OverlayCollection:
         )
 
     async def aggregate(self, pipeline, *args, **kwargs):
+        if self._local_only():
+            return OverlayCursor(inner=self._test.aggregate(pipeline, *args, **kwargs))
+        if not await self._has_any_deltas():
+            return OverlayCursor(inner=self._prod.aggregate(pipeline, *args, **kwargs))
         stages = list(pipeline or [])
         match = {}
         rest = stages
         if stages and isinstance(stages[0], Mapping) and "$match" in stages[0]:
             match = dict(stages[0]["$match"] or {})
             rest = stages[1:]
-        docs = await self._merged(match)
+        docs = await self._collect_merged(match)
         try:
             out = _memory_aggregate(docs, rest)
         except Exception as exc:
             logger.warning("In-memory overlay aggregate fallback to production-only for %s: %s", self.name, exc)
-            if self._local_only():
-                inner = self._test.aggregate(pipeline, *args, **kwargs)
-                return OverlayCursor(lambda: inner.to_list(100000) if hasattr(inner, "to_list") else _as_list(inner))
-            inner = self._prod.aggregate(pipeline, *args, **kwargs)
+            return OverlayCursor(inner=self._prod.aggregate(pipeline, *args, **kwargs))
 
-            async def fetch_prod():
-                return await inner.to_list(100000)
+        async def stream():
+            for row in out:
+                yield row
 
-            return OverlayCursor(fetch_prod)
-
-        async def fetch():
-            return out
-
-        return OverlayCursor(fetch)
+        return OverlayCursor(stream=stream)
 
     async def create_index(self, *args, **kwargs):
         return await self._test.create_index(*args, **kwargs)
@@ -609,7 +816,7 @@ class OverlayCollection:
 
 async def _as_list(value):
     if hasattr(value, "to_list"):
-        return await value.to_list(100000)
+        return await value.to_list(None)
     return list(value)
 
 
@@ -745,23 +952,58 @@ class OverlayDatabase:
         return self[name]
 
 
-def wrap_testing_database(client, test_db, mongo_url: str = "", mongo_kwargs: Optional[dict] = None):
-    """Attach a read-only production database handle.
+READONLY_OPERATOR_STEPS = (
+    "Create a DocumentDB user that can read Production db 'nmts' only, for example: "
+    "db.createUser({user:'nmts_testing_readonly', pwd:'<secret>', "
+    "roles:[{role:'read', db:'nmts'}]}). Store the URI on the Testing host as "
+    "MONGO_READONLY_URL or as Secrets Manager secret DOCDB_READONLY_SECRET_ID. "
+    "Do not commit credentials. Do not grant readWrite or clusterAdmin."
+)
 
-    Uses the same DocumentDB cluster/client. Writes to production collections
-    are blocked by ReadOnlyDatabase even if the OS credentials could write.
-    Optional MONGO_READONLY_URL may point at a dedicated read-only user later.
+
+def resolve_production_readonly_url() -> str:
+    """Dedicated Production read-only URI. Never logs the value."""
+    url = (os.getenv("MONGO_READONLY_URL") or "").strip()
+    if url:
+        return url
+    secret_id = (
+        (os.getenv("DOCDB_READONLY_SECRET_ID") or "").strip()
+        or (os.getenv("SNAPSHOT_SOURCE_DOCDB_SECRET_ID") or "").strip()
+    )
+    if secret_id:
+        try:
+            from .mongo_connection import fetch_documentdb_mongo_url
+        except ImportError:
+            from mongo_connection import fetch_documentdb_mongo_url
+        env = dict(os.environ)
+        env["DOCDB_SECRET_ID"] = secret_id
+        return fetch_documentdb_mongo_url(env)
+    raise RuntimeError(
+        "Testing overlay mode requires MONGO_READONLY_URL or DOCDB_READONLY_SECRET_ID. "
+        + READONLY_OPERATOR_STEPS
+    )
+
+
+def wrap_testing_database(client, test_db, mongo_url: str = "", mongo_kwargs: Optional[dict] = None):
+    """Attach Production as a dedicated read-only base.
+
+    Requires MONGO_READONLY_URL (or DOCDB_READONLY_SECRET_ID). Writes are also
+    blocked in-process by ReadOnlyDatabase. The Testing Motor client is used
+    only for nmts_testing.
     """
     from motor.motor_asyncio import AsyncIOMotorClient
 
+    readonly_url = resolve_production_readonly_url()
     prod_name = testing_runtime.PRODUCTION_DB_NAME
-    readonly_url = (os.getenv("MONGO_READONLY_URL") or "").strip()
-    if readonly_url:
-        prod_client = AsyncIOMotorClient(readonly_url, **(mongo_kwargs or {}))
-        prod_inner = prod_client[prod_name]
-    else:
-        prod_inner = client[prod_name]
-    return OverlayDatabase(ReadOnlyDatabase(prod_inner), test_db)
+    kwargs = dict(mongo_kwargs or {})
+    try:
+        from .mongo_connection import build_mongo_client_args
+    except ImportError:
+        from mongo_connection import build_mongo_client_args
+    readonly_url, tls_kwargs = build_mongo_client_args(readonly_url)
+    kwargs.update(tls_kwargs)
+    prod_client = AsyncIOMotorClient(readonly_url, **kwargs)
+    return OverlayDatabase(ReadOnlyDatabase(prod_client[prod_name]), test_db)
 
 
 async def ensure_overlay_indexes(test_db) -> None:
