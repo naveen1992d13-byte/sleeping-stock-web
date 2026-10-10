@@ -3387,9 +3387,10 @@ def _nmts_now():
 
 
 def _nmts_date_key(dt=None):
-    # Testing freezes "today" to the active snapshot business date so copied
-    # Product Hub rows remain visible without rewriting production records.
-    if testing_runtime.is_testing_env() and dt is None:
+    # Overlay mode is a live Production mirror: "today" is the real IST
+    # business date so a Production publish appears immediately. The snapshot
+    # freeze is only for the legacy copy-based Testing mode.
+    if testing_runtime.should_freeze_business_date():
         frozen = testing_runtime.snapshot_business_date_key()
         if frozen:
             return frozen
@@ -3398,10 +3399,6 @@ def _nmts_date_key(dt=None):
         value = value.replace(tzinfo=NMTS_TIMEZONE)
     else:
         value = value.astimezone(NMTS_TIMEZONE)
-    if testing_runtime.is_testing_env():
-        frozen = testing_runtime.snapshot_business_date_key()
-        if frozen:
-            return frozen
     return value.strftime("%Y%m%d")
 
 

@@ -106,6 +106,11 @@ def load_snapshot_metadata() -> dict[str, Any]:
     return _read_json(snapshot_metadata_path())
 
 
+def should_freeze_business_date() -> bool:
+    """True only for legacy snapshot-copy Testing. Overlay mode uses live IST today."""
+    return is_testing_env() and not overlay_mode_enabled() and bool(snapshot_business_date_key())
+
+
 def snapshot_business_date_key() -> Optional[str]:
     if not is_testing_env():
         return None

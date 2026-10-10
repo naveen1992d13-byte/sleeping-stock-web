@@ -94,3 +94,19 @@ def test_overlay_origin_query_does_not_use_snapshot_copy(monkeypatch):
 def test_stamp_origin_noop_in_production(monkeypatch):
     monkeypatch.delenv("APP_ENV", raising=False)
     assert "data_origin" not in tr.stamp_testing_origin({"id": "1"})
+
+
+def test_overlay_mode_does_not_freeze_business_date(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "testing")
+    monkeypatch.setenv("TESTING_OVERLAY_MODE", "true")
+    monkeypatch.setenv("TESTING_SNAPSHOT_DATE_KEY", "20260920")
+    assert tr.snapshot_business_date_key() == "20260920"
+    assert tr.should_freeze_business_date() is False
+
+
+def test_snapshot_mode_still_freezes_business_date(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "testing")
+    monkeypatch.setenv("TESTING_OVERLAY_MODE", "false")
+    monkeypatch.setenv("TESTING_SNAPSHOT_DATE_KEY", "20260920")
+    assert tr.should_freeze_business_date() is True
+    assert tr.snapshot_business_date_key() == "20260920"

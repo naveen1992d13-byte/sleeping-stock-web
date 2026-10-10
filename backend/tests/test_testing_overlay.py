@@ -290,6 +290,26 @@ def test_overlay_count_and_pagination_beyond_previous_cap():
     assert [row["id"] for row in page] == [str(i) for i in range(200000, 200010)]
 
 
+def test_counters_remain_local_only():
+    col = ov.OverlayCollection("counters", FakeCollection([{"_id": "x"}]), FakeCollection(), FakeCollection(), FakeCollection())
+    assert col._local_only() is True
+
+
+def test_unlisted_business_collection_overlays_production():
+    """Mobile Users / archives / etc. must live-mirror Production, not Testing-only."""
+    prod = FakeCollection([{"id": "mu1", "name": "prod-mobile"}])
+    test = FakeCollection([])
+    col = ov.OverlayCollection("mobile_users", prod, test, FakeCollection(), FakeCollection())
+    assert col._local_only() is False
+
+    async def _go():
+        return await col.find({}).to_list(10)
+
+    rows = asyncio.run(_go())
+    assert [row["id"] for row in rows] == ["mu1"]
+    assert rows[0]["name"] == "prod-mobile"
+
+
 def test_local_only_insert_many_does_not_stamp_origin():
     test = FakeCollection([])
     col = ov.OverlayCollection("testing_overlays", FakeCollection(), test, FakeCollection(), FakeCollection())

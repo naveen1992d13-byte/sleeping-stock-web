@@ -38,12 +38,16 @@ DATA_ORIGIN_TESTING = testing_runtime.DATA_ORIGIN_TESTING
 DATA_ORIGIN_SNAPSHOT = testing_runtime.DATA_ORIGIN_SNAPSHOT
 
 # Collections that stay testing-local (never read production, never overlay).
+# Everything else is a live Production read-only base plus Testing deltas.
 LOCAL_ONLY_COLLECTIONS = frozenset({
     OVERLAY_COLLECTION,
     TOMBSTONE_COLLECTION,
     AUDIT_COLLECTION,
     OPERATION_COLLECTION,
     "testing_snapshot_meta",
+    "counters",
+    "archive_job_locks",
+    "login_repair_canaries",
 })
 
 # Business collections merged from production + testing deltas.
@@ -676,7 +680,7 @@ class OverlayCollection:
         self._tombstones = tombstones
 
     def _local_only(self) -> bool:
-        return self.name in LOCAL_ONLY_COLLECTIONS or self.name not in OVERLAY_COLLECTIONS
+        return self.name in LOCAL_ONLY_COLLECTIONS
 
     async def _tombstone_ids(self) -> set[str]:
         hidden = set()
