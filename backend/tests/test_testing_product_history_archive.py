@@ -4,6 +4,7 @@ from testing_product_history_archive import (
     is_oct10_testing_upload,
     is_testing_owned,
     production_leak_reason,
+    upload_center_ist_date,
 )
 
 
@@ -56,6 +57,27 @@ def test_cancelled_testing_upload_excluded():
         "created_at": "2026-10-10T13:39:28+05:30",
     }
     assert is_oct10_testing_upload(doc) is False
+
+
+def test_frozen_date_key_is_ignored_for_selection():
+    frozen = {
+        "upload_no": "TS-PUHY261010002",
+        "data_origin": "testing",
+        "publish_status": "Published",
+        "date_key": "20260920",
+        "created_at": "2026-10-10T13:38:23+05:30",
+    }
+    assert upload_center_ist_date(frozen) == "20261010"
+    assert is_oct10_testing_upload(frozen) is True
+    snapshot_key_only = {
+        "upload_no": "TS-PUHY260920099",
+        "data_origin": "testing",
+        "publish_status": "Published",
+        "date_key": "20261010",
+        "created_at": "2026-09-20T09:00:00+05:30",
+    }
+    assert upload_center_ist_date(snapshot_key_only) == "20260920"
+    assert is_oct10_testing_upload(snapshot_key_only) is False
 
 
 def test_assert_stops_when_production_row_present():

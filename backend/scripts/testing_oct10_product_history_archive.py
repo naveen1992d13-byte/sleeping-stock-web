@@ -149,6 +149,20 @@ async def _main(execute: bool, prune: bool) -> int:
     print("branches", sorted({r.get("branch") for r in rows}))
     print("upload_nos", sorted({r.get("upload_no") for r in rows}))
 
+    production_rows = sum(1 for r in rows if production_leak_reason(r))
+    cancelled_rows = sum(1 for r in rows if str(r.get("publish_status") or "") == "Cancelled")
+    dry = {
+        "uploads": len(eligible),
+        "testing_rows": len(rows),
+        "production_rows": production_rows,
+        "cancelled_rows": cancelled_rows,
+        "chrompet_in_selection": sum(1 for r in rows if str(r.get("branch") or "").lower() in {"chrompet", "chromepet"}),
+    }
+    print("DRY_RUN", json.dumps(dry))
+    if dry["uploads"] != 4 or dry["testing_rows"] != 10133 or dry["production_rows"] != 0 or dry["cancelled_rows"] != 0:
+        print("STOP: dry-run counts do not match expected 4 uploads / 10133 Testing / 0 Production / 0 cancelled")
+        return 2
+
     before = {
         "testing_products_eligible": len(rows),
         "testing_products_total": await db.products.count_documents({"data_origin": "testing"}),
@@ -162,7 +176,7 @@ async def _main(execute: bool, prune: bool) -> int:
     print("before", json.dumps(before))
 
     if not execute:
-        print("List-only complete. Re-run with --execute after 00:00 IST to archive.")
+        print("Dry-run complete. Archive/prune stay scheduled after 00:00 IST.")
         return 0
 
     products_key = storage.key("product-history", ARCHIVE_DATE, "testing-only-products.jsonl.gz")

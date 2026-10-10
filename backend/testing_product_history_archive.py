@@ -5,15 +5,37 @@ Operator entry: scripts/testing_oct10_product_history_archive.py
 """
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping
+from datetime import datetime, timezone
+from typing import Any, Iterable, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 TESTING_ORIGIN = "testing"
 TS_PREFIX = "TS-"
-OCT10_DATE_KEYS = frozenset({"20261010", "2026-10-10", "261010"})
-OCT10_CREATED_PREFIXES = ("2026-10-10",)
+ARCHIVE_DAY = "20261010"
+IST = ZoneInfo("Asia/Kolkata")
 EXCLUDED_UPLOAD_NOS = frozenset({"PUHY261010001"})
 EXCLUDED_BRANCHES = frozenset({"chrompet", "chromepet"})
 EXCLUDED_DEALER_MARKERS = ("kun auto",)
+_UPLOAD_TS_FIELDS = ("published_at", "uploaded_at", "created_at")
+
+
+def upload_center_ist_date(doc: Mapping[str, Any]) -> Optional[str]:
+    """Upload Center created/published calendar day in IST. Ignores frozen date_key."""
+    for field in _UPLOAD_TS_FIELDS:
+        raw = doc.get(field)
+        if not raw:
+            continue
+        text = str(raw).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            value = datetime.fromisoformat(text)
+        except ValueError:
+            continue
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(IST).strftime("%Y%m%d")
+    return None
 
 
 def is_testing_owned(doc: Mapping[str, Any]) -> bool:
@@ -26,16 +48,9 @@ def is_testing_owned(doc: Mapping[str, Any]) -> bool:
 def is_oct10_testing_upload(doc: Mapping[str, Any]) -> bool:
     if not is_testing_owned(doc):
         return False
-    if str(doc.get("publish_status") or "") == "Cancelled":
+    if str(doc.get("publish_status") or "") != "Published":
         return False
-    uno = str(doc.get("upload_no") or "")
-    date_key = str(doc.get("date_key") or "")
-    created = str(doc.get("created_at") or "")
-    if date_key in OCT10_DATE_KEYS:
-        return True
-    if "261010" in uno:
-        return True
-    return created.startswith(OCT10_CREATED_PREFIXES)
+    return upload_center_ist_date(doc) == ARCHIVE_DAY
 
 
 def production_leak_reason(doc: Mapping[str, Any]) -> str | None:
