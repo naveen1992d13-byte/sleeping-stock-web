@@ -145,11 +145,35 @@ async def find_s3_readable(db, module: str, archive_date: Optional[str] = None, 
     rows = await db.archive_manifests.find(q, {"_id": 0}).sort("created_at", -1).to_list(20)
     if not rows:
         return None
+    rows = _prefer_current_storage_env(rows)
     verified = [r for r in rows if r.get("status") == STATUS_VERIFIED and r.get("eligible_for_prune")]
     if verified:
         return verified[0]
     pruned = [r for r in rows if r.get("status") == STATUS_PRUNED]
     return pruned[0] if pruned else None
+
+
+def _prefer_current_storage_env(rows: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """In Testing, prefer manifests written under the testing/ S3 prefix.
+
+    Production never sets APP_ENV=testing, so this is a no-op there.
+    """
+    try:
+        import testing_runtime
+        from s3_storage import storage_env
+    except Exception:
+        return rows
+    if not testing_runtime.is_testing_env():
+        return rows
+    prefix = f"{storage_env()}/"
+    local = [
+        r
+        for r in rows
+        if str(r.get("storage_key") or "").startswith(prefix)
+        or r.get("archive_scope") == "testing-only"
+        or r.get("data_origin") == "testing"
+    ]
+    return local or rows
 
 
 def _real_s3_q(module: str) -> Dict[str, Any]:
