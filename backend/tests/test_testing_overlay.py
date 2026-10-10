@@ -41,6 +41,7 @@ class FakeCursor:
 class FakeCollection:
     def __init__(self, rows=None):
         self.rows = list(rows or [])
+        self.writes = []
 
     def find(self, query=None, projection=None):
         return FakeCursor([r for r in self.rows if ov._doc_matches(r, query or {})])
@@ -59,6 +60,7 @@ class FakeCollection:
         return ov._WriteResult(inserted_ids=[d.get("id") for d in docs])
 
     async def update_one(self, query, update, upsert=False):
+        self.writes.append(("update_one", query, update, upsert))
         for i, row in enumerate(self.rows):
             if ov._doc_matches(row, query or {}):
                 self.rows[i] = ov.apply_mongo_update(row, update)
@@ -70,6 +72,29 @@ class FakeCollection:
             self.rows.append(payload)
             return ov._WriteResult(matched_count=0, modified_count=1, upserted_id=payload.get("id"))
         return ov._WriteResult(matched_count=0, modified_count=0)
+
+    async def find_one_and_update(self, query, update, *args, **kwargs):
+        self.writes.append(("find_one_and_update", query, update, args, kwargs))
+        upsert = bool(kwargs.get("upsert"))
+        return_document = kwargs.get("return_document")
+        after = True
+        if return_document is not None:
+            after = str(getattr(return_document, "name", return_document)).upper().endswith("AFTER")
+        for i, row in enumerate(self.rows):
+            if ov._doc_matches(row, query or {}):
+                before = dict(row)
+                self.rows[i] = ov.apply_mongo_update(row, update)
+                return dict(self.rows[i]) if after else before
+        if not upsert:
+            return None
+        payload = dict(query or {})
+        set_on_insert = (update or {}).get("$setOnInsert") or {}
+        if isinstance(set_on_insert, dict):
+            payload.update(set_on_insert)
+        apply_update = {k: v for k, v in (update or {}).items() if k != "$setOnInsert"}
+        payload = ov.apply_mongo_update(payload, apply_update)
+        self.rows.append(payload)
+        return dict(payload) if after else None
 
     async def delete_one(self, query):
         for i, row in enumerate(self.rows):
@@ -342,3 +367,135 @@ def test_ops_db_does_not_bool_motor_database():
         pass
     assert tv.ops_db(raw, fallback) is raw
     assert tv.ops_db(None, fallback) is fallback
+
+
+def _counters_col(prod=None, test=None):
+    prod = prod if prod is not None else FakeCollection([])
+    test = test if test is not None else FakeCollection([])
+    return ov.OverlayCollection("counters", prod, test, FakeCollection(), FakeCollection()), prod, test
+
+
+def test_local_only_upload_counter_upserts_missing_daily_seq():
+    col, prod, test = _counters_col()
+
+    async def _go():
+        first = await col.find_one_and_update(
+            {"_id": "upload_PU_HY_261010"},
+            {"$inc": {"seq": 1}, "$setOnInsert": {"date_key": "261010", "type": "PU", "brand_code": "HY"}},
+            upsert=True,
+            return_document="AFTER",
+        )
+        second = await col.find_one_and_update(
+            {"_id": "upload_PU_HY_261010"},
+            {"$inc": {"seq": 1}, "$setOnInsert": {"date_key": "261010", "type": "PU", "brand_code": "HY"}},
+            upsert=True,
+            return_document="AFTER",
+        )
+        return first, second
+
+    first, second = asyncio.run(_go())
+    assert first["seq"] == 1
+    assert first["date_key"] == "261010"
+    assert second["seq"] == 2
+    assert len(test.rows) == 1
+    assert test.rows[0]["seq"] == 2
+    assert prod.rows == []
+    assert prod.writes == []
+    assert [w[0] for w in test.writes] == ["find_one_and_update", "find_one_and_update"]
+
+
+def test_local_only_order_counter_upserts_missing_daily_seq():
+    col, prod, test = _counters_col()
+
+    async def _go():
+        return await col.find_one_and_update(
+            {"_id": "order_OR_HY_261010"},
+            {"$inc": {"seq": 1}, "$setOnInsert": {"date_key": "261010", "brand_code": "HY"}},
+            upsert=True,
+            return_document="AFTER",
+        )
+
+    doc = asyncio.run(_go())
+    assert doc["seq"] == 1
+    assert doc["_id"] == "order_OR_HY_261010"
+    assert test.rows[0]["seq"] == 1
+    assert prod.rows == []
+    assert prod.writes == []
+
+
+def test_existing_counter_increment_stays_atomic_and_off_production():
+    prod = FakeCollection([{"_id": "order_OR_HY_261010", "seq": 9}])
+    test = FakeCollection([{"_id": "order_OR_HY_261010", "seq": 4, "date_key": "261010"}])
+    col, prod, test = _counters_col(prod, test)
+
+    async def _go():
+        return await col.find_one_and_update(
+            {"_id": "order_OR_HY_261010"},
+            {"$inc": {"seq": 1}},
+            upsert=True,
+            return_document="AFTER",
+        )
+
+    doc = asyncio.run(_go())
+    assert doc["seq"] == 5
+    assert test.rows == [{"_id": "order_OR_HY_261010", "seq": 5, "date_key": "261010"}]
+    assert prod.rows == [{"_id": "order_OR_HY_261010", "seq": 9}]
+    assert prod.writes == []
+
+
+def test_doc_matches_analytics_and_reports_date_or_clauses():
+    from datetime import datetime, timezone
+
+    start = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 10, 11, tzinfo=timezone.utc)
+    # Same $or shape as reports_center._date_clause / analytics _orders_query.
+    orders_q = {
+        "$or": [
+            {"created_at": {"$gte": start, "$lt": end}},
+            {"created_at": {"$gte": start.isoformat(), "$lt": end.isoformat()}},
+        ]
+    }
+    # Same shape as analytics _requests_query / reports-center _requests.
+    requests_q = {
+        "$or": [
+            {"requested_at": {"$gte": start, "$lt": end}},
+            {"requested_at": {"$gte": start.isoformat(), "$lt": end.isoformat()}},
+            {"created_at": {"$gte": start, "$lt": end}},
+            {"created_at": {"$gte": start.isoformat(), "$lt": end.isoformat()}},
+        ]
+    }
+    in_range_iso = {"id": "o1", "created_at": "2026-10-05T02:26:09.769728+00:00"}
+    in_range_dt = {"id": "o2", "created_at": datetime(2026, 10, 5, 8, 0, tzinfo=timezone.utc)}
+    out_of_range = {"id": "o3", "created_at": "2026-09-20T00:00:00+00:00"}
+    req_iso = {"id": "r1", "requested_at": "2026-10-05T02:26:09+00:00", "created_at": "2026-10-05T02:26:09+00:00"}
+    assert ov._doc_matches(in_range_iso, orders_q) is True
+    assert ov._doc_matches(in_range_dt, orders_q) is True
+    assert ov._doc_matches(out_of_range, orders_q) is False
+    assert ov._doc_matches(req_iso, requests_q) is True
+    # Failed type compare on the datetime branch must not raise / block $or.
+    assert ov._doc_matches({"created_at": "2026-10-03T12:00:00+00:00"}, {
+        "$or": [
+            {"created_at": {"$gte": start, "$lt": end}},
+            {"created_at": {"$gte": start.isoformat(), "$lt": end.isoformat()}},
+        ]
+    }) is True
+
+
+def test_stock_trend_and_aging_query_shapes_unchanged():
+    """Stock Trend / Aging Trend use date keys and equality, not str-vs-datetime $gte."""
+    row = {
+        "id": "b1",
+        "publish_status": "Published",
+        "active_date_key": "20260920",
+        "brand_name": "Hyundai",
+        "available_qty": 2,
+    }
+    stock_q = {
+        "publish_status": "Published",
+        "active_date_key": {"$in": ["20260920", "2026-09-20"]},
+        "brand_name": "Hyundai",
+    }
+    aging_q = {"active_date_key": "20260920", "publish_status": "Published"}
+    assert ov._doc_matches(row, stock_q) is True
+    assert ov._doc_matches(row, aging_q) is True
+    assert ov._doc_matches({**row, "active_date_key": "20261010"}, stock_q) is False

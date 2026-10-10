@@ -105,3 +105,59 @@ def test_retry_does_not_merge_again(monkeypatch):
     assert result["ok"] is True
     assert result["status"] == tv.STATUS_WAITING
     assert started == [("op-1", "abc")]
+
+
+def _retry(db, status, monkeypatch, started, extra=None):
+    row = {
+        "operation_id": f"op-{status}",
+        "result_status": status,
+        "expected_sha": "abc",
+        "kind": "github_merge",
+    }
+    if extra:
+        row.update(extra)
+    db[tv.ov.OPERATION_COLLECTION] = FakeCollection([row])
+    monkeypatch.setattr(tv, "start_verification", lambda *a, **k: started.append(a[1]))
+    return asyncio.run(tv.retry_verification(db, row["operation_id"], {"id": "u1", "role": "master"}))
+
+
+def test_retry_allowed_for_retryable_statuses(monkeypatch):
+    for status in (
+        tv.STATUS_WAITING,
+        tv.STATUS_FAILED,
+        tv.STATUS_TIMEOUT,
+        tv.STATUS_CLEANUP_RETAINED,
+    ):
+        db = FakeDB()
+        started = []
+        result = _retry(db, status, monkeypatch, started)
+        assert result["ok"] is True
+        assert result["status"] == tv.STATUS_WAITING
+        assert started == [f"op-{status}"]
+        stored = asyncio.run(tv.load_operation(db, f"op-{status}"))
+        assert stored["result_status"] == tv.STATUS_WAITING
+
+
+def test_retry_rejected_for_blocked_dry_run_and_unknown(monkeypatch):
+    for status in ("blocked", "dry_run", "rejected", "not_eligible", "unknown"):
+        db = FakeDB()
+        started = []
+        result = _retry(db, status, monkeypatch, started)
+        assert result["ok"] is False
+        assert result["error"] == "retry_not_allowed"
+        assert result["status"] == status
+        assert started == []
+        stored = asyncio.run(tv.load_operation(db, f"op-{status}"))
+        assert stored["result_status"] == status
+
+
+def test_retry_idempotent_replay_for_completed_statuses(monkeypatch):
+    for status in (tv.STATUS_VERIFIED, tv.STATUS_CLEANUP_DEFERRED, tv.STATUS_CLEANUP_COMPLETED):
+        db = FakeDB()
+        started = []
+        result = _retry(db, status, monkeypatch, started)
+        assert result["ok"] is True
+        assert result["status"] == "idempotent_replay"
+        assert started == []
+        stored = asyncio.run(tv.load_operation(db, f"op-{status}"))
+        assert stored["result_status"] == status

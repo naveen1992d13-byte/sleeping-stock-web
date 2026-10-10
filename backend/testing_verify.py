@@ -214,9 +214,16 @@ async def retry_verification(test_db, operation_id: str, actor: dict) -> dict:
     existing = await load_operation(test_db, operation_id)
     if not existing:
         return {"ok": False, "error": "operation_not_found"}
-    if existing.get("result_status") not in RETRYABLE and existing.get("result_status") != STATUS_WAITING:
-        if existing.get("result_status") in {STATUS_VERIFIED, STATUS_CLEANUP_DEFERRED, STATUS_CLEANUP_COMPLETED}:
-            return {"ok": True, "status": "idempotent_replay", "operation": existing}
+    status = existing.get("result_status")
+    if status in {STATUS_VERIFIED, STATUS_CLEANUP_DEFERRED, STATUS_CLEANUP_COMPLETED}:
+        return {"ok": True, "status": "idempotent_replay", "operation": existing}
+    if status not in RETRYABLE:
+        return {
+            "ok": False,
+            "error": "retry_not_allowed",
+            "status": status,
+            "operation": existing,
+        }
     expected = str(existing.get("expected_sha") or (existing.get("receipt") or {}).get("head_sha") or "")
     confirm_text = str(existing.get("confirm_text") or tg.MERGE_PHRASE)
     saved = await save_operation(test_db, operation_id, {

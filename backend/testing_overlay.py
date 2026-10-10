@@ -185,6 +185,57 @@ def merge_documents(
     return list(merged.values())
 
 
+def _as_datetime(value: Any) -> Optional[datetime]:
+    """Parse ISO date/datetime strings so overlay queries can match Mongo $or clauses."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return None
+
+
+def _normalize_compare_pair(actual: Any, expected: Any) -> tuple[Any, Any]:
+    left_dt = _as_datetime(actual)
+    right_dt = _as_datetime(expected)
+    if left_dt is not None and right_dt is not None:
+        if left_dt.tzinfo is None and right_dt.tzinfo is not None:
+            left_dt = left_dt.replace(tzinfo=timezone.utc)
+        if right_dt.tzinfo is None and left_dt.tzinfo is not None:
+            right_dt = right_dt.replace(tzinfo=timezone.utc)
+        return left_dt, right_dt
+    return actual, expected
+
+
+def _ordered_compare(actual: Any, expected: Any, op: str) -> bool:
+    """Compare $gt/$gte/$lt/$lte without raising on mixed str/datetime types."""
+    if actual is None:
+        return False
+    left, right = _normalize_compare_pair(actual, expected)
+    try:
+        if op == "gt":
+            return left > right
+        if op == "gte":
+            return left >= right
+        if op == "lt":
+            return left < right
+        if op == "lte":
+            return left <= right
+    except TypeError:
+        return False
+    return False
+
+
 def _doc_matches(doc: Mapping[str, Any], query: Mapping[str, Any] | None) -> bool:
     if not query:
         return True
@@ -217,13 +268,13 @@ def _doc_matches(doc: Mapping[str, Any], query: Mapping[str, Any] | None) -> boo
                 flags = re.I if "i" in str(expected.get("$options") or "") else 0
                 if not re.search(str(expected["$regex"]), str(actual or ""), flags):
                     return False
-            if "$gt" in expected and not (actual is not None and actual > expected["$gt"]):
+            if "$gt" in expected and not _ordered_compare(actual, expected["$gt"], "gt"):
                 return False
-            if "$gte" in expected and not (actual is not None and actual >= expected["$gte"]):
+            if "$gte" in expected and not _ordered_compare(actual, expected["$gte"], "gte"):
                 return False
-            if "$lt" in expected and not (actual is not None and actual < expected["$lt"]):
+            if "$lt" in expected and not _ordered_compare(actual, expected["$lt"], "lt"):
                 return False
-            if "$lte" in expected and not (actual is not None and actual <= expected["$lte"]):
+            if "$lte" in expected and not _ordered_compare(actual, expected["$lte"], "lte"):
                 return False
             continue
         if actual != expected and str(actual) != str(expected):
@@ -965,6 +1016,9 @@ class OverlayCollection:
         return await self.update_one(query, {"$set": dict(replacement)})
 
     async def find_one_and_update(self, query, update, *args, **kwargs):
+        """Atomic find-and-modify. Local-only collections (counters) go to Testing."""
+        if self._local_only():
+            return await self._test.find_one_and_update(query, update, *args, **kwargs)
         await self.update_one(query, update)
         return await self.find_one(query)
 

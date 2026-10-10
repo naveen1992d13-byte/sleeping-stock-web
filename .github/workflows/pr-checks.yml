@@ -48,6 +48,7 @@ jobs:
             tests/test_testing_overlay.py \
             tests/test_testing_github_merge.py \
             tests/test_testing_cleanup.py \
+            tests/test_testing_verify.py \
             tests/test_testing_runtime.py \
             tests/test_hybrid_storage.py::test_prune_deletes_misflagged_historical_rows_after_s3_reverify \
             tests/test_hybrid_storage.py::test_never_prune_today_even_if_enabled \
