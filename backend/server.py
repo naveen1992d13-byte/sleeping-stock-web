@@ -3792,7 +3792,7 @@ async def _finalize_product_publish(
         upsert=True,
     )
     await db.upload_items.update_many(
-        {"upload_id": upload_id},
+        _testing_created_only_query({"upload_id": upload_id}),
         {"$set": {"publish_status": "Published", "published_at": now.isoformat()}},
     )
     await db.uploads.update_one({"id": upload_id}, {"$set": {
@@ -3844,8 +3844,12 @@ async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends
     # Prefer the upload's own business date so late publish still lands on the
     # intended day; fall back to "today" for legacy rows without date_key.
     date_key = str(upload.get("date_key") or _nmts_date_key(now))
-    existing_products = await db.products.count_documents({"upload_id": upload_id, "publish_status": "Published"})
-    items = await db.upload_items.find({"upload_id": upload_id}, {"_id": 0}).to_list(200000)
+    existing_products = await db.products.count_documents(
+        _testing_created_only_query({"upload_id": upload_id, "publish_status": "Published"})
+    )
+    items = await db.upload_items.find(
+        _testing_created_only_query({"upload_id": upload_id}), {"_id": 0}
+    ).to_list(200000)
     if not items and existing_products <= 0:
         raise HTTPException(status_code=400, detail="No upload items found")
 
@@ -3903,7 +3907,7 @@ async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends
                     {"$set": {"is_active_today": False}},
                 )
                 await db.products.update_many(
-                    {"upload_id": upload_id},
+                    _testing_created_only_query({"upload_id": upload_id}),
                     {"$set": {
                         "is_active_today": True,
                         "active_date_key": date_key,
@@ -3970,7 +3974,7 @@ async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends
 
         # Non-product uploads: mark published only.
         await db.upload_items.update_many(
-            {"upload_id": upload_id},
+            _testing_created_only_query({"upload_id": upload_id}),
             {"$set": {"publish_status": "Published", "published_at": now.isoformat()}},
         )
         await db.uploads.update_one({"id": upload_id}, {"$set": {
@@ -4018,8 +4022,14 @@ async def cancel_upload_v2(upload_id: str, data: CancelUploadRequest, current_us
         "cancelled_by": current_user.id,
         "cancelled_user_name": current_user.username,
     }})
-    await db.upload_items.update_many({"upload_id": upload_id}, {"$set": {"publish_status": "Cancelled", "upload_no": cancel_no, "cancel_reason": reason}})
-    await db.products.update_many({"upload_id": upload_id}, {"$set": {"is_active_today": False, "publish_status": "Cancelled", "cancel_reason": reason}})
+    await db.upload_items.update_many(
+        _testing_created_only_query({"upload_id": upload_id}),
+        {"$set": {"publish_status": "Cancelled", "upload_no": cancel_no, "cancel_reason": reason}},
+    )
+    await db.products.update_many(
+        _testing_created_only_query({"upload_id": upload_id}),
+        {"$set": {"is_active_today": False, "publish_status": "Cancelled", "cancel_reason": reason}},
+    )
     await db.batch_summaries.delete_one({"upload_id": upload_id})
     try:
         await event_archive.maybe_enqueue_upload_cancelled(
@@ -4200,10 +4210,16 @@ async def list_product_hub_history_rows(
 # written at upload time, so there is no string-concatenation risk.
 
 def _testing_created_only_query(query: dict) -> dict:
-    """Keep snapshot reference Product Hub rows active when testing publishes."""
+    """Keep snapshot reference Product Hub rows active when testing publishes.
+
+    In overlay mode this also sets QUERY_TESTING_ONLY so publish/cancel
+    update_many/find/count stay on the Testing collection and do not scan
+    Production or walk matching rows one-by-one.
+    """
     if testing_runtime.is_testing_env():
         query = dict(query)
         query["data_origin"] = testing_runtime.DATA_ORIGIN_TESTING
+        query.update(testing_runtime.origin_query("testing"))
     return query
 
 

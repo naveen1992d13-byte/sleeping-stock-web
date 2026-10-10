@@ -73,6 +73,15 @@ class FakeCollection:
             return ov._WriteResult(matched_count=0, modified_count=1, upserted_id=payload.get("id"))
         return ov._WriteResult(matched_count=0, modified_count=0)
 
+    async def update_many(self, query, update, upsert=False):
+        self.writes.append(("update_many", query, update, upsert))
+        matched = 0
+        for i, row in enumerate(self.rows):
+            if ov._doc_matches(row, query or {}):
+                self.rows[i] = ov.apply_mongo_update(row, update)
+                matched += 1
+        return ov._WriteResult(matched_count=matched, modified_count=matched)
+
     async def find_one_and_update(self, query, update, *args, **kwargs):
         self.writes.append(("find_one_and_update", query, update, args, kwargs))
         upsert = bool(kwargs.get("upsert"))
@@ -536,6 +545,46 @@ def test_overlay_find_one_and_update_production_base_returns_after_by_id():
     assert doc["email_claimed_at"] == "now"
     assert "email_claimed_at" not in prod.rows[0]
     assert overlays.rows and overlays.rows[0]["production_id"] == "p1"
+
+
+def test_overlay_update_many_testing_only_is_native_not_serial():
+    """Publish/cancel must not walk 10k upload_items via update_one."""
+    prod = FakeCollection([
+        {"id": "p1", "upload_id": "u1", "publish_status": "Waiting", "data_origin": "production"},
+    ])
+    test = FakeCollection([
+        {"id": "t1", "upload_id": "u1", "data_origin": "testing", "publish_status": "Waiting"},
+        {"id": "t2", "upload_id": "u1", "data_origin": "testing", "publish_status": "Waiting"},
+    ])
+    col = ov.OverlayCollection("upload_items", prod, test, FakeCollection(), FakeCollection())
+
+    async def _go():
+        return await col.update_many(
+            {"upload_id": "u1", ov.QUERY_TESTING_ONLY: True},
+            {"$set": {"publish_status": "Published"}},
+        )
+
+    result = asyncio.run(_go())
+    assert result.modified_count == 2
+    assert [w[0] for w in test.writes] == ["update_many"]
+    assert all(r["publish_status"] == "Published" for r in test.rows)
+    assert prod.rows[0]["publish_status"] == "Waiting"
+    assert prod.writes == []
+
+
+def test_overlay_update_many_without_testing_only_still_skips_production_writes():
+    prod = FakeCollection([{"id": "p1", "name": "prod", "qty": 1}])
+    test = FakeCollection([])
+    overlays = FakeCollection([])
+    tombs = FakeCollection([])
+    col = ov.OverlayCollection("products", prod, test, overlays, tombs)
+
+    async def _go():
+        return await col.update_many({"id": "p1"}, {"$set": {"qty": 9}})
+
+    asyncio.run(_go())
+    assert prod.rows == [{"id": "p1", "name": "prod", "qty": 1}]
+    assert overlays.rows and overlays.rows[0]["payload"]["qty"] == 9
 
 
 def test_stock_trend_and_aging_query_shapes_unchanged():

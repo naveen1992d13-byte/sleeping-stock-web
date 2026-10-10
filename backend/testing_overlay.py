@@ -1005,6 +1005,15 @@ class OverlayCollection:
     async def update_many(self, query, update, *args, **kwargs):
         if self._local_only():
             return await self._test.update_many(query, update, *args, **kwargs)
+        raw, _base_only, testing_only = _strip_overlay_flags(query)
+        # Upload publish/cancel pass QUERY_TESTING_ONLY so 10k-row batches stay
+        # one Testing-collection update. Do not scan Production or loop update_one.
+        if testing_only:
+            result = await self._test.update_many(self._testing_created_query(raw), update)
+            return _WriteResult(
+                matched_count=int(getattr(result, "matched_count", 0) or 0),
+                modified_count=int(getattr(result, "modified_count", 0) or 0),
+            )
         rows = await self._collect_merged(query)
         modified = 0
         for row in rows:
