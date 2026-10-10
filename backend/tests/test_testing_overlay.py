@@ -481,6 +481,63 @@ def test_doc_matches_analytics_and_reports_date_or_clauses():
     }) is True
 
 
+def test_overlay_find_one_and_update_claim_filter_returns_after():
+    """Request Sent claim uses email_claimed_at $exists False; AFTER must return the doc."""
+    prod = FakeCollection([])
+    test = FakeCollection([{
+        "id": "rh1",
+        "request_number": "TS-RQHY2610100002",
+        "data_origin": "testing",
+        "email_sent": False,
+    }])
+    col = ov.OverlayCollection("request_headers", prod, test, FakeCollection(), FakeCollection())
+
+    async def _go():
+        claimed = await col.find_one_and_update(
+            {"id": "rh1", "email_sent": {"$ne": True}, "email_claimed_at": {"$exists": False}},
+            {"$set": {"email_claimed_at": "2026-10-10T03:28:26+00:00"}},
+            return_document="AFTER",
+        )
+        duplicate = await col.find_one_and_update(
+            {"id": "rh1", "email_sent": {"$ne": True}, "email_claimed_at": {"$exists": False}},
+            {"$set": {"email_claimed_at": "2026-10-10T03:28:27+00:00"}},
+            return_document="AFTER",
+        )
+        return claimed, duplicate
+
+    claimed, duplicate = asyncio.run(_go())
+    assert claimed is not None
+    assert claimed["id"] == "rh1"
+    assert claimed["email_claimed_at"] == "2026-10-10T03:28:26+00:00"
+    assert duplicate is None
+    assert test.rows[0]["email_claimed_at"] == "2026-10-10T03:28:26+00:00"
+    assert prod.rows == []
+    assert prod.writes == []
+    assert [w[0] for w in test.writes] == ["find_one_and_update"]
+
+
+def test_overlay_find_one_and_update_production_base_returns_after_by_id():
+    prod = FakeCollection([{"id": "p1", "name": "prod", "email_sent": False}])
+    test = FakeCollection([])
+    overlays = FakeCollection([])
+    tombs = FakeCollection([])
+    col = ov.OverlayCollection("request_headers", prod, test, overlays, tombs)
+
+    async def _go():
+        return await col.find_one_and_update(
+            {"id": "p1", "email_claimed_at": {"$exists": False}},
+            {"$set": {"email_claimed_at": "now"}},
+            return_document="AFTER",
+        )
+
+    doc = asyncio.run(_go())
+    assert doc is not None
+    assert doc["id"] == "p1"
+    assert doc["email_claimed_at"] == "now"
+    assert "email_claimed_at" not in prod.rows[0]
+    assert overlays.rows and overlays.rows[0]["production_id"] == "p1"
+
+
 def test_stock_trend_and_aging_query_shapes_unchanged():
     """Stock Trend / Aging Trend use date keys and equality, not str-vs-datetime $gte."""
     row = {

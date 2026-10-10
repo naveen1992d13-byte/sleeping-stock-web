@@ -1016,11 +1016,31 @@ class OverlayCollection:
         return await self.update_one(query, {"$set": dict(replacement)})
 
     async def find_one_and_update(self, query, update, *args, **kwargs):
-        """Atomic find-and-modify. Local-only collections (counters) go to Testing."""
+        """Atomic find-and-modify.
+
+        Local-only collections and testing-owned docs go to the Testing
+        collection so claim filters (email_claimed_at $exists False) still
+        return the updated document. Overlay writes return BEFORE/AFTER by
+        id — never re-query the pre-update filter, which no longer matches.
+        """
         if self._local_only():
             return await self._test.find_one_and_update(query, update, *args, **kwargs)
-        await self.update_one(query, update)
-        return await self.find_one(query)
+        existing = await self.find_one(query)
+        if existing is None:
+            return None
+        ident = doc_id(existing)
+        if await self._is_testing_owned(ident, existing):
+            return await self._test.find_one_and_update(query, update, *args, **kwargs)
+        await self.update_one({"id": ident} if ident else query, update)
+        return_document = kwargs.get("return_document")
+        after = False
+        if return_document is not None:
+            after = str(getattr(return_document, "name", return_document)).upper().endswith("AFTER")
+        if not after:
+            return existing
+        if ident:
+            return await self.find_one({"id": ident})
+        return apply_mongo_update(copy.deepcopy(existing), update)
 
     async def delete_one(self, query, *args, **kwargs):
         if self._local_only():
