@@ -3,6 +3,8 @@ import {
   Users,
   UserPlus,
   Settings,
+  Settings2,
+  Smartphone,
   Plus,
   Edit,
   Trash2,
@@ -18,10 +20,11 @@ import {
   Upload,
   Download,
 } from "lucide-react";
-import { useOutletContext } from "react-router-dom";
+import { useOutletContext, useSearchParams } from "react-router-dom";
 import { Button } from "../components/ui/button";
 import { useAuth, API } from "../App";
 import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
+import NMTSMobile from "./NMTSMobile";
 import { toast } from "sonner";
 import { NmtsConfirmDialog } from "../components/NmtsConfirmDialog";
 import { NmtsModal } from "../components/NmtsModal";
@@ -40,6 +43,16 @@ const COLORS = {
 };
 
 const MENU_LIST = APPLICATION_PERMISSION_LABELS;
+const HUB_SECTIONS = ["website", "mobile", "add", "settings", "app"];
+
+function normalizeHubSection(raw, { isMaster, isAdmin }) {
+  const value = String(raw || "website").toLowerCase();
+  const mapped = value === "list" ? "website" : value;
+  if (!HUB_SECTIONS.includes(mapped)) return "website";
+  if (mapped === "settings" && !isMaster) return "website";
+  if (mapped === "add" && !(isMaster || isAdmin)) return "website";
+  return mapped;
+}
 
 async function apiErrorMessage(res, fallback) {
   try {
@@ -90,8 +103,14 @@ export default function UsersPage() {
     return `${API}/masters/branches/${encodeURIComponent(name)}${qs ? `?${qs}` : ""}`;
   };
 
-  const [activeTab, setActiveTab] = useState("list");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [mobileReady, setMobileReady] = useState(false);
   const [settingsTab, setSettingsTab] = useState("brand");
+  const activeTab = normalizeHubSection(searchParams.get("section"), { isMaster, isAdmin });
+  const selectSection = (next) => {
+    const section = normalizeHubSection(next, { isMaster, isAdmin });
+    setSearchParams({ section }, { replace: true });
+  };
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
 
@@ -224,6 +243,10 @@ export default function UsersPage() {
     loadTemplates();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (activeTab === "mobile" || activeTab === "app") setMobileReady(true);
+  }, [activeTab]);
 
   useEffect(() => {
     if (isAdmin) {
@@ -608,7 +631,7 @@ export default function UsersPage() {
       status: item.status || "active",
       permissions: Array.isArray(item.permissions) ? item.permissions : [],
     });
-    setActiveTab("add");
+    selectSection("add");
   };
 
   const saveUser = async () => {
@@ -653,7 +676,7 @@ export default function UsersPage() {
       if (!res.ok) return toast.error((await res.json()).detail || "User update failed");
       toast.success("User updated successfully");
       resetUserForm();
-      setActiveTab("list");
+      selectSection("website");
       loadData();
       return;
     }
@@ -668,7 +691,7 @@ export default function UsersPage() {
 
     toast.success("User created successfully");
     resetUserForm();
-    setActiveTab("list");
+    selectSection("website");
     loadData();
   };
 
@@ -830,7 +853,7 @@ export default function UsersPage() {
   };
 
   return (
-    <div className="space-y-6 p-0 md:p-0" style={{ color: COLORS.text }}>
+    <div className="space-y-6 p-0 md:p-0" data-testid="user-hub-page" style={{ color: COLORS.text }}>
 
       <div className="grid grid-cols-2 xl:grid-cols-7 gap-4 mb-5">
         <Stat title="Total Users" value={stats.totalUsers} icon={Users} />
@@ -842,17 +865,19 @@ export default function UsersPage() {
         <Stat title="Branches" value={stats.branches} icon={MapPin} />
       </div>
 
-      <div className="flex flex-wrap gap-3 mb-5">
-        <Tab active={activeTab === "list"} onClick={() => setActiveTab("list")} icon={Users} label="User List" />
+      <div className="flex flex-wrap gap-3 mb-5" data-testid="user-hub-nav">
+        <Tab active={activeTab === "website"} onClick={() => selectSection("website")} icon={Users} label="Website Users" testId="user-hub-tab-website" />
+        <Tab active={activeTab === "mobile"} onClick={() => selectSection("mobile")} icon={Smartphone} label="Mobile Users & Pairing Code" testId="user-hub-tab-mobile" />
         {(isMaster || isAdmin) && (
-          <Tab active={activeTab === "add"} onClick={() => setActiveTab("add")} icon={UserPlus} label={editingUser ? "Edit User" : "Add New User"} />
+          <Tab active={activeTab === "add"} onClick={() => selectSection("add")} icon={UserPlus} label={editingUser ? "Edit User" : "Add User"} testId="user-hub-tab-add" />
         )}
         {isMaster && (
-          <Tab active={activeTab === "settings"} onClick={() => setActiveTab("settings")} icon={Settings} label="Settings" />
+          <Tab active={activeTab === "settings"} onClick={() => selectSection("settings")} icon={Settings} label="Settings" testId="user-hub-tab-settings" />
         )}
+        <Tab active={activeTab === "app"} onClick={() => selectSection("app")} icon={Settings2} label="App Settings" testId="user-hub-tab-app" />
       </div>
 
-      {activeTab === "list" && (
+      {activeTab === "website" && (
         <Panel>
           <div className="flex justify-between mb-4 gap-3">
             <h2 className="text-xl font-bold">Created User List <span className="text-xs font-medium" style={{ color: COLORS.muted }}>(Top filter applied)</span></h2>
@@ -1180,6 +1205,18 @@ export default function UsersPage() {
         </Panel>
       )}
 
+      {mobileReady && (
+        <div
+          data-testid="user-hub-mobile-embed"
+          style={{ display: activeTab === "mobile" || activeTab === "app" ? undefined : "none" }}
+        >
+          <NMTSMobile
+            hideInternalNav
+            sectionOverride={activeTab === "app" ? "settings" : "mobile"}
+          />
+        </div>
+      )}
+
       <NmtsConfirmDialog
         open={!!confirmDlg}
         title={confirmDlg?.title || ""}
@@ -1288,8 +1325,8 @@ function Panel({ children }) {
   return <div className="rounded-2xl p-5 shadow-sm" style={{ backgroundColor: COLORS.card, border: `1px solid ${COLORS.border}` }}>{children}</div>;
 }
 
-function Tab({ active, onClick, icon: Icon, label }) {
-  return <Button onClick={onClick} style={{ backgroundColor: active ? COLORS.active : COLORS.primary }}><Icon className="h-4 w-4 mr-2" /> {label}</Button>;
+function Tab({ active, onClick, icon: Icon, label, testId }) {
+  return <Button data-testid={testId} onClick={onClick} style={{ backgroundColor: active ? COLORS.active : COLORS.primary }}><Icon className="h-4 w-4 mr-2" /> {label}</Button>;
 }
 
 function MiniTab({ active, onClick, label }) {

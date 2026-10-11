@@ -25,7 +25,7 @@ const fmt = (v) => {
 };
 const todayKey = (v=new Date()) => new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(v));
 
-export default function NMTSMobile({ variant = 'mobile' }){
+export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false, sectionOverride = null }){
   const showMobileSections = variant !== 'audit';
   const showAuditSections = variant !== 'mobile';
   const { user } = useAuth();
@@ -305,11 +305,12 @@ export default function NMTSMobile({ variant = 'mobile' }){
   const todayItems=useMemo(()=>sessions.filter(s=>todayKey(s.created_at)===todayKey()).reduce((n,s)=>n+Number(s.total_items||0),0),[sessions]);
 
   const latestVersion = appVersions[0];
+  const visibleSection = sectionOverride || section;
 
   return <div className="space-y-6" data-testid={variant === 'audit' ? 'stock-audit-page' : 'nmts-mobile-page'}>
     {showMobileSections && (
       <>
-    <div className="grid md:grid-cols-2 gap-3 max-w-xl"><Tab active={section==='mobile'} onClick={()=>setSection('mobile')} icon={Smartphone} title="Mobile Users"/><Tab active={section==='settings'} onClick={()=>setSection('settings')} icon={Settings2} title="App &amp; Settings"/></div>
+    {!hideInternalNav && <div className="grid md:grid-cols-2 gap-3 max-w-xl"><Tab active={visibleSection==='mobile'} onClick={()=>setSection('mobile')} icon={Smartphone} title="Mobile Users"/><Tab active={visibleSection==='settings'} onClick={()=>setSection('settings')} icon={Settings2} title="App &amp; Settings"/></div>}
     {!scopeReady && user?.role!=='user' && <div className="border border-amber-300 bg-amber-50 p-3 rounded-lg text-amber-800">Select an exact Brand, Dealer and Branch in the Dashboard filter. Mobile User creation and pairing use only that selected scope.</div>}
       </>
     )}
@@ -321,7 +322,7 @@ export default function NMTSMobile({ variant = 'mobile' }){
       </>
     )}
 
-    {showMobileSections && section==='mobile'&&<div className="space-y-5">
+    {showMobileSections && visibleSection==='mobile'&&<div className="space-y-5">
       {canManage && <Card title="Pair a New Mobile User"><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
         <div><p className="font-medium">Generate one-time QR for the selected Brand / Dealer / Branch.</p><p className="text-xs text-gray-500 mt-1">The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.</p></div>
         <Button onClick={generateNewPairing} disabled={creatingUser||!scopeReady}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button>
@@ -377,7 +378,7 @@ export default function NMTSMobile({ variant = 'mobile' }){
       </tbody></table></div></Card>
     </div>}
 
-    {showMobileSections && section==='settings'&&<div className="space-y-5">
+    {showMobileSections && visibleSection==='settings'&&<div className="space-y-5">
       <Card title="Notification Repeat Interval"><div className="flex items-center gap-3 flex-wrap">
         <input type="number" min="1" className="border rounded h-10 px-3 w-32" value={notificationInterval} disabled={!isMaster} onChange={e=>setNotificationInterval(e.target.value)}/>
         <span className="text-sm text-gray-500">minutes between repeat alerts for an unaccepted branch request</span>

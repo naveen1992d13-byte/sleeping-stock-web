@@ -75,7 +75,7 @@ export function DashboardLayout() {
 
   const navItems = APPLICATION_MENU_ITEMS;
 
-  const filteredNavItems = navItems.filter((item) => canAccessMenuItem(user, item));
+  const filteredNavItems = navItems.filter((item) => !item.sidebarHidden && canAccessMenuItem(user, item));
 
   useEffect(() => {
     if (!user) return;
@@ -227,18 +227,30 @@ export function DashboardLayout() {
     if (savedTabs) {
       try {
         const parsedTabs = JSON.parse(savedTabs);
-        const allowedTabs = Array.isArray(parsedTabs)
-          ? parsedTabs.filter(
-              (tab) =>
-                canAccessPermission(user, tab.permission || tab.label) || tab.label === 'My Profile'
-            )
+        const remapped = Array.isArray(parsedTabs)
+          ? parsedTabs.map((tab) => {
+              if (tab?.id === 'sleeping-stock-mobile' || tab?.path === '/sleeping-stock-mobile') {
+                return { id: 'users', label: 'User Hub', path: '/users', permission: 'User Hub' };
+              }
+              return tab;
+            })
           : [];
+        const seen = new Set();
+        const allowedTabs = remapped.filter((tab) => {
+          if (!tab || seen.has(tab.id)) return false;
+          const ok =
+            canAccessPermission(user, tab.permission || tab.label) || tab.label === 'My Profile';
+          if (ok) seen.add(tab.id);
+          return ok;
+        });
         setTabs(allowedTabs);
       } catch {
         setTabs([]);
       }
 
-      if (savedActiveTab) {
+      if (savedActiveTab === 'sleeping-stock-mobile') {
+        setActiveTabId('users');
+      } else if (savedActiveTab) {
         setActiveTabId(savedActiveTab);
       }
     }
@@ -272,7 +284,7 @@ export function DashboardLayout() {
     const path = location.pathname;
     if (!path || path === '/' || path === '/login') return;
     const menuItem = navItems.find((item) => item.path === path);
-    if (!menuItem) return;
+    if (!menuItem || menuItem.sidebarHidden) return;
     if (!canAccessMenuItem(user, menuItem) && menuItem.id !== 'profile') return;
     setTabs((prev) => {
       if (prev.some((t) => t.id === menuItem.id)) return prev;

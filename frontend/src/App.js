@@ -20,7 +20,6 @@ import { Reports } from './pages/Reports';
 import { Analytics } from './pages/Analytics';
 import { Requests } from './pages/Requests';
 import { QueryDesk } from './pages/QueryDesk';
-import NMTSMobile from './pages/NMTSMobile';
 import { OrderHistory } from './pages/OrderHistory';
 import StockAudit from './pages/StockAudit';
 import { StorageCostMonitor } from './pages/StorageCostMonitor';
@@ -328,17 +327,13 @@ function App() {
                 <Requests />
               </ProtectedRoute>
             } />
-            <Route path="sleeping-stock-mobile" element={
-              <ProtectedRoute>
-                <NMTSMobile />
-              </ProtectedRoute>
-            } />
+            <Route path="sleeping-stock-mobile" element={<Navigate to="/users?section=mobile" replace />} />
             <Route path="stock-audit" element={
               <ProtectedRoute>
                 <StockAudit />
               </ProtectedRoute>
             } />
-            <Route path="nmts-mobile" element={<Navigate to="/sleeping-stock-mobile" replace />} />
+            <Route path="nmts-mobile" element={<Navigate to="/users?section=mobile" replace />} />
             <Route path="query" element={
               <ProtectedRoute>
                 <QueryDesk />
