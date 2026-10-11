@@ -12,6 +12,14 @@ from zoneinfo import ZoneInfo
 TESTING_ORIGIN = "testing"
 TS_PREFIX = "TS-"
 ARCHIVE_DAY = "20261010"
+
+
+def is_testing_upload_on_day(doc: Mapping[str, Any], yyyymmdd: str) -> bool:
+    if not is_testing_owned(doc):
+        return False
+    if str(doc.get("publish_status") or "") != "Published":
+        return False
+    return upload_center_ist_date(doc) == yyyymmdd
 IST = ZoneInfo("Asia/Kolkata")
 EXCLUDED_UPLOAD_NOS = frozenset({"PUHY261010001"})
 EXCLUDED_BRANCHES = frozenset({"chrompet", "chromepet"})
@@ -46,11 +54,7 @@ def is_testing_owned(doc: Mapping[str, Any]) -> bool:
 
 
 def is_oct10_testing_upload(doc: Mapping[str, Any]) -> bool:
-    if not is_testing_owned(doc):
-        return False
-    if str(doc.get("publish_status") or "") != "Published":
-        return False
-    return upload_center_ist_date(doc) == ARCHIVE_DAY
+    return is_testing_upload_on_day(doc, ARCHIVE_DAY)
 
 
 def production_leak_reason(doc: Mapping[str, Any]) -> str | None:

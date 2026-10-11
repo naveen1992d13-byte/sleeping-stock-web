@@ -35,6 +35,21 @@ def test_chrompet_production_is_rejected():
     assert production_leak_reason(doc)
 
 
+def test_vanagaram_oct3_is_selected_for_its_ist_day():
+    from testing_product_history_archive import is_testing_upload_on_day
+    doc = {
+        "upload_no": "TS-PUHY261003001",
+        "data_origin": "testing",
+        "publish_status": "Published",
+        "branch": "Vanagaram",
+        "date_key": "20260920",
+        "created_at": "2026-10-03T13:28:44+05:30",
+        "published_at": "2026-10-03T13:29:35+05:30",
+    }
+    assert is_testing_upload_on_day(doc, "20261003") is True
+    assert is_testing_upload_on_day(doc, "20261010") is False
+
+
 def test_vanagaram_oct3_testing_is_not_oct10():
     doc = {
         "upload_no": "TS-PUHY261003001",
