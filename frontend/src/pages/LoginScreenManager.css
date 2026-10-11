@@ -97,18 +97,45 @@
   height: 40px;
   margin-top: 6px;
   border-radius: 8px;
-  border: 1px solid rgba(229, 231, 235, 0.18);
+  border: 1px solid rgba(229, 231, 235, 0.28);
   background: #151b21;
-  color: #f3f4f6;
+  color: #ffffff;
   padding: 0 10px;
   font-size: 0.875rem;
   color-scheme: dark;
+  accent-color: #85c808;
+  caret-color: #ffffff;
 }
 
 .lsm-input:focus {
   outline: none;
   border-color: #85c808;
   box-shadow: 0 0 0 3px rgba(133, 200, 8, 0.18);
+}
+
+.lsm-input[type="datetime-local"] {
+  color-scheme: dark;
+  background: #151b21 !important;
+  color: #ffffff !important;
+  min-height: 42px;
+}
+
+.lsm-input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+  opacity: 1;
+  cursor: pointer;
+  filter: invert(1) brightness(1.6);
+}
+
+.lsm-input[type="datetime-local"]::-webkit-datetime-edit,
+.lsm-input[type="datetime-local"]::-webkit-datetime-edit-fields-wrapper,
+.lsm-input[type="datetime-local"]::-webkit-datetime-edit-text,
+.lsm-input[type="datetime-local"]::-webkit-datetime-edit-year-field,
+.lsm-input[type="datetime-local"]::-webkit-datetime-edit-month-field,
+.lsm-input[type="datetime-local"]::-webkit-datetime-edit-day-field,
+.lsm-input[type="datetime-local"]::-webkit-datetime-edit-hour-field,
+.lsm-input[type="datetime-local"]::-webkit-datetime-edit-minute-field,
+.lsm-input[type="datetime-local"]::-webkit-datetime-edit-ampm-field {
+  color: #ffffff;
 }
 
 .lsm-file {

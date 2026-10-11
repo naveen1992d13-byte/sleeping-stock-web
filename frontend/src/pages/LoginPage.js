@@ -135,7 +135,13 @@ export function LoginPage() {
 
       <main className="nmts-login-shell">
         <div className={`nmts-login-panel${showPromo ? ' nmts-login-panel--split' : ''}`}>
+        <div className="nmts-login-panel-run" aria-hidden="true" />
         <div className="nmts-login-panel-face">
+        {showPromo && (
+          <div className="nmts-login-panel-blur" aria-hidden="true">
+            <img src={promoUrl} alt="" />
+          </div>
+        )}
         {showPromo && (
           <aside className="nmts-login-promo" aria-label="Login promotional image">
             <div className="nmts-login-promo-media">
