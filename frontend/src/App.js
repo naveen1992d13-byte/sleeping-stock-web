@@ -33,6 +33,8 @@ import {
 } from './utils/sessionActivity';
 import { resolveApiUrl, resolveBackendUrl } from '@/backendUrl';
 import { getFirstAllowedMenuItem } from './config/menuConfig';
+import { isTestingUiEnabled } from './testingUi';
+import { LoginScreenManager } from './pages/LoginScreenManager';
 import { TestingBanner } from './components/TestingBanner';
 
 const AuthContext = createContext(null);
@@ -81,6 +83,7 @@ export const canAccessPermission = (user, permissionName) => {
 
 export const canAccessMenuItem = (user, item) => {
   if (!user || !item) return false;
+  if (item.testingOnly && !isTestingUiEnabled()) return false;
   if (item.masterOnly) return user.role === 'master';
   if (item.allRoles) return true;
   if (item.adminOnly && user.role === 'user') {
@@ -313,6 +316,11 @@ function App() {
             <Route path="storage-cost-monitor" element={
               <ProtectedRoute permission="Storage & Cost Monitor" masterOnly>
                 <StorageCostMonitor />
+              </ProtectedRoute>
+            } />
+            <Route path="login-screen-manager" element={
+              <ProtectedRoute masterOnly>
+                <LoginScreenManager />
               </ProtectedRoute>
             } />
             <Route path="requests" element={

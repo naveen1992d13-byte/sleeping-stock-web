@@ -41,6 +41,8 @@ export function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [maintenance, setMaintenance] = useState(null);
+  const [promoUrl, setPromoUrl] = useState(null);
+  const [promoFailed, setPromoFailed] = useState(false);
   const { login } = useAuth();
   const navigate = useNavigate();
 
@@ -52,6 +54,22 @@ export function LoginPage() {
         if (!cancelled) setMaintenance(res.data || null);
       } catch {
         if (!cancelled) setMaintenance(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await axios.get(`${API}/login-screen/active`);
+        const path = res.data?.image_url;
+        if (!cancelled && path) {
+          setPromoUrl(`${API.replace(/\/api$/, '')}${path}`);
+        }
+      } catch {
+        if (!cancelled) setPromoUrl(null);
       }
     })();
     return () => { cancelled = true; };
@@ -78,6 +96,15 @@ export function LoginPage() {
       <div className="nmts-login-overlay" />
 
       <main className="nmts-login-shell">
+        {promoUrl && !promoFailed && (
+          <aside className="nmts-login-promo" aria-label="Login promotional image">
+            <img
+              src={promoUrl}
+              alt=""
+              onError={() => setPromoFailed(true)}
+            />
+          </aside>
+        )}
         <section className="nmts-login-card" aria-label="NMTS login">
           <div className="nmts-login-card-glow" />
 

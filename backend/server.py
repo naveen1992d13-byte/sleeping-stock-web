@@ -69,6 +69,7 @@ try:
     from . import order_desk_guards as odg
     from . import request_fulfillment as rff
     from . import request_in_transit_reminder
+    from . import login_screen
 except ImportError:
     import s3_storage
     import file_objects
@@ -88,6 +89,7 @@ except ImportError:
     import order_desk_guards as odg
     import request_fulfillment as rff
     import request_in_transit_reminder
+    import login_screen
 
 s3_storage.load_storage_dotenv()
 
@@ -8807,6 +8809,44 @@ async def storage_archive_delete_mongo(
 async def testing_runtime_status():
     """Non-secret testing banner / filter status. Production returns is_testing=false."""
     return testing_runtime.public_runtime_status()
+
+
+@api_router.get("/login-screen/active")
+async def login_screen_active():
+    return await login_screen.active_payload(db)
+
+
+@api_router.get("/login-screen/image/{image_id}")
+async def login_screen_image(image_id: str):
+    return await login_screen.stream_image(db, image_id)
+
+
+@api_router.get("/login-screen/manage")
+async def login_screen_manage(current_user: UserResponse = Depends(get_current_user)):
+    login_screen.require_testing_master(current_user)
+    return await login_screen.manage_payload(db)
+
+
+@api_router.post("/login-screen/default")
+async def login_screen_upload_default(
+    file: UploadFile = File(...),
+    current_user: UserResponse = Depends(get_current_user),
+):
+    login_screen.require_testing_master(current_user)
+    data = await file.read()
+    return await login_screen.save_default(db, data, file.content_type, file.filename)
+
+
+@api_router.post("/login-screen/scheduled")
+async def login_screen_upload_scheduled(
+    file: UploadFile = File(...),
+    start_at: str = Form(...),
+    end_at: str = Form(...),
+    current_user: UserResponse = Depends(get_current_user),
+):
+    login_screen.require_testing_master(current_user)
+    data = await file.read()
+    return await login_screen.save_scheduled(db, data, file.content_type, file.filename, start_at, end_at)
 
 
 @api_router.get("/testing/deployment")
