@@ -56,3 +56,11 @@ def test_user_repair_scope_requires_full_brand_dealer_branch():
         mobile_user,
         {"brand_name": "Hyundai", "dealer_name": "Other Dealer", "branch": "Chrompet"},
     )
+
+
+def test_overlay_identifies_mobile_user_and_device_docs():
+    from testing_overlay import doc_id
+
+    assert doc_id({"mobile_user_id": "MUVAN2609190001", "branch": "Vanagaram"}) == "MUVAN2609190001"
+    assert doc_id({"device_id": "dev-1", "mobile_user_id": "MUVAN2609190001"}) == "dev-1"
+    assert doc_id({"id": "web-1", "mobile_user_id": "MUVAN2609190001"}) == "web-1"

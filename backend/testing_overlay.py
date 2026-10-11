@@ -63,7 +63,7 @@ OVERLAY_COLLECTIONS = frozenset({
     "stock_verifications", "stock_verification_sessions", "stock_verification_history",
 })
 
-_ID_FIELDS = ("id", "user_id", "upload_id", "order_id", "request_id")
+_ID_FIELDS = ("id", "user_id", "upload_id", "order_id", "request_id", "device_id", "mobile_user_id")
 
 
 class ProductionWriteBlocked(RuntimeError):
