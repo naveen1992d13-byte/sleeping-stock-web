@@ -48,6 +48,7 @@ LOCAL_ONLY_COLLECTIONS = frozenset({
     "counters",
     "archive_job_locks",
     "login_repair_canaries",
+    "login_screen_images",
 })
 
 # Business collections merged from production + testing deltas.

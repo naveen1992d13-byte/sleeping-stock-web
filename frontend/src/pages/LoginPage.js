@@ -41,6 +41,8 @@ export function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [maintenance, setMaintenance] = useState(null);
+  const [promoUrl, setPromoUrl] = useState(null);
+  const [promoFailed, setPromoFailed] = useState(false);
   const { login } = useAuth();
   const navigate = useNavigate();
 
@@ -55,6 +57,58 @@ export function LoginPage() {
       }
     })();
     return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const timers = { expiry: null, poll: null };
+    let lastUrl = null;
+
+    const clearExpiry = () => {
+      if (timers.expiry) {
+        clearTimeout(timers.expiry);
+        timers.expiry = null;
+      }
+    };
+
+    const applyPayload = (data) => {
+      const path = data?.image_url;
+      const nextUrl = path ? `${API.replace(/\/api$/, '')}${path}` : null;
+      if (lastUrl !== nextUrl) {
+        lastUrl = nextUrl;
+        if (!cancelled) {
+          setPromoFailed(false);
+          setPromoUrl(nextUrl);
+        }
+      }
+      clearExpiry();
+      if (data?.type === 'scheduled' && data?.end_at) {
+        const endMs = new Date(data.end_at).getTime();
+        if (!Number.isNaN(endMs)) {
+          timers.expiry = setTimeout(() => {
+            fetchActive();
+          }, Math.max(250, endMs - Date.now() + 400));
+        }
+      }
+    };
+
+    const fetchActive = async () => {
+      try {
+        const res = await axios.get(`${API}/login-screen/active`);
+        if (!cancelled) applyPayload(res.data || {});
+      } catch {
+        /* keep current promo and form values */
+      }
+    };
+
+    fetchActive();
+    timers.poll = setInterval(fetchActive, 30000);
+
+    return () => {
+      cancelled = true;
+      clearExpiry();
+      if (timers.poll) clearInterval(timers.poll);
+    };
   }, []);
 
   const handleSubmit = async (e) => {
@@ -73,11 +127,33 @@ export function LoginPage() {
     }
   };
 
+  const showPromo = Boolean(promoUrl) && !promoFailed;
+
   return (
     <div className="nmts-login-page" data-testid="login-page">
       <div className="nmts-login-overlay" />
 
       <main className="nmts-login-shell">
+        <div className={`nmts-login-panel${showPromo ? ' nmts-login-panel--split' : ''}`}>
+        <div className="nmts-login-panel-run" aria-hidden="true" />
+        <div className="nmts-login-panel-face">
+        {showPromo && (
+          <div className="nmts-login-panel-blur" aria-hidden="true">
+            <img src={promoUrl} alt="" />
+          </div>
+        )}
+        {showPromo && (
+          <aside className="nmts-login-promo" aria-label="Login promotional image">
+            <div className="nmts-login-promo-media">
+              <img
+                src={promoUrl}
+                alt=""
+                data-testid="login-promo-image"
+                onError={() => setPromoFailed(true)}
+              />
+            </div>
+          </aside>
+        )}
         <section className="nmts-login-card" aria-label="NMTS login">
           <div className="nmts-login-card-glow" />
 
@@ -168,6 +244,8 @@ export function LoginPage() {
             </footer>
           </div>
         </section>
+        </div>
+        </div>
       </main>
     </div>
   );
