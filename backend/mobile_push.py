@@ -404,6 +404,101 @@ async def notify_request_picked_push(db, group_doc: dict, *, picked_by_name: str
         return {"ok": False, "error": str(exc)[:300]}
 
 
+BRANCH_TRANSFERRED_MESSAGE = "Your branch has been transferred. Please re-pair your device to continue."
+
+
+def build_branch_transferred_push_message(
+    token: str,
+    *,
+    from_branch: str = "",
+    to_branch: str = "",
+    mobile_user_id: str = "",
+) -> dict:
+    return {
+        "to": token,
+        "title": "Branch transferred",
+        "body": BRANCH_TRANSFERRED_MESSAGE,
+        "sound": "default",
+        "priority": "high",
+        "_contentAvailable": True,
+        "data": {
+            "type": "branch_transferred",
+            "code": "BRANCH_TRANSFERRED",
+            "re_pair_required": True,
+            "from_branch": from_branch or "",
+            "to_branch": to_branch or "",
+            "mobile_user_id": mobile_user_id or "",
+            "screen": "pair",
+        },
+    }
+
+
+async def notify_branch_transferred(db, *, mobile_user_id: str, from_branch: str = "", to_branch: str = ""):
+    """Best-effort data/push event after Admin Transfer Branch. Never raises.
+
+    Testing still blocks live Expo/FCM so a Testing transfer cannot notify a
+    production-installed device that shares the same Expo token.
+    """
+    title = "Branch transferred"
+    body = BRANCH_TRANSFERRED_MESSAGE
+    data = build_branch_transferred_push_message(
+        "ExponentPushToken[preview]",
+        from_branch=from_branch,
+        to_branch=to_branch,
+        mobile_user_id=mobile_user_id,
+    )["data"]
+    try:
+        devices = await db.mobile_devices.find(
+            {"mobile_user_id": mobile_user_id, "push_token": {"$exists": True, "$ne": ""}},
+            {"_id": 0, "device_id": 1, "push_token": 1, "mobile_user_id": 1},
+        ).to_list(50)
+        devices = [dev for dev in devices if is_expo_push_token(dev.get("push_token") or "")]
+        if not devices:
+            await log_push_attempt(
+                db,
+                mobile_user_id=mobile_user_id or "",
+                device_id="",
+                push_token="",
+                title=title,
+                body=body,
+                data=data,
+                status="skipped",
+                detail="no_push_token",
+            )
+            return {"ok": True, "sent": 0, "skipped": True}
+        batch = [
+            build_branch_transferred_push_message(
+                dev.get("push_token"),
+                from_branch=from_branch,
+                to_branch=to_branch,
+                mobile_user_id=mobile_user_id,
+            )
+            for dev in devices
+            if dev.get("push_token")
+        ]
+        result = send_expo_push_messages(batch)
+        status = "sent" if result.get("ok") and not result.get("skipped") else (
+            "skipped" if result.get("skipped") else "failed"
+        )
+        detail = str(result.get("reason") or result.get("error") or result.get("body") or "")[:500]
+        for dev in devices:
+            await log_push_attempt(
+                db,
+                mobile_user_id=mobile_user_id or "",
+                device_id=dev.get("device_id", ""),
+                push_token=dev.get("push_token", ""),
+                title=title,
+                body=body,
+                data=data,
+                status=status,
+                detail=detail,
+            )
+        return {"ok": result.get("ok"), "sent": 0 if result.get("skipped") else len(batch), "skipped": result.get("skipped")}
+    except Exception as exc:
+        logger.warning("branch_transferred push failed: %s", exc)
+        return {"ok": False, "error": str(exc)[:300]}
+
+
 async def notify_request_transferred_push(db, group_doc: dict, *, target_device_id: str):
     """Ringing-style push to the new owner only. Never raises."""
     try:

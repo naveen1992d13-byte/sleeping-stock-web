@@ -89,6 +89,8 @@ ERR_ALREADY_PICKED = "ALREADY_PICKED"
 ERR_NOT_OWNER = "NOT_OWNER"
 ERR_INVALID_STATE = "INVALID_STATE"
 ERR_TRANSFER_TARGET_INVALID = "TRANSFER_TARGET_INVALID"
+ERR_BRANCH_TRANSFERRED = "BRANCH_TRANSFERRED"
+BRANCH_TRANSFERRED_MESSAGE = "Your branch has been transferred. Please re-pair your device to continue."
 PRESENCE_ONLINE_SECONDS = 90
 
 
@@ -134,6 +136,32 @@ def _now_iso():
 
 def _hash_token(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+def branch_transferred_detail() -> dict:
+    return {
+        "code": ERR_BRANCH_TRANSFERRED,
+        "message": BRANCH_TRANSFERRED_MESSAGE,
+        "re_pair_required": True,
+    }
+
+
+def raise_branch_transferred() -> None:
+    raise HTTPException(status_code=401, detail=branch_transferred_detail())
+
+
+def is_branch_changed_device(device) -> bool:
+    return bool(device) and str(device.get("inactive_reason") or "") == "branch_changed"
+
+
+def session_predates_branch_change(session, mobile_user) -> bool:
+    if not session or not mobile_user:
+        return False
+    changed_at = mobile_user.get("branch_changed_at")
+    created_at = session.get("created_at")
+    if not changed_at or not created_at:
+        return False
+    return str(created_at) < str(changed_at)
 
 
 def _new_raw_token() -> str:
@@ -577,6 +605,8 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
     Resolves a mobile device session from 'Authorization: Bearer <token>'.
     Scope (brand/dealer/branch) is read from the stored session — the
     mobile client's own claims about its branch are never trusted.
+    A transferred user's old token is always rejected with BRANCH_TRANSFERRED
+    and is never reactivated.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Missing device session token")
@@ -584,10 +614,17 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
     token_hash = _hash_token(raw_token)
 
     session = await db.mobile_sessions.find_one({"session_token_hash": token_hash}, {"_id": 0})
-    if not session:
+    device = None
+    if session:
+        device = await db.mobile_devices.find_one({"device_id": session["device_id"]}, {"_id": 0})
+    else:
+        device = await db.mobile_devices.find_one({"session_token_hash": token_hash}, {"_id": 0})
+        if is_branch_changed_device(device):
+            raise_branch_transferred()
         raise HTTPException(401, "Invalid or expired device session")
 
-    device = await db.mobile_devices.find_one({"device_id": session["device_id"]}, {"_id": 0})
+    if is_branch_changed_device(device):
+        raise_branch_transferred()
     if not device or device.get("status") != "active":
         raise HTTPException(403, "Device is inactive or removed — please re-pair")
     if device.get("session_active") is False:
@@ -596,6 +633,8 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
     mobile_user = await db.mobile_users.find_one({"mobile_user_id": device["mobile_user_id"]}, {"_id": 0})
     if not mobile_user or mobile_user.get("status") != "active":
         raise HTTPException(403, "Mobile user is inactive")
+    if session_predates_branch_change(session, mobile_user):
+        raise_branch_transferred()
 
     seen_at = _now_iso()
     await db.mobile_devices.update_one(
@@ -902,6 +941,18 @@ async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBran
                     raise
 
     now = _now_iso()
+    from_branch = current_scope.get("branch") or ""
+    try:
+        import mobile_push
+        await mobile_push.notify_branch_transferred(
+            db,
+            mobile_user_id=mobile_user_id,
+            from_branch=from_branch,
+            to_branch=branch,
+        )
+    except Exception as exc:
+        logger.warning("branch-transfer push failed for %s: %s", mobile_user_id, exc)
+
     await db.mobile_users.update_one({"mobile_user_id": mobile_user_id}, {"$set": {
         "brand_name": brand, "dealer_name": dealer, "branch": branch,
         "updated_at": now, "branch_changed_at": now,
@@ -916,13 +967,12 @@ async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBran
     await db.mobile_devices.update_many(
         {"mobile_user_id": mobile_user_id},
         {"$set": {
-            "brand_name": brand,
-            "dealer_name": dealer,
-            "branch": branch,
             "status": "inactive",
             "session_active": False,
+            "push_enabled": False,
             "inactive_reason": "branch_changed",
             "updated_at": now,
+            "session_revoked_at": now,
         }},
     )
     await _audit(current_user, "mobile_user_branch_changed", mobile_user_id, destination)
@@ -932,6 +982,8 @@ async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBran
         "brand_name": brand,
         "dealer_name": dealer,
         "branch": branch,
+        "re_pair_required": True,
+        "code": ERR_BRANCH_TRANSFERRED,
     }
 
 

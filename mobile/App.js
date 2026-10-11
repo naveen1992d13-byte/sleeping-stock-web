@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  AppState,
   BackHandler,
   FlatList,
   Image,
@@ -25,12 +26,21 @@ import * as Device from 'expo-device';
 import Constants from 'expo-constants';
 import NetInfo from '@react-native-community/netinfo';
 
-import { getSession, saveSession, clearSession } from './src/services/session';
+import {
+  getSession,
+  saveSession,
+  clearSession,
+  getBranchTransferredFlag,
+  setBranchTransferredFlag,
+  BRANCH_TRANSFERRED_MESSAGE,
+} from './src/services/session';
 import {
   ApiError,
   setOnSessionInvalidated,
+  isBranchTransferredError,
   verifyPairing,
   validateSession,
+  sendHeartbeat,
   getNotifications,
   acceptNotification,
   skipNotification,
@@ -48,6 +58,7 @@ import {
   subscribeToQueueChanges,
   startAutoSync,
   syncQueue,
+  clearQueuedRecords,
 } from './src/services/offlineQueue';
 import {
   initPushNotifications,
@@ -172,6 +183,7 @@ export default function App() {
   const [booting, setBooting] = useState(true);
   const [screen, setScreen] = useState('pair');
   const [session, setSession] = useState(null);
+  const [branchTransferred, setBranchTransferred] = useState(false);
   const [isOffline, setIsOffline] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
 
@@ -213,10 +225,39 @@ export default function App() {
   const [scannerTarget, setScannerTarget] = useState('verification');
   const [permission, requestPermission] = useCameraPermissions();
   const cameraRef = useRef(null);
+  const transferAlertedRef = useRef(false);
   const [ocrBusy, setOcrBusy] = useState(false);
   const scanLine = useRef(new Animated.Value(0)).current;
   const scanFrameLayout = useRef({ x: 36, y: 190, width: 320, height: 120 });
   const cameraLayout = useRef({ width: 390, height: 700 });
+
+  const clearOldBranchCache = useCallback(async () => {
+    try { await clearQueuedRecords(); } catch (_e) {}
+    setNotifications([]);
+    setSelectedRequest(null);
+    setRequestRows([]);
+    setVerificationList([]);
+    setSelectedPart(null);
+    setSearchParts([]);
+    setSearchResults([]);
+    setAutoTasks([]);
+    setAutoSelected(null);
+    setLastAutoResult(null);
+    setPendingCount(0);
+  }, []);
+
+  const handleBranchTransferred = useCallback(async () => {
+    await clearSession();
+    await setBranchTransferredFlag(true);
+    await clearOldBranchCache();
+    setSession(null);
+    setBranchTransferred(true);
+    setScreen('pair');
+    if (!transferAlertedRef.current) {
+      transferAlertedRef.current = true;
+      Alert.alert('Branch Transferred', BRANCH_TRANSFERRED_MESSAGE);
+    }
+  }, [clearOldBranchCache]);
 
   useEffect(() => {
     let mounted = true;
@@ -231,7 +272,11 @@ export default function App() {
       if (mounted) setIsOffline(!(state.isConnected && state.isInternetReachable !== false));
     });
 
-    setOnSessionInvalidated(async () => {
+    setOnSessionInvalidated(async (error) => {
+      if (isBranchTransferredError(error)) {
+        await handleBranchTransferred();
+        return;
+      }
       await clearSession();
       if (!mounted) return;
       setSession(null);
@@ -254,7 +299,12 @@ export default function App() {
       } catch (_e) {}
 
       try {
+        const transferred = await getBranchTransferredFlag();
         const saved = await getSession();
+        if (transferred) {
+          await handleBranchTransferred();
+          return;
+        }
         if (saved) {
           setSession(saved);
           try {
@@ -275,17 +325,28 @@ export default function App() {
       unsubscribeQueue?.();
       unsubscribeNetwork?.();
     };
-  }, []);
+  }, [handleBranchTransferred]);
 
   useEffect(() => {
     if (!session) return undefined;
     let teardown = () => {};
+    const isTransferPush = (data) =>
+      data?.type === 'branch_transferred' || data?.code === 'BRANCH_TRANSFERRED';
+
     initPushNotifications({
       onNotificationReceived: (data) => {
+        if (isTransferPush(data)) {
+          handleBranchTransferred();
+          return;
+        }
         if (data?.type === 'auto_perpetual') loadAutoTasks();
         if (screen === 'notifications') loadNotifications();
       },
       onNotificationTapped: (data) => {
+        if (isTransferPush(data)) {
+          handleBranchTransferred();
+          return;
+        }
         if (data?.type === 'auto_perpetual') {
           loadAutoTasks().finally(() => setScreen('auto'));
           return;
@@ -310,7 +371,25 @@ export default function App() {
       })
       .catch(() => {});
     return () => teardown();
-  }, [session?.deviceId, screen]);
+  }, [session?.deviceId, screen, handleBranchTransferred]);
+
+  useEffect(() => {
+    if (!session || branchTransferred) return undefined;
+    const check = () => {
+      validateSession().catch(() => {});
+    };
+    check();
+    const interval = setInterval(() => {
+      sendHeartbeat().catch(() => {});
+    }, 45000);
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'active') check();
+    });
+    return () => {
+      clearInterval(interval);
+      sub.remove();
+    };
+  }, [session, branchTransferred]);
 
 
   useEffect(() => {
@@ -335,6 +414,11 @@ export default function App() {
         return true;
       }
 
+      if (branchTransferred) {
+        setScreen(screen === 'scanner' && scannerTarget === 'pairing' ? 'pair' : 'pair');
+        return true;
+      }
+
       if (screen === 'verification' || screen === 'search' || screen === 'notifications' || screen === 'auto') {
         setScreen('home');
         return true;
@@ -347,7 +431,7 @@ export default function App() {
 
     const subscription = BackHandler.addEventListener('hardwareBackPress', handleHardwareBack);
     return () => subscription.remove();
-  }, [booting, screen, scannerTarget]);
+  }, [booting, screen, scannerTarget, branchTransferred]);
 
   useEffect(() => {
     if (screen !== 'scanner') return undefined;
@@ -376,7 +460,11 @@ export default function App() {
       const pushToken = await registerForPushNotificationsAsync().catch(() => null);
       const result = await verifyPairing({ mobileUserId: qrMobileUserId?.trim()?.toUpperCase() || null, pairingType, pairingCode: qrPairingCode.trim().toUpperCase(), pairingToken, apiBaseUrl, deviceUserName: userName.trim(), deviceUserMobile: mobileNumber.trim(), deviceName: Device.deviceName || `${Platform.OS} device`, deviceInfo: `${Device.modelName || 'Unknown'} • ${Device.osName || Platform.OS} ${Device.osVersion || ''}`, appVersion: Constants.expoConfig?.version || '1.0.0', pushToken });
       const nextSession = { apiBaseUrl, sessionToken: result.session_token, deviceId: result.device_id, mobileUserId: result.mobile_user_id, name: result.device_user_name || result.name || userName.trim(), deviceUserMobile: result.device_user_mobile || mobileNumber.trim(), brandName: result.brand_name, dealerName: result.dealer_name, branch: result.branch };
+      await setBranchTransferredFlag(false);
+      await clearOldBranchCache();
+      transferAlertedRef.current = false;
       await saveSession(nextSession);
+      setBranchTransferred(false);
       setSession(nextSession);
       setPairingScanned(false);
       setScreen('home');
@@ -417,7 +505,20 @@ Server: ${apiBaseUrl}`, [
     setScreen('pair');
   };
 
+  const navigateGuarded = (next) => {
+    if (branchTransferred || !session) {
+      setScreen('pair');
+      return;
+    }
+    setScreen(next);
+  };
+
   const openScanner = async (target) => {
+    if (branchTransferred && target !== 'pairing') {
+      setScreen('pair');
+      Alert.alert('Branch Transferred', BRANCH_TRANSFERRED_MESSAGE);
+      return;
+    }
     if (!permission?.granted) {
       const result = await requestPermission();
       if (!result.granted) {
@@ -809,6 +910,10 @@ Server: ${apiBaseUrl}`, [
   }
 
   const goBack = () => {
+    if (branchTransferred) {
+      setScreen('pair');
+      return;
+    }
     if (screen === 'scanner') setScreen(scannerTarget === 'pairing' ? 'pair' : scannerTarget === 'verification' ? 'verification' : 'search');
     else if (screen === 'request') setScreen('notifications');
     else setScreen('home');
@@ -829,11 +934,12 @@ Server: ${apiBaseUrl}`, [
           pairingCode={pairingCode}
           setPairingCode={setPairingCode}
           busy={pairingBusy}
+          branchTransferred={branchTransferred}
           onScanQr={() => openScanner('pairing')}
         />
       )}
-      {screen === 'home' && <HomeScreen session={session} pendingCount={pendingCount} navigate={setScreen} logout={logout} />}
-      {screen === 'auto' && (
+      {screen === 'home' && !branchTransferred && session && <HomeScreen session={session} pendingCount={pendingCount} navigate={navigateGuarded} logout={logout} />}
+      {screen === 'auto' && !branchTransferred && session && (
         <AutoPerpetualScreen
           onBack={goBack}
           sessionId={autoSessionId}
@@ -856,7 +962,7 @@ Server: ${apiBaseUrl}`, [
           lastResult={lastAutoResult}
         />
       )}
-      {screen === 'verification' && (
+      {screen === 'verification' && !branchTransferred && session && (
         <VerificationScreen
           onBack={goBack}
           input={verificationInput}
@@ -880,7 +986,7 @@ Server: ${apiBaseUrl}`, [
           busy={verificationBusy}
         />
       )}
-      {screen === 'search' && (
+      {screen === 'search' && !branchTransferred && session && (
         <SearchScreen
           onBack={goBack}
           input={searchInput}
@@ -894,7 +1000,7 @@ Server: ${apiBaseUrl}`, [
           busy={searchBusy}
         />
       )}
-      {screen === 'notifications' && (
+      {screen === 'notifications' && !branchTransferred && session && (
         <NotificationsScreen
           onBack={goBack}
           rows={notifications}
@@ -905,7 +1011,7 @@ Server: ${apiBaseUrl}`, [
           snoozeRequest={snoozeRequest}
         />
       )}
-      {screen === 'request' && (
+      {screen === 'request' && !branchTransferred && session && (
         <RequestScreen
           onBack={goBack}
           request={selectedRequest}
@@ -918,8 +1024,22 @@ Server: ${apiBaseUrl}`, [
       {screen === 'scanner' && (
         scannerTarget === 'pairing' ? (
           <PairingScannerScreen onBack={goBack} onBarcodeScanned={handlePairingQr} scanned={pairingScanned || pairingBusy} onScanAgain={() => setPairingScanned(false)} />
-        ) : (
+        ) : !branchTransferred && session ? (
           <ScannerScreen onBack={goBack} permission={permission} cameraRef={cameraRef} cameraLayout={cameraLayout} scanFrameLayout={scanFrameLayout} scanLine={scanLine} onScan={scanPartNumber} busy={ocrBusy} />
+        ) : (
+          <PairScreen
+            mobileUserId={mobileUserId}
+            setMobileUserId={setMobileUserId}
+            userName={userName}
+            setUserName={setUserName}
+            mobileNumber={mobileNumber}
+            setMobileNumber={setMobileNumber}
+            pairingCode={pairingCode}
+            setPairingCode={setPairingCode}
+            busy={pairingBusy}
+            branchTransferred={branchTransferred}
+            onScanQr={() => openScanner('pairing')}
+          />
         )
       )}
     </SafeAreaView>
@@ -933,6 +1053,12 @@ function PairScreen(props) {
         <Image source={require("./assets/sleeping-stock-logo-transparent.png")} style={styles.brandLogo} resizeMode="contain" />
         <Text style={styles.appTitle}>Sleeping Stock Mobile</Text>
         <Text style={styles.appSub}>PAIR THIS DEVICE</Text>
+        {props.branchTransferred ? (
+          <View style={styles.transferBanner}>
+            <Text style={styles.transferBannerTitle}>BRANCH TRANSFERRED</Text>
+            <Text style={styles.transferBannerText}>{BRANCH_TRANSFERRED_MESSAGE}</Text>
+          </View>
+        ) : null}
         <View style={styles.card}>
           <Field label="Your Name" value={props.userName} onChangeText={props.setUserName} />
           <Field label="Mobile Number" value={props.mobileNumber} onChangeText={props.setMobileNumber} keyboardType="phone-pad" />
@@ -1213,7 +1339,7 @@ function StockRow({ row }) { return <View style={styles.stockRow}><View style={{
 const styles = StyleSheet.create({
   flex: { flex: 1 }, safeArea: { flex: 1, backgroundColor: BG }, center: { alignItems: 'center', justifyContent: 'center' },
   offline: { backgroundColor: '#fff2c7', paddingVertical: 7, alignItems: 'center' }, offlineText: { color: '#7b5b00', fontSize: 12, fontWeight: '700' },
-  pairPage: { flexGrow: 1, justifyContent: 'center', padding: 24, paddingBottom: 56 }, qrInfo: { color: MUTED, fontSize: 12, lineHeight: 18, marginBottom: 16 }, detectedUser: { marginTop: 12, color: SUCCESS, fontSize: 12, fontWeight: '800', textAlign: 'center' }, brandLogo: { alignSelf: 'center', width: 190, height: 190 }, appTitle: { marginTop: 16, textAlign: 'center', color: DARK, fontSize: 24, fontWeight: '900' }, appSub: { marginTop: 4, marginBottom: 22, textAlign: 'center', color: MUTED, fontSize: 11, fontWeight: '800', letterSpacing: 1.4 },
+  pairPage: { flexGrow: 1, justifyContent: 'center', padding: 24, paddingBottom: 56 }, qrInfo: { color: MUTED, fontSize: 12, lineHeight: 18, marginBottom: 16 }, detectedUser: { marginTop: 12, color: SUCCESS, fontSize: 12, fontWeight: '800', textAlign: 'center' }, brandLogo: { alignSelf: 'center', width: 190, height: 190 }, appTitle: { marginTop: 16, textAlign: 'center', color: DARK, fontSize: 24, fontWeight: '900' }, appSub: { marginTop: 4, marginBottom: 22, textAlign: 'center', color: MUTED, fontSize: 11, fontWeight: '800', letterSpacing: 1.4 }, transferBanner: { marginBottom: 16, padding: 16, backgroundColor: '#fde8e8', borderWidth: 1, borderColor: '#f3b4b4', borderRadius: 16 }, transferBannerTitle: { color: DANGER, fontSize: 12, fontWeight: '900', letterSpacing: 0.8 }, transferBannerText: { marginTop: 8, color: DARK, fontSize: 15, fontWeight: '800', lineHeight: 22 },
   card: { backgroundColor: '#fff', padding: 18, borderRadius: 20, borderWidth: 1, borderColor: BORDER }, label: { marginBottom: 7, color: DARK, fontSize: 12, fontWeight: '800' }, input: { minHeight: 50, borderWidth: 1, borderColor: BORDER, borderRadius: 13, paddingHorizontal: 14, backgroundColor: '#fbfcff', color: DARK },
   primaryButton: { minHeight: 50, paddingHorizontal: 18, borderRadius: 13, backgroundColor: BLUE, alignItems: 'center', justifyContent: 'center' }, primaryText: { color: '#fff', fontWeight: '900' }, secondaryButton: { flex: 1, minHeight: 50, borderRadius: 13, borderWidth: 1, borderColor: BLUE, alignItems: 'center', justifyContent: 'center', marginRight: 10 }, secondaryText: { color: BLUE, fontWeight: '900' }, disabled: { opacity: 0.45 },
   homePage: { padding: 20, paddingBottom: 50 }, homeHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, hello: { color: MUTED, fontSize: 11, fontWeight: '800' }, homeName: { marginTop: 3, color: DARK, fontSize: 24, fontWeight: '900' }, logout: { color: DANGER, fontWeight: '800' }, branchCard: { marginTop: 20, marginBottom: 22, padding: 18, backgroundColor: BLUE, borderRadius: 20 }, branchTitle: { color: '#fff', fontSize: 18, fontWeight: '900' }, branchSub: { marginTop: 5, color: '#dbe7ff', fontSize: 12 }, menuButton: { minHeight: 82, marginBottom: 13, padding: 15, backgroundColor: '#fff', borderWidth: 1, borderColor: BORDER, borderRadius: 18, flexDirection: 'row', alignItems: 'center' }, menuIcon: { width: 48, height: 48, borderRadius: 15, backgroundColor: '#edf3ff', alignItems: 'center', justifyContent: 'center', marginRight: 13 }, menuTitle: { color: DARK, fontSize: 16, fontWeight: '900' }, menuSub: { marginTop: 4, color: MUTED, fontSize: 11 }, chevron: { color: BLUE, fontSize: 28 }, pendingCard: { marginTop: 10, padding: 14, backgroundColor: '#fff7e6', borderRadius: 14, flexDirection: 'row', justifyContent: 'space-between' }, pendingText: { color: '#865b00', flex: 1 }, pendingAction: { color: BLUE, fontWeight: '900' },
