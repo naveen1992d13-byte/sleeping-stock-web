@@ -1,7 +1,7 @@
 import { User, Upload, Package, FileSpreadsheet, ClipboardCheck, ClipboardList, BarChart3, Globe, Megaphone, HelpCircle, Smartphone, History, ScanLine, HardDrive, Image } from 'lucide-react';
 
 export const APPLICATION_MENU_ITEMS = [
-  { path: '/users', label: 'User Hub', icon: User, id: 'users', adminOnly: true },
+  { path: '/users', label: 'User Hub', icon: User, id: 'users', adminOnly: true, allowUser: true },
   { path: '/upload', label: 'Upload Center', icon: Upload, id: 'upload', adminOnly: true },
   { path: '/products', label: 'Product Hub', icon: Package, id: 'products' },
   { path: '/product-history', label: 'Product Hub History', icon: FileSpreadsheet, id: 'product-history', adminOnly: true },

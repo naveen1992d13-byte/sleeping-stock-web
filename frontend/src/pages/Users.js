@@ -51,6 +51,7 @@ function normalizeHubSection(raw, { isMaster, isAdmin }) {
   if (!HUB_SECTIONS.includes(mapped)) return "website";
   if (mapped === "settings" && !isMaster) return "website";
   if (mapped === "add" && !(isMaster || isAdmin)) return "website";
+  if (mapped === "app" && !(isMaster || isAdmin)) return "website";
   return mapped;
 }
 
@@ -115,6 +116,7 @@ export default function UsersPage() {
   const [statusFilter, setStatusFilter] = useState("all");
 
   const [users, setUsers] = useState([]);
+  const [mobileUsers, setMobileUsers] = useState([]);
   const [states, setStates] = useState([]);
   const [brands, setBrands] = useState([]);
   const [dealers, setDealers] = useState([]);
@@ -238,11 +240,34 @@ export default function UsersPage() {
     }
   };
 
+  const loadMobileStats = async () => {
+    try {
+      const params = new URLSearchParams();
+      if (!isAllValue(scopeBrand)) params.set("brand_name", scopeBrand);
+      if (!isAllValue(scopeDealer)) params.set("dealer_name", scopeDealer);
+      if (!isAllValue(scopeBranch)) params.set("branch", scopeBranch);
+      const qs = params.toString();
+      const res = await fetch(`${API}/mobile/users${qs ? `?${qs}` : ""}`, { headers: authHeaders });
+      const data = await res.json().catch(() => []);
+      setMobileUsers(Array.isArray(data) ? data : []);
+    } catch {
+      setMobileUsers([]);
+    }
+  };
+
   useEffect(() => {
     loadData();
     loadTemplates();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    loadMobileStats();
+    const refresh = () => { loadMobileStats(); };
+    window.addEventListener("nmts-mobile-users-changed", refresh);
+    return () => window.removeEventListener("nmts-mobile-users-changed", refresh);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopeBrand, scopeDealer, scopeBranch, user?.id]);
 
   useEffect(() => {
     if (activeTab === "mobile" || activeTab === "app") setMobileReady(true);
@@ -307,13 +332,32 @@ export default function UsersPage() {
     ));
     const scopedBrands = brands.filter(b => isAllValue(scopeBrand) || b.name === scopeBrand);
     const scopedStates = states.filter(st => isAllValue(scopeBrand) || scopedUsers.some(u => u.state === st.name || u.state === st.code));
+    const scopedMobile = mobileUsers.filter((mu) => {
+      const uBrand = mu.brand_name || "";
+      const uDealer = mu.dealer_name || "";
+      const uBranch = mu.branch || "";
+      return (isAllValue(scopeBrand) || uBrand === scopeBrand) &&
+        (isAllValue(scopeDealer) || uDealer === scopeDealer) &&
+        (isAllValue(scopeBranch) || uBranch === scopeBranch);
+    });
+    const websiteActive = scopedUsers.filter((x) => String(x.status || "active").toLowerCase() === "active").length;
+    const websiteInactive = scopedUsers.filter((x) => String(x.status || "active").toLowerCase() !== "active").length;
+    const mobileAdmin = (mu) => String(mu.admin_status || mu.status || "active").toLowerCase();
+    const mobileActive = scopedMobile.filter((mu) => mobileAdmin(mu) === "active").length;
+    const mobileInactive = scopedMobile.filter((mu) => mobileAdmin(mu) !== "active").length;
     return {
-      totalUsers: scopedUsers.length,
-      activeUsers: scopedUsers.filter((x) => String(x.status || "active").toLowerCase() === "active").length,
-      inactiveUsers: scopedUsers.filter((x) => String(x.status || "active").toLowerCase() !== "active").length,
+      totalUsers: scopedUsers.length + scopedMobile.length,
+      activeUsers: websiteActive + mobileActive,
+      inactiveUsers: websiteInactive + mobileInactive,
+      websiteTotal: scopedUsers.length,
+      websiteActive,
+      websiteInactive,
+      mobileTotal: scopedMobile.length,
+      mobileActive,
+      mobileInactive,
       states: scopedStates.length, brands: scopedBrands.length, dealers: scopedDealers.length, branches: scopedBranches.length,
     };
-  }, [scopedUsers, states, brands, dealers, branches, scopeBrand, scopeDealer, scopeBranch]);
+  }, [scopedUsers, mobileUsers, states, brands, dealers, branches, scopeBrand, scopeDealer, scopeBranch]);
 
   const filteredUsers = scopedUsers.filter((u) => {
     const s = search.toLowerCase();
@@ -856,9 +900,9 @@ export default function UsersPage() {
     <div className="space-y-6 p-0 md:p-0" data-testid="user-hub-page" style={{ color: COLORS.text }}>
 
       <div className="grid grid-cols-2 xl:grid-cols-7 gap-4 mb-5">
-        <Stat title="Total Users" value={stats.totalUsers} icon={Users} />
-        <Stat title="Active Users" value={stats.activeUsers} icon={Power} />
-        <Stat title="Inactive" value={stats.inactiveUsers} icon={Power} />
+        <Stat title="Total Users" value={stats.totalUsers} icon={Users} breakdown={{ website: stats.websiteTotal, mobile: stats.mobileTotal }} />
+        <Stat title="Active Users" value={stats.activeUsers} icon={Power} breakdown={{ website: stats.websiteActive, mobile: stats.mobileActive }} />
+        <Stat title="Inactive" value={stats.inactiveUsers} icon={Power} breakdown={{ website: stats.websiteInactive, mobile: stats.mobileInactive }} />
         <Stat title="States" value={stats.states} icon={MapPin} />
         <Stat title="Brands" value={stats.brands} icon={Building2} />
         <Stat title="Dealers" value={stats.dealers} icon={Users} />
@@ -874,7 +918,9 @@ export default function UsersPage() {
         {isMaster && (
           <Tab active={activeTab === "settings"} onClick={() => selectSection("settings")} icon={Settings} label="Settings" testId="user-hub-tab-settings" />
         )}
-        <Tab active={activeTab === "app"} onClick={() => selectSection("app")} icon={Settings2} label="App Settings" testId="user-hub-tab-app" />
+        {(isMaster || isAdmin) && (
+          <Tab active={activeTab === "app"} onClick={() => selectSection("app")} icon={Settings2} label="App Settings" testId="user-hub-tab-app" />
+        )}
       </div>
 
       {activeTab === "website" && (
@@ -1311,12 +1357,18 @@ function Header() {
   );
 }
 
-function Stat({ title, value, icon: Icon }) {
+function Stat({ title, value, icon: Icon, breakdown }) {
   return (
     <div className="rounded-2xl p-4 shadow-sm" style={{ backgroundColor: COLORS.card, border: `1px solid ${COLORS.border}` }}>
       <Icon className="h-5 w-5 mb-3" />
       <p className="text-sm">{title}</p>
       <h2 className="text-3xl font-bold">{value}</h2>
+      {breakdown && (
+        <div className="mt-2 text-xs leading-5" style={{ color: COLORS.muted }} data-testid="user-hub-stat-breakdown">
+          <div>Website: {breakdown.website}</div>
+          <div>Mobile: {breakdown.mobile}</div>
+        </div>
+      )}
     </div>
   );
 }

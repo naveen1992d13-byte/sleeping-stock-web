@@ -299,6 +299,30 @@ def _require_scope_selected(brand, dealer, branch):
         raise HTTPException(400, "Brand, Dealer and Branch must all be selected before generating a pairing code")
 
 
+def _same_mobile_scope(left, right) -> bool:
+    def _norm(row):
+        return (
+            str((row or {}).get("brand_name") or "").strip().casefold(),
+            str((row or {}).get("dealer_name") or "").strip().casefold(),
+            str((row or {}).get("branch") or "").strip().casefold(),
+        )
+    return _norm(left) == _norm(right) and all(_norm(left))
+
+
+def _require_master_or_admin(current_user, action="this action"):
+    role = str(getattr(current_user, "role", "") or "").strip().lower()
+    if role not in ("master", "admin"):
+        raise HTTPException(403, f"Only Master/Admin can {action}")
+
+
+def _actor_scope(current_user) -> dict:
+    return {
+        "brand_name": str(getattr(current_user, "brand", "") or "").strip(),
+        "dealer_name": str(getattr(current_user, "group", "") or "").strip(),
+        "branch": str(getattr(current_user, "location", "") or "").strip(),
+    }
+
+
 def _scoped_query_for_user(current_user, brand=None, dealer=None, branch=None) -> dict:
     """
     Mirrors the existing NMTS role-scoping pattern (master: full access,
@@ -524,9 +548,9 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
     return {
         "device": device,
         "mobile_user": mobile_user,
-        "brand_name": device["brand_name"],
-        "dealer_name": device["dealer_name"],
-        "branch": device["branch"],
+        "brand_name": mobile_user.get("brand_name") or device.get("brand_name"),
+        "dealer_name": mobile_user.get("dealer_name") or device.get("dealer_name"),
+        "branch": mobile_user.get("branch") or device.get("branch"),
     }
 
 
@@ -534,15 +558,13 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
 
 @router.post("/users", response_model=MobileUserResponse)
 async def create_mobile_user(payload: MobileUserCreate, current_user: UserResponse = Depends(_web_current_user)):
+    _require_master_or_admin(current_user, "create mobile users")
     if current_user.role == "master":
         brand, dealer, branch = payload.brand_name, payload.dealer_name, payload.branch
         _require_scope_selected(brand, dealer, branch)
-    elif current_user.role == "admin":
+    else:
         brand, dealer = current_user.brand, current_user.group
         branch = payload.branch
-        _require_scope_selected(brand, dealer, branch)
-    else:
-        brand, dealer, branch = current_user.brand, current_user.group, current_user.location
         _require_scope_selected(brand, dealer, branch)
 
     brand, dealer, branch = await _resolve_canonical_pairing_scope(brand, dealer, branch)
@@ -598,9 +620,8 @@ async def list_mobile_users(
 
 @router.get("/users/{mobile_user_id}", response_model=MobileUserResponse)
 async def get_mobile_user(mobile_user_id: str, current_user: UserResponse = Depends(_web_current_user)):
-    row = await db.mobile_users.find_one({"mobile_user_id": mobile_user_id}, {"_id": 0, "password_hash": 0})
-    if not row:
-        raise HTTPException(404, "Mobile user not found")
+    row = await _assert_mobile_user_access(current_user, mobile_user_id)
+    row.pop("password_hash", None)
     enriched = await _enrich_mobile_user_presence([row])
     return enriched[0]
 
@@ -610,8 +631,7 @@ async def set_mobile_user_status(mobile_user_id: str, payload: DeviceStatusUpdat
     if payload.status not in ("active", "inactive"):
         raise HTTPException(400, "status must be active or inactive")
     await _assert_mobile_user_access(current_user, mobile_user_id)
-    if current_user.role not in ("master", "admin", "user"):
-        raise HTTPException(403, "Not allowed")
+    _require_master_or_admin(current_user, "change mobile user status")
     result = await db.mobile_users.update_one(
         {"mobile_user_id": mobile_user_id}, {"$set": {"status": payload.status, "updated_at": _now_iso()}}
     )
@@ -653,8 +673,7 @@ async def set_mobile_user_attendance(
     payload: MobileUserAttendanceUpdate,
     current_user: UserResponse = Depends(_web_current_user),
 ):
-    if current_user.role not in ("master", "admin", "user"):
-        raise HTTPException(403, "Not allowed")
+    _require_master_or_admin(current_user, "change mobile user attendance")
     if payload.status not in ("active", "inactive"):
         raise HTTPException(400, "status must be active or inactive")
     row = await _assert_mobile_user_access(current_user, mobile_user_id)
@@ -703,41 +722,74 @@ async def list_today_attendance(
 
 @router.put("/users/{mobile_user_id}/branch")
 async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBranchUpdate, current_user: UserResponse = Depends(_web_current_user)):
-    user_doc = await db.mobile_users.find_one({"mobile_user_id": mobile_user_id}, {"_id": 0})
+    _require_master_or_admin(current_user, "transfer a mobile user's branch")
+    user_doc = await db.mobile_users.find_one({"mobile_user_id": mobile_user_id, "deleted_at": {"$exists": False}}, {"_id": 0})
     if not user_doc:
         raise HTTPException(404, "Mobile user not found")
 
+    current_scope = {
+        "brand_name": user_doc.get("brand_name"),
+        "dealer_name": user_doc.get("dealer_name"),
+        "branch": user_doc.get("branch"),
+    }
     if current_user.role == "master":
         brand = payload.brand_name or user_doc.get("brand_name")
         dealer = payload.dealer_name or user_doc.get("dealer_name")
         branch = payload.branch
-    elif current_user.role == "admin":
-        if user_doc.get("brand_name") != current_user.brand or user_doc.get("dealer_name") != current_user.group:
-            raise HTTPException(403, "Mobile user is outside your Brand/Dealer scope")
-        brand, dealer, branch = current_user.brand, current_user.group, payload.branch
     else:
-        raise HTTPException(403, "Only Master/Admin can change a mobile user's branch")
+        actor = _actor_scope(current_user)
+        if (
+            str(user_doc.get("brand_name") or "").casefold() != actor["brand_name"].casefold()
+            or str(user_doc.get("dealer_name") or "").casefold() != actor["dealer_name"].casefold()
+        ):
+            raise HTTPException(403, "Mobile user is outside your Brand/Dealer scope")
+        brand = payload.brand_name or actor["brand_name"]
+        dealer = payload.dealer_name or actor["dealer_name"]
+        branch = payload.branch
+        if brand.casefold() != actor["brand_name"].casefold() or dealer.casefold() != actor["dealer_name"].casefold():
+            raise HTTPException(403, "Destination is outside your Brand/Dealer scope")
     _require_scope_selected(brand, dealer, branch)
     brand, dealer, branch = await _resolve_canonical_pairing_scope(brand, dealer, branch)
+    destination = {"brand_name": brand, "dealer_name": dealer, "branch": branch}
+    if _same_mobile_scope(current_scope, destination):
+        raise HTTPException(400, "Select a different destination branch")
 
+    now = _now_iso()
     await db.mobile_users.update_one({"mobile_user_id": mobile_user_id}, {"$set": {
         "brand_name": brand, "dealer_name": dealer, "branch": branch,
-        "updated_at": _now_iso(), "branch_changed_at": _now_iso(),
+        "updated_at": now, "branch_changed_at": now,
         "branch_changed_by": current_user.id,
+        "active_device_count": 0,
     }})
     await db.mobile_sessions.delete_many({"mobile_user_id": mobile_user_id})
-    # Any unused Re-pair QR generated for the old scope must stop working.
+    await db.mobile_request_group_locks.delete_many({"mobile_user_id": mobile_user_id})
     await db.mobile_pairing_codes.update_many(
         {"mobile_user_id": mobile_user_id, "pairing_type": "REPAIR", "used": False},
-        {"$set": {"used": True, "used_at": _now_iso(), "invalidated_reason": "branch_changed"}},
+        {"$set": {"used": True, "used_at": now, "invalidated_reason": "branch_changed"}},
+    )
+    await db.auto_perpetual_assignments.delete_many(
+        {"mobile_user_id": mobile_user_id, "status": "pending"}
     )
     await db.mobile_devices.update_many(
-        {"mobile_user_id": mobile_user_id, "status": "active"},
-        {"$set": {"status": "inactive", "inactive_reason": "branch_changed", "updated_at": _now_iso()}},
+        {"mobile_user_id": mobile_user_id},
+        {"$set": {
+            "brand_name": brand,
+            "dealer_name": dealer,
+            "branch": branch,
+            "status": "inactive",
+            "session_active": False,
+            "inactive_reason": "branch_changed",
+            "updated_at": now,
+        }},
     )
-    await db.mobile_users.update_one({"mobile_user_id": mobile_user_id}, {"$set": {"active_device_count": 0}})
-    await _audit(current_user, "mobile_user_branch_changed", mobile_user_id, {"brand_name": brand, "dealer_name": dealer, "branch": branch})
-    return {"message": "Branch updated. Generate a Re-pair QR for this user.", "mobile_user_id": mobile_user_id, "branch": branch}
+    await _audit(current_user, "mobile_user_branch_changed", mobile_user_id, destination)
+    return {
+        "message": "Branch updated. Generate a Re-pair QR for this user.",
+        "mobile_user_id": mobile_user_id,
+        "brand_name": brand,
+        "dealer_name": dealer,
+        "branch": branch,
+    }
 
 
 # ==================== PAIRING (WEB generates code, MOBILE consumes it) ====================
@@ -767,7 +819,7 @@ async def generate_pairing_code(request: Request, payload: PairingGenerateReques
         branch = payload.branch or (mobile_user or {}).get("branch")
     else:
         brand, dealer, branch = current_user.brand, current_user.group, current_user.location
-        if pairing_type == "REPAIR" and mobile_user.get("branch") != branch:
+        if pairing_type == "REPAIR" and not _same_mobile_scope(mobile_user, {"brand_name": brand, "dealer_name": dealer, "branch": branch}):
             raise HTTPException(403, "Mobile user is outside your assigned Branch")
     _require_scope_selected(brand, dealer, branch)
     brand, dealer, branch = await _resolve_canonical_pairing_scope(brand, dealer, branch)
@@ -1096,11 +1148,13 @@ async def list_devices(
 
 @router.put("/devices/{device_id}/status")
 async def set_device_status(device_id: str, payload: DeviceStatusUpdate, current_user: UserResponse = Depends(_web_current_user)):
+    _require_master_or_admin(current_user, "change device status")
     if payload.status not in ("active", "inactive", "removed"):
         raise HTTPException(400, "Invalid status")
     device = await db.mobile_devices.find_one({"device_id": device_id})
     if not device:
         raise HTTPException(404, "Device not found")
+    await _assert_mobile_user_access(current_user, device.get("mobile_user_id"))
 
     was_active = device.get("status") == "active"
     await db.mobile_devices.update_one({"device_id": device_id}, {"$set": {"status": payload.status}})
@@ -1406,6 +1460,13 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
 
     mu = session["mobile_user"]["mobile_user_id"]
     allocation_date = ist_date_key()
+    scope_q = {
+        "allocation_date": allocation_date,
+        "mobile_user_id": mu,
+        "brand_name": session["brand_name"],
+        "dealer_name": session["dealer_name"],
+        "branch": session["branch"],
+    }
     # Always use the authoritative daily get-or-create session. Do not trust
     # per-assignment session_id stamps — those can diverge across parts.
     session_id = await get_or_create_auto_daily_session(
@@ -1417,29 +1478,18 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
         device_id=session["device"]["device_id"],
     )
     rows = await db.auto_perpetual_assignments.find(
-        {
-            "allocation_date": allocation_date,
-            "mobile_user_id": mu,
-            "status": "pending",
-        },
+        {**scope_q, "status": "pending"},
         {"_id": 0},
     ).to_list(500)
     rows.sort(key=lambda r: (r.get("loc") or r.get("part_number") or "").upper())
     # Normalize assignment stamps to today's single session for consistency.
     if rows:
         await db.auto_perpetual_assignments.update_many(
-            {
-                "allocation_date": allocation_date,
-                "mobile_user_id": mu,
-            },
+            scope_q,
             {"$set": {"session_id": session_id}},
         )
-    assigned = await db.auto_perpetual_assignments.count_documents(
-        {"allocation_date": allocation_date, "mobile_user_id": mu}
-    )
-    completed = await db.auto_perpetual_assignments.count_documents(
-        {"allocation_date": allocation_date, "mobile_user_id": mu, "status": "completed"}
-    )
+    assigned = await db.auto_perpetual_assignments.count_documents(scope_q)
+    completed = await db.auto_perpetual_assignments.count_documents({**scope_q, "status": "completed"})
     enriched = []
     for row in rows:
         product, _ = await find_scoped_product(row.get("part_number", ""), session["brand_name"], session["dealer_name"], session["branch"])

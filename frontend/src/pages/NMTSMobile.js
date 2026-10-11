@@ -6,6 +6,7 @@ import { Smartphone, Download, Ban, Trash2, ScanLine, Copy, ClipboardCheck, Came
 import { Button } from '../components/ui/button';
 import { toast } from 'sonner';
 import { NmtsConfirmDialog } from '../components/NmtsConfirmDialog';
+import { NmtsModal } from '../components/NmtsModal';
 
 const clean = (v) => String(v || '').trim();
 const exact = (v) => clean(v) && clean(v) !== 'N/A' && !clean(v).startsWith('All ');
@@ -34,7 +35,16 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   const scopeReady=exact(brand)&&exact(dealer)&&exact(branch);
   const canManage=['master','admin'].includes(user?.role);
   const isMaster = user?.role==='master';
-  const canManageMobileAccount = ['master','admin','user'].includes(user?.role);
+  const isUser = user?.role==='user';
+  const canPair = canManage || isUser;
+  const canManageMobileAccount = canManage;
+  const userBrand = clean(user?.brand);
+  const userDealer = clean(user?.dealer || user?.group);
+  const userBranch = clean(user?.branch || user?.location);
+  const pairBrand = isUser ? userBrand : brand;
+  const pairDealer = isUser ? userDealer : dealer;
+  const pairBranch = isUser ? userBranch : branch;
+  const pairReady = exact(pairBrand) && exact(pairDealer) && exact(pairBranch);
   const [section,setSection]=useState(showAuditSections ? 'physical' : 'mobile');
 
   // ==================== Mobile User Management (new model) ====================
@@ -58,6 +68,11 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
 
   const [branchMoveTarget, setBranchMoveTarget] = useState(null);
   const [branchMoveBusy, setBranchMoveBusy] = useState(false);
+  const [moveDestDealer, setMoveDestDealer] = useState('');
+  const [moveDestBranch, setMoveDestBranch] = useState('');
+  const [moveDealers, setMoveDealers] = useState([]);
+  const [moveBranches, setMoveBranches] = useState([]);
+  const [moveConfirm, setMoveConfirm] = useState(false);
   const [notificationInterval,setNotificationInterval]=useState(30);
   const [savingInterval,setSavingInterval]=useState(false);
   const [appVersions,setAppVersions]=useState([]);
@@ -143,10 +158,10 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   },[scopeBrand,scopeDealer,scopeBranch,user?.id, showMobileSections]);
 
   const generateNewPairing=async()=>{
-    if(!scopeReady) return toast.error('Select an exact Brand, Dealer and Branch in the Dashboard filter first');
+    if(!pairReady) return toast.error(isUser ? 'Your assigned Brand, Dealer and Branch are required for pairing' : 'Select an exact Brand, Dealer and Branch in the Dashboard filter first');
     setCreatingUser(true);
     try{
-      const payload = {pairing_type:'NEW',brand_name:brand,dealer_name:dealer,branch};
+      const payload = {pairing_type:'NEW',brand_name:pairBrand,dealer_name:pairDealer,branch:pairBranch};
       const r=await axios.post(`${API}/mobile/pairing/generate`,payload);
       setPairingResult(r.data);
       toast.success('New-user pairing QR generated — valid for 10 minutes');
@@ -265,24 +280,79 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     finally{setPairingFor(null)}
   };
 
+  const destDealerDoc = useMemo(
+    () => moveDealers.find((d) => clean(d.name) === clean(moveDestDealer)),
+    [moveDealers, moveDestDealer]
+  );
+  const destBrand = clean(destDealerDoc?.brand || destDealerDoc?.brand_name || branchMoveTarget?.brand_name);
+  const destOptions = useMemo(
+    () => moveBranches.filter((b) => {
+      const dealerName = clean(b.dealer || b.dealer_name);
+      if (moveDestDealer && dealerName !== clean(moveDestDealer)) return false;
+      const sameCurrent = branchMoveTarget
+        && clean(b.name) === clean(branchMoveTarget.branch)
+        && dealerName === clean(branchMoveTarget.dealer_name);
+      return !sameCurrent;
+    }),
+    [moveBranches, moveDestDealer, branchMoveTarget]
+  );
+  const moveReady = Boolean(branchMoveTarget && clean(moveDestDealer) && clean(moveDestBranch) && destOptions.some((b) => clean(b.name) === clean(moveDestBranch)));
+
+  const closeTransfer = (force=false) => {
+    if (branchMoveBusy && !force) return;
+    setBranchMoveTarget(null);
+    setMoveDestDealer('');
+    setMoveDestBranch('');
+    setMoveConfirm(false);
+  };
+
   const performChangeBranch = async () => {
     const mu = branchMoveTarget;
-    if (!mu || branchMoveBusy) return;
-    if (!scopeReady) return toast.error('Select the new Brand / Dealer / Branch in the Dashboard filter first');
+    if (!mu || branchMoveBusy || !moveReady) return;
+    if (!moveConfirm) {
+      setMoveConfirm(true);
+      return;
+    }
     setBranchMoveBusy(true);
     try {
-      const r = await axios.put(`${API}/mobile/users/${mu.mobile_user_id}/branch`, { brand_name: brand, dealer_name: dealer, branch });
+      const r = await axios.put(`${API}/mobile/users/${mu.mobile_user_id}/branch`, {
+        brand_name: destBrand || mu.brand_name,
+        dealer_name: moveDestDealer,
+        branch: moveDestBranch,
+      });
       toast.success(r.data?.message || 'Branch updated');
-      setBranchMoveTarget(null);
+      closeTransfer(true);
       loadMobileUsers();
       loadTodayAttendance();
+      window.dispatchEvent(new Event('nmts-mobile-users-changed'));
     }catch(e){const d=e.response?.data?.detail;toast.error(typeof d==='string'?d:(d?.message||'Branch change failed'))}
     finally { setBranchMoveBusy(false); }
   };
 
-  const changeBranch = (mu) => {
-    if (!scopeReady) return toast.error('Select the new Brand / Dealer / Branch in the Dashboard filter first');
+  const changeBranch = async (mu) => {
     setBranchMoveTarget(mu);
+    setMoveDestDealer('');
+    setMoveDestBranch('');
+    setMoveConfirm(false);
+    try {
+      const [dRes, bRes] = await Promise.all([
+        axios.get(`${API}/masters/dealers`),
+        axios.get(`${API}/masters/branches`),
+      ]);
+      const dealers = Array.isArray(dRes.data) ? dRes.data : [];
+      const branches = Array.isArray(bRes.data) ? bRes.data : [];
+      const allowedDealers = isMaster
+        ? dealers
+        : dealers.filter((d) => clean(d.name) === userDealer || clean(d.name) === clean(user?.group));
+      setMoveDealers(allowedDealers);
+      setMoveBranches(isMaster ? branches : branches.filter((b) => {
+        const dealerName = clean(b.dealer || b.dealer_name);
+        return dealerName === userDealer || dealerName === clean(user?.group);
+      }));
+    } catch {
+      toast.error('Could not load destination dealers and branches');
+      setBranchMoveTarget(null);
+    }
   };
 
   const saveNotificationInterval=async()=>{
@@ -323,9 +393,9 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     )}
 
     {showMobileSections && visibleSection==='mobile'&&<div className="space-y-5">
-      {canManage && <Card title="Pair a New Mobile User"><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-        <div><p className="font-medium">Generate one-time QR for the selected Brand / Dealer / Branch.</p><p className="text-xs text-gray-500 mt-1">The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.</p></div>
-        <Button onClick={generateNewPairing} disabled={creatingUser||!scopeReady}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button>
+      {canPair && <Card title="Pair a New Mobile User"><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        <div><p className="font-medium">{isUser ? 'Generate one-time QR for your assigned Brand / Dealer / Branch.' : 'Generate one-time QR for the selected Brand / Dealer / Branch.'}</p><p className="text-xs text-gray-500 mt-1">The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.{isUser ? ` Scope: ${pairBrand} / ${pairDealer} / ${pairBranch}.` : ''}</p></div>
+        <Button onClick={generateNewPairing} disabled={creatingUser||!pairReady}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button>
       </div></Card>}
 
       {pairingResult && <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/75 backdrop-blur-sm p-4" onMouseDown={()=>setPairingResult(null)}>
@@ -364,8 +434,8 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
           <td>{mu.last_seen_at?fmt(mu.last_seen_at):(mu.last_active_at?fmt(mu.last_active_at):'-')}</td>
           <td><span className={`px-2 py-1 rounded text-xs ${att==='active'?'bg-emerald-100 text-emerald-800':att==='inactive'?'bg-amber-100 text-amber-800':'bg-gray-100 text-gray-600'}`}>{attLabel}</span></td>
           <td><div className="flex gap-2 flex-wrap">
-            {canManage && <Button size="sm" variant="outline" title="Re-pair QR" onClick={()=>generatePairing(mu)} disabled={pairingFor===mu.mobile_user_id || mu.status!=='active'}><RefreshCw className="h-4 w-4"/></Button>}
-            {canManage && <Button size="sm" variant="outline" title="Change branch" onClick={()=>changeBranch(mu)} disabled={!scopeReady}><ArrowRightLeft className="h-4 w-4"/></Button>}
+            {canPair && <Button size="sm" variant="outline" title="Re-pair QR" onClick={()=>generatePairing(mu)} disabled={pairingFor===mu.mobile_user_id || mu.status!=='active'}><RefreshCw className="h-4 w-4"/></Button>}
+            {canManage && <Button size="sm" variant="outline" title="Transfer Branch" onClick={()=>changeBranch(mu)}><ArrowRightLeft className="h-4 w-4"/></Button>}
             {canManageMobileAccount && mu.status!=='deleted' && <>
               <Button size="sm" variant="outline" title="Account active/inactive" onClick={()=>toggleUserStatus(mu)}>{mu.status==='active'?<Ban className="h-4 w-4"/>:<CheckCircle2 className="h-4 w-4"/>}</Button>
               <Button size="sm" variant={att==='active'?'default':'outline'} title="Present for Auto today" onClick={()=>setDailyAttendance(mu,'active')}>Present</Button>
@@ -473,22 +543,48 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
 
     {showAuditSections && viewSession&&<div className="fixed inset-0 bg-black/50 z-50 p-4 overflow-auto"><div className="bg-white rounded-xl max-w-7xl mx-auto p-5 border shadow-lg"><div className="flex justify-between mb-4"><div><h2 className="text-xl font-bold">{viewSession.session_id}</h2><p className="text-gray-500">{fmt(viewSession.created_at)}</p></div><Button variant="outline" onClick={()=>setViewSession(null)}><X className="h-4 w-4"/></Button></div><DetailTable rows={viewSession.items||[]} canManage={canManage} onCorrection={updateCorrection}/></div></div>}
 
-    <NmtsConfirmDialog
+    <NmtsModal
       open={!!branchMoveTarget}
-      title="Move Mobile User Branch"
-      message={
-        branchMoveTarget
-          ? `Move ${branchMoveTarget.mobile_user_id} from ${branchMoveTarget.branch} to ${branch}? Existing mobile session will be logged out.`
-          : ''
-      }
-      confirmLabel="Move Branch"
-      variant="danger"
-      loading={branchMoveBusy}
-      onCancel={() => {
-        if (!branchMoveBusy) setBranchMoveTarget(null);
-      }}
-      onConfirm={performChangeBranch}
-    />
+      onClose={closeTransfer}
+      title="Transfer Branch"
+    >
+      {branchMoveTarget && (
+        <div className="space-y-4" data-testid="transfer-branch-dialog">
+          <div className="grid md:grid-cols-3 gap-3">
+            <div className="border rounded-lg p-3 bg-gray-50"><div className="text-xs text-gray-500 mb-1">Current Brand</div><div className="font-semibold">{branchMoveTarget.brand_name || '-'}</div></div>
+            <div className="border rounded-lg p-3 bg-gray-50"><div className="text-xs text-gray-500 mb-1">Current Dealer</div><div className="font-semibold">{branchMoveTarget.dealer_name || '-'}</div></div>
+            <div className="border rounded-lg p-3 bg-gray-50"><div className="text-xs text-gray-500 mb-1">Current Branch</div><div className="font-semibold">{branchMoveTarget.branch || '-'}</div></div>
+          </div>
+          <div className="grid md:grid-cols-2 gap-3">
+            <label className="block">
+              <span className="text-sm font-semibold">Destination Dealer</span>
+              <select className="mt-1 w-full border rounded-lg h-10 px-3" value={moveDestDealer} onChange={(e)=>{setMoveDestDealer(e.target.value); setMoveDestBranch(''); setMoveConfirm(false);}}>
+                <option value="">Select dealer</option>
+                {moveDealers.map((d)=> <option key={d.id || d.name} value={d.name}>{d.name}{d.brand || d.brand_name ? ` (${d.brand || d.brand_name})` : ''}</option>)}
+              </select>
+            </label>
+            <label className="block">
+              <span className="text-sm font-semibold">Destination Branch</span>
+              <select className="mt-1 w-full border rounded-lg h-10 px-3" value={moveDestBranch} disabled={!moveDestDealer} onChange={(e)=>{setMoveDestBranch(e.target.value); setMoveConfirm(false);}}>
+                <option value="">Select branch</option>
+                {destOptions.map((b)=> <option key={b.id || b.name} value={b.name}>{b.name}</option>)}
+              </select>
+            </label>
+          </div>
+          {moveConfirm && (
+            <div className="border border-amber-300 bg-amber-50 text-amber-900 rounded-lg p-3 text-sm">
+              Move {branchMoveTarget.mobile_user_id} from {branchMoveTarget.dealer_name} / {branchMoveTarget.branch} to {moveDestDealer} / {moveDestBranch}? The current mobile session will be logged out.
+            </div>
+          )}
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="outline" disabled={branchMoveBusy} onClick={closeTransfer}>Cancel</Button>
+            <Button type="button" disabled={!moveReady || branchMoveBusy} onClick={performChangeBranch}>
+              {branchMoveBusy ? 'Moving…' : (moveConfirm ? 'Confirm Move' : 'Move')}
+            </Button>
+          </div>
+        </div>
+      )}
+    </NmtsModal>
 
     <NmtsConfirmDialog
       open={!!deleteTarget}

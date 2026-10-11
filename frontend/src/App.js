@@ -85,6 +85,7 @@ export const canAccessMenuItem = (user, item) => {
   if (item.testingOnly && !isTestingUiEnabled()) return false;
   if (item.masterOnly) return user.role === 'master';
   if (item.allRoles) return true;
+  if (item.allowUser && user.role === 'user') return true;
   if (item.adminOnly && user.role === 'user') {
     return normalizePermissions(user.permissions).includes(item.permissionLabel || item.label);
   }
@@ -185,7 +186,7 @@ function AuthProvider({ children }) {
   );
 }
 
-function ProtectedRoute({ children, permission, masterOnly = false }) {
+function ProtectedRoute({ children, permission, masterOnly = false, allowUser = false }) {
   const { user, loading } = useAuth();
   const location = useLocation();
 
@@ -197,6 +198,10 @@ function ProtectedRoute({ children, permission, masterOnly = false }) {
 
   if (masterOnly && user.role !== 'master') {
     return <Navigate to="/" replace />;
+  }
+
+  if (allowUser && user.role === 'user') {
+    return children;
   }
 
   if (!canAccessPermission(user, permission)) {
@@ -297,7 +302,7 @@ function App() {
             } />
             <Route path="notifications" element={<Notifications />} />
             <Route path="users" element={
-              <ProtectedRoute permission="User Hub">
+              <ProtectedRoute permission="User Hub" allowUser>
                 <Users />
               </ProtectedRoute>
             } />
