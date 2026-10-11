@@ -299,6 +299,15 @@ def _require_scope_selected(brand, dealer, branch):
         raise HTTPException(400, "Brand, Dealer and Branch must all be selected before generating a pairing code")
 
 
+def _same_text(left, right) -> bool:
+    return str(left or "").strip().casefold() == str(right or "").strip().casefold()
+
+
+def _is_all_scope_label(value) -> bool:
+    text = str(value or "").strip()
+    return (not text) or text == "N/A" or text.casefold().startswith("all ")
+
+
 def _same_mobile_scope(left, right) -> bool:
     def _norm(row):
         return (
@@ -406,6 +415,7 @@ class MobileUserBranchUpdate(BaseModel):
     brand_name: Optional[str] = None
     dealer_name: Optional[str] = None
     branch: str
+    confirm_pending_release: bool = False
 
 
 class DeviceStatusUpdate(BaseModel):
@@ -720,6 +730,32 @@ async def list_today_attendance(
     return {"attendance_date": attendance_date, "records": {r["mobile_user_id"]: r["status"] for r in rows}}
 
 
+async def _pending_transfer_work(mobile_user_id: str) -> dict:
+    locks = await db.mobile_request_group_locks.find(
+        {
+            "mobile_user_id": mobile_user_id,
+            "lock_status": {"$nin": ["picking_completed", "accepted", "rejected"]},
+        },
+        {"_id": 0, "request_group_key": 1, "lock_status": 1, "branch": 1, "dealer_name": 1, "picked_at": 1},
+    ).to_list(200)
+    assignments = await db.auto_perpetual_assignments.find(
+        {"mobile_user_id": mobile_user_id, "status": "pending"},
+        {"_id": 0, "part_number": 1, "loc": 1, "allocation_date": 1, "branch": 1, "status": 1},
+    ).to_list(200)
+    return {
+        "pending_requests": locks,
+        "pending_assignments": assignments,
+        "has_pending": bool(locks or assignments),
+    }
+
+
+@router.get("/users/{mobile_user_id}/transfer-pending")
+async def get_transfer_pending(mobile_user_id: str, current_user: UserResponse = Depends(_web_current_user)):
+    _require_master_or_admin(current_user, "review a mobile user's pending transfer work")
+    await _assert_mobile_user_access(current_user, mobile_user_id)
+    return await _pending_transfer_work(mobile_user_id)
+
+
 @router.put("/users/{mobile_user_id}/branch")
 async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBranchUpdate, current_user: UserResponse = Depends(_web_current_user)):
     _require_master_or_admin(current_user, "transfer a mobile user's branch")
@@ -732,27 +768,59 @@ async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBran
         "dealer_name": user_doc.get("dealer_name"),
         "branch": user_doc.get("branch"),
     }
-    if current_user.role == "master":
-        brand = payload.brand_name or user_doc.get("brand_name")
-        dealer = payload.dealer_name or user_doc.get("dealer_name")
-        branch = payload.branch
-    else:
+    if current_user.role != "master":
         actor = _actor_scope(current_user)
         if (
-            str(user_doc.get("brand_name") or "").casefold() != actor["brand_name"].casefold()
-            or str(user_doc.get("dealer_name") or "").casefold() != actor["dealer_name"].casefold()
+            not _same_text(user_doc.get("brand_name"), actor["brand_name"])
+            or not _same_text(user_doc.get("dealer_name"), actor["dealer_name"])
         ):
             raise HTTPException(403, "Mobile user is outside your Brand/Dealer scope")
-        brand = payload.brand_name or actor["brand_name"]
-        dealer = payload.dealer_name or actor["dealer_name"]
-        branch = payload.branch
-        if brand.casefold() != actor["brand_name"].casefold() or dealer.casefold() != actor["dealer_name"].casefold():
-            raise HTTPException(403, "Destination is outside your Brand/Dealer scope")
+    if payload.dealer_name and not _same_text(payload.dealer_name, current_scope["dealer_name"]):
+        raise HTTPException(400, "Cross-dealer transfer is not allowed")
+    if payload.brand_name and not _same_text(payload.brand_name, current_scope["brand_name"]):
+        raise HTTPException(400, "Cross-dealer transfer is not allowed")
+    brand = current_scope["brand_name"]
+    dealer = current_scope["dealer_name"]
+    branch = payload.branch
+    if _is_all_scope_label(branch) or _same_text(branch, current_scope["branch"]):
+        raise HTTPException(400, "Select a different destination branch")
     _require_scope_selected(brand, dealer, branch)
     brand, dealer, branch = await _resolve_canonical_pairing_scope(brand, dealer, branch)
+    if not _same_text(dealer, current_scope["dealer_name"]) or not _same_text(brand, current_scope["brand_name"]):
+        raise HTTPException(400, "Cross-dealer transfer is not allowed")
     destination = {"brand_name": brand, "dealer_name": dealer, "branch": branch}
     if _same_mobile_scope(current_scope, destination):
         raise HTTPException(400, "Select a different destination branch")
+
+    pending = await _pending_transfer_work(mobile_user_id)
+    if pending["has_pending"] and not payload.confirm_pending_release:
+        raise HTTPException(status_code=409, detail={
+            "code": "PENDING_WORK",
+            "message": "This mobile user has pending requests or work. Review and confirm after using the existing release process.",
+            "pending_requests": pending["pending_requests"],
+            "pending_assignments": pending["pending_assignments"],
+        })
+    if pending["pending_requests"]:
+        if not payload.confirm_pending_release:
+            raise HTTPException(status_code=409, detail={
+                "code": "PENDING_WORK",
+                "message": "Release pending requests before moving this mobile user.",
+                "pending_requests": pending["pending_requests"],
+                "pending_assignments": pending["pending_assignments"],
+            })
+        for lock in pending["pending_requests"]:
+            try:
+                await _release_lock(
+                    lock.get("request_group_key"),
+                    "SHIFT_CHANGE",
+                    "Released through Transfer Branch after Admin confirmation",
+                    current_user.id,
+                    getattr(current_user, "username", "") or current_user.id,
+                    "web_admin",
+                )
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
 
     now = _now_iso()
     await db.mobile_users.update_one({"mobile_user_id": mobile_user_id}, {"$set": {
@@ -762,13 +830,9 @@ async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBran
         "active_device_count": 0,
     }})
     await db.mobile_sessions.delete_many({"mobile_user_id": mobile_user_id})
-    await db.mobile_request_group_locks.delete_many({"mobile_user_id": mobile_user_id})
     await db.mobile_pairing_codes.update_many(
         {"mobile_user_id": mobile_user_id, "pairing_type": "REPAIR", "used": False},
         {"$set": {"used": True, "used_at": now, "invalidated_reason": "branch_changed"}},
-    )
-    await db.auto_perpetual_assignments.delete_many(
-        {"mobile_user_id": mobile_user_id, "status": "pending"}
     )
     await db.mobile_devices.update_many(
         {"mobile_user_id": mobile_user_id},

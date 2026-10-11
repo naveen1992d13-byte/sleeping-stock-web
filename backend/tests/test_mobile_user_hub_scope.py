@@ -58,6 +58,13 @@ def test_user_repair_scope_requires_full_brand_dealer_branch():
     )
 
 
+def test_same_text_and_all_branch_labels():
+    assert ma._same_text("FPL automobiles pvt ltd", "fpl automobiles pvt ltd")
+    assert ma._is_all_scope_label("All Branches")
+    assert ma._is_all_scope_label("")
+    assert not ma._is_all_scope_label("Koyambedu")
+
+
 def test_overlay_identifies_mobile_user_and_device_docs():
     from testing_overlay import doc_id
 

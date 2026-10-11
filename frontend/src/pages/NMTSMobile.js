@@ -8,8 +8,18 @@ import { toast } from 'sonner';
 import { NmtsConfirmDialog } from '../components/NmtsConfirmDialog';
 import { NmtsModal } from '../components/NmtsModal';
 
+const HUB_COLORS = {
+  card: '#DCE8D1',
+  primary: '#059669',
+  active: '#8BC34A',
+  button: '#708A5D',
+  border: '#C8D5BF',
+  text: '#263326',
+  muted: '#5F6B5A',
+};
 const clean = (v) => String(v || '').trim();
 const exact = (v) => clean(v) && clean(v) !== 'N/A' && !clean(v).startsWith('All ');
+const isAllLabel = (v) => !clean(v) || clean(v) === 'N/A' || clean(v).toLowerCase().startsWith('all ');
 const money = (v) => Number(v || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmt = (v) => {
   if (!v) return '-';
@@ -68,11 +78,11 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
 
   const [branchMoveTarget, setBranchMoveTarget] = useState(null);
   const [branchMoveBusy, setBranchMoveBusy] = useState(false);
-  const [moveDestDealer, setMoveDestDealer] = useState('');
   const [moveDestBranch, setMoveDestBranch] = useState('');
-  const [moveDealers, setMoveDealers] = useState([]);
   const [moveBranches, setMoveBranches] = useState([]);
   const [moveConfirm, setMoveConfirm] = useState(false);
+  const [movePending, setMovePending] = useState({ pending_requests: [], pending_assignments: [], has_pending: false });
+  const hubTheme = hideInternalNav;
   const [notificationInterval,setNotificationInterval]=useState(30);
   const [savingInterval,setSavingInterval]=useState(false);
   const [appVersions,setAppVersions]=useState([]);
@@ -280,30 +290,24 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     finally{setPairingFor(null)}
   };
 
-  const destDealerDoc = useMemo(
-    () => moveDealers.find((d) => clean(d.name) === clean(moveDestDealer)),
-    [moveDealers, moveDestDealer]
-  );
-  const destBrand = clean(destDealerDoc?.brand || destDealerDoc?.brand_name || branchMoveTarget?.brand_name);
   const destOptions = useMemo(
     () => moveBranches.filter((b) => {
+      const name = clean(b.name);
+      if (isAllLabel(name)) return false;
       const dealerName = clean(b.dealer || b.dealer_name);
-      if (moveDestDealer && dealerName !== clean(moveDestDealer)) return false;
-      const sameCurrent = branchMoveTarget
-        && clean(b.name) === clean(branchMoveTarget.branch)
-        && dealerName === clean(branchMoveTarget.dealer_name);
-      return !sameCurrent;
+      if (!branchMoveTarget || dealerName.toLowerCase() !== clean(branchMoveTarget.dealer_name).toLowerCase()) return false;
+      return name.toLowerCase() !== clean(branchMoveTarget.branch).toLowerCase();
     }),
-    [moveBranches, moveDestDealer, branchMoveTarget]
+    [moveBranches, branchMoveTarget]
   );
-  const moveReady = Boolean(branchMoveTarget && clean(moveDestDealer) && clean(moveDestBranch) && destOptions.some((b) => clean(b.name) === clean(moveDestBranch)));
+  const moveReady = Boolean(branchMoveTarget && clean(moveDestBranch) && destOptions.some((b) => clean(b.name) === clean(moveDestBranch)));
 
   const closeTransfer = (force=false) => {
     if (branchMoveBusy && !force) return;
     setBranchMoveTarget(null);
-    setMoveDestDealer('');
     setMoveDestBranch('');
     setMoveConfirm(false);
+    setMovePending({ pending_requests: [], pending_assignments: [], has_pending: false });
   };
 
   const performChangeBranch = async () => {
@@ -316,41 +320,58 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     setBranchMoveBusy(true);
     try {
       const r = await axios.put(`${API}/mobile/users/${mu.mobile_user_id}/branch`, {
-        brand_name: destBrand || mu.brand_name,
-        dealer_name: moveDestDealer,
+        brand_name: mu.brand_name,
+        dealer_name: mu.dealer_name,
         branch: moveDestBranch,
+        confirm_pending_release: Boolean(movePending.has_pending),
       });
       toast.success(r.data?.message || 'Branch updated');
       closeTransfer(true);
       loadMobileUsers();
       loadTodayAttendance();
       window.dispatchEvent(new Event('nmts-mobile-users-changed'));
-    }catch(e){const d=e.response?.data?.detail;toast.error(typeof d==='string'?d:(d?.message||'Branch change failed'))}
+    }catch(e){
+      const d=e.response?.data?.detail;
+      if (d && typeof d==='object' && d.code==='PENDING_WORK') {
+        setMovePending({
+          pending_requests: d.pending_requests || [],
+          pending_assignments: d.pending_assignments || [],
+          has_pending: true,
+        });
+        setMoveConfirm(true);
+        toast.error(d.message || 'Pending work must be reviewed before moving');
+      } else {
+        toast.error(typeof d==='string'?d:(d?.message||'Branch change failed'));
+      }
+    }
     finally { setBranchMoveBusy(false); }
   };
 
   const changeBranch = async (mu) => {
+    if (!canManageMobileAccount) return;
     setBranchMoveTarget(mu);
-    setMoveDestDealer('');
     setMoveDestBranch('');
     setMoveConfirm(false);
+    setMovePending({ pending_requests: [], pending_assignments: [], has_pending: false });
     try {
-      const [dRes, bRes] = await Promise.all([
-        axios.get(`${API}/masters/dealers`),
+      const [bRes, pendingRes] = await Promise.all([
         axios.get(`${API}/masters/branches`),
+        axios.get(`${API}/mobile/users/${mu.mobile_user_id}/transfer-pending`).catch(() => ({ data: {} })),
       ]);
-      const dealers = Array.isArray(dRes.data) ? dRes.data : [];
       const branches = Array.isArray(bRes.data) ? bRes.data : [];
-      const allowedDealers = isMaster
-        ? dealers
-        : dealers.filter((d) => clean(d.name) === userDealer || clean(d.name) === clean(user?.group));
-      setMoveDealers(allowedDealers);
-      setMoveBranches(isMaster ? branches : branches.filter((b) => {
+      const currentDealer = clean(mu.dealer_name);
+      setMoveBranches(branches.filter((b) => {
         const dealerName = clean(b.dealer || b.dealer_name);
-        return dealerName === userDealer || dealerName === clean(user?.group);
+        return dealerName.toLowerCase() === currentDealer.toLowerCase() && !isAllLabel(b.name);
       }));
+      const pending = pendingRes.data || {};
+      setMovePending({
+        pending_requests: pending.pending_requests || [],
+        pending_assignments: pending.pending_assignments || [],
+        has_pending: Boolean(pending.has_pending),
+      });
     } catch {
-      toast.error('Could not load destination dealers and branches');
+      toast.error('Could not load destination branches');
       setBranchMoveTarget(null);
     }
   };
@@ -392,10 +413,10 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       </>
     )}
 
-    {showMobileSections && visibleSection==='mobile'&&<div className="space-y-5">
-      {canPair && <Card title="Pair a New Mobile User"><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-        <div><p className="font-medium">{isUser ? 'Generate one-time QR for your assigned Brand / Dealer / Branch.' : 'Generate one-time QR for the selected Brand / Dealer / Branch.'}</p><p className="text-xs text-gray-500 mt-1">The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.{isUser ? ` Scope: ${pairBrand} / ${pairDealer} / ${pairBranch}.` : ''}</p></div>
-        <Button onClick={generateNewPairing} disabled={creatingUser||!pairReady}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button>
+    {showMobileSections && visibleSection==='mobile'&&<div className="space-y-5" style={hubTheme ? { color: HUB_COLORS.text } : undefined}>
+      {canPair && <Card title="Pair a New Mobile User" themed={hubTheme}><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        <div><p className="font-medium">{isUser ? 'Generate one-time QR for your assigned Brand / Dealer / Branch.' : 'Generate one-time QR for the selected Brand / Dealer / Branch.'}</p><p className="text-xs mt-1" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }} >The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.{isUser ? ` Scope: ${pairBrand} / ${pairDealer} / ${pairBranch}.` : ''}</p></div>
+        <Button onClick={generateNewPairing} disabled={creatingUser||!pairReady} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button>
       </div></Card>}
 
       {pairingResult && <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/75 backdrop-blur-sm p-4" onMouseDown={()=>setPairingResult(null)}>
@@ -417,7 +438,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
         </div>
       </div>}
 
-      <Card title="Mobile Users">
+      <Card title="Mobile Users" themed={hubTheme}>
         <p className="text-xs text-gray-500 mb-3">Admin Status is the website Active/Inactive control. Session is Logged In after pair and Logged Out after Logout. Presence is Online while the app sends heartbeats; Offline covers phone-off and network-off. Mark <b>Today (Auto)</b> before Generate Auto Perpetual.</p>
         <div className="overflow-x-auto"><table className="w-full text-sm min-w-[1500px]"><thead><tr>{['Mobile User ID','Name','Mobile','Brand','Dealer','Branch','Admin Status','Session','Presence','Last Seen','Today (Auto)','Actions'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>
         {mobileUsers.map(mu=>{
@@ -448,23 +469,23 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       </tbody></table></div></Card>
     </div>}
 
-    {showMobileSections && visibleSection==='settings'&&<div className="space-y-5">
-      <Card title="Notification Repeat Interval"><div className="flex items-center gap-3 flex-wrap">
+    {showMobileSections && visibleSection==='settings'&&<div className="space-y-5" style={hubTheme ? { color: HUB_COLORS.text } : undefined}>
+      <Card title="Notification Repeat Interval" themed={hubTheme}><div className="flex items-center gap-3 flex-wrap">
         <input type="number" min="1" className="border rounded h-10 px-3 w-32" value={notificationInterval} disabled={!isMaster} onChange={e=>setNotificationInterval(e.target.value)}/>
         <span className="text-sm text-gray-500">minutes between repeat alerts for an unaccepted branch request</span>
-        {isMaster && <Button onClick={saveNotificationInterval} disabled={savingInterval}><RefreshCw className="h-4 w-4 mr-2"/>{savingInterval?'Saving...':'Save'}</Button>}
+        {isMaster && <Button onClick={saveNotificationInterval} disabled={savingInterval} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><RefreshCw className="h-4 w-4 mr-2"/>{savingInterval?'Saving...':'Save'}</Button>}
       </div></Card>
 
-      <Card title="Mobile APK">
+      <Card title="Mobile APK" themed={hubTheme}>
         {isMaster && <div className="mb-4 flex flex-wrap items-center gap-3">
           <input ref={apkFileRef} type="file" accept=".apk,application/vnd.android.package-archive" className="hidden" onChange={uploadApk}/>
-          <Button onClick={()=>apkFileRef.current?.click()} disabled={apkUploading}><Upload className="h-4 w-4 mr-2"/>{apkUploading?'Uploading...':'Upload APK'}</Button>
+          <Button onClick={()=>apkFileRef.current?.click()} disabled={apkUploading} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><Upload className="h-4 w-4 mr-2"/>{apkUploading?'Uploading...':'Upload APK'}</Button>
           <span className="text-xs text-gray-500">.apk only · Master Admin</span>
         </div>}
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <div>{latestVersion ? <>Latest: <b>{latestVersion.version_name||latestVersion.apk_filename}</b><div className="text-xs text-gray-500 mt-1">Released {fmt(latestVersion.release_date)}</div></> : 'No APK published yet.'}</div>
           <div className="flex flex-wrap gap-2">
-            {latestVersion && <Button onClick={downloadApk}><Download className="h-4 w-4 mr-2"/>Download APK</Button>}
+            {latestVersion && <Button onClick={downloadApk} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><Download className="h-4 w-4 mr-2"/>Download APK</Button>}
             {latestVersion && <Button variant="outline" onClick={copyApkLink}><Copy className="h-4 w-4 mr-2"/>Copy Download Link</Button>}
           </div>
         </div>
@@ -549,36 +570,54 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       title="Transfer Branch"
     >
       {branchMoveTarget && (
-        <div className="space-y-4" data-testid="transfer-branch-dialog">
+        <div className="space-y-4" data-testid="transfer-branch-dialog" style={hubTheme ? { color: HUB_COLORS.text } : undefined}>
           <div className="grid md:grid-cols-3 gap-3">
-            <div className="border rounded-lg p-3 bg-gray-50"><div className="text-xs text-gray-500 mb-1">Current Brand</div><div className="font-semibold">{branchMoveTarget.brand_name || '-'}</div></div>
-            <div className="border rounded-lg p-3 bg-gray-50"><div className="text-xs text-gray-500 mb-1">Current Dealer</div><div className="font-semibold">{branchMoveTarget.dealer_name || '-'}</div></div>
-            <div className="border rounded-lg p-3 bg-gray-50"><div className="text-xs text-gray-500 mb-1">Current Branch</div><div className="font-semibold">{branchMoveTarget.branch || '-'}</div></div>
+            <div className="border rounded-lg p-3" style={{ backgroundColor: hubTheme ? HUB_COLORS.card : undefined }}><div className="text-xs mb-1" style={{ color: HUB_COLORS.muted }}>Current Brand</div><div className="font-semibold">{branchMoveTarget.brand_name || '-'}</div></div>
+            <div className="border rounded-lg p-3" style={{ backgroundColor: hubTheme ? HUB_COLORS.card : undefined }}><div className="text-xs mb-1" style={{ color: HUB_COLORS.muted }}>Current Dealer</div><div className="font-semibold">{branchMoveTarget.dealer_name || '-'}</div></div>
+            <div className="border rounded-lg p-3" style={{ backgroundColor: hubTheme ? HUB_COLORS.card : undefined }}><div className="text-xs mb-1" style={{ color: HUB_COLORS.muted }}>Current Branch</div><div className="font-semibold">{branchMoveTarget.branch || '-'}</div></div>
           </div>
-          <div className="grid md:grid-cols-2 gap-3">
-            <label className="block">
-              <span className="text-sm font-semibold">Destination Dealer</span>
-              <select className="mt-1 w-full border rounded-lg h-10 px-3" value={moveDestDealer} onChange={(e)=>{setMoveDestDealer(e.target.value); setMoveDestBranch(''); setMoveConfirm(false);}}>
-                <option value="">Select dealer</option>
-                {moveDealers.map((d)=> <option key={d.id || d.name} value={d.name}>{d.name}{d.brand || d.brand_name ? ` (${d.brand || d.brand_name})` : ''}</option>)}
-              </select>
-            </label>
-            <label className="block">
-              <span className="text-sm font-semibold">Destination Branch</span>
-              <select className="mt-1 w-full border rounded-lg h-10 px-3" value={moveDestBranch} disabled={!moveDestDealer} onChange={(e)=>{setMoveDestBranch(e.target.value); setMoveConfirm(false);}}>
-                <option value="">Select branch</option>
-                {destOptions.map((b)=> <option key={b.id || b.name} value={b.name}>{b.name}</option>)}
-              </select>
-            </label>
-          </div>
+          <label className="block">
+            <span className="text-sm font-semibold">Select Branch</span>
+            <select className="mt-1 w-full border rounded-lg h-10 px-3" value={moveDestBranch} onChange={(e)=>{setMoveDestBranch(e.target.value); setMoveConfirm(false);}} data-testid="transfer-select-branch">
+              <option value="">Select branch</option>
+              {destOptions.map((b)=> <option key={b.id || b.name} value={b.name}>{b.name}</option>)}
+            </select>
+          </label>
+          {movePending.has_pending && (
+            <div className="border border-amber-300 bg-amber-50 text-amber-900 rounded-lg p-3 text-sm space-y-2" data-testid="transfer-pending-work">
+              <p className="font-semibold">Pending requests or work must be reviewed before Move.</p>
+              {!!movePending.pending_requests.length && (
+                <div>
+                  <div className="font-medium">Pending requests</div>
+                  <ul className="list-disc pl-5">
+                    {movePending.pending_requests.map((row)=> (
+                      <li key={row.request_group_key}>{row.request_group_key} · {row.lock_status || 'picked'} · {row.branch || branchMoveTarget.branch}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {!!movePending.pending_assignments.length && (
+                <div>
+                  <div className="font-medium">Pending Auto Perpetual work</div>
+                  <ul className="list-disc pl-5">
+                    {movePending.pending_assignments.map((row, idx)=> (
+                      <li key={`${row.part_number || 'part'}-${idx}`}>{row.part_number || 'Part'} · {row.loc || '-'} · {row.allocation_date || ''}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              <p>Confirming Move releases pending requests with the existing Admin release process. Pending work is not removed silently.</p>
+            </div>
+          )}
           {moveConfirm && (
             <div className="border border-amber-300 bg-amber-50 text-amber-900 rounded-lg p-3 text-sm">
-              Move {branchMoveTarget.mobile_user_id} from {branchMoveTarget.dealer_name} / {branchMoveTarget.branch} to {moveDestDealer} / {moveDestBranch}? The current mobile session will be logged out.
+              Move {branchMoveTarget.mobile_user_id} from {branchMoveTarget.branch} to {moveDestBranch} under {branchMoveTarget.dealer_name}? The current mobile session will be logged out.
+              {movePending.has_pending ? ' Pending requests will be released first using the existing release process.' : ''}
             </div>
           )}
           <div className="flex justify-end gap-2">
             <Button type="button" variant="outline" disabled={branchMoveBusy} onClick={closeTransfer}>Cancel</Button>
-            <Button type="button" disabled={!moveReady || branchMoveBusy} onClick={performChangeBranch}>
+            <Button type="button" disabled={!moveReady || branchMoveBusy} onClick={performChangeBranch} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}>
               {branchMoveBusy ? 'Moving…' : (moveConfirm ? 'Confirm Move' : 'Move')}
             </Button>
           </div>
@@ -599,7 +638,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   </div>
 }
 
-const Card=({title,children})=><div className="bg-white rounded-xl border p-5"><h2 className="font-bold text-lg mb-4">{title}</h2>{children}</div>;
+const Card=({title,children,themed=false})=><div className={themed ? 'rounded-2xl p-5 shadow-sm' : 'bg-white rounded-xl border p-5'} style={themed ? { backgroundColor: HUB_COLORS.card, border: `1px solid ${HUB_COLORS.border}`, color: HUB_COLORS.text } : undefined}><h2 className="font-bold text-lg mb-4">{title}</h2>{children}</div>;
 const Tab=({active,onClick,icon:Icon,title})=><button onClick={onClick} className={`border rounded-xl p-4 flex gap-3 items-center ${active?'bg-green-50 ring-2 ring-green-500':'bg-white'}`}><Icon className="h-5 w-5 text-green-600"/><b>{title}</b></button>;
 const Info=({label,value})=><div className="border rounded-lg p-3 bg-gray-50"><div className="text-xs text-gray-500 mb-1">{label}</div><div className="font-semibold">{value}</div></div>;
 const SimpleTable=({headers,rows})=><div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr>{headers.map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{rows.map((r,i)=><tr className="border-t" key={i}>{r.map((v,j)=><td className="p-3" key={j}>{v}</td>)}</tr>)}{!rows.length&&<tr><td colSpan={headers.length} className="text-center py-8 text-gray-500">No records yet.</td></tr>}</tbody></table></div>;
