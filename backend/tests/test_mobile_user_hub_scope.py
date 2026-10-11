@@ -65,6 +65,26 @@ def test_same_text_and_all_branch_labels():
     assert not ma._is_all_scope_label("Koyambedu")
 
 
+def test_branch_belongs_to_exact_brand_and_dealer():
+    hyundai_fpl = {"id": "fpl-hyundai", "name": "FPL automobiles pvt ltd", "brand": "Hyundai"}
+    assert ma._branch_belongs_to_dealer(
+        {"name": "Koyambedu", "dealer": "FPL automobiles pvt ltd", "brand": "Hyundai"},
+        hyundai_fpl,
+    )
+    assert not ma._branch_belongs_to_dealer(
+        {"name": "Retteri", "dealer": "FPL automobiles pvt ltd", "brand": "Tata Motors"},
+        hyundai_fpl,
+    )
+    assert not ma._branch_belongs_to_dealer(
+        {"name": "Chrompet", "dealer": "KUN Auto Company Pvt Ltd", "brand": "Hyundai"},
+        hyundai_fpl,
+    )
+    assert ma._branch_belongs_to_dealer(
+        {"name": "Koyambedu", "dealer_id": "fpl-hyundai"},
+        hyundai_fpl,
+    )
+
+
 def test_overlay_identifies_mobile_user_and_device_docs():
     from testing_overlay import doc_id
 

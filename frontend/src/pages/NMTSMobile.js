@@ -293,10 +293,14 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   const destOptions = useMemo(
     () => moveBranches.filter((b) => {
       const name = clean(b.name);
-      if (isAllLabel(name)) return false;
-      const dealerName = clean(b.dealer || b.dealer_name);
-      if (!branchMoveTarget || dealerName.toLowerCase() !== clean(branchMoveTarget.dealer_name).toLowerCase()) return false;
-      return name.toLowerCase() !== clean(branchMoveTarget.branch).toLowerCase();
+      if (!branchMoveTarget || isAllLabel(name)) return false;
+      if (name.toLowerCase() === clean(branchMoveTarget.branch).toLowerCase()) return false;
+      const currentBrand = clean(branchMoveTarget.brand_name).toLowerCase();
+      const currentDealer = clean(branchMoveTarget.dealer_name).toLowerCase();
+      const rowBrand = clean(b.brand || b.brand_name).toLowerCase();
+      const rowDealer = clean(b.dealer || b.dealer_name).toLowerCase();
+      if (b.dealer_id && branchMoveTarget.dealer_id) return b.dealer_id === branchMoveTarget.dealer_id;
+      return rowBrand === currentBrand && rowDealer === currentDealer;
     }),
     [moveBranches, branchMoveTarget]
   );
@@ -355,15 +359,12 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     setMovePending({ pending_requests: [], pending_assignments: [], has_pending: false });
     try {
       const [bRes, pendingRes] = await Promise.all([
-        axios.get(`${API}/masters/branches`),
+        axios.get(`${API}/mobile/users/${mu.mobile_user_id}/transfer-branches`),
         axios.get(`${API}/mobile/users/${mu.mobile_user_id}/transfer-pending`).catch(() => ({ data: {} })),
       ]);
-      const branches = Array.isArray(bRes.data) ? bRes.data : [];
-      const currentDealer = clean(mu.dealer_name);
-      setMoveBranches(branches.filter((b) => {
-        const dealerName = clean(b.dealer || b.dealer_name);
-        return dealerName.toLowerCase() === currentDealer.toLowerCase() && !isAllLabel(b.name);
-      }));
+      const payload = bRes.data || {};
+      setBranchMoveTarget((prev) => prev && prev.mobile_user_id === mu.mobile_user_id ? { ...prev, dealer_id: payload.dealer_id || prev.dealer_id } : prev);
+      setMoveBranches(Array.isArray(payload.branches) ? payload.branches : []);
       const pending = pendingRes.data || {};
       setMovePending({
         pending_requests: pending.pending_requests || [],
@@ -439,22 +440,34 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       </div>}
 
       <Card title="Mobile Users" themed={hubTheme}>
-        <p className="text-xs text-gray-500 mb-3">Admin Status is the website Active/Inactive control. Session is Logged In after pair and Logged Out after Logout. Presence is Online while the app sends heartbeats; Offline covers phone-off and network-off. Mark <b>Today (Auto)</b> before Generate Auto Perpetual.</p>
-        <div className="overflow-x-auto"><table className="w-full text-sm min-w-[1500px]"><thead><tr>{['Mobile User ID','Name','Mobile','Brand','Dealer','Branch','Admin Status','Session','Presence','Last Seen','Today (Auto)','Actions'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>
+        <p className="text-xs mb-3" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }}>Admin Status is the website Active/Inactive control. Session is Logged In after pair and Logged Out after Logout. Presence is Online while the app sends heartbeats; Offline covers phone-off and network-off. Mark <b>Today (Auto)</b> before Generate Auto Perpetual.</p>
+        <div className="nmts-users-table-wrap overflow-x-auto rounded-xl bg-white border">
+          <table className="w-full text-sm nmts-users-table" style={{ minWidth: 1500 }}>
+            <thead>
+              <tr style={{ backgroundColor: HUB_COLORS.primary, color: '#fff' }}>
+                {['Mobile User ID','Name','Mobile','Brand','Dealer','Branch','Admin Status','Session','Presence','Last Seen','Today (Auto)','Actions'].map(h=><th key={h} className="p-3 text-left whitespace-nowrap">{h}</th>)}
+              </tr>
+            </thead>
+            <tbody>
         {mobileUsers.map(mu=>{
           const att=todayAttendance[mu.mobile_user_id];
           const attLabel=att==='active'?'Active':att==='inactive'?'Inactive':'Not set';
           const adminStatus = mu.admin_status || mu.status;
           const sessionLabel = mu.session_state === 'logged_in' ? 'Logged In' : 'Logged Out';
           const presenceLabel = mu.presence === 'online' ? 'Online' : 'Offline';
-          return <tr className="border-t" key={mu.mobile_user_id}>
-          <td className="p-3 font-mono">{mu.mobile_user_id}</td><td>{mu.name}</td><td>{mu.mobile_number}</td><td>{mu.brand_name}</td><td>{mu.dealer_name}</td><td>{mu.branch}</td>
-          <td><span className={`px-2 py-1 rounded text-xs ${adminStatus==='active'?'bg-green-100 text-green-700':'bg-gray-200 text-gray-600'}`}>{adminStatus==='active'?'Active':'Inactive'}</span></td>
-          <td><span className={`px-2 py-1 rounded text-xs ${mu.session_state==='logged_in'?'bg-sky-100 text-sky-800':'bg-gray-100 text-gray-600'}`}>{sessionLabel}</span></td>
-          <td><span className={`px-2 py-1 rounded text-xs ${mu.presence==='online'?'bg-emerald-100 text-emerald-800':'bg-gray-100 text-gray-600'}`}>{presenceLabel}</span></td>
-          <td>{mu.last_seen_at?fmt(mu.last_seen_at):(mu.last_active_at?fmt(mu.last_active_at):'-')}</td>
-          <td><span className={`px-2 py-1 rounded text-xs ${att==='active'?'bg-emerald-100 text-emerald-800':att==='inactive'?'bg-amber-100 text-amber-800':'bg-gray-100 text-gray-600'}`}>{attLabel}</span></td>
-          <td><div className="flex gap-2 flex-wrap">
+          return <tr className="border-b" key={mu.mobile_user_id}>
+          <td className="p-3 font-mono whitespace-nowrap">{mu.mobile_user_id}</td>
+          <td className="p-3 min-w-[120px]">{mu.name}</td>
+          <td className="p-3 whitespace-nowrap">{mu.mobile_number}</td>
+          <td className="p-3 whitespace-nowrap">{mu.brand_name}</td>
+          <td className="p-3 min-w-[100px]">{mu.dealer_name}</td>
+          <td className="p-3 min-w-[100px]">{mu.branch}</td>
+          <td className="p-3 status-cell"><span className={`inline-flex px-2.5 py-1 rounded-full text-xs font-bold whitespace-nowrap ${adminStatus==='active'?'bg-green-100 text-green-700':'bg-gray-200 text-gray-600'}`}>{adminStatus==='active'?'Active':'Inactive'}</span></td>
+          <td className="p-3 whitespace-nowrap"><span className={`inline-flex px-2.5 py-1 rounded-full text-xs font-bold ${mu.session_state==='logged_in'?'bg-sky-100 text-sky-800':'bg-gray-100 text-gray-600'}`}>{sessionLabel}</span></td>
+          <td className="p-3 whitespace-nowrap"><span className={`inline-flex px-2.5 py-1 rounded-full text-xs font-bold ${mu.presence==='online'?'bg-emerald-100 text-emerald-800':'bg-gray-100 text-gray-600'}`}>{presenceLabel}</span></td>
+          <td className="p-3 whitespace-nowrap">{mu.last_seen_at?fmt(mu.last_seen_at):(mu.last_active_at?fmt(mu.last_active_at):'-')}</td>
+          <td className="p-3 whitespace-nowrap"><span className={`inline-flex px-2.5 py-1 rounded-full text-xs font-bold ${att==='active'?'bg-emerald-100 text-emerald-800':att==='inactive'?'bg-amber-100 text-amber-800':'bg-gray-100 text-gray-600'}`}>{attLabel}</span></td>
+          <td className="p-3"><div className="flex gap-2 flex-wrap">
             {canPair && <Button size="sm" variant="outline" title="Re-pair QR" onClick={()=>generatePairing(mu)} disabled={pairingFor===mu.mobile_user_id || mu.status!=='active'}><RefreshCw className="h-4 w-4"/></Button>}
             {canManage && <Button size="sm" variant="outline" title="Transfer Branch" onClick={()=>changeBranch(mu)}><ArrowRightLeft className="h-4 w-4"/></Button>}
             {canManageMobileAccount && mu.status!=='deleted' && <>

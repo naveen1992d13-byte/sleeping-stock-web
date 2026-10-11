@@ -308,6 +308,68 @@ def _is_all_scope_label(value) -> bool:
     return (not text) or text == "N/A" or text.casefold().startswith("all ")
 
 
+async def _resolve_dealer_identity(brand: str, dealer: str) -> dict:
+    brand = (brand or "").strip()
+    dealer = (dealer or "").strip()
+    if not brand or not dealer:
+        raise HTTPException(400, "Brand and Dealer are required")
+    dealer_doc = await db.dealers.find_one(
+        {
+            "name": _scope_ci(dealer),
+            "$or": [{"brand": _scope_ci(brand)}, {"brand_name": _scope_ci(brand)}, {"brand_id": brand}],
+        },
+        {"_id": 0, "id": 1, "name": 1, "brand": 1, "brand_name": 1, "brand_id": 1, "code": 1, "dealer_code": 1},
+    )
+    if not dealer_doc:
+        raise HTTPException(400, f"Invalid dealer '{dealer}' for brand '{brand}'")
+    return dealer_doc
+
+
+def _branch_belongs_to_dealer(branch_doc: dict, dealer_doc: dict) -> bool:
+    dealer_id = str((dealer_doc or {}).get("id") or "").strip()
+    branch_dealer_id = str((branch_doc or {}).get("dealer_id") or "").strip()
+    if dealer_id and branch_dealer_id:
+        return dealer_id == branch_dealer_id
+    brand = (dealer_doc or {}).get("brand") or (dealer_doc or {}).get("brand_name")
+    name = (dealer_doc or {}).get("name")
+    return _same_text((branch_doc or {}).get("dealer") or (branch_doc or {}).get("dealer_name"), name) and _same_text(
+        (branch_doc or {}).get("brand") or (branch_doc or {}).get("brand_name"), brand
+    )
+
+
+async def _eligible_transfer_branches(brand: str, dealer: str, current_branch: str) -> list:
+    dealer_doc = await _resolve_dealer_identity(brand, dealer)
+    brand_name = dealer_doc.get("brand") or dealer_doc.get("brand_name") or brand
+    dealer_name = dealer_doc.get("name") or dealer
+    dealer_id = str(dealer_doc.get("id") or "").strip()
+    brand_clauses = [{"brand": _scope_ci(brand_name)}, {"brand_name": _scope_ci(brand_name)}]
+    if dealer_doc.get("brand_id"):
+        brand_clauses.append({"brand_id": dealer_doc.get("brand_id")})
+    dealer_clauses = [{"dealer": _scope_ci(dealer_name)}, {"dealer_name": _scope_ci(dealer_name)}]
+    if dealer_id:
+        dealer_clauses.append({"dealer_id": dealer_id})
+    rows = await db.branches.find(
+        {"$and": [{"$or": dealer_clauses}, {"$or": brand_clauses}]},
+        {"_id": 0},
+    ).sort("name", 1).to_list(1000)
+    out = []
+    for row in rows:
+        name = str(row.get("name") or "").strip()
+        if _is_all_scope_label(name) or _same_text(name, current_branch):
+            continue
+        if not _branch_belongs_to_dealer(row, dealer_doc):
+            continue
+        out.append({
+            "id": row.get("id"),
+            "name": name,
+            "brand": row.get("brand") or row.get("brand_name"),
+            "dealer": row.get("dealer") or row.get("dealer_name"),
+            "dealer_id": row.get("dealer_id") or dealer_id or None,
+            "brand_id": row.get("brand_id") or dealer_doc.get("brand_id"),
+        })
+    return out
+
+
 def _same_mobile_scope(left, right) -> bool:
     def _norm(row):
         return (
@@ -756,6 +818,20 @@ async def get_transfer_pending(mobile_user_id: str, current_user: UserResponse =
     return await _pending_transfer_work(mobile_user_id)
 
 
+@router.get("/users/{mobile_user_id}/transfer-branches")
+async def list_transfer_branches(mobile_user_id: str, current_user: UserResponse = Depends(_web_current_user)):
+    _require_master_or_admin(current_user, "list transfer branches")
+    row = await _assert_mobile_user_access(current_user, mobile_user_id)
+    dealer_doc = await _resolve_dealer_identity(row.get("brand_name"), row.get("dealer_name"))
+    branches = await _eligible_transfer_branches(row.get("brand_name"), row.get("dealer_name"), row.get("branch"))
+    return {
+        "brand_name": dealer_doc.get("brand") or dealer_doc.get("brand_name") or row.get("brand_name"),
+        "dealer_name": dealer_doc.get("name") or row.get("dealer_name"),
+        "dealer_id": dealer_doc.get("id"),
+        "branches": branches,
+    }
+
+
 @router.put("/users/{mobile_user_id}/branch")
 async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBranchUpdate, current_user: UserResponse = Depends(_web_current_user)):
     _require_master_or_admin(current_user, "transfer a mobile user's branch")
@@ -785,6 +861,9 @@ async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBran
     if _is_all_scope_label(branch) or _same_text(branch, current_scope["branch"]):
         raise HTTPException(400, "Select a different destination branch")
     _require_scope_selected(brand, dealer, branch)
+    eligible = await _eligible_transfer_branches(current_scope["brand_name"], current_scope["dealer_name"], current_scope["branch"])
+    if not any(_same_text(item.get("name"), branch) for item in eligible):
+        raise HTTPException(400, "Destination branch is outside this mobile user's Brand/Dealer")
     brand, dealer, branch = await _resolve_canonical_pairing_scope(brand, dealer, branch)
     if not _same_text(dealer, current_scope["dealer_name"]) or not _same_text(brand, current_scope["brand_name"]):
         raise HTTPException(400, "Cross-dealer transfer is not allowed")
