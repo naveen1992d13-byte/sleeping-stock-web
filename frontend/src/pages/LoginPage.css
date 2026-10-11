@@ -33,32 +33,13 @@
   display: flex;
   justify-content: center;
   align-items: center;
-  gap: 28px;
-  flex-wrap: wrap;
 }
 
-.nmts-login-promo {
-  width: min(560px, 92vw);
-  max-height: 80vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.nmts-login-promo img {
-  display: block;
-  max-width: 100%;
-  max-height: 80vh;
-  width: auto;
-  height: auto;
-  object-fit: contain;
-  object-position: center;
-}
-
-.nmts-login-card {
+.nmts-login-panel {
   position: relative;
+  display: flex;
+  align-items: stretch;
   width: min(430px, 92vw);
-  min-height: 690px;
   border-radius: 32px;
   border: 1px solid rgba(128, 214, 65, 0.62);
   background:
@@ -73,7 +54,11 @@
   overflow: hidden;
 }
 
-.nmts-login-card::before {
+.nmts-login-panel--split {
+  width: min(1180px, 96vw);
+}
+
+.nmts-login-panel::before {
   content: "";
   position: absolute;
   inset: 0;
@@ -82,6 +67,43 @@
   background:
     linear-gradient(135deg, rgba(255, 255, 255, 0.13), transparent 24%, transparent 72%, rgba(113, 204, 49, 0.06)),
     radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.08), transparent 33%);
+}
+
+.nmts-login-promo {
+  flex: 0 0 58%;
+  width: 58%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px 20px;
+}
+
+.nmts-login-promo img {
+  display: block;
+  max-width: 100%;
+  max-height: min(72vh, 640px);
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  object-position: center;
+}
+
+.nmts-login-card {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 690px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.nmts-login-panel--split .nmts-login-card {
+  flex: 0 0 42%;
+  width: 42%;
 }
 
 .nmts-login-card-glow {
@@ -287,6 +309,36 @@
   letter-spacing: 0.05px;
 }
 
+@media (max-width: 900px) {
+  .nmts-login-panel {
+    border-radius: 26px;
+  }
+
+  .nmts-login-panel--split {
+    flex-direction: column;
+    width: min(430px, 94vw);
+  }
+
+  .nmts-login-promo,
+  .nmts-login-panel--split .nmts-login-card {
+    width: 100%;
+    flex: none;
+  }
+
+  .nmts-login-promo {
+    padding: 18px 18px 0;
+  }
+
+  .nmts-login-promo img {
+    max-height: 34vh;
+  }
+
+  .nmts-login-panel--split .nmts-login-card,
+  .nmts-login-panel--split .nmts-login-content {
+    min-height: 0;
+  }
+}
+
 @media (max-width: 700px) {
   .nmts-login-page {
     padding: 18px 14px;
@@ -298,8 +350,9 @@
     min-height: 640px;
   }
 
-  .nmts-login-card {
-    border-radius: 26px;
+  .nmts-login-panel--split .nmts-login-card,
+  .nmts-login-panel--split .nmts-login-content {
+    min-height: 0;
   }
 
   .nmts-login-content {
@@ -319,7 +372,7 @@
   }
 }
 
-@media (max-height: 760px) and (min-width: 701px) {
+@media (max-height: 760px) and (min-width: 901px) {
   .nmts-login-page {
     padding: 16px;
   }
@@ -343,5 +396,9 @@
 
   .nmts-login-header {
     margin-bottom: 20px;
+  }
+
+  .nmts-login-promo img {
+    max-height: min(64vh, 560px);
   }
 }

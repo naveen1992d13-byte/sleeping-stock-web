@@ -4,6 +4,7 @@ import { API, useAuth } from '@/App';
 import { isTestingUiEnabled } from '@/testingUi';
 import { toast } from 'sonner';
 import { Image as ImageIcon } from 'lucide-react';
+import './LoginScreenManager.css';
 
 function toIstValue(iso) {
   if (!iso) return '';
@@ -45,7 +46,7 @@ export function LoginScreenManager() {
     return <div className="p-6 text-sm text-gray-500">Master Admin only in Testing.</div>;
   }
 
-  const uploadDefault = async (file) => {
+  const uploadDefault = async (file, input) => {
     if (!file) return;
     const form = new FormData();
     form.append('file', file);
@@ -58,13 +59,15 @@ export function LoginScreenManager() {
       toast.error(error.response?.data?.detail || 'Default upload failed');
     } finally {
       setBusy(false);
+      if (input) input.value = '';
     }
   };
 
-  const uploadScheduled = async (file) => {
+  const uploadScheduled = async (file, input) => {
     if (!file) return;
     if (!startAt || !endAt) {
       toast.error('Select Start and End date/time in IST');
+      if (input) input.value = '';
       return;
     }
     const form = new FormData();
@@ -80,54 +83,69 @@ export function LoginScreenManager() {
       toast.error(error.response?.data?.detail || 'Scheduled upload failed');
     } finally {
       setBusy(false);
+      if (input) input.value = '';
     }
   };
 
   const preview = (row) => row?.image_url ? `${API.replace(/\/api$/, '')}${row.image_url}` : null;
 
   return (
-    <div className="p-6 max-w-3xl mx-auto space-y-6" data-testid="login-screen-manager">
-      <div className="flex items-center gap-2">
-        <ImageIcon className="h-5 w-5" />
-        <h1 className="text-xl font-semibold">Login Screen Manager</h1>
+    <div className="nmts-login-screen-manager" data-testid="login-screen-manager">
+      <header className="nmts-module-header">
+        <div className="nmts-module-header-row">
+          <ImageIcon className="h-5 w-5 nmts-module-header-icon" />
+          <h1>Login Screen Manager</h1>
+        </div>
+        <p>Testing only. Dates and times are IST.</p>
+      </header>
+
+      <div className="lsm-grid">
+        <section className="nmts-card lsm-card" data-testid="lsm-default-card">
+          <h2>Default Image</h2>
+          <div className="lsm-preview">
+            {preview(state.default) ? (
+              <img src={preview(state.default)} alt="Default login image" />
+            ) : (
+              <p className="lsm-empty">No Default Image yet.</p>
+            )}
+          </div>
+          <label className="lsm-file" data-busy={busy ? 'true' : 'false'}>
+            <span className="nmts-btn-primary lsm-file-btn">{busy ? 'Uploading…' : 'Upload Default Image'}</span>
+            <input
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              disabled={busy}
+              onChange={(e) => uploadDefault(e.target.files?.[0], e.target)}
+            />
+          </label>
+        </section>
+
+        <section className="nmts-card lsm-card" data-testid="lsm-scheduled-card">
+          <h2>Scheduled Image</h2>
+          <div className="lsm-preview">
+            {preview(state.scheduled) ? (
+              <img src={preview(state.scheduled)} alt="Scheduled login image" />
+            ) : (
+              <p className="lsm-empty">No Scheduled Image.</p>
+            )}
+          </div>
+          <label className="lsm-field">Start Date/Time (IST)
+            <input className="lsm-input" type="datetime-local" value={startAt} onChange={(e) => setStartAt(e.target.value)} />
+          </label>
+          <label className="lsm-field">End Date/Time (IST)
+            <input className="lsm-input" type="datetime-local" value={endAt} onChange={(e) => setEndAt(e.target.value)} />
+          </label>
+          <label className="lsm-file" data-busy={busy ? 'true' : 'false'}>
+            <span className="nmts-btn-primary lsm-file-btn">{busy ? 'Uploading…' : 'Upload Scheduled Image'}</span>
+            <input
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              disabled={busy}
+              onChange={(e) => uploadScheduled(e.target.files?.[0], e.target)}
+            />
+          </label>
+        </section>
       </div>
-      <p className="text-sm text-gray-500">Testing only. Dates and times are IST.</p>
-
-      <section className="rounded-xl border bg-white p-4 space-y-3">
-        <h2 className="font-semibold">1. Default Image</h2>
-        {preview(state.default) ? (
-          <img src={preview(state.default)} alt="Default login image" style={{ maxWidth: '100%', height: 'auto', objectFit: 'contain' }} />
-        ) : (
-          <p className="text-sm text-gray-500">No Default Image yet.</p>
-        )}
-        <input
-          type="file"
-          accept="image/png,image/jpeg,image/webp"
-          disabled={busy}
-          onChange={(e) => uploadDefault(e.target.files?.[0])}
-        />
-      </section>
-
-      <section className="rounded-xl border bg-white p-4 space-y-3">
-        <h2 className="font-semibold">2. Scheduled Image</h2>
-        {preview(state.scheduled) ? (
-          <img src={preview(state.scheduled)} alt="Scheduled login image" style={{ maxWidth: '100%', height: 'auto', objectFit: 'contain' }} />
-        ) : (
-          <p className="text-sm text-gray-500">No Scheduled Image.</p>
-        )}
-        <label className="block text-sm">Start Date/Time (IST)
-          <input className="mt-1 block border rounded px-2 py-1" type="datetime-local" value={startAt} onChange={(e) => setStartAt(e.target.value)} />
-        </label>
-        <label className="block text-sm">End Date/Time (IST)
-          <input className="mt-1 block border rounded px-2 py-1" type="datetime-local" value={endAt} onChange={(e) => setEndAt(e.target.value)} />
-        </label>
-        <input
-          type="file"
-          accept="image/png,image/jpeg,image/webp"
-          disabled={busy}
-          onChange={(e) => uploadScheduled(e.target.files?.[0])}
-        />
-      </section>
     </div>
   );
 }

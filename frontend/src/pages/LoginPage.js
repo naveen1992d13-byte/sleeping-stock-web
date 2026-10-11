@@ -61,18 +61,54 @@ export function LoginPage() {
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    const timers = { expiry: null, poll: null };
+    let lastUrl = null;
+
+    const clearExpiry = () => {
+      if (timers.expiry) {
+        clearTimeout(timers.expiry);
+        timers.expiry = null;
+      }
+    };
+
+    const applyPayload = (data) => {
+      const path = data?.image_url;
+      const nextUrl = path ? `${API.replace(/\/api$/, '')}${path}` : null;
+      if (lastUrl !== nextUrl) {
+        lastUrl = nextUrl;
+        if (!cancelled) {
+          setPromoFailed(false);
+          setPromoUrl(nextUrl);
+        }
+      }
+      clearExpiry();
+      if (data?.type === 'scheduled' && data?.end_at) {
+        const endMs = new Date(data.end_at).getTime();
+        if (!Number.isNaN(endMs)) {
+          timers.expiry = setTimeout(() => {
+            fetchActive();
+          }, Math.max(250, endMs - Date.now() + 400));
+        }
+      }
+    };
+
+    const fetchActive = async () => {
       try {
         const res = await axios.get(`${API}/login-screen/active`);
-        const path = res.data?.image_url;
-        if (!cancelled && path) {
-          setPromoUrl(`${API.replace(/\/api$/, '')}${path}`);
-        }
+        if (!cancelled) applyPayload(res.data || {});
       } catch {
-        if (!cancelled) setPromoUrl(null);
+        /* keep current promo and form values */
       }
-    })();
-    return () => { cancelled = true; };
+    };
+
+    fetchActive();
+    timers.poll = setInterval(fetchActive, 30000);
+
+    return () => {
+      cancelled = true;
+      clearExpiry();
+      if (timers.poll) clearInterval(timers.poll);
+    };
   }, []);
 
   const handleSubmit = async (e) => {
@@ -91,16 +127,20 @@ export function LoginPage() {
     }
   };
 
+  const showPromo = Boolean(promoUrl) && !promoFailed;
+
   return (
     <div className="nmts-login-page" data-testid="login-page">
       <div className="nmts-login-overlay" />
 
       <main className="nmts-login-shell">
-        {promoUrl && !promoFailed && (
+        <div className={`nmts-login-panel${showPromo ? ' nmts-login-panel--split' : ''}`}>
+        {showPromo && (
           <aside className="nmts-login-promo" aria-label="Login promotional image">
             <img
               src={promoUrl}
               alt=""
+              data-testid="login-promo-image"
               onError={() => setPromoFailed(true)}
             />
           </aside>
@@ -195,6 +235,7 @@ export function LoginPage() {
             </footer>
           </div>
         </section>
+        </div>
       </main>
     </div>
   );
