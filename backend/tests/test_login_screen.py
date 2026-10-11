@@ -56,17 +56,15 @@ def _match(row, query):
     return True
 
 
-def test_require_testing_master_blocks_production(monkeypatch):
+def test_require_master_allows_production_master(monkeypatch):
+    monkeypatch.setattr(ls.testing_runtime, "is_testing_env", lambda: False)
+    ls.require_master(SimpleNamespace(role="master"))
+
+
+def test_require_master_blocks_non_master(monkeypatch):
     monkeypatch.setattr(ls.testing_runtime, "is_testing_env", lambda: False)
     with pytest.raises(HTTPException) as exc:
-        ls.require_testing_master(SimpleNamespace(role="master"))
-    assert exc.value.status_code == 404
-
-
-def test_require_testing_master_blocks_non_master(monkeypatch):
-    monkeypatch.setattr(ls.testing_runtime, "is_testing_env", lambda: True)
-    with pytest.raises(HTTPException) as exc:
-        ls.require_testing_master(SimpleNamespace(role="admin"))
+        ls.require_master(SimpleNamespace(role="admin"))
     assert exc.value.status_code == 403
 
 
@@ -125,12 +123,47 @@ def test_choose_active_returns_default_after_expiry_and_deletes(monkeypatch):
     asyncio.get_event_loop().run_until_complete(run())
 
 
-def test_production_active_payload_is_empty(monkeypatch):
+def test_production_choose_active_returns_default(monkeypatch):
     monkeypatch.setattr(ls.testing_runtime, "is_testing_env", lambda: False)
 
     async def run():
-        payload = await ls.active_payload(FakeDB([{"id": "d1", "type": "default"}]))
-        assert payload["image_url"] is None
+        payload = await ls.active_payload(FakeDB([
+            {"id": "d1", "type": "default", "storage_key": "dev/login-screen/default/a.png"},
+        ]))
+        assert payload["id"] == "d1"
+        assert payload["image_url"] == "/api/login-screen/image/d1"
+
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(run())
+
+
+def test_production_does_not_delete_testing_keys(monkeypatch):
+    monkeypatch.setattr(ls.testing_runtime, "is_testing_env", lambda: False)
+    now = datetime(2026, 10, 11, 13, 0, tzinfo=IST)
+    monkeypatch.setattr(ls, "_now_ist", lambda: now)
+    deleted = []
+
+    class Storage:
+        def delete(self, key):
+            deleted.append(key)
+
+    monkeypatch.setattr(ls.s3_storage, "get_storage", lambda: Storage())
+    db = FakeDB([
+        {"id": "d1", "type": "default", "storage_key": "dev/login-screen/default/a.png"},
+        {
+            "id": "s1",
+            "type": "scheduled",
+            "storage_key": "testing/login-screen/scheduled/b.png",
+            "start_at": (now - timedelta(hours=3)).isoformat(),
+            "end_at": (now - timedelta(minutes=1)).isoformat(),
+        },
+    ])
+
+    async def run():
+        row = await ls.choose_active(db)
+        assert row["id"] == "d1"
+        assert not any(r.get("type") == "scheduled" for r in db.login_screen_images.rows)
+        assert deleted == []
 
     import asyncio
     asyncio.get_event_loop().run_until_complete(run())

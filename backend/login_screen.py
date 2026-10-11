@@ -1,7 +1,8 @@
-"""Testing-only Login Screen Default/Scheduled image manager.
+"""Login Screen Default/Scheduled image manager.
 
-Production callers get an empty public payload and 404 on manage/upload.
-Never writes Production S3 (dev/) or Production collections.
+Testing writes testing/ keys into nmts_testing.
+Production writes dev/ keys into nmts.
+Never copies Testing records or Testing S3 keys into Production.
 """
 from __future__ import annotations
 
@@ -34,11 +35,24 @@ ALLOWED_CONTENT = {
 MAX_BYTES = 6 * 1024 * 1024
 
 
-def require_testing_master(current_user) -> None:
-    if not testing_runtime.is_testing_env():
-        raise HTTPException(status_code=404, detail="Login Screen Manager is available only in Testing")
+def require_master(current_user) -> None:
     if str(getattr(current_user, "role", "") or "").lower() != "master":
         raise HTTPException(status_code=403, detail="Master Admin only")
+
+
+def require_testing_master(current_user) -> None:
+    require_master(current_user)
+
+
+def _data_origin() -> str:
+    return "testing" if testing_runtime.is_testing_env() else "production"
+
+
+def _key_allowed(key: str) -> bool:
+    text = str(key or "")
+    if testing_runtime.is_testing_env():
+        return text.startswith("testing/")
+    return text.startswith("dev/") and not text.startswith("testing/")
 
 
 def _parse_ist(value: Optional[str]) -> Optional[datetime]:
@@ -83,11 +97,11 @@ def _validate_bytes(data: bytes, content_type: Optional[str], filename: Optional
     return ext, (ctype if ctype in ALLOWED_CONTENT else f"image/{'jpeg' if ext == 'jpg' else ext}")
 
 
-def _testing_key(kind: str, ext: str) -> str:
+def _storage_key(kind: str, ext: str) -> str:
     storage = s3_storage.get_storage()
     key = storage.key("login-screen", kind, f"{uuid.uuid4().hex}.{ext}")
-    if not str(key).startswith("testing/"):
-        raise HTTPException(status_code=500, detail="Refusing non-testing storage key")
+    if not _key_allowed(key):
+        raise HTTPException(status_code=500, detail="Refusing unexpected storage key")
     return key
 
 
@@ -95,7 +109,7 @@ async def _delete_row(db, row: Optional[dict]) -> None:
     if not row:
         return
     key = str(row.get("storage_key") or "")
-    if key.startswith("testing/"):
+    if _key_allowed(key):
         try:
             s3_storage.get_storage().delete(key)
         except Exception:
@@ -104,8 +118,6 @@ async def _delete_row(db, row: Optional[dict]) -> None:
 
 
 async def purge_expired_scheduled(db) -> int:
-    if not testing_runtime.is_testing_env():
-        return 0
     now = _now_ist()
     rows = await db[COLLECTION].find({"type": TYPE_SCHEDULED}, {"_id": 0}).to_list(20)
     removed = 0
@@ -130,8 +142,6 @@ def _public_row(row: Optional[dict]) -> Dict[str, Any]:
 
 
 async def choose_active(db) -> Optional[dict]:
-    if not testing_runtime.is_testing_env():
-        return None
     await purge_expired_scheduled(db)
     now = _now_ist()
     scheduled = await db[COLLECTION].find_one({"type": TYPE_SCHEDULED}, {"_id": 0})
@@ -151,8 +161,6 @@ async def active_payload(db) -> Dict[str, Any]:
 
 
 async def stream_image(db, image_id: str):
-    if not testing_runtime.is_testing_env():
-        raise HTTPException(status_code=404, detail="Image not found")
     await purge_expired_scheduled(db)
     row = await db[COLLECTION].find_one({"id": str(image_id)}, {"_id": 0})
     if not row:
@@ -168,7 +176,7 @@ async def stream_image(db, image_id: str):
             if end and now >= end:
                 raise HTTPException(status_code=404, detail="Image not found")
     key = str(row.get("storage_key") or "")
-    if not key.startswith("testing/"):
+    if not _key_allowed(key):
         raise HTTPException(status_code=404, detail="Image not found")
     try:
         data, ctype = s3_storage.get_storage().download_bytes(key)
@@ -191,12 +199,12 @@ async def manage_payload(db) -> Dict[str, Any]:
 async def save_default(db, data: bytes, content_type: Optional[str], filename: Optional[str]) -> Dict[str, Any]:
     ext, ctype = _validate_bytes(data, content_type, filename)
     old = await db[COLLECTION].find_one({"type": TYPE_DEFAULT}, {"_id": 0})
-    key = _testing_key(TYPE_DEFAULT, ext)
+    key = _storage_key(TYPE_DEFAULT, ext)
     stored = s3_storage.get_storage().upload_bytes(
         key,
         data,
         content_type=ctype,
-        metadata={"login_screen": TYPE_DEFAULT, "data_origin": "testing"},
+        metadata={"login_screen": TYPE_DEFAULT, "data_origin": _data_origin()},
         allow_replace=True,
     )
     doc = {
@@ -206,7 +214,7 @@ async def save_default(db, data: bytes, content_type: Optional[str], filename: O
         "content_type": ctype,
         "start_at": None,
         "end_at": None,
-        "data_origin": "testing",
+        "data_origin": _data_origin(),
         "updated_at": _now_ist().isoformat(),
     }
     await db[COLLECTION].insert_one(dict(doc))
@@ -231,12 +239,12 @@ async def save_scheduled(
     if end <= start:
         raise HTTPException(status_code=400, detail="End date/time must be after Start date/time")
     old = await db[COLLECTION].find_one({"type": TYPE_SCHEDULED}, {"_id": 0})
-    key = _testing_key(TYPE_SCHEDULED, ext)
+    key = _storage_key(TYPE_SCHEDULED, ext)
     stored = s3_storage.get_storage().upload_bytes(
         key,
         data,
         content_type=ctype,
-        metadata={"login_screen": TYPE_SCHEDULED, "data_origin": "testing"},
+        metadata={"login_screen": TYPE_SCHEDULED, "data_origin": _data_origin()},
         allow_replace=True,
     )
     doc = {
@@ -246,7 +254,7 @@ async def save_scheduled(
         "content_type": ctype,
         "start_at": start.isoformat(),
         "end_at": end.isoformat(),
-        "data_origin": "testing",
+        "data_origin": _data_origin(),
         "updated_at": _now_ist().isoformat(),
     }
     await db[COLLECTION].insert_one(dict(doc))

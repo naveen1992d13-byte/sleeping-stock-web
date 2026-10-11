@@ -12,7 +12,7 @@ export const APPLICATION_MENU_ITEMS = [
   // User-facing name "Analytics"; permission key remains "Analytics"
   { path: '/analytics', label: 'Analytics', icon: Globe, id: 'analytics', adminOnly: true, permissionLabel: 'Analytics' },
   { path: '/storage-cost-monitor', label: 'Storage & Data Cleanup', icon: HardDrive, id: 'storage-cost-monitor', masterOnly: true, permissionLabel: 'Storage & Cost Monitor' },
-  { path: '/login-screen-manager', label: 'Login Screen Manager', icon: Image, id: 'login-screen-manager', masterOnly: true, testingOnly: true },
+  { path: '/login-screen-manager', label: 'Login Screen Manager', icon: Image, id: 'login-screen-manager', masterOnly: true },
   { path: '/notice-board', label: 'Notice Board', icon: Megaphone, id: 'dashboard' },
   { path: '/query', label: 'Query Desk', icon: HelpCircle, id: 'query', allRoles: true },
   { path: '/sleeping-stock-mobile', label: 'Sleeping Stock Mobile', icon: Smartphone, id: 'sleeping-stock-mobile', allRoles: true },

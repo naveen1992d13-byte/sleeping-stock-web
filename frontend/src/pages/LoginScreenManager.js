@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
-import { isTestingUiEnabled } from '@/testingUi';
 import { toast } from 'sonner';
 import { Image as ImageIcon } from 'lucide-react';
 import { LoginImageCropper } from './LoginImageCropper';
@@ -40,12 +39,12 @@ export function LoginScreenManager() {
   };
 
   useEffect(() => {
-    if (!isTestingUiEnabled() || user?.role !== 'master') return;
+    if (user?.role !== 'master') return;
     load().catch(() => toast.error('Could not load Login Screen images'));
   }, [user?.role]);
 
-  if (!isTestingUiEnabled() || user?.role !== 'master') {
-    return <div className="p-6 text-sm text-gray-500">Master Admin only in Testing.</div>;
+  if (user?.role !== 'master') {
+    return <div className="p-6 text-sm text-gray-500">Master Admin only.</div>;
   }
 
   const closeCrop = () => {

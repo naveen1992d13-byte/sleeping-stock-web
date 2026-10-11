@@ -8823,7 +8823,7 @@ async def login_screen_image(image_id: str):
 
 @api_router.get("/login-screen/manage")
 async def login_screen_manage(current_user: UserResponse = Depends(get_current_user)):
-    login_screen.require_testing_master(current_user)
+    login_screen.require_master(current_user)
     return await login_screen.manage_payload(db)
 
 
@@ -8832,7 +8832,7 @@ async def login_screen_upload_default(
     file: UploadFile = File(...),
     current_user: UserResponse = Depends(get_current_user),
 ):
-    login_screen.require_testing_master(current_user)
+    login_screen.require_master(current_user)
     data = await file.read()
     return await login_screen.save_default(db, data, file.content_type, file.filename)
 
@@ -8844,7 +8844,7 @@ async def login_screen_upload_scheduled(
     end_at: str = Form(...),
     current_user: UserResponse = Depends(get_current_user),
 ):
-    login_screen.require_testing_master(current_user)
+    login_screen.require_master(current_user)
     data = await file.read()
     return await login_screen.save_scheduled(db, data, file.content_type, file.filename, start_at, end_at)
 
