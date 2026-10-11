@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -94,9 +95,28 @@ async def log_push_attempt(db, *, mobile_user_id: str, device_id: str, push_toke
     )
 
 
+def _testing_push_blocked() -> bool:
+    """Never deliver live Expo/FCM to production devices from Testing.
+
+    Default-on in APP_ENV=testing. Set PUSH_TEST_MODE=false only when an
+    approved test device allow-list is in use.
+    """
+    try:
+        from . import testing_runtime
+    except ImportError:
+        import testing_runtime
+    if not testing_runtime.is_testing_env():
+        return False
+    flag = str(os.getenv("PUSH_TEST_MODE", "true") or "true").strip().lower()
+    return flag not in {"0", "false", "no", "off"}
+
+
 def send_expo_push_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not messages:
         return {"ok": True, "sent": 0}
+    if _testing_push_blocked():
+        logger.info("Skipping Expo push from testing environment (%s messages)", len(messages))
+        return {"ok": True, "sent": 0, "skipped": True, "reason": "testing_push_blocked"}
     try:
         resp = requests.post(
             EXPO_PUSH_URL,

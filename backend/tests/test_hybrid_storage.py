@@ -925,6 +925,9 @@ def test_prune_deletes_misflagged_historical_rows_after_s3_reverify():
                 "is_active_today": True,
             }
         ]
+        db.uploads.docs = [
+            {"id": "u1", "upload_no": "PUHY260501001", "file_key": "dev/uploads/keep.xlsx"}
+        ]
         os.environ["ARCHIVE_PRUNE_ENABLED"] = "true"
         try:
             with _FakeS3Mode():
@@ -937,8 +940,16 @@ def test_prune_deletes_misflagged_historical_rows_after_s3_reverify():
                 pruned = await ha.prune_product_history_date(db, date_iso)
                 assert pruned["status"] == "pruned"
                 assert pruned["deleted"] == 1
+                assert pruned["uploads_metadata_deleted"] == 0
+                assert pruned.get("upload_items_deleted", 0) == 0
+                assert pruned.get("s3_keys")
                 assert db.products.docs == []
+                assert db.uploads.docs == [
+                    {"id": "u1", "upload_no": "PUHY260501001", "file_key": "dev/uploads/keep.xlsx"}
+                ]
                 assert storage.exists(key)  # S3 archive retained
+                assert db.archive_prune_receipts.docs
+                assert db.archive_prune_receipts.docs[0]["archive_date"] == date_iso
         finally:
             os.environ["ARCHIVE_PRUNE_ENABLED"] = "false"
 

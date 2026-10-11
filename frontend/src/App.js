@@ -237,12 +237,17 @@ function PublicHome() {
   return <LoginPage />;
 }
 
+function TestingBannerWithAuth() {
+  const { user } = useAuth();
+  return <TestingBanner user={user} />;
+}
+
 function App() {
   return (
     <ProcessingProvider>
     <AuthProvider>
       <BrowserRouter>
-        <TestingBanner />
+        <TestingBannerWithAuth />
         <SessionInactivityGuard />
         <Toaster position="top-right" richColors />
         <Routes>

@@ -262,6 +262,20 @@ def test_routing_still_targets_receiving_branch_user():
     assert "admin@sleepingstock.in" not in cc_emails
 
 
+def test_email_test_mode_defaults_true_in_testing(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "testing")
+    monkeypatch.delenv("EMAIL_TEST_MODE", raising=False)
+    assert notifications.email_test_mode() is True
+    monkeypatch.setenv("EMAIL_TEST_MODE", "false")
+    assert notifications.email_test_mode() is False
+
+
+def test_email_test_mode_defaults_false_in_production(monkeypatch):
+    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.delenv("EMAIL_TEST_MODE", raising=False)
+    assert notifications.email_test_mode() is False
+
+
 def test_receive_confirmed_routing_swaps_to_receiving_branch():
     users = [
         {"email": "koyambedu.user@gmail.com", "role": "user", "group": "FPL Automobiles PVT LTD", "location": "Koyambedu", "status": "active"},

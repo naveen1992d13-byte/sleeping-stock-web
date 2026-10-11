@@ -110,7 +110,17 @@ testing_runtime.assert_env_isolation()
 mongo_url = resolve_mongo_url()
 _mongo_url, _mongo_kwargs = build_mongo_client_args(mongo_url)
 client = AsyncIOMotorClient(_mongo_url, **_mongo_kwargs)
-db = client[os.environ['DB_NAME']]
+_raw_db = client[os.environ['DB_NAME']]
+if testing_runtime.is_testing_env() and testing_runtime.overlay_mode_enabled():
+    try:
+        from . import testing_overlay as _testing_overlay
+    except ImportError:
+        import testing_overlay as _testing_overlay
+    db = _testing_overlay.wrap_testing_database(client, _raw_db, _mongo_url, _mongo_kwargs)
+    testing_db_raw = _raw_db
+else:
+    db = _raw_db
+    testing_db_raw = _raw_db if testing_runtime.is_testing_env() else None
 
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -546,10 +556,18 @@ async def login(login_data: LoginRequest):
         )
 
     now = datetime.now(timezone.utc).isoformat()
-    await db.users.update_one(
-        {"id": user["id"]},
-        {"$set": {"last_login": now, "lastLogin": now}}
-    )
+    stamp_login = True
+    if testing_runtime.is_testing_env() and testing_runtime.overlay_mode_enabled():
+        try:
+            from . import testing_overlay as _login_overlay
+        except ImportError:
+            import testing_overlay as _login_overlay
+        stamp_login = _login_overlay.is_testing_created_doc(user)
+    if stamp_login:
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$set": {"last_login": now, "lastLogin": now}}
+        )
     user["last_login"] = now
     user["permissions"] = normalize_permissions(user.get("permissions"))
     _apply_testing_master_permissions(user)
@@ -3369,9 +3387,10 @@ def _nmts_now():
 
 
 def _nmts_date_key(dt=None):
-    # Testing freezes "today" to the active snapshot business date so copied
-    # Product Hub rows remain visible without rewriting production records.
-    if testing_runtime.is_testing_env() and dt is None:
+    # Overlay mode is a live Production mirror: "today" is the real IST
+    # business date so a Production publish appears immediately. The snapshot
+    # freeze is only for the legacy copy-based Testing mode.
+    if testing_runtime.should_freeze_business_date():
         frozen = testing_runtime.snapshot_business_date_key()
         if frozen:
             return frozen
@@ -3380,10 +3399,6 @@ def _nmts_date_key(dt=None):
         value = value.replace(tzinfo=NMTS_TIMEZONE)
     else:
         value = value.astimezone(NMTS_TIMEZONE)
-    if testing_runtime.is_testing_env():
-        frozen = testing_runtime.snapshot_business_date_key()
-        if frozen:
-            return frozen
     return value.strftime("%Y%m%d")
 
 
@@ -3774,7 +3789,7 @@ async def _finalize_product_publish(
         upsert=True,
     )
     await db.upload_items.update_many(
-        {"upload_id": upload_id},
+        _testing_created_only_query({"upload_id": upload_id}),
         {"$set": {"publish_status": "Published", "published_at": now.isoformat()}},
     )
     await db.uploads.update_one({"id": upload_id}, {"$set": {
@@ -3826,8 +3841,12 @@ async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends
     # Prefer the upload's own business date so late publish still lands on the
     # intended day; fall back to "today" for legacy rows without date_key.
     date_key = str(upload.get("date_key") or _nmts_date_key(now))
-    existing_products = await db.products.count_documents({"upload_id": upload_id, "publish_status": "Published"})
-    items = await db.upload_items.find({"upload_id": upload_id}, {"_id": 0}).to_list(200000)
+    existing_products = await db.products.count_documents(
+        _testing_created_only_query({"upload_id": upload_id, "publish_status": "Published"})
+    )
+    items = await db.upload_items.find(
+        _testing_created_only_query({"upload_id": upload_id}), {"_id": 0}
+    ).to_list(200000)
     if not items and existing_products <= 0:
         raise HTTPException(status_code=400, detail="No upload items found")
 
@@ -3885,7 +3904,7 @@ async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends
                     {"$set": {"is_active_today": False}},
                 )
                 await db.products.update_many(
-                    {"upload_id": upload_id},
+                    _testing_created_only_query({"upload_id": upload_id}),
                     {"$set": {
                         "is_active_today": True,
                         "active_date_key": date_key,
@@ -3952,7 +3971,7 @@ async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends
 
         # Non-product uploads: mark published only.
         await db.upload_items.update_many(
-            {"upload_id": upload_id},
+            _testing_created_only_query({"upload_id": upload_id}),
             {"$set": {"publish_status": "Published", "published_at": now.isoformat()}},
         )
         await db.uploads.update_one({"id": upload_id}, {"$set": {
@@ -4000,8 +4019,14 @@ async def cancel_upload_v2(upload_id: str, data: CancelUploadRequest, current_us
         "cancelled_by": current_user.id,
         "cancelled_user_name": current_user.username,
     }})
-    await db.upload_items.update_many({"upload_id": upload_id}, {"$set": {"publish_status": "Cancelled", "upload_no": cancel_no, "cancel_reason": reason}})
-    await db.products.update_many({"upload_id": upload_id}, {"$set": {"is_active_today": False, "publish_status": "Cancelled", "cancel_reason": reason}})
+    await db.upload_items.update_many(
+        _testing_created_only_query({"upload_id": upload_id}),
+        {"$set": {"publish_status": "Cancelled", "upload_no": cancel_no, "cancel_reason": reason}},
+    )
+    await db.products.update_many(
+        _testing_created_only_query({"upload_id": upload_id}),
+        {"$set": {"is_active_today": False, "publish_status": "Cancelled", "cancel_reason": reason}},
+    )
     await db.batch_summaries.delete_one({"upload_id": upload_id})
     try:
         await event_archive.maybe_enqueue_upload_cancelled(
@@ -4182,10 +4207,16 @@ async def list_product_hub_history_rows(
 # written at upload time, so there is no string-concatenation risk.
 
 def _testing_created_only_query(query: dict) -> dict:
-    """Keep snapshot reference Product Hub rows active when testing publishes."""
+    """Keep snapshot reference Product Hub rows active when testing publishes.
+
+    In overlay mode this also sets QUERY_TESTING_ONLY so publish/cancel
+    update_many/find/count stay on the Testing collection and do not scan
+    Production or walk matching rows one-by-one.
+    """
     if testing_runtime.is_testing_env():
         query = dict(query)
         query["data_origin"] = testing_runtime.DATA_ORIGIN_TESTING
+        query.update(testing_runtime.origin_query("testing"))
     return query
 
 
@@ -8785,6 +8816,197 @@ async def testing_deployment_metadata():
     return testing_runtime.load_deployment_metadata()
 
 
+def _require_testing_master(current_user: UserResponse):
+    if not testing_runtime.is_testing_env():
+        raise HTTPException(status_code=404, detail="Not a testing environment")
+    if str(current_user.role or "").lower() != "master":
+        raise HTTPException(status_code=403, detail="Testing Master / Master Admin only")
+
+
+def _testing_ops_db():
+    """Testing-local Motor handle for merge/cleanup/overlay operations.
+
+    Motor Database objects are not boolean; never use `testing_db_raw or db`.
+    """
+    return testing_db_raw if testing_db_raw is not None else db
+
+
+@api_router.get("/testing/github/status")
+async def testing_github_status():
+    """Public-in-testing PR banner payload. Never includes GitHub tokens."""
+    if not testing_runtime.is_testing_env():
+        raise HTTPException(status_code=404, detail="Not a testing environment")
+    try:
+        from . import testing_github as tg
+        from . import testing_verify as tv
+    except ImportError:
+        import testing_github as tg
+        import testing_verify as tv
+    status = await tg.fetch_pr_status()
+    try:
+        operation = await tv.latest_operation(_testing_ops_db())
+    except Exception as exc:
+        logging.getLogger(__name__).warning("testing operation status unavailable: %s", exc)
+        operation = None
+    status["operation"] = operation
+    status["operation_status"] = (operation or {}).get("result_status")
+    status["operation_label"] = tv.public_label((operation or {}).get("result_status"))
+    return status
+
+
+@api_router.post("/testing/github/merge")
+async def testing_github_merge(payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    _require_testing_master(current_user)
+    try:
+        from . import testing_github as tg
+        from . import testing_overlay as ov
+    except ImportError:
+        import testing_github as tg
+        import testing_overlay as ov
+    body = payload or {}
+    operation_id = str(body.get("operation_id") or "").strip() or tg.operation_id_for(
+        f"{current_user.id}:{body.get('confirm_text')}"
+    )
+    existing = await _testing_ops_db()[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
+    if existing:
+        return {"ok": True, "status": "idempotent_replay", "receipt": existing.get("receipt") or existing}
+    try:
+        from . import testing_verify as tv
+    except ImportError:
+        import testing_verify as tv
+    result = await tg.merge_pull_request(
+        confirm_text=str(body.get("confirm_text") or ""),
+        operation_id=operation_id,
+        actor={"id": current_user.id, "role": current_user.role},
+    )
+    stored_status = result.get("status")
+    expected_sha = (
+        (result.get("receipt") or {}).get("merge_sha")
+        or (result.get("receipt") or {}).get("head_sha")
+        or ""
+    )
+    if stored_status == "merged":
+        stored_status = tv.STATUS_WAITING
+        result["status"] = stored_status
+        result["ok"] = True
+        result["message"] = "Merge submitted. Waiting for Production deployment."
+        await tv.save_operation(_testing_ops_db(), operation_id, {
+            "kind": "github_merge",
+            "user_id": current_user.id,
+            "result_status": tv.STATUS_WAITING,
+            "receipt": result.get("receipt") or {},
+            "expected_sha": expected_sha,
+            "actor": {"id": current_user.id, "role": current_user.role},
+        })
+        tv.start_verification(
+            _testing_ops_db(),
+            operation_id,
+            expected_sha,
+            {"id": current_user.id, "role": current_user.role},
+            str(body.get("confirm_text") or ""),
+        )
+    else:
+        await tv.save_operation(_testing_ops_db(), operation_id, {
+            "kind": "github_merge",
+            "user_id": current_user.id,
+            "result_status": stored_status,
+            "receipt": result.get("receipt") or {},
+            "expected_sha": expected_sha,
+            "actor": {"id": current_user.id, "role": current_user.role},
+            "blockers": result.get("blockers") or [],
+        })
+    result["operation_id"] = operation_id
+    result["operation_label"] = tv.public_label(stored_status)
+    return result
+
+
+@api_router.post("/testing/github/verify-retry")
+async def testing_github_verify_retry(payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    _require_testing_master(current_user)
+    try:
+        from . import testing_verify as tv
+        from . import testing_overlay as ov
+    except ImportError:
+        import testing_verify as tv
+        import testing_overlay as ov
+    body = payload or {}
+    operation_id = str(body.get("operation_id") or "").strip()
+    if not operation_id:
+        latest = await tv.latest_operation(_testing_ops_db())
+        operation_id = str((latest or {}).get("operation_id") or "")
+    if not operation_id:
+        raise HTTPException(status_code=400, detail="operation_id is required")
+    existing = await _testing_ops_db()[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Unknown operation")
+    return await tv.retry_verification(
+        _testing_ops_db(),
+        operation_id,
+        {"id": current_user.id, "role": current_user.role},
+    )
+
+
+@api_router.get("/testing/cleanup/inventory")
+async def testing_cleanup_inventory(current_user: UserResponse = Depends(get_current_user)):
+    _require_testing_master(current_user)
+    try:
+        from . import testing_cleanup as tc
+    except ImportError:
+        import testing_cleanup as tc
+    return await tc.inventory(_testing_ops_db())
+
+
+@api_router.post("/testing/cleanup")
+async def testing_cleanup_run(payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    _require_testing_master(current_user)
+    try:
+        from . import testing_cleanup as tc
+        from . import testing_github as tg
+        from . import testing_overlay as ov
+    except ImportError:
+        import testing_cleanup as tc
+        import testing_github as tg
+        import testing_overlay as ov
+    body = payload or {}
+    operation_id = str(body.get("operation_id") or "").strip() or tg.operation_id_for(
+        f"cleanup:{current_user.id}"
+    )
+    existing = await _testing_ops_db()[ov.OPERATION_COLLECTION].find_one({"operation_id": operation_id}, {"_id": 0})
+    if existing:
+        return {"ok": True, "status": "idempotent_replay", "receipt": existing.get("receipt") or existing}
+    result = await tc.cleanup_testing_data(
+        _testing_ops_db(),
+        confirm_text=str(body.get("confirm_text") or ""),
+        actor={"id": current_user.id, "role": current_user.role},
+        operation_id=operation_id,
+        reason=str(body.get("reason") or "manual"),
+    )
+    await _testing_ops_db()[ov.OPERATION_COLLECTION].insert_one({
+        "operation_id": operation_id,
+        "kind": "testing_cleanup",
+        "user_id": current_user.id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "result_status": result.get("status"),
+        "receipt": result.get("receipt") or {},
+    })
+    return result
+
+
+@api_router.post("/testing/overlay/reset")
+async def testing_overlay_reset(payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    _require_testing_master(current_user)
+    try:
+        from . import testing_overlay as ov
+    except ImportError:
+        import testing_overlay as ov
+    body = payload or {}
+    return await ov.reset_overlay(
+        _testing_ops_db(),
+        str(body.get("production_id") or body.get("id") or ""),
+        str(body.get("collection") or ""),
+    )
+
+
 app.include_router(api_router)
 
 @app.middleware("http")
@@ -8809,6 +9031,8 @@ async def maintenance_guard(request: Request, call_next):
     if path.endswith("/testing/runtime") or path.endswith("/api/testing/runtime"):
         return await call_next(request)
     if path.endswith("/testing/deployment") or path.endswith("/api/testing/deployment"):
+        return await call_next(request)
+    if path.endswith("/testing/github/status") or path.endswith("/api/testing/github/status"):
         return await call_next(request)
 
     # Identify caller (best-effort)
@@ -8968,13 +9192,28 @@ async def seed_master_user_on_startup():
         logger.info("Archive manifest indexes verified")
         await archive_runs.ensure_run_indexes(db)
         logger.info("Archive run ledger indexes verified")
+        if testing_runtime.is_testing_env() and testing_db_raw is not None:
+            try:
+                from . import testing_overlay as _testing_overlay
+            except ImportError:
+                import testing_overlay as _testing_overlay
+            await _testing_overlay.ensure_overlay_indexes(testing_db_raw)
+            logger.info("Testing overlay indexes verified")
+            try:
+                from . import testing_verify as _testing_verify
+            except ImportError:
+                import testing_verify as _testing_verify
+            resumed = await _testing_verify.resume_pending(testing_db_raw)
+            if resumed:
+                logger.info("Resumed %s Production verification loop(s)", resumed)
         try:
             import storage_usage as su
             await su.ensure_usage_indexes(db)
             logger.info("Storage usage indexes verified")
         except Exception as exc:
             logger.warning("Storage usage index creation failed: %s", exc)
-        archive_scheduler.start_archive_scheduler(db)
+        archive_target = testing_db_raw if testing_runtime.is_testing_env() and testing_db_raw is not None else db
+        archive_scheduler.start_archive_scheduler(archive_target)
         logger.info("Archive scheduler started (ARCHIVE_PRUNE_ENABLED=%s)", s3_storage.archive_prune_enabled())
 
         async def _sla_apply_timeout(header):

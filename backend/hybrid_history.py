@@ -813,7 +813,50 @@ async def summarize_product_history(
                     }
             except Exception:
                 used_mongo = False
-        if used_mongo:
+        added_testing_s3 = False
+        try:
+            import testing_runtime
+            merge_testing_s3 = testing_runtime.is_testing_env()
+        except Exception:
+            merge_testing_s3 = False
+        if merge_testing_s3:
+            archived = await am.find_s3_readable(db, MODULE_PRODUCT_HISTORY, archive_date=date_iso)
+            key = str((archived or {}).get("storage_key") or "")
+            if archived and (key.startswith("testing/") or archived.get("archive_scope") == "testing-only"):
+                already = set(buckets)
+                storage = get_storage()
+                try:
+                    data, _ctype = storage.download_bytes(key)
+                except Exception:
+                    data = None
+                s3_rows = _load_jsonl_gz(data) if data else []
+                for r in s3_rows:
+                    if not _match_scope(r, brand, dealer, branch):
+                        continue
+                    b = r.get("brand_name") or ""
+                    d = r.get("dealer_name") or ""
+                    br = r.get("branch") or ""
+                    slot_key = (dk, b, d, br)
+                    if slot_key in already:
+                        continue
+                    added_testing_s3 = True
+                    slot = buckets.setdefault(
+                        slot_key,
+                        {
+                            "date_key": dk,
+                            "brand": b,
+                            "dealer": d,
+                            "branch": br,
+                            "records": 0,
+                            "total_available_qty": 0.0,
+                            "total_value": 0.0,
+                            "last_published_at": r.get("published_at"),
+                        },
+                    )
+                    slot["records"] += 1
+                    slot["total_available_qty"] += float(r.get("available_qty_number", r.get("quantity", 0)) or 0)
+                    slot["total_value"] += float(r.get("total_value_number", r.get("total_value", 0)) or 0)
+        if used_mongo or added_testing_s3:
             continue
         result = await read_product_history(
             db,

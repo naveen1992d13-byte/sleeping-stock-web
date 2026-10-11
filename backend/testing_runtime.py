@@ -106,6 +106,11 @@ def load_snapshot_metadata() -> dict[str, Any]:
     return _read_json(snapshot_metadata_path())
 
 
+def should_freeze_business_date() -> bool:
+    """True only for legacy snapshot-copy Testing. Overlay mode uses live IST today."""
+    return is_testing_env() and not overlay_mode_enabled() and bool(snapshot_business_date_key())
+
+
 def snapshot_business_date_key() -> Optional[str]:
     if not is_testing_env():
         return None
@@ -164,10 +169,28 @@ def stamp_testing_origin(doc: Mapping[str, Any] | dict[str, Any]) -> dict[str, A
     return payload
 
 
+def overlay_mode_enabled() -> bool:
+    """Testing reads production as a read-only base plus local deltas."""
+    if not is_testing_env():
+        return False
+    flag = _env("TESTING_OVERLAY_MODE", "true").lower()
+    return flag not in {"0", "false", "no", "off"}
+
+
 def origin_query(origin: Optional[str] = None) -> dict[str, Any]:
-    """Product Hub / master-data origin clause. Empty in production."""
+    """Product Hub / master-data origin clause. Empty in production.
+
+    Overlay mode does not filter Mongo snapshot copies. The overlay database
+    merges live production rows with testing deltas instead.
+    """
     if not is_testing_env():
         return {}
+    if overlay_mode_enabled():
+        try:
+            from . import testing_overlay as _overlay
+        except ImportError:
+            import testing_overlay as _overlay
+        return _overlay.origin_overlay_clause(origin)
     version = active_snapshot_version()
     requested = str(origin or "all").strip().lower()
     snapshot_clause: dict[str, Any] = {"data_origin": DATA_ORIGIN_SNAPSHOT}
@@ -218,6 +241,8 @@ def public_runtime_status() -> dict[str, Any]:
         "snapshot_version": active_snapshot_version(),
         "snapshot_copied_at": meta.get("copied_at"),
         "snapshot_source": meta.get("source_origin") or meta.get("source"),
+        "overlay_mode": overlay_mode_enabled(),
+        "read_model": "production_readonly_plus_testing_deltas" if overlay_mode_enabled() else "snapshot_copy",
         "deployment": {
             "pr_number": deploy.get("pr_number"),
             "git_branch": deploy.get("git_branch"),

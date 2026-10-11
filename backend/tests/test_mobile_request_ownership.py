@@ -737,3 +737,15 @@ async def _test_complete_repeated_is_idempotent(monkeypatch):
     assert len(calls) == 1
     assert fake_db.reservations["L1"]["apply_count"] == 1
     assert fake_db.order_requests.lines["L1"]["accepted_qty"] == 1
+
+
+def test_testing_env_blocks_live_expo_push(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "testing")
+    monkeypatch.delenv("PUSH_TEST_MODE", raising=False)
+    result = mobile_push.send_expo_push_messages([
+        {"to": "ExponentPushToken[prod-device]", "title": "should-not-send"},
+    ])
+    assert result["ok"] is True
+    assert result["sent"] == 0
+    assert result["skipped"] is True
+    assert result["reason"] == "testing_push_blocked"
