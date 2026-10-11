@@ -83,8 +83,6 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   const [moveConfirm, setMoveConfirm] = useState(false);
   const [movePending, setMovePending] = useState({ pending_requests: [], pending_assignments: [], has_pending: false });
   const hubTheme = hideInternalNav;
-  const [notificationInterval,setNotificationInterval]=useState(30);
-  const [savingInterval,setSavingInterval]=useState(false);
   const [appVersions,setAppVersions]=useState([]);
   const [apkDownloadUrl,setApkDownloadUrl]=useState('');
 
@@ -106,7 +104,8 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       const r=await axios.get(`${API}/mobile/users`,{params});
       setMobileUsers(r.data||[]);
     }catch(e){toast.error(e.response?.data?.detail||'Mobile user list load failed')}
-  };  const loadTodayAttendance=async()=>{
+  };
+  const loadTodayAttendance=async()=>{
     if(!scopeReady) { setTodayAttendance({}); return; }
     try{
       const r=await axios.get(`${API}/mobile/users/attendance/today`,{params:{brand_name:brand,dealer_name:dealer,branch}});
@@ -143,9 +142,6 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       setApkDownloadUrl(r.data?.download_url||'');
     }catch{ setApkDownloadUrl(''); }
   };
-  const loadNotificationInterval=async()=>{
-    try{const r=await axios.get(`${API}/mobile/settings/notification-interval`);setNotificationInterval(r.data?.interval_minutes||30);}catch(e){/* non-blocking */}
-  };
   const loadAppVersions=async()=>{
     try{const r=await axios.get(`${API}/mobile/app-versions`);setAppVersions(r.data||[]);}catch{/* non-blocking */}
     loadApkLink();
@@ -155,7 +151,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
 
   useEffect(()=>{
     setPairingResult(null);setPairingFor(null);setPending([]);setSnapshot(null);
-    loadMobileUsers();loadNotificationInterval();loadAppVersions();loadTodayAttendance();
+    loadMobileUsers();loadAppVersions();loadTodayAttendance();
     if (showAuditSections) { loadSessions(); loadAutoPerpetual(); loadHistoryRecords(); }
     /* eslint-disable-next-line */
   },[scopeBrand,scopeDealer,scopeBranch,user?.id, showAuditSections]);
@@ -377,13 +373,6 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     }
   };
 
-  const saveNotificationInterval=async()=>{
-    setSavingInterval(true);
-    try{await axios.put(`${API}/mobile/settings/notification-interval`,{interval_minutes:Number(notificationInterval)});toast.success('Notification interval updated')}
-    catch(e){toast.error(e.response?.data?.detail||'Update failed')}
-    finally{setSavingInterval(false)}
-  };
-
   const lookup=async()=>{if(!scopeReady)return toast.error('Select exact Dashboard Brand, Dealer and Branch');if(!clean(partNumber))return toast.error('Enter Part Number');try{const r=await axios.get(`${API}/mobile/perpetual-stock/lookup`,{params:{part_number:clean(partNumber),brand,dealer,branch}});setSnapshot(r.data);setPhysicalLocation(r.data.pin_location||'');setPhysicalQty('');setRemarks('')}catch(e){setSnapshot(null);toast.error(e.response?.data?.detail||'Part not found')}};
   const scan=async(e)=>{const file=e.target.files?.[0];e.target.value='';if(!file)return;if(!('TextDetector'in window))return toast.info('OCR is not supported in this browser. Enter Part Number manually.');try{const bitmap=await createImageBitmap(file);const result=await new window.TextDetector().detect(bitmap);const candidates=result.map(x=>x.rawValue).join(' ').match(/[A-Z0-9][A-Z0-9\-_/]{4,}/gi)||[];if(!candidates.length)return toast.error('Part Number not detected');setPartNumber(candidates.sort((a,b)=>b.length-a.length)[0])}catch{toast.error('OCR scan failed')}};
   const calc=useMemo(()=>{if(!snapshot||physicalQty==='')return null;const sys=Number(snapshot.system_quantity||0),phy=Number(physicalQty),mav=Number(snapshot.mav||0),diff=phy-sys;return{difference:diff,shortage_qty:diff<0?-diff:0,excess_qty:diff>0?diff:0,shortage_value:(diff<0?-diff:0)*mav,excess_value:(diff>0?diff:0)*mav}},[snapshot,physicalQty]);
@@ -483,12 +472,6 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     </div>}
 
     {showMobileSections && visibleSection==='settings'&&<div className="space-y-5" style={hubTheme ? { color: HUB_COLORS.text } : undefined}>
-      <Card title="Notification Repeat Interval" themed={hubTheme}><div className="flex items-center gap-3 flex-wrap">
-        <input type="number" min="1" className="border rounded h-10 px-3 w-32" value={notificationInterval} disabled={!isMaster} onChange={e=>setNotificationInterval(e.target.value)}/>
-        <span className="text-sm text-gray-500">minutes between repeat alerts for an unaccepted branch request</span>
-        {isMaster && <Button onClick={saveNotificationInterval} disabled={savingInterval} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><RefreshCw className="h-4 w-4 mr-2"/>{savingInterval?'Saving...':'Save'}</Button>}
-      </div></Card>
-
       <Card title="Mobile APK" themed={hubTheme}>
         {isMaster && <div className="mb-4 flex flex-wrap items-center gap-3">
           <input ref={apkFileRef} type="file" accept=".apk,application/vnd.android.package-archive" className="hidden" onChange={uploadApk}/>

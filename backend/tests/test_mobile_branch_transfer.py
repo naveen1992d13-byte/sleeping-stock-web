@@ -1,6 +1,7 @@
 """Branch-transfer session revocation and mobile API rejection."""
 import asyncio
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -59,6 +60,25 @@ class FakeColl:
                 ]
 
         return _Cursor()
+
+
+def test_mobile_app_allows_only_testing_and_production_urls():
+    env = Path(__file__).resolve().parents[2] / "mobile" / "src" / "config" / "env.js"
+    src = env.read_text()
+    assert "https://testing.sleepingstock.in/api" in src
+    assert "https://api.sleepingstock.in/api" in src
+    assert "ALLOWED_API_BASE_URLS" in src
+    assert "PRODUCTION_API_BASE_URL" in src
+    app = Path(__file__).resolve().parents[2] / "mobile" / "App.js"
+    app_src = app.read_text()
+    assert "PRODUCTION_API_BASE_URL" in app_src
+    assert "pairWithManualCode" in app_src
+    assert "login-background.jpg" in app_src
+    assert "sleeping-stock-logo-transparent.png" in app_src
+    settings = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "NMTSMobile.js"
+    settings_src = settings.read_text()
+    assert "Notification Repeat Interval" not in settings_src
+    assert "notification-interval" not in settings_src
 
 
 def test_branch_transferred_helpers():
