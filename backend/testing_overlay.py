@@ -120,6 +120,27 @@ def doc_id(doc: Mapping[str, Any] | None) -> str:
     return ""
 
 
+def identity_query(ident: str) -> dict:
+    value = str(ident or "")
+    if not value:
+        return {"id": "__missing_overlay_id__"}
+    return {"$or": [{key: value} for key in _ID_FIELDS]}
+
+
+def identity_nin(idents) -> dict:
+    values = [str(x) for x in idents if x]
+    if not values:
+        return {}
+    return {"$and": [{key: {"$nin": values}} for key in _ID_FIELDS]}
+
+
+def identity_in(idents) -> dict:
+    values = [str(x) for x in idents if x]
+    if not values:
+        return {"id": "__missing_overlay_id__"}
+    return {"$or": [{key: {"$in": values}} for key in _ID_FIELDS]}
+
+
 def apply_mongo_update(base: dict, update: Mapping[str, Any]) -> dict:
     """Apply a subset of Mongo update operators in memory for overlay payloads."""
     out = copy.deepcopy(base)
@@ -786,14 +807,14 @@ class OverlayCollection:
         exclude = set(hidden) | overlay_ids
         prod_query = raw
         if exclude:
-            nin = {"id": {"$nin": list(exclude)}}
+            nin = identity_nin(exclude)
             prod_query = {"$and": [raw, nin]} if raw else nin
         overlay_docs = []
         for ident, overlay in overlays.items():
             if ident in hidden:
                 continue
             try:
-                orig = await self._prod.find_one({"id": ident}, {"_id": 0})
+                orig = await self._prod.find_one(identity_query(ident), {"_id": 0})
             except Exception:
                 orig = None
             if not orig:
@@ -900,7 +921,8 @@ class OverlayCollection:
             return created_n
         prod_query: dict = raw
         if hidden:
-            prod_query = {"$and": [raw, {"id": {"$nin": list(hidden)}}]} if raw else {"id": {"$nin": list(hidden)}}
+            nin = identity_nin(hidden)
+            prod_query = {"$and": [raw, nin]} if raw else nin
         try:
             prod_n = int(await self._prod.count_documents(prod_query))
         except Exception as exc:
@@ -910,7 +932,7 @@ class OverlayCollection:
         if created_ids:
             try:
                 overlap = int(await self._prod.count_documents(
-                    {"$and": [prod_query, {"id": {"$in": created_ids}}]} if prod_query else {"id": {"$in": created_ids}}
+                    {"$and": [prod_query, identity_in(created_ids)]} if prod_query else identity_in(created_ids)
                 ))
             except Exception:
                 overlap = 0
@@ -919,7 +941,7 @@ class OverlayCollection:
             if ident in hidden:
                 continue
             try:
-                orig = await self._prod.find_one({"id": ident}, {"_id": 0})
+                orig = await self._prod.find_one(identity_query(ident), {"_id": 0})
             except Exception:
                 orig = None
             if not orig:
@@ -971,8 +993,8 @@ class OverlayCollection:
             return True
         if ident:
             found = await self._test.find_one(
-                self._testing_created_query({"id": ident}),
-                {"_id": 0, "id": 1, "data_origin": 1},
+                self._testing_created_query(identity_query(ident)),
+                {"_id": 0, "id": 1, "mobile_user_id": 1, "device_id": 1, "data_origin": 1},
             )
             return bool(found)
         return False
@@ -985,7 +1007,7 @@ class OverlayCollection:
             return _WriteResult(matched_count=0, modified_count=0)
         ident = doc_id(existing)
         if await self._is_testing_owned(ident, existing):
-            return await self._test.update_one({"id": ident} if ident else query, update)
+            return await self._test.update_one(identity_query(ident) if ident else query, update)
         overlay_payload = apply_mongo_update(
             (await self._overlays.find_one({"collection": self.name, "production_id": ident}) or {}).get("payload") or existing,
             update,
@@ -1045,7 +1067,7 @@ class OverlayCollection:
         ident = doc_id(existing)
         if await self._is_testing_owned(ident, existing):
             return await self._test.find_one_and_update(query, update, *args, **kwargs)
-        await self.update_one({"id": ident} if ident else query, update)
+        await self.update_one(identity_query(ident) if ident else query, update)
         return_document = kwargs.get("return_document")
         after = False
         if return_document is not None:
@@ -1053,7 +1075,7 @@ class OverlayCollection:
         if not after:
             return existing
         if ident:
-            return await self.find_one({"id": ident})
+            return await self.find_one(identity_query(ident))
         return apply_mongo_update(copy.deepcopy(existing), update)
 
     async def delete_one(self, query, *args, **kwargs):
@@ -1064,7 +1086,7 @@ class OverlayCollection:
             return _WriteResult(deleted_count=0)
         ident = doc_id(existing)
         if await self._is_testing_owned(ident, existing):
-            result = await self._test.delete_one({"id": ident} if ident else query)
+            result = await self._test.delete_one(identity_query(ident) if ident else query)
             await self._overlays.delete_many({"collection": self.name, "production_id": ident})
             return result
         await self._tombstones.update_one(
@@ -1140,7 +1162,7 @@ class OverlayCollection:
 
         prod_match = dict(match)
         if exclude:
-            nin = {"id": {"$nin": list(exclude)}}
+            nin = identity_nin(exclude)
             prod_match = {"$and": [match, nin]} if match else nin
         created_match = self._testing_created_query(match)
 
@@ -1167,7 +1189,7 @@ class OverlayCollection:
             if ident in hidden:
                 continue
             try:
-                orig = await self._prod.find_one({"id": ident}, {"_id": 0})
+                orig = await self._prod.find_one(identity_query(ident), {"_id": 0})
             except Exception:
                 orig = None
             if not orig:
