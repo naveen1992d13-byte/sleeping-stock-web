@@ -135,14 +135,17 @@ export function LoginPage() {
 
       <main className="nmts-login-shell">
         <div className={`nmts-login-panel${showPromo ? ' nmts-login-panel--split' : ''}`}>
+        <div className="nmts-login-panel-face">
         {showPromo && (
           <aside className="nmts-login-promo" aria-label="Login promotional image">
-            <img
-              src={promoUrl}
-              alt=""
-              data-testid="login-promo-image"
-              onError={() => setPromoFailed(true)}
-            />
+            <div className="nmts-login-promo-media">
+              <img
+                src={promoUrl}
+                alt=""
+                data-testid="login-promo-image"
+                onError={() => setPromoFailed(true)}
+              />
+            </div>
           </aside>
         )}
         <section className="nmts-login-card" aria-label="NMTS login">
@@ -235,6 +238,7 @@ export function LoginPage() {
             </footer>
           </div>
         </section>
+        </div>
         </div>
       </main>
     </div>

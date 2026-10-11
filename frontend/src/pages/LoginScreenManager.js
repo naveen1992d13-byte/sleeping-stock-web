@@ -4,6 +4,7 @@ import { API, useAuth } from '@/App';
 import { isTestingUiEnabled } from '@/testingUi';
 import { toast } from 'sonner';
 import { Image as ImageIcon } from 'lucide-react';
+import { LoginImageCropper } from './LoginImageCropper';
 import './LoginScreenManager.css';
 
 function toIstValue(iso) {
@@ -29,6 +30,7 @@ export function LoginScreenManager() {
   const [busy, setBusy] = useState(false);
   const [startAt, setStartAt] = useState('');
   const [endAt, setEndAt] = useState('');
+  const [cropJob, setCropJob] = useState(null);
 
   const load = async () => {
     const res = await axios.get(`${API}/login-screen/manage`);
@@ -45,6 +47,26 @@ export function LoginScreenManager() {
   if (!isTestingUiEnabled() || user?.role !== 'master') {
     return <div className="p-6 text-sm text-gray-500">Master Admin only in Testing.</div>;
   }
+
+  const closeCrop = () => {
+    if (cropJob?.input) cropJob.input.value = '';
+    setCropJob(null);
+  };
+
+  const chooseDefault = (file, input) => {
+    if (!file) return;
+    setCropJob({ kind: 'default', file, input });
+  };
+
+  const chooseScheduled = (file, input) => {
+    if (!file) return;
+    if (!startAt || !endAt) {
+      toast.error('Select Start and End date/time in IST');
+      if (input) input.value = '';
+      return;
+    }
+    setCropJob({ kind: 'scheduled', file, input });
+  };
 
   const uploadDefault = async (file, input) => {
     if (!file) return;
@@ -87,6 +109,17 @@ export function LoginScreenManager() {
     }
   };
 
+  const confirmCrop = (processed) => {
+    const job = cropJob;
+    setCropJob(null);
+    if (!job) return;
+    if (job.kind === 'scheduled') {
+      uploadScheduled(processed, job.input);
+    } else {
+      uploadDefault(processed, job.input);
+    }
+  };
+
   const preview = (row) => row?.image_url ? `${API.replace(/\/api$/, '')}${row.image_url}` : null;
 
   return (
@@ -115,7 +148,7 @@ export function LoginScreenManager() {
               type="file"
               accept="image/png,image/jpeg,image/webp"
               disabled={busy}
-              onChange={(e) => uploadDefault(e.target.files?.[0], e.target)}
+              onChange={(e) => chooseDefault(e.target.files?.[0], e.target)}
             />
           </label>
         </section>
@@ -141,11 +174,20 @@ export function LoginScreenManager() {
               type="file"
               accept="image/png,image/jpeg,image/webp"
               disabled={busy}
-              onChange={(e) => uploadScheduled(e.target.files?.[0], e.target)}
+              onChange={(e) => chooseScheduled(e.target.files?.[0], e.target)}
             />
           </label>
         </section>
       </div>
+
+      {cropJob && (
+        <LoginImageCropper
+          file={cropJob.file}
+          title={cropJob.kind === 'scheduled' ? 'Crop Scheduled Image' : 'Crop Default Image'}
+          onConfirm={confirmCrop}
+          onCancel={closeCrop}
+        />
+      )}
     </div>
   );
 }
