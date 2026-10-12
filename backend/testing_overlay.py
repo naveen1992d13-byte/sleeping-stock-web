@@ -50,6 +50,11 @@ LOCAL_ONLY_COLLECTIONS = frozenset({
     "login_repair_canaries",
     "login_screen_images",
     "mobile_user_attendance",
+    "auto_perpetual_pool",
+    "auto_perpetual_assignments",
+    "auto_perpetual_suggestions",
+    "auto_perpetual_daily_runs",
+    "auto_perpetual_branch_planner",
 })
 
 # Business collections merged from production + testing deltas.

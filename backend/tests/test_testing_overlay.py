@@ -295,6 +295,18 @@ def test_counters_remain_local_only():
     assert col._local_only() is True
 
 
+def test_auto_perpetual_collections_are_local_only():
+    for name in (
+        "auto_perpetual_pool",
+        "auto_perpetual_assignments",
+        "auto_perpetual_suggestions",
+        "auto_perpetual_daily_runs",
+        "auto_perpetual_branch_planner",
+    ):
+        col = ov.OverlayCollection(name, FakeCollection([{"id": "prod"}]), FakeCollection(), FakeCollection(), FakeCollection())
+        assert col._local_only() is True
+
+
 def test_mobile_user_attendance_is_local_only_and_upserts():
     prod = FakeCollection([{"id": "prod-att", "mobile_user_id": "MU1"}])
     test = FakeCollection([])
