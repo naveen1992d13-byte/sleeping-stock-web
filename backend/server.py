@@ -8821,6 +8821,11 @@ async def login_screen_image(image_id: str):
     return await login_screen.stream_image(db, image_id)
 
 
+@api_router.get("/login-screen/poster/{image_id}")
+async def login_screen_poster(image_id: str):
+    return await login_screen.stream_poster(db, image_id)
+
+
 @api_router.get("/login-screen/manage")
 async def login_screen_manage(current_user: UserResponse = Depends(get_current_user)):
     login_screen.require_master(current_user)
@@ -8830,11 +8835,21 @@ async def login_screen_manage(current_user: UserResponse = Depends(get_current_u
 @api_router.post("/login-screen/default")
 async def login_screen_upload_default(
     file: UploadFile = File(...),
+    poster: Optional[UploadFile] = File(default=None),
     current_user: UserResponse = Depends(get_current_user),
 ):
     login_screen.require_master(current_user)
     data = await file.read()
-    return await login_screen.save_default(db, data, file.content_type, file.filename)
+    poster_data = await poster.read() if poster is not None else None
+    return await login_screen.save_default(
+        db,
+        data,
+        file.content_type,
+        file.filename,
+        poster_data=poster_data,
+        poster_content_type=poster.content_type if poster is not None else None,
+        poster_filename=poster.filename if poster is not None else None,
+    )
 
 
 @api_router.post("/login-screen/scheduled")
@@ -8842,11 +8857,23 @@ async def login_screen_upload_scheduled(
     file: UploadFile = File(...),
     start_at: str = Form(...),
     end_at: str = Form(...),
+    poster: Optional[UploadFile] = File(default=None),
     current_user: UserResponse = Depends(get_current_user),
 ):
     login_screen.require_master(current_user)
     data = await file.read()
-    return await login_screen.save_scheduled(db, data, file.content_type, file.filename, start_at, end_at)
+    poster_data = await poster.read() if poster is not None else None
+    return await login_screen.save_scheduled(
+        db,
+        data,
+        file.content_type,
+        file.filename,
+        start_at,
+        end_at,
+        poster_data=poster_data,
+        poster_content_type=poster.content_type if poster is not None else None,
+        poster_filename=poster.filename if poster is not None else None,
+    )
 
 
 @api_router.get("/testing/deployment")

@@ -3,7 +3,6 @@ import {
   Users,
   UserPlus,
   Settings,
-  Settings2,
   Smartphone,
   Plus,
   Edit,
@@ -43,15 +42,14 @@ const COLORS = {
 };
 
 const MENU_LIST = APPLICATION_PERMISSION_LABELS;
-const HUB_SECTIONS = ["website", "mobile", "add", "settings", "app"];
+const HUB_SECTIONS = ["website", "mobile", "add", "settings"];
 
 function normalizeHubSection(raw, { isMaster, isAdmin }) {
   const value = String(raw || "website").toLowerCase();
-  const mapped = value === "list" ? "website" : value;
+  const mapped = value === "list" ? "website" : value === "app" ? "mobile" : value;
   if (!HUB_SECTIONS.includes(mapped)) return "website";
   if (mapped === "settings" && !isMaster) return "website";
   if (mapped === "add" && !(isMaster || isAdmin)) return "website";
-  if (mapped === "app" && !(isMaster || isAdmin)) return "website";
   return mapped;
 }
 
@@ -270,7 +268,7 @@ export default function UsersPage() {
   }, [scopeBrand, scopeDealer, scopeBranch, user?.id]);
 
   useEffect(() => {
-    if (activeTab === "mobile" || activeTab === "app") setMobileReady(true);
+    if (activeTab === "mobile") setMobileReady(true);
   }, [activeTab]);
 
   useEffect(() => {
@@ -918,9 +916,6 @@ export default function UsersPage() {
         {isMaster && (
           <Tab active={activeTab === "settings"} onClick={() => selectSection("settings")} icon={Settings} label="Settings" testId="user-hub-tab-settings" />
         )}
-        {(isMaster || isAdmin) && (
-          <Tab active={activeTab === "app"} onClick={() => selectSection("app")} icon={Settings2} label="App Settings" testId="user-hub-tab-app" />
-        )}
       </div>
 
       {activeTab === "website" && (
@@ -1254,11 +1249,11 @@ export default function UsersPage() {
       {mobileReady && (
         <div
           data-testid="user-hub-mobile-embed"
-          style={{ display: activeTab === "mobile" || activeTab === "app" ? undefined : "none" }}
+          style={{ display: activeTab === "mobile" ? undefined : "none" }}
         >
           <NMTSMobile
             hideInternalNav
-            sectionOverride={activeTab === "app" ? "settings" : "mobile"}
+            sectionOverride="mobile"
           />
         </div>
       )}

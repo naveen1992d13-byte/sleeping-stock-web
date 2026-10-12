@@ -30,7 +30,7 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
   const dragRef = useRef(null);
   const [src, setSrc] = useState('');
   const [ready, setReady] = useState(false);
-  const [mode, setMode] = useState('cover');
+  const [mode, setMode] = useState('contain');
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [viewSize, setViewSize] = useState({ w: LOGIN_PROMO_WIDTH, h: LOGIN_PROMO_HEIGHT });
@@ -40,7 +40,7 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
     const url = URL.createObjectURL(file);
     setSrc(url);
     setReady(false);
-    setMode('cover');
+    setMode('contain');
     setZoom(1);
     setOffset({ x: 0, y: 0 });
     return () => URL.revokeObjectURL(url);
@@ -86,7 +86,7 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
   };
 
   const reset = () => {
-    setMode('cover');
+    setMode('contain');
     setZoom(1);
     setOffset({ x: 0, y: 0 });
   };
@@ -131,7 +131,7 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
           <h3>{title}</h3>
           <button type="button" className="lsm-crop-close" onClick={onCancel} aria-label="Close">×</button>
         </div>
-        <p className="lsm-crop-note">Final preview · {LOGIN_PROMO_WIDTH}×{LOGIN_PROMO_HEIGHT} Login area</p>
+        <p className="lsm-crop-note">Final preview · {LOGIN_PROMO_WIDTH}×{LOGIN_PROMO_HEIGHT} square (1:1)</p>
         <div
           ref={viewRef}
           className="lsm-crop-view"
@@ -173,6 +173,7 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
         <div className="lsm-crop-actions">
           <button type="button" className="lsm-crop-btn" onClick={reset}>Reset</button>
           <button type="button" className="lsm-crop-btn" onClick={fitFull}>Fit Full Image</button>
+          <button type="button" className="lsm-crop-btn" onClick={() => { setMode('cover'); setZoom(1); setOffset({ x: 0, y: 0 }); }}>Fill Frame</button>
           <button type="button" className="lsm-crop-btn lsm-crop-btn--primary" disabled={busy || !ready} onClick={confirm}>
             {busy ? 'Saving…' : 'Confirm Crop'}
           </button>

@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import axios from 'axios';
 import { API, useAuth } from '../App';
-import { Smartphone, Download, Ban, Trash2, ScanLine, Copy, ClipboardCheck, Camera, History, Eye, Plus, Upload, X, RefreshCw, Settings2, QrCode, CheckCircle2, ArrowRightLeft } from 'lucide-react';
+import { Download, Ban, Trash2, ScanLine, Copy, ClipboardCheck, Camera, History, Eye, Plus, Upload, X, RefreshCw, QrCode, CheckCircle2, ArrowRightLeft } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { toast } from 'sonner';
 import { NmtsConfirmDialog } from '../components/NmtsConfirmDialog';
@@ -71,6 +71,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   const [autoSuggestions,setAutoSuggestions]=useState([]);
   const [suggestionDetail,setSuggestionDetail]=useState(null);
   const [sendBusy,setSendBusy]=useState(false);
+  const [autoGenerating,setAutoGenerating]=useState(false);
   const [autoRecalcBusy,setAutoRecalcBusy]=useState(false);
   const [creatingUser,setCreatingUser]=useState(false);
   const [pairingFor,setPairingFor]=useState(null);
@@ -391,7 +392,6 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   return <div className="space-y-6" data-testid={variant === 'audit' ? 'stock-audit-page' : 'nmts-mobile-page'}>
     {showMobileSections && (
       <>
-    {!hideInternalNav && <div className="grid md:grid-cols-2 gap-3 max-w-xl"><Tab active={visibleSection==='mobile'} onClick={()=>setSection('mobile')} icon={Smartphone} title="Mobile Users"/><Tab active={visibleSection==='settings'} onClick={()=>setSection('settings')} icon={Settings2} title="App &amp; Settings"/></div>}
     {!scopeReady && user?.role!=='user' && <div className="border border-amber-300 bg-amber-50 p-3 rounded-lg text-amber-800">Select an exact Brand, Dealer and Branch in the Dashboard filter. Mobile User creation and pairing use only that selected scope.</div>}
       </>
     )}
@@ -404,7 +404,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     )}
 
     {showMobileSections && visibleSection==='mobile'&&<div className="space-y-5" style={hubTheme ? { color: HUB_COLORS.text } : undefined}>
-      {canPair && <Card title="Pair a New Mobile User" themed={hubTheme}><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+      {canPair && <Card title="Pair Mobile User" themed={hubTheme}><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
         <div><p className="font-medium">{isUser ? 'Generate one-time QR for your assigned Brand / Dealer / Branch.' : 'Generate one-time QR for the selected Brand / Dealer / Branch.'}</p><p className="text-xs mt-1" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }} >The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.{isUser ? ` Scope: ${pairBrand} / ${pairDealer} / ${pairBranch}.` : ''}</p></div>
         <Button onClick={generateNewPairing} disabled={creatingUser||!pairReady} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button>
       </div></Card>}
@@ -469,20 +469,18 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
         </tr>})}
         {!mobileUsers.length && <tr><td colSpan={12} className="text-center py-8 text-gray-500">No mobile users yet for this scope.</td></tr>}
       </tbody></table></div></Card>
-    </div>}
 
-    {showMobileSections && visibleSection==='settings'&&<div className="space-y-5" style={hubTheme ? { color: HUB_COLORS.text } : undefined}>
-      <Card title="Mobile APK" themed={hubTheme}>
+      <Card title="Download Mobile App" themed={hubTheme}>
         {isMaster && <div className="mb-4 flex flex-wrap items-center gap-3">
           <input ref={apkFileRef} type="file" accept=".apk,application/vnd.android.package-archive" className="hidden" onChange={uploadApk}/>
-          <Button onClick={()=>apkFileRef.current?.click()} disabled={apkUploading} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><Upload className="h-4 w-4 mr-2"/>{apkUploading?'Uploading...':'Upload APK'}</Button>
-          <span className="text-xs text-gray-500">.apk only · Master Admin</span>
+          <Button onClick={()=>apkFileRef.current?.click()} disabled={apkUploading} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined} data-testid="user-hub-upload-apk"><Upload className="h-4 w-4 mr-2"/>{apkUploading?'Uploading...':'Upload APK'}</Button>
+          <span className="text-xs" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }}>.apk only · Master Admin</span>
         </div>}
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-          <div>{latestVersion ? <>Latest: <b>{latestVersion.version_name||latestVersion.apk_filename}</b><div className="text-xs text-gray-500 mt-1">Released {fmt(latestVersion.release_date)}</div></> : 'No APK published yet.'}</div>
+          <div>{latestVersion ? <>Latest: <b>{latestVersion.version_name||latestVersion.apk_filename}</b><div className="text-xs mt-1" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }}>Released {fmt(latestVersion.release_date)}</div></> : 'No APK published yet.'}</div>
           <div className="flex flex-wrap gap-2">
-            {latestVersion && <Button onClick={downloadApk} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><Download className="h-4 w-4 mr-2"/>Download APK</Button>}
-            {latestVersion && <Button variant="outline" onClick={copyApkLink}><Copy className="h-4 w-4 mr-2"/>Copy Download Link</Button>}
+            {latestVersion && <Button onClick={downloadApk} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined} data-testid="user-hub-download-apk"><Download className="h-4 w-4 mr-2"/>Download APK</Button>}
+            {latestVersion && <Button variant="outline" onClick={copyApkLink} data-testid="user-hub-copy-apk-link"><Copy className="h-4 w-4 mr-2"/>Copy Download Link</Button>}
           </div>
         </div>
       </Card>

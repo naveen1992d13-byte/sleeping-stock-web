@@ -295,6 +295,38 @@ def test_counters_remain_local_only():
     assert col._local_only() is True
 
 
+def test_mobile_user_attendance_is_local_only_and_upserts():
+    prod = FakeCollection([{"id": "prod-att", "mobile_user_id": "MU1"}])
+    test = FakeCollection([])
+    col = ov.OverlayCollection("mobile_user_attendance", prod, test, FakeCollection(), FakeCollection())
+    assert col._local_only() is True
+
+    async def _go():
+        first = await col.update_one(
+            {"attendance_date": "2026-10-12", "mobile_user_id": "MU1"},
+            {"$set": {"status": "active", "branch": "Retteri"}, "$setOnInsert": {"created_at": "now"}},
+            upsert=True,
+        )
+        found = await col.find_one({"attendance_date": "2026-10-12", "mobile_user_id": "MU1"})
+        second = await col.update_one(
+            {"attendance_date": "2026-10-12", "mobile_user_id": "MU1"},
+            {"$set": {"status": "inactive"}},
+            upsert=True,
+        )
+        after = await col.find_one({"attendance_date": "2026-10-12", "mobile_user_id": "MU1"})
+        return first, found, second, after
+
+    first, found, second, after = asyncio.run(_go())
+    assert int(getattr(first, "matched_count", 0) or 0) in (0, 1)
+    assert found["status"] == "active"
+    assert found["branch"] == "Retteri"
+    assert after["status"] == "inactive"
+    assert after["attendance_date"] == "2026-10-12"
+    assert prod.rows == [{"id": "prod-att", "mobile_user_id": "MU1"}]
+    assert prod.writes == []
+    assert len(test.rows) == 1
+
+
 def test_unlisted_business_collection_overlays_production():
     """Mobile Users / archives / etc. must live-mirror Production, not Testing-only."""
     prod = FakeCollection([{"id": "mu1", "name": "prod-mobile"}])

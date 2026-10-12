@@ -42,6 +42,8 @@ export function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [maintenance, setMaintenance] = useState(null);
   const [promoUrl, setPromoUrl] = useState(null);
+  const [promoPosterUrl, setPromoPosterUrl] = useState(null);
+  const [promoKind, setPromoKind] = useState('image');
   const [promoFailed, setPromoFailed] = useState(false);
   const { login } = useAuth();
   const navigate = useNavigate();
@@ -72,13 +74,19 @@ export function LoginPage() {
     };
 
     const applyPayload = (data) => {
-      const path = data?.image_url;
-      const nextUrl = path ? `${API.replace(/\/api$/, '')}${path}` : null;
-      if (lastUrl !== nextUrl) {
-        lastUrl = nextUrl;
+      const origin = API.replace(/\/api$/, '');
+      const mediaPath = data?.media_url || data?.image_url;
+      const posterPath = data?.poster_url || (data?.media_kind === 'video' ? data?.image_url : mediaPath);
+      const nextUrl = mediaPath ? `${origin}${mediaPath}` : null;
+      const nextPoster = posterPath ? `${origin}${posterPath}` : nextUrl;
+      const nextKind = data?.media_kind === 'video' ? 'video' : 'image';
+      if (lastUrl !== `${nextKind}:${nextUrl}:${nextPoster}`) {
+        lastUrl = `${nextKind}:${nextUrl}:${nextPoster}`;
         if (!cancelled) {
           setPromoFailed(false);
           setPromoUrl(nextUrl);
+          setPromoPosterUrl(nextPoster);
+          setPromoKind(nextKind);
         }
       }
       clearExpiry();
@@ -138,19 +146,32 @@ export function LoginPage() {
         <div className="nmts-login-panel-run" aria-hidden="true" />
         <div className="nmts-login-panel-face">
         {showPromo && (
-          <div className="nmts-login-panel-blur" aria-hidden="true">
-            <img src={promoUrl} alt="" />
-          </div>
-        )}
-        {showPromo && (
-          <aside className="nmts-login-promo" aria-label="Login promotional image">
+          <aside className="nmts-login-promo" aria-label="Login promotional media">
+            <div className="nmts-login-promo-bg" aria-hidden="true">
+              <img src={promoPosterUrl || promoUrl} alt="" />
+            </div>
             <div className="nmts-login-promo-media">
-              <img
-                src={promoUrl}
-                alt=""
-                data-testid="login-promo-image"
-                onError={() => setPromoFailed(true)}
-              />
+              {promoKind === 'video' ? (
+                <video
+                  src={promoUrl}
+                  poster={promoPosterUrl || undefined}
+                  autoPlay
+                  muted
+                  loop
+                  playsInline
+                  controls={false}
+                  disablePictureInPicture
+                  data-testid="login-promo-video"
+                  onError={() => setPromoFailed(true)}
+                />
+              ) : (
+                <img
+                  src={promoUrl}
+                  alt=""
+                  data-testid="login-promo-image"
+                  onError={() => setPromoFailed(true)}
+                />
+              )}
             </div>
           </aside>
         )}
