@@ -43,3 +43,15 @@ def test_select_dedupes():
     picked = select_items_502525(eligible, 3, set())
     parts = [p["part_number"] for p in picked]
     assert len(parts) == len(set(parts))
+
+
+def test_select_sorts_mixed_digit_and_letter_locations():
+    from auto_perpetual_suggestions import select_items_502525
+
+    eligible = [
+        {"part_number": "A", "system_qty": 1, "loc": "12-A", "movement": "location"},
+        {"part_number": "B", "system_qty": 1, "loc": "A-12", "movement": "location"},
+        {"part_number": "C", "system_qty": 1, "loc": "B-01", "movement": "location"},
+    ]
+    picked = select_items_502525(eligible, 3, set())
+    assert {p["part_number"] for p in picked} == {"A", "B", "C"}

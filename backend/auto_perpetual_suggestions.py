@@ -39,7 +39,8 @@ def _natural_sort_key(text: str) -> Tuple:
     for p in parts:
         if not p:
             continue
-        out.append(int(p) if p.isdigit() else p)
+        # Tag type so mixed locations like "12-A" and "A-12" can sort together.
+        out.append((0, int(p)) if p.isdigit() else (1, p))
     return tuple(out)
 
 
