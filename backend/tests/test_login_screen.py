@@ -233,11 +233,22 @@ def test_public_row_exposes_video_media_and_poster():
         "poster_key": "testing/login-screen/default/x-poster.jpg",
         "storage_key": "testing/login-screen/default/x.mp4",
         "content_type": "video/mp4",
+        "display_settings": {"fit": "contain", "zoom": 1.4, "offset_x": 0.1, "offset_y": -0.2},
     })
     assert payload["media_kind"] == "video"
     assert payload["media_url"] == "/api/login-screen/image/v1"
     assert payload["poster_url"] == "/api/login-screen/poster/v1"
     assert payload["image_url"] == "/api/login-screen/poster/v1"
+    assert payload["display_settings"]["zoom"] == 1.4
+    assert payload["display_settings"]["fit"] == "contain"
+
+
+def test_normalize_display_settings_clamps_values():
+    out = ls.normalize_display_settings('{"fit":"cover","zoom":9,"offset_x":-3,"offset_y":2}')
+    assert out["fit"] == "cover"
+    assert out["zoom"] == 3.0
+    assert out["offset_x"] == -1.0
+    assert out["offset_y"] == 1.0
 
 
 def test_video_validation_accepts_h264_aac_under_limits():

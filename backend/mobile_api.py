@@ -1530,9 +1530,9 @@ async def generate_auto_perpetual(
         raise HTTPException(403, "Dealer outside scope")
     if q.get("branch") and q["branch"] != branch:
         raise HTTPException(403, "Branch outside scope")
-    from auto_perpetual import generate_auto_perpetual_for_branch, ist_date_key, resolve_branch_inventory_date_key
+    from auto_perpetual import generate_auto_perpetual_for_branch, require_todays_branch_stock
 
-    active_date_key = await resolve_branch_inventory_date_key(
+    active_date_key = await require_todays_branch_stock(
         db, brand_name=brand_name, dealer_name=dealer_name, branch=branch
     )
     result = await generate_auto_perpetual_for_branch(
@@ -1567,15 +1567,9 @@ async def get_auto_suggestion_detail(
     suggestion_id: str,
     current_user: UserResponse = Depends(_web_current_user),
 ):
-    row = await db.auto_perpetual_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
-    if not row:
-        raise HTTPException(404, "Suggestion not found")
-    items = sorted(
-        row.get("items") or [],
-        key=lambda r: (r.get("system_location") or "").upper(),
-    )
-    row["items"] = items
-    return row
+    from auto_perpetual_suggestions import suggestion_with_line_items
+
+    return await suggestion_with_line_items(db, suggestion_id)
 
 
 @router.post("/auto-perpetual/suggestions/{suggestion_id}/send")
@@ -1649,53 +1643,124 @@ async def auto_perpetual_assignments_today(
     return rows
 
 
-@router.get("/auto-perpetual/tasks")
-async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
-    from auto_perpetual import get_or_create_auto_daily_session, ist_date_key
-
-    mu = session["mobile_user"]["mobile_user_id"]
-    allocation_date = ist_date_key()
-    scope_q = {
-        "allocation_date": allocation_date,
-        "mobile_user_id": mu,
-        "brand_name": session["brand_name"],
-        "dealer_name": session["dealer_name"],
-        "branch": session["branch"],
-    }
-    # Always use the authoritative daily get-or-create session. Do not trust
-    # per-assignment session_id stamps — those can diverge across parts.
-    session_id = await get_or_create_auto_daily_session(
-        db,
-        mobile_user_id=mu,
-        brand_name=session["brand_name"],
-        dealer_name=session["dealer_name"],
-        branch=session["branch"],
-        device_id=session["device"]["device_id"],
-    )
+async def _pending_auto_assignment_rows(scope_q: dict, brand_name: str, dealer_name: str, branch: str):
     rows = await db.auto_perpetual_assignments.find(
         {**scope_q, "status": "pending"},
         {"_id": 0},
     ).to_list(500)
-    rows.sort(key=lambda r: (r.get("loc") or r.get("part_number") or "").upper())
-    # Normalize assignment stamps to today's single session for consistency.
     if rows:
-        await db.auto_perpetual_assignments.update_many(
-            scope_q,
-            {"$set": {"session_id": session_id}},
+        return rows, scope_q
+    loose_q = {
+        "allocation_date": scope_q.get("allocation_date"),
+        "mobile_user_id": scope_q.get("mobile_user_id"),
+        "status": "pending",
+        "brand_name": {"$regex": f"^{re.escape(str(brand_name or ''))}$", "$options": "i"},
+        "dealer_name": {"$regex": f"^{re.escape(str(dealer_name or ''))}$", "$options": "i"},
+        "branch": {"$regex": f"^{re.escape(str(branch or ''))}$", "$options": "i"},
+    }
+    rows = await db.auto_perpetual_assignments.find(loose_q, {"_id": 0}).to_list(500)
+    if not rows:
+        return [], scope_q
+    matched = {
+        "allocation_date": scope_q.get("allocation_date"),
+        "mobile_user_id": scope_q.get("mobile_user_id"),
+        "brand_name": rows[0].get("brand_name"),
+        "dealer_name": rows[0].get("dealer_name"),
+        "branch": rows[0].get("branch"),
+    }
+    return rows, matched
+
+
+@router.get("/auto-perpetual/tasks")
+async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
+    from auto_perpetual import (
+        get_or_create_auto_daily_session,
+        ist_date_key,
+        resolve_pending_auto_assignment_date,
+    )
+
+    mu = session["mobile_user"]["mobile_user_id"]
+    brand_name = session["brand_name"]
+    dealer_name = session["dealer_name"]
+    branch = session["branch"]
+    today = ist_date_key()
+    allocation_date = await resolve_pending_auto_assignment_date(
+        db,
+        mobile_user_id=mu,
+        brand_name=brand_name,
+        dealer_name=dealer_name,
+        branch=branch,
+    )
+    if not allocation_date:
+        session_id = await get_or_create_auto_daily_session(
+            db,
+            mobile_user_id=mu,
+            brand_name=brand_name,
+            dealer_name=dealer_name,
+            branch=branch,
+            device_id=session["device"]["device_id"],
         )
+        return {
+            "tasks": [],
+            "count": 0,
+            "session_id": session_id,
+            "allocation_date": today,
+            "assigned_count": 0,
+            "completed_count": 0,
+        }
+
+    scope_q = {
+        "allocation_date": allocation_date,
+        "mobile_user_id": mu,
+        "brand_name": brand_name,
+        "dealer_name": dealer_name,
+        "branch": branch,
+    }
+    rows, scope_q = await _pending_auto_assignment_rows(scope_q, brand_name, dealer_name, branch)
+    rows.sort(key=lambda r: str(r.get("loc") or r.get("part_number") or "").upper())
+
+    if allocation_date == today:
+        session_id = await get_or_create_auto_daily_session(
+            db,
+            mobile_user_id=mu,
+            brand_name=brand_name,
+            dealer_name=dealer_name,
+            branch=branch,
+            device_id=session["device"]["device_id"],
+        )
+        if rows:
+            await db.auto_perpetual_assignments.update_many(
+                scope_q,
+                {"$set": {"session_id": session_id}},
+            )
+    else:
+        session_id = next((r.get("session_id") for r in rows if r.get("session_id")), None)
+        if not session_id:
+            session_id = await get_or_create_auto_daily_session(
+                db,
+                mobile_user_id=mu,
+                brand_name=brand_name,
+                dealer_name=dealer_name,
+                branch=branch,
+                device_id=session["device"]["device_id"],
+            )
+
     assigned = await db.auto_perpetual_assignments.count_documents(scope_q)
     completed = await db.auto_perpetual_assignments.count_documents({**scope_q, "status": "completed"})
     enriched = []
     for row in rows:
-        product, _ = await find_scoped_product(row.get("part_number", ""), session["brand_name"], session["dealer_name"], session["branch"])
+        product, _ = await find_scoped_product(row.get("part_number", ""), brand_name, dealer_name, branch)
+        loc = row.get("loc")
+        if loc is None or loc == "":
+            loc = _product_pin_location(product or {})
         enriched.append(
             {
                 **row,
                 "session_id": session_id,
                 "part_name": resolve_product_part_name(product or {}),
                 "system_qty": _mobile_stock_qty(product),
-                "system_location": row.get("loc") or _product_pin_location(product or {}),
-                "loc": row.get("loc") or _product_pin_location(product or {}),
+                "system_location": loc,
+                "loc": loc,
             }
         )
     return {
@@ -1723,18 +1788,44 @@ async def finish_auto_perpetual_session(session=Depends(get_device_session)):
 
 @router.get("/auto-perpetual/session/today")
 async def auto_perpetual_session_today(session=Depends(get_device_session)):
-    from auto_perpetual import get_or_create_auto_daily_session, ist_date_key
+    from auto_perpetual import (
+        get_or_create_auto_daily_session,
+        ist_date_key,
+        resolve_pending_auto_assignment_date,
+    )
 
     mu = session["mobile_user"]["mobile_user_id"]
+    brand_name = session["brand_name"]
+    dealer_name = session["dealer_name"]
+    branch = session["branch"]
+    today = ist_date_key()
+    allocation_date = await resolve_pending_auto_assignment_date(
+        db,
+        mobile_user_id=mu,
+        brand_name=brand_name,
+        dealer_name=dealer_name,
+        branch=branch,
+    )
+    if allocation_date and allocation_date != today:
+        row = await db.auto_perpetual_assignments.find_one(
+            {
+                "allocation_date": allocation_date,
+                "mobile_user_id": mu,
+                "status": "pending",
+            },
+            {"_id": 0, "session_id": 1},
+        )
+        if row and row.get("session_id"):
+            return {"session_id": row["session_id"], "allocation_date": allocation_date}
     session_id = await get_or_create_auto_daily_session(
         db,
         mobile_user_id=mu,
-        brand_name=session["brand_name"],
-        dealer_name=session["dealer_name"],
-        branch=session["branch"],
+        brand_name=brand_name,
+        dealer_name=dealer_name,
+        branch=branch,
         device_id=session["device"]["device_id"],
     )
-    return {"session_id": session_id, "allocation_date": ist_date_key()}
+    return {"session_id": session_id, "allocation_date": allocation_date or today}
 
 
 # ==================== NOTIFICATIONS (BRANCH-SCOPED, MOBILE SIDE) ====================

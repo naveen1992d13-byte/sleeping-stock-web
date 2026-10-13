@@ -85,7 +85,42 @@ export async function validateLoginVideoFile(file) {
   return null;
 }
 
-export async function captureLoginVideoPoster(file, size = LOGIN_PROMO_OUTPUT_WIDTH) {
+export function normalizeLoginDisplay(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const fit = src.fit === 'cover' ? 'cover' : 'contain';
+  const zoom = Math.min(3, Math.max(1, Number(src.zoom) || 1));
+  const offsetX = Math.max(-1, Math.min(1, Number(src.offset_x) || 0));
+  const offsetY = Math.max(-1, Math.min(1, Number(src.offset_y) || 0));
+  return { fit, zoom, offset_x: offsetX, offset_y: offsetY };
+}
+
+export function loginDisplayStyle(raw, { forceContain = false } = {}) {
+  const settings = normalizeLoginDisplay(raw);
+  const fit = forceContain ? 'contain' : settings.fit;
+  return {
+    objectFit: fit,
+    objectPosition: 'center',
+    transform: `translate(${settings.offset_x * 50}%, ${settings.offset_y * 50}%) scale(${settings.zoom})`,
+    transformOrigin: 'center center',
+  };
+}
+
+export function displaySettingsFromCropper({ mode, zoom, offset, viewSize, mediaWidth, mediaHeight }) {
+  let nextZoom = Math.min(3, Math.max(1, Number(zoom) || 1));
+  if (mode === 'cover' && mediaWidth && mediaHeight && viewSize?.w && viewSize?.h) {
+    const contain = Math.min(viewSize.w / mediaWidth, viewSize.h / mediaHeight);
+    const cover = Math.max(viewSize.w / mediaWidth, viewSize.h / mediaHeight);
+    if (contain > 0) nextZoom = Math.min(3, nextZoom * (cover / contain));
+  }
+  return normalizeLoginDisplay({
+    fit: 'contain',
+    zoom: nextZoom,
+    offset_x: viewSize?.w ? offset.x / viewSize.w : 0,
+    offset_y: viewSize?.h ? offset.y / viewSize.h : 0,
+  });
+}
+
+export async function captureLoginVideoPoster(file) {
   const url = URL.createObjectURL(file);
   const video = document.createElement('video');
   video.muted = true;
@@ -108,18 +143,13 @@ export async function captureLoginVideoPoster(file, size = LOGIN_PROMO_OUTPUT_WI
         }
       });
     }
+    const vw = Math.max(1, video.videoWidth || LOGIN_PROMO_OUTPUT_WIDTH);
+    const vh = Math.max(1, video.videoHeight || LOGIN_PROMO_OUTPUT_HEIGHT);
     const canvas = document.createElement('canvas');
-    canvas.width = size;
-    canvas.height = size;
+    canvas.width = vw;
+    canvas.height = vh;
     const ctx = canvas.getContext('2d');
-    ctx.fillStyle = LOGIN_PROMO_FILL;
-    ctx.fillRect(0, 0, size, size);
-    const vw = video.videoWidth || size;
-    const vh = video.videoHeight || size;
-    const scale = Math.min(size / vw, size / vh);
-    const dw = vw * scale;
-    const dh = vh * scale;
-    ctx.drawImage(video, (size - dw) / 2, (size - dh) / 2, dw, dh);
+    ctx.drawImage(video, 0, 0, vw, vh);
     const blob = await new Promise((resolve, reject) => {
       canvas.toBlob((next) => (next ? resolve(next) : reject(new Error('Poster capture failed'))), 'image/jpeg', 0.86);
     });

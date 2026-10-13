@@ -47,6 +47,12 @@ def inventory_date_key(dt: Optional[datetime] = None) -> str:
     return (dt or _ist_now()).strftime("%Y%m%d")
 
 
+TODAY_STOCK_MISSING_MESSAGE = (
+    "Today's stock has not been uploaded for the selected Branch. "
+    "Upload today's stock before generating Auto Perpetual."
+)
+
+
 async def resolve_branch_inventory_date_key(
     db, *, brand_name: str, dealer_name: str, branch: str
 ) -> str:
@@ -64,6 +70,87 @@ async def resolve_branch_inventory_date_key(
         sort=[("active_date_key", -1)],
     )
     return (row or {}).get("active_date_key") or inventory_date_key()
+
+
+def today_inventory_date_keys(dt: Optional[datetime] = None) -> List[str]:
+    return [inventory_date_key(dt), ist_date_key(dt)]
+
+
+async def todays_branch_stock_date_key(
+    db, *, brand_name: str, dealer_name: str, branch: str
+) -> Optional[str]:
+    """Return the stored IST-today inventory key, or None if today's stock is missing."""
+    row = await db.products.find_one(
+        {
+            "brand_name": brand_name,
+            "dealer_name": dealer_name,
+            "branch": branch,
+            "publish_status": "Published",
+            "active_date_key": {"$in": today_inventory_date_keys()},
+        },
+        {"_id": 0, "active_date_key": 1},
+    )
+    return (row or {}).get("active_date_key")
+
+
+async def require_todays_branch_stock(
+    db, *, brand_name: str, dealer_name: str, branch: str
+) -> str:
+    date_key = await todays_branch_stock_date_key(
+        db, brand_name=brand_name, dealer_name=dealer_name, branch=branch
+    )
+    if not date_key:
+        raise HTTPException(status_code=400, detail=TODAY_STOCK_MISSING_MESSAGE)
+    return date_key
+
+
+def _ci_exact(value: str) -> dict:
+    return {"$regex": f"^{re.escape(str(value or ''))}$", "$options": "i"}
+
+
+async def resolve_pending_auto_assignment_date(
+    db,
+    *,
+    mobile_user_id: str,
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+) -> Optional[str]:
+    """Today's pending work, else the latest still-open allocation for this user/scope."""
+    today = ist_date_key()
+    exact_scope = {
+        "mobile_user_id": mobile_user_id,
+        "status": "pending",
+        "brand_name": brand_name,
+        "dealer_name": dealer_name,
+        "branch": branch,
+    }
+    if await db.auto_perpetual_assignments.find_one(
+        {**exact_scope, "allocation_date": today},
+        {"_id": 0, "allocation_date": 1},
+    ):
+        return today
+    latest_rows = await db.auto_perpetual_assignments.find(
+        exact_scope, {"_id": 0, "allocation_date": 1}
+    ).sort("allocation_date", -1).to_list(1)
+    if latest_rows and latest_rows[0].get("allocation_date"):
+        return latest_rows[0]["allocation_date"]
+    loose = {
+        "mobile_user_id": mobile_user_id,
+        "status": "pending",
+        "brand_name": _ci_exact(brand_name),
+        "dealer_name": _ci_exact(dealer_name),
+        "branch": _ci_exact(branch),
+    }
+    if await db.auto_perpetual_assignments.find_one(
+        {**loose, "allocation_date": today},
+        {"_id": 0, "allocation_date": 1},
+    ):
+        return today
+    latest_loose = await db.auto_perpetual_assignments.find(
+        loose, {"_id": 0, "allocation_date": 1}
+    ).sort("allocation_date", -1).to_list(1)
+    return (latest_loose[0] or {}).get("allocation_date") if latest_loose else None
 
 
 def yymmdd_key(dt: Optional[datetime] = None) -> str:

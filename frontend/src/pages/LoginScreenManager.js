@@ -6,8 +6,8 @@ import { Image as ImageIcon } from 'lucide-react';
 import { LoginImageCropper } from './LoginImageCropper';
 import {
   LOGIN_MEDIA_ACCEPT,
-  captureLoginVideoPoster,
   isLoginVideoFile,
+  loginDisplayStyle,
   validateLoginImageFile,
   validateLoginVideoFile,
 } from './loginPromoCrop';
@@ -39,22 +39,35 @@ function PreviewMedia({ row, alt }) {
   const kind = row?.media_kind === 'video' ? 'video' : 'image';
   const src = mediaSrc(row, 'media');
   const poster = mediaSrc(row, 'poster');
+  const blurSrc = poster || src;
+  const style = loginDisplayStyle(row?.display_settings);
   if (!src) return <p className="lsm-empty">No media yet.</p>;
-  if (kind === 'video') {
-    return (
-      <video
-        src={src}
-        poster={poster || undefined}
-        autoPlay
-        muted
-        loop
-        playsInline
-        controls={false}
-        disablePictureInPicture
-      />
-    );
-  }
-  return <img src={src} alt={alt} />;
+  return (
+    <div className="lsm-preview-frame">
+      {blurSrc && (
+        <div className="lsm-media-blur" aria-hidden="true">
+          <img src={blurSrc} alt="" />
+        </div>
+      )}
+      <div className="lsm-preview-fg">
+        {kind === 'video' ? (
+          <video
+            src={src}
+            poster={poster || undefined}
+            autoPlay
+            muted
+            loop
+            playsInline
+            controls={false}
+            disablePictureInPicture
+            style={style}
+          />
+        ) : (
+          <img src={src} alt={alt} style={style} />
+        )}
+      </div>
+    </div>
+  );
 }
 
 export function LoginScreenManager() {
@@ -64,8 +77,6 @@ export function LoginScreenManager() {
   const [startAt, setStartAt] = useState('');
   const [endAt, setEndAt] = useState('');
   const [cropJob, setCropJob] = useState(null);
-  const [videoJob, setVideoJob] = useState(null);
-  const [videoSrc, setVideoSrc] = useState('');
 
   const load = async () => {
     const res = await axios.get(`${API}/login-screen/manage`);
@@ -79,16 +90,6 @@ export function LoginScreenManager() {
     load().catch(() => toast.error('Could not load Login Screen media'));
   }, [user?.role]);
 
-  useEffect(() => {
-    if (!videoJob?.file) {
-      setVideoSrc('');
-      return undefined;
-    }
-    const url = URL.createObjectURL(videoJob.file);
-    setVideoSrc(url);
-    return () => URL.revokeObjectURL(url);
-  }, [videoJob]);
-
   if (user?.role !== 'master') {
     return <div className="p-6 text-sm text-gray-500">Master Admin only.</div>;
   }
@@ -96,11 +97,6 @@ export function LoginScreenManager() {
   const closeCrop = () => {
     if (cropJob?.input) cropJob.input.value = '';
     setCropJob(null);
-  };
-
-  const closeVideo = () => {
-    if (videoJob?.input) videoJob.input.value = '';
-    setVideoJob(null);
   };
 
   const chooseFile = async (kind, file, input) => {
@@ -117,7 +113,7 @@ export function LoginScreenManager() {
         if (input) input.value = '';
         return;
       }
-      setVideoJob({ kind, file, input });
+      setCropJob({ kind, file, input, mediaKind: 'video' });
       return;
     }
     const imageError = validateLoginImageFile(file);
@@ -126,14 +122,15 @@ export function LoginScreenManager() {
       if (input) input.value = '';
       return;
     }
-    setCropJob({ kind, file, input });
+    setCropJob({ kind, file, input, mediaKind: 'image' });
   };
 
-  const uploadDefault = async (file, input, posterFile) => {
+  const uploadDefault = async (file, input, posterFile, displaySettings) => {
     if (!file) return;
     const form = new FormData();
     form.append('file', file);
     if (posterFile) form.append('poster', posterFile);
+    if (displaySettings) form.append('display_settings', JSON.stringify(displaySettings));
     setBusy(true);
     try {
       await axios.post(`${API}/login-screen/default`, form);
@@ -147,7 +144,7 @@ export function LoginScreenManager() {
     }
   };
 
-  const uploadScheduled = async (file, input, posterFile) => {
+  const uploadScheduled = async (file, input, posterFile, displaySettings) => {
     if (!file) return;
     if (!startAt || !endAt) {
       toast.error('Select Start and End date/time in IST');
@@ -157,6 +154,7 @@ export function LoginScreenManager() {
     const form = new FormData();
     form.append('file', file);
     if (posterFile) form.append('poster', posterFile);
+    if (displaySettings) form.append('display_settings', JSON.stringify(displaySettings));
     form.append('start_at', `${startAt}:00+05:30`);
     form.append('end_at', `${endAt}:00+05:30`);
     setBusy(true);
@@ -172,32 +170,14 @@ export function LoginScreenManager() {
     }
   };
 
-  const confirmCrop = (processed) => {
+  const confirmCrop = ({ file, posterFile, displaySettings } = {}) => {
     const job = cropJob;
     setCropJob(null);
-    if (!job) return;
+    if (!job || !file) return;
     if (job.kind === 'scheduled') {
-      uploadScheduled(processed, job.input);
+      uploadScheduled(file, job.input, posterFile, displaySettings);
     } else {
-      uploadDefault(processed, job.input);
-    }
-  };
-
-  const confirmVideo = async () => {
-    const job = videoJob;
-    if (!job) return;
-    setBusy(true);
-    try {
-      const poster = await captureLoginVideoPoster(job.file);
-      setVideoJob(null);
-      if (job.kind === 'scheduled') {
-        await uploadScheduled(job.file, job.input, poster);
-      } else {
-        await uploadDefault(job.file, job.input, poster);
-      }
-    } catch (error) {
-      toast.error(error?.message || 'Video preview failed');
-      setBusy(false);
+      uploadDefault(file, job.input, posterFile, displaySettings);
     }
   };
 
@@ -208,7 +188,7 @@ export function LoginScreenManager() {
           <ImageIcon className="h-5 w-5 nmts-module-header-icon" />
           <h1>Login Screen Manager</h1>
         </div>
-        <p>Images: JPG, PNG, WebP. Videos: MP4 H.264/AAC, max 30 seconds / 20 MB. Square 1:1, recommended 1080×1080. Dates and times are IST.</p>
+        <p>Images: JPG, PNG, WebP. Videos: MP4 H.264/AAC, max 30 seconds / 20 MB. Square 1:1, recommended 1080×1080. Crop, zoom, and reposition are saved for the login display. Dates and times are IST.</p>
       </header>
 
       <div className="lsm-grid">
@@ -262,41 +242,14 @@ export function LoginScreenManager() {
       {cropJob && (
         <LoginImageCropper
           file={cropJob.file}
-          title={cropJob.kind === 'scheduled' ? 'Crop Scheduled Image' : 'Crop Default Image'}
+          title={
+            cropJob.mediaKind === 'video'
+              ? (cropJob.kind === 'scheduled' ? 'Adjust Scheduled Video' : 'Adjust Default Video')
+              : (cropJob.kind === 'scheduled' ? 'Crop Scheduled Image' : 'Crop Default Image')
+          }
           onConfirm={confirmCrop}
           onCancel={closeCrop}
         />
-      )}
-
-      {videoJob && (
-        <div className="lsm-crop-overlay" role="presentation" onMouseDown={(e) => e.target === e.currentTarget && closeVideo()}>
-          <div className="lsm-crop-panel" role="dialog" aria-modal="true" aria-label="Preview login video" onMouseDown={(e) => e.stopPropagation()}>
-            <div className="lsm-crop-head">
-              <h3>{videoJob.kind === 'scheduled' ? 'Preview Scheduled Video' : 'Preview Default Video'}</h3>
-              <button type="button" className="lsm-crop-close" onClick={closeVideo} aria-label="Close">×</button>
-            </div>
-            <p className="lsm-crop-note">Square 1:1 preview · muted, looping, no controls</p>
-            <div className="lsm-crop-view lsm-video-view" style={{ aspectRatio: '1 / 1' }}>
-              {videoSrc && (
-                <video
-                  src={videoSrc}
-                  autoPlay
-                  muted
-                  loop
-                  playsInline
-                  controls={false}
-                  disablePictureInPicture
-                />
-              )}
-            </div>
-            <div className="lsm-crop-actions">
-              <button type="button" className="lsm-crop-btn" onClick={closeVideo}>Cancel</button>
-              <button type="button" className="lsm-crop-btn lsm-crop-btn--primary" disabled={busy} onClick={confirmVideo}>
-                {busy ? 'Saving…' : 'Confirm Video'}
-              </button>
-            </div>
-          </div>
-        </div>
       )}
     </div>
   );

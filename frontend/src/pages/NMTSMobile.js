@@ -126,7 +126,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       setAutoAssignments(a.data||[]);
       setUserPerformance(p.data||[]);
       setAutoSuggestions(sg.data||[]);
-    }catch(e){ setAutoSummary(null); setAutoAssignments([]); setUserPerformance([]); }
+    }catch(e){ setAutoSummary(null); setAutoAssignments([]); setUserPerformance([]); setAutoSuggestions([]); }
   };
   const loadHistoryRecords=async()=>{
     if(!scopeReady){ setHistoryRecords([]); return; }
@@ -251,11 +251,15 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     if(!scopeReady) return toast.error('Select exact Brand, Dealer and Branch');
     if(recalc) setAutoRecalcBusy(true); else setAutoGenerating(true);
     try{
-      const r=await axios.post(`${API}/mobile/auto-perpetual/generate`,null,{params:{brand_name:brand,dealer_name:dealer,branch,recalc_pending:recalc}});
+      const r=await axios.post(`${API}/mobile/auto-perpetual/generate`,null,{params:{brand_name:brand,dealer_name:dealer,branch,recalc_pending:recalc},timeout:90000});
       if(r.data?.duplicate) toast.info('Draft suggestion already exists for today');
-      else toast.success(`Draft ${r.data?.suggestion_number||''} created with ${r.data?.total_items||r.data?.suggestion?.total_items||0} items — review and Send to Mobile`);
+      else toast.success(`Draft ${r.data?.suggestion_number||r.data?.suggestion?.suggestion_number||''} created with ${r.data?.total_items||r.data?.suggestion?.total_items||0} items — review and Send to Mobile`);
       loadAutoPerpetual();
-    }catch(e){toast.error(e.response?.data?.detail||'Generate failed')}
+    }catch(e){
+      const detail=e.response?.data?.detail;
+      const msg=typeof detail==='string'?detail:(e.code==='ECONNABORTED'?'Generate timed out. Nothing was created.':'Generate failed');
+      toast.error(msg);
+    }
     finally{ setAutoGenerating(false); setAutoRecalcBusy(false); }
   };
 
@@ -404,10 +408,26 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     )}
 
     {showMobileSections && visibleSection==='mobile'&&<div className="space-y-5" style={hubTheme ? { color: HUB_COLORS.text } : undefined}>
-      {canPair && <Card title="Pair Mobile User" themed={hubTheme}><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+      <div className="grid md:grid-cols-2 gap-5 items-stretch">
+      {canPair && <Card title="Pair Mobile User" themed={hubTheme}><div className="flex flex-col gap-3 h-full">
         <div><p className="font-medium">{isUser ? 'Generate one-time QR for your assigned Brand / Dealer / Branch.' : 'Generate one-time QR for the selected Brand / Dealer / Branch.'}</p><p className="text-xs mt-1" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }} >The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.{isUser ? ` Scope: ${pairBrand} / ${pairDealer} / ${pairBranch}.` : ''}</p></div>
-        <Button onClick={generateNewPairing} disabled={creatingUser||!pairReady} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button>
+        <div className="mt-auto"><Button onClick={generateNewPairing} disabled={creatingUser||!pairReady} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button></div>
       </div></Card>}
+      <Card title="Download Mobile App" themed={hubTheme}>
+        {isMaster && <div className="mb-4 flex flex-wrap items-center gap-3">
+          <input ref={apkFileRef} type="file" accept=".apk,application/vnd.android.package-archive" className="hidden" onChange={uploadApk}/>
+          <Button onClick={()=>apkFileRef.current?.click()} disabled={apkUploading} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined} data-testid="user-hub-upload-apk"><Upload className="h-4 w-4 mr-2"/>{apkUploading?'Uploading...':'Upload APK'}</Button>
+          <span className="text-xs" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }}>.apk only · Master Admin</span>
+        </div>}
+        <div className="flex flex-col gap-4 h-full">
+          <div>{latestVersion ? <>Latest: <b>{latestVersion.version_name||latestVersion.apk_filename}</b><div className="text-xs mt-1" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }}>Released {fmt(latestVersion.release_date)}</div></> : 'No APK published yet.'}</div>
+          <div className="mt-auto flex flex-wrap gap-2">
+            {latestVersion && <Button onClick={downloadApk} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined} data-testid="user-hub-download-apk"><Download className="h-4 w-4 mr-2"/>Download APK</Button>}
+            {latestVersion && <Button variant="outline" onClick={copyApkLink} data-testid="user-hub-copy-apk-link"><Copy className="h-4 w-4 mr-2"/>Copy Download Link</Button>}
+          </div>
+        </div>
+      </Card>
+      </div>
 
       {pairingResult && <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/75 backdrop-blur-sm p-4" onMouseDown={()=>setPairingResult(null)}>
         <div className="relative w-full max-w-[720px] overflow-hidden rounded-[28px] border border-white/20 bg-gradient-to-b from-[#1b1d1c] to-[#080a09] p-6 md:p-8 text-white shadow-2xl" onMouseDown={e=>e.stopPropagation()}>
@@ -431,7 +451,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       <Card title="Mobile Users" themed={hubTheme}>
         <p className="text-xs mb-3" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }}>Admin Status is the website Active/Inactive control. Session is Logged In after pair and Logged Out after Logout. Presence is Online while the app sends heartbeats; Offline covers phone-off and network-off. Mark <b>Today (Auto)</b> before Generate Auto Perpetual.</p>
         <div className="nmts-users-table-wrap overflow-x-auto rounded-xl bg-white border">
-          <table className="w-full text-sm nmts-users-table" style={{ minWidth: 1500 }}>
+          <table className="w-full text-sm nmts-users-table" style={{ minWidth: 2100 }}>
             <thead>
               <tr style={{ backgroundColor: HUB_COLORS.primary, color: '#fff' }}>
                 {['Mobile User ID','Name','Mobile','Brand','Dealer','Branch','Admin Status','Session','Presence','Last Seen','Today (Auto)','Actions'].map(h=><th key={h} className="p-3 text-left whitespace-nowrap">{h}</th>)}
@@ -444,7 +464,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
           const adminStatus = mu.admin_status || mu.status;
           const sessionLabel = mu.session_state === 'logged_in' ? 'Logged In' : 'Logged Out';
           const presenceLabel = mu.presence === 'online' ? 'Online' : 'Offline';
-          return <tr className="border-b" key={mu.mobile_user_id}>
+          return <tr className="border-b whitespace-nowrap" key={mu.mobile_user_id}>
           <td className="p-3 font-mono whitespace-nowrap">{mu.mobile_user_id}</td>
           <td className="p-3 min-w-[120px]">{mu.name}</td>
           <td className="p-3 whitespace-nowrap">{mu.mobile_number}</td>
@@ -456,7 +476,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
           <td className="p-3 whitespace-nowrap"><span className={`inline-flex px-2.5 py-1 rounded-full text-xs font-bold ${mu.presence==='online'?'bg-emerald-100 text-emerald-800':'bg-gray-100 text-gray-600'}`}>{presenceLabel}</span></td>
           <td className="p-3 whitespace-nowrap">{mu.last_seen_at?fmt(mu.last_seen_at):(mu.last_active_at?fmt(mu.last_active_at):'-')}</td>
           <td className="p-3 whitespace-nowrap"><span className={`inline-flex px-2.5 py-1 rounded-full text-xs font-bold ${att==='active'?'bg-emerald-100 text-emerald-800':att==='inactive'?'bg-amber-100 text-amber-800':'bg-gray-100 text-gray-600'}`}>{attLabel}</span></td>
-          <td className="p-3"><div className="flex gap-2 flex-wrap">
+          <td className="p-3 whitespace-nowrap"><div className="flex gap-2 flex-nowrap items-center" style={{ minWidth: 540 }}>
             {canPair && <Button size="sm" variant="outline" title="Re-pair QR" onClick={()=>generatePairing(mu)} disabled={pairingFor===mu.mobile_user_id || mu.status!=='active'}><RefreshCw className="h-4 w-4"/></Button>}
             {canManage && <Button size="sm" variant="outline" title="Transfer Branch" onClick={()=>changeBranch(mu)}><ArrowRightLeft className="h-4 w-4"/></Button>}
             {canManageMobileAccount && mu.status!=='deleted' && <>
@@ -469,21 +489,6 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
         </tr>})}
         {!mobileUsers.length && <tr><td colSpan={12} className="text-center py-8 text-gray-500">No mobile users yet for this scope.</td></tr>}
       </tbody></table></div></Card>
-
-      <Card title="Download Mobile App" themed={hubTheme}>
-        {isMaster && <div className="mb-4 flex flex-wrap items-center gap-3">
-          <input ref={apkFileRef} type="file" accept=".apk,application/vnd.android.package-archive" className="hidden" onChange={uploadApk}/>
-          <Button onClick={()=>apkFileRef.current?.click()} disabled={apkUploading} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined} data-testid="user-hub-upload-apk"><Upload className="h-4 w-4 mr-2"/>{apkUploading?'Uploading...':'Upload APK'}</Button>
-          <span className="text-xs" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }}>.apk only · Master Admin</span>
-        </div>}
-        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-          <div>{latestVersion ? <>Latest: <b>{latestVersion.version_name||latestVersion.apk_filename}</b><div className="text-xs mt-1" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }}>Released {fmt(latestVersion.release_date)}</div></> : 'No APK published yet.'}</div>
-          <div className="flex flex-wrap gap-2">
-            {latestVersion && <Button onClick={downloadApk} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined} data-testid="user-hub-download-apk"><Download className="h-4 w-4 mr-2"/>Download APK</Button>}
-            {latestVersion && <Button variant="outline" onClick={copyApkLink} data-testid="user-hub-copy-apk-link"><Copy className="h-4 w-4 mr-2"/>Copy Download Link</Button>}
-          </div>
-        </div>
-      </Card>
     </div>}
 
     {showAuditSections && section==='physical'&&<div className="space-y-5">
@@ -632,7 +637,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   </div>
 }
 
-const Card=({title,children,themed=false})=><div className={themed ? 'rounded-2xl p-5 shadow-sm' : 'bg-white rounded-xl border p-5'} style={themed ? { backgroundColor: HUB_COLORS.card, border: `1px solid ${HUB_COLORS.border}`, color: HUB_COLORS.text } : undefined}><h2 className="font-bold text-lg mb-4">{title}</h2>{children}</div>;
+const Card=({title,children,themed=false})=><div className={themed ? 'rounded-2xl p-5 shadow-sm h-full' : 'bg-white rounded-xl border p-5 h-full'} style={themed ? { backgroundColor: HUB_COLORS.card, border: `1px solid ${HUB_COLORS.border}`, color: HUB_COLORS.text } : undefined}><h2 className="font-bold text-lg mb-4">{title}</h2>{children}</div>;
 const Tab=({active,onClick,icon:Icon,title})=><button onClick={onClick} className={`border rounded-xl p-4 flex gap-3 items-center ${active?'bg-green-50 ring-2 ring-green-500':'bg-white'}`}><Icon className="h-5 w-5 text-green-600"/><b>{title}</b></button>;
 const Info=({label,value})=><div className="border rounded-lg p-3 bg-gray-50"><div className="text-xs text-gray-500 mb-1">{label}</div><div className="font-semibold">{value}</div></div>;
 const SimpleTable=({headers,rows})=><div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr>{headers.map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{rows.map((r,i)=><tr className="border-t" key={i}>{r.map((v,j)=><td className="p-3" key={j}>{v}</td>)}</tr>)}{!rows.length&&<tr><td colSpan={headers.length} className="text-center py-8 text-gray-500">No records yet.</td></tr>}</tbody></table></div>;

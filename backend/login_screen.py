@@ -6,6 +6,7 @@ Never copies Testing records or Testing S3 keys into Production.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime
 from io import BytesIO
@@ -296,6 +297,39 @@ def _row_kind(row: Optional[dict]) -> str:
     return KIND_IMAGE
 
 
+def normalize_display_settings(raw: Any) -> Dict[str, Any]:
+    payload = raw
+    if isinstance(payload, str) and payload.strip():
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    fit = str(payload.get("fit") or "contain").strip().lower()
+    if fit not in {"contain", "cover"}:
+        fit = "contain"
+    try:
+        zoom = float(payload.get("zoom") or 1)
+    except (TypeError, ValueError):
+        zoom = 1.0
+    zoom = min(3.0, max(1.0, zoom))
+    try:
+        offset_x = float(payload.get("offset_x") or 0)
+    except (TypeError, ValueError):
+        offset_x = 0.0
+    try:
+        offset_y = float(payload.get("offset_y") or 0)
+    except (TypeError, ValueError):
+        offset_y = 0.0
+    return {
+        "fit": fit,
+        "zoom": zoom,
+        "offset_x": max(-1.0, min(1.0, offset_x)),
+        "offset_y": max(-1.0, min(1.0, offset_y)),
+    }
+
+
 def _public_row(row: Optional[dict]) -> Dict[str, Any]:
     if not row:
         return {
@@ -306,6 +340,7 @@ def _public_row(row: Optional[dict]) -> Dict[str, Any]:
             "type": None,
             "start_at": None,
             "end_at": None,
+            "display_settings": None,
         }
     media_id = row.get("id")
     kind = _row_kind(row)
@@ -321,6 +356,7 @@ def _public_row(row: Optional[dict]) -> Dict[str, Any]:
         "media_kind": kind,
         "start_at": row.get("start_at"),
         "end_at": row.get("end_at"),
+        "display_settings": normalize_display_settings(row.get("display_settings")),
     }
 
 
@@ -348,6 +384,7 @@ async def active_payload(db) -> Dict[str, Any]:
             "type": None,
             "start_at": None,
             "end_at": None,
+            "display_settings": None,
         }
 
 
@@ -448,6 +485,7 @@ def _build_doc(
     poster_key: Optional[str],
     poster_content_type: Optional[str],
     duration: Optional[float],
+    display_settings: Optional[dict] = None,
 ) -> Dict[str, Any]:
     return {
         "id": str(uuid.uuid4()),
@@ -458,6 +496,7 @@ def _build_doc(
         "poster_key": poster_key,
         "poster_content_type": poster_content_type,
         "duration_seconds": duration,
+        "display_settings": normalize_display_settings(display_settings),
         "start_at": start_at,
         "end_at": end_at,
         "data_origin": _data_origin(),
@@ -473,6 +512,7 @@ async def save_default(
     poster_data: Optional[bytes] = None,
     poster_content_type: Optional[str] = None,
     poster_filename: Optional[str] = None,
+    display_settings: Optional[Any] = None,
 ) -> Dict[str, Any]:
     ext, ctype, media_kind, duration = _validate_media(data, content_type, filename)
     if media_kind == KIND_VIDEO and not poster_data:
@@ -482,7 +522,18 @@ async def save_default(
     poster_key, poster_ctype = (None, None)
     if media_kind == KIND_VIDEO:
         poster_key, poster_ctype = _store_poster(TYPE_DEFAULT, poster_data, poster_content_type, poster_filename)
-    doc = _build_doc(TYPE_DEFAULT, key, ctype, media_kind, None, None, poster_key, poster_ctype, duration)
+    doc = _build_doc(
+        TYPE_DEFAULT,
+        key,
+        ctype,
+        media_kind,
+        None,
+        None,
+        poster_key,
+        poster_ctype,
+        duration,
+        display_settings=display_settings,
+    )
     await db[COLLECTION].insert_one(dict(doc))
     if old:
         await _delete_row(db, old)
@@ -499,6 +550,7 @@ async def save_scheduled(
     poster_data: Optional[bytes] = None,
     poster_content_type: Optional[str] = None,
     poster_filename: Optional[str] = None,
+    display_settings: Optional[Any] = None,
 ) -> Dict[str, Any]:
     ext, ctype, media_kind, duration = _validate_media(data, content_type, filename)
     if media_kind == KIND_VIDEO and not poster_data:
@@ -524,6 +576,7 @@ async def save_scheduled(
         poster_key,
         poster_ctype,
         duration,
+        display_settings=display_settings,
     )
     await db[COLLECTION].insert_one(dict(doc))
     if old:

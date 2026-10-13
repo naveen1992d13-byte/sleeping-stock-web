@@ -8836,6 +8836,7 @@ async def login_screen_manage(current_user: UserResponse = Depends(get_current_u
 async def login_screen_upload_default(
     file: UploadFile = File(...),
     poster: Optional[UploadFile] = File(default=None),
+    display_settings: Optional[str] = Form(default=None),
     current_user: UserResponse = Depends(get_current_user),
 ):
     login_screen.require_master(current_user)
@@ -8849,6 +8850,7 @@ async def login_screen_upload_default(
         poster_data=poster_data,
         poster_content_type=poster.content_type if poster is not None else None,
         poster_filename=poster.filename if poster is not None else None,
+        display_settings=display_settings,
     )
 
 
@@ -8858,6 +8860,7 @@ async def login_screen_upload_scheduled(
     start_at: str = Form(...),
     end_at: str = Form(...),
     poster: Optional[UploadFile] = File(default=None),
+    display_settings: Optional[str] = Form(default=None),
     current_user: UserResponse = Depends(get_current_user),
 ):
     login_screen.require_master(current_user)
@@ -8873,6 +8876,7 @@ async def login_screen_upload_scheduled(
         poster_data=poster_data,
         poster_content_type=poster.content_type if poster is not None else None,
         poster_filename=poster.filename if poster is not None else None,
+        display_settings=display_settings,
     )
 
 

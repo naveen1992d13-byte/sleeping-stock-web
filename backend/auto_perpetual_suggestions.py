@@ -33,7 +33,7 @@ from auto_perpetual import (
 
 
 def _natural_sort_key(text: str) -> Tuple:
-    s = (text or "").strip().upper()
+    s = str(text or "").strip().upper()
     parts = re.split(r"(\d+)", s)
     out: List[Any] = []
     for p in parts:
@@ -61,6 +61,46 @@ def _product_mav(product: Optional[dict]) -> float:
         except (TypeError, ValueError):
             continue
     return 0.0
+
+
+def _item_location_sort_key(row: dict) -> str:
+    return str(row.get("system_location") or row.get("loc") or "").upper()
+
+
+def assignment_as_suggestion_item(row: dict) -> dict:
+    return {
+        "part_number": row.get("part_number"),
+        "part_name": row.get("part_name") or "",
+        "system_qty": row.get("system_qty"),
+        "system_location": row.get("loc") or row.get("system_location") or "",
+        "suggestion_type": row.get("suggestion_type"),
+        "mobile_user_id": row.get("mobile_user_id"),
+        "batch_no": row.get("batch_no"),
+        "verification_status": row.get("status") or row.get("verification_status") or "pending",
+    }
+
+
+async def suggestion_with_line_items(db, suggestion_id: str) -> dict:
+    row = await db.auto_perpetual_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
+    if not row:
+        raise HTTPException(404, "Suggestion not found")
+    items = list(row.get("items") or [])
+    if not items:
+        assigns = await db.auto_perpetual_assignments.find(
+            {
+                "$or": [
+                    {"suggestion_id": suggestion_id},
+                    {"suggestion_number": row.get("suggestion_number")},
+                ]
+            },
+            {"_id": 0},
+        ).to_list(5000)
+        items = [assignment_as_suggestion_item(a) for a in assigns]
+    items.sort(key=_item_location_sort_key)
+    row["items"] = items
+    if items and not row.get("total_items"):
+        row["total_items"] = len(items)
+    return row
 
 
 async def ensure_suggestion_indexes(db) -> None:

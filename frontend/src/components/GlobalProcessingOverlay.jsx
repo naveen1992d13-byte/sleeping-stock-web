@@ -66,6 +66,10 @@ export function ProcessingProvider({ children }) {
   useEffect(() => {
     const requestId = axios.interceptors.request.use((config) => {
       if (config?.skipGlobalProcessing) return config;
+      const url = String(config.url || '').toLowerCase();
+      if (url.includes('/auto-perpetual/generate') && !config.timeout) {
+        config.timeout = 90000;
+      }
       const copy = operationCopy(config);
       begin(copy);
       config.__nmtsGlobalProcessing = true;

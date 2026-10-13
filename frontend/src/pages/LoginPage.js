@@ -6,6 +6,7 @@ import { getFirstAllowedMenuItem } from '@/config/menuConfig';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { User, Key, ArrowRight, Eye, EyeOff } from 'lucide-react';
+import { loginDisplayStyle } from './loginPromoCrop';
 import './LoginPage.css';
 
 function seedHomeTab(user) {
@@ -45,6 +46,7 @@ export function LoginPage() {
   const [promoPosterUrl, setPromoPosterUrl] = useState(null);
   const [promoKind, setPromoKind] = useState('image');
   const [promoFailed, setPromoFailed] = useState(false);
+  const [promoDisplay, setPromoDisplay] = useState(null);
   const { login } = useAuth();
   const navigate = useNavigate();
 
@@ -87,6 +89,7 @@ export function LoginPage() {
           setPromoUrl(nextUrl);
           setPromoPosterUrl(nextPoster);
           setPromoKind(nextKind);
+          setPromoDisplay(data?.display_settings || null);
         }
       }
       clearExpiry();
@@ -162,6 +165,7 @@ export function LoginPage() {
                   controls={false}
                   disablePictureInPicture
                   data-testid="login-promo-video"
+                  style={loginDisplayStyle(promoDisplay, { forceContain: true })}
                   onError={() => setPromoFailed(true)}
                 />
               ) : (
@@ -169,6 +173,7 @@ export function LoginPage() {
                   src={promoUrl}
                   alt=""
                   data-testid="login-promo-image"
+                  style={loginDisplayStyle(promoDisplay, { forceContain: true })}
                   onError={() => setPromoFailed(true)}
                 />
               )}
