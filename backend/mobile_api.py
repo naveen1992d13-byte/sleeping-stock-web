@@ -1718,6 +1718,9 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
     }
     rows, scope_q = await _pending_auto_assignment_rows(scope_q, brand_name, dealer_name, branch)
     rows.sort(key=lambda r: str(r.get("loc") or r.get("part_number") or "").upper())
+    products_by_part = await _scoped_products_by_part(
+        [row.get("part_number") for row in rows], brand_name, dealer_name, branch
+    )
 
     if allocation_date == today:
         session_id = await get_or_create_auto_daily_session(
@@ -1749,7 +1752,8 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
     completed = await db.auto_perpetual_assignments.count_documents({**scope_q, "status": "completed"})
     enriched = []
     for row in rows:
-        product, _ = await find_scoped_product(row.get("part_number", ""), brand_name, dealer_name, branch)
+        part_key = _normalize_part_number(row.get("part_number", ""))
+        product = products_by_part.get(part_key)
         loc = row.get("loc")
         if loc is None or loc == "":
             loc = _product_pin_location(product or {})
@@ -3117,6 +3121,47 @@ def _product_pin_location(product: dict) -> str:
         or product.get("location")
         or ""
     ).strip()
+
+
+async def _scoped_products_by_part(part_numbers, brand_name: str, dealer_name: str, branch: str) -> dict:
+    """One Product Hub lookup for many Auto Perpetual parts (avoids per-row overlay scans)."""
+    from auto_perpetual import inventory_date_key
+
+    cleaned = []
+    seen = set()
+    for part in part_numbers:
+        key = _normalize_part_number(part)
+        if key and key not in seen:
+            seen.add(key)
+            cleaned.append(key)
+    if not cleaned:
+        return {}
+    query = {
+        "brand_name": brand_name,
+        "dealer_name": dealer_name,
+        "branch": branch,
+        "publish_status": "Published",
+        "is_active_today": True,
+        "active_date_key": inventory_date_key(),
+        "part_number": {"$in": cleaned},
+    }
+    rows = await db.products.find(query, {"_id": 0}).to_list(max(len(cleaned) * 3, 50))
+    found = {}
+    for product in rows:
+        key = _normalize_part_number(product.get("part_number"))
+        if key and key not in found:
+            found[key] = product
+    missing = [key for key in cleaned if key not in found]
+    if missing:
+        query["part_number"] = {
+            "$in": list({*missing, *[k.lower() for k in missing], *[k.upper() for k in missing]})
+        }
+        extra = await db.products.find(query, {"_id": 0}).to_list(max(len(missing) * 3, 50))
+        for product in extra:
+            key = _normalize_part_number(product.get("part_number"))
+            if key and key not in found:
+                found[key] = product
+    return found
 
 
 async def find_scoped_product(part_number: str, brand_name: str, dealer_name: str, branch: str):
