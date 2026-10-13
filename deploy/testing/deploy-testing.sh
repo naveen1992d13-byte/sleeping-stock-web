@@ -201,9 +201,19 @@ chmod 644 "$DEPLOYMENT_JSON"
 echo "Installing backend requirements into testing venv..."
 "$ROOT/backend/venv/bin/pip" install -q -r "$ROOT/backend/requirements.txt"
 
+# Testing-only systemd unit: keep Restart=on-failure and the start health check.
+# Never copy or modify the Production nmts-backend.service unit.
+if [[ -f "$ROOT/deploy/testing/nmts-backend-testing.service" ]]; then
+  echo "Installing $SERVICE unit (Testing health check only)..."
+  sudo cp "$ROOT/deploy/testing/nmts-backend-testing.service" /etc/systemd/system/nmts-backend-testing.service
+  sudo systemctl daemon-reload
+fi
+
 # This instance has ~1Gi RAM; CRA OOMs if the testing backend is also resident.
+# Stopping :8001 here is the known 502 Connection-refused window. Nginx cannot
+# proxy to a stopped uvicorn. Restart + health wait below close that window.
 if systemctl is-active --quiet "$SERVICE"; then
-  echo "Stopping $SERVICE during frontend build to free RAM..."
+  echo "Stopping $SERVICE during frontend build to free RAM (expected brief Testing 502)..."
   sudo systemctl stop "$SERVICE"
 fi
 
@@ -232,9 +242,11 @@ sudo systemctl restart "$SERVICE"
 sudo systemctl is-active --quiet "$SERVICE" || true
 
 TEST_PID_AFTER=""
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 15 18 20; do
+HEALTH_OK=""
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 15 18 20 24 30; do
   TEST_PID_AFTER="$(pid_on_port "$TEST_PORT" || true)"
-  if [[ -n "$TEST_PID_AFTER" ]]; then
+  if [[ -n "$TEST_PID_AFTER" ]] && curl -fsS "http://127.0.0.1:${TEST_PORT}/api/maintenance/status" >/dev/null 2>&1; then
+    HEALTH_OK="1"
     break
   fi
   sleep 2
@@ -248,6 +260,10 @@ if [[ -n "$PROD_PID_BEFORE" && "$PROD_PID_AFTER" != "$PROD_PID_BEFORE" ]]; then
 fi
 if [[ -z "$TEST_PID_AFTER" ]]; then
   echo "ERROR: testing :${TEST_PORT} is not listening after restart" >&2
+  exit 1
+fi
+if [[ -z "$HEALTH_OK" ]]; then
+  echo "ERROR: testing :${TEST_PORT} is listening but /api/maintenance/status is not healthy" >&2
   exit 1
 fi
 

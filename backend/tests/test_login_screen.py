@@ -225,6 +225,54 @@ def build_mp4(duration_ms=10000, video_codec=b"avc1", audio_codec=b"mp4a", with_
     return ftyp + _box(b"moov", tracks) + _box(b"mdat", b"\x00" * 16)
 
 
+def test_manage_payload_returns_same_active_as_public(monkeypatch):
+    monkeypatch.setattr(ls.testing_runtime, "is_testing_env", lambda: True)
+    now = datetime(2026, 10, 13, 10, 0, tzinfo=IST)
+    monkeypatch.setattr(ls, "_now_ist", lambda: now)
+    db = FakeDB([
+        {"id": "d1", "type": "default", "storage_key": "testing/login-screen/default/a.png"},
+        {
+            "id": "s1",
+            "type": "scheduled",
+            "storage_key": "testing/login-screen/scheduled/b.png",
+            "start_at": "2026-10-13T09:00:00+05:30",
+            "end_at": "2026-10-13T12:00:00+05:30",
+        },
+    ])
+
+    async def run():
+        manage = await ls.manage_payload(db)
+        active = await ls.active_payload(db)
+        assert manage["active"]["id"] == "s1"
+        assert active["id"] == "s1"
+        assert manage["active"]["media_url"] == active["media_url"]
+        assert manage["default"]["id"] == "d1"
+        assert manage["scheduled"]["id"] == "s1"
+
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(run())
+
+
+def test_manage_payload_survives_unparseable_scheduled_dates(monkeypatch):
+    monkeypatch.setattr(ls.testing_runtime, "is_testing_env", lambda: True)
+    now = datetime(2026, 10, 13, 10, 0, tzinfo=IST)
+    monkeypatch.setattr(ls, "_now_ist", lambda: now)
+    db = FakeDB([
+        {"id": "d1", "type": "default", "storage_key": "testing/login-screen/default/a.png"},
+        {"id": "s1", "type": "scheduled", "storage_key": "testing/login-screen/scheduled/b.png", "start_at": "not-a-date", "end_at": "also-bad"},
+    ])
+
+    async def run():
+        manage = await ls.manage_payload(db)
+        active = await ls.active_payload(db)
+        assert manage["default"]["id"] == "d1"
+        assert active["id"] == "d1"
+        assert any(r.get("id") == "s1" for r in db.login_screen_images.rows)
+
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(run())
+
+
 def test_public_row_exposes_video_media_and_poster():
     payload = ls._public_row({
         "id": "v1",

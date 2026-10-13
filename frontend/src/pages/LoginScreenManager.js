@@ -6,6 +6,11 @@ import { Image as ImageIcon } from 'lucide-react';
 import { LoginImageCropper } from './LoginImageCropper';
 import {
   LOGIN_MEDIA_ACCEPT,
+  LOGIN_PROMO_ALT_HEIGHT,
+  LOGIN_PROMO_ALT_WIDTH,
+  LOGIN_PROMO_ASPECT_LABEL,
+  LOGIN_PROMO_OUTPUT_HEIGHT,
+  LOGIN_PROMO_OUTPUT_WIDTH,
   isLoginVideoFile,
   loginDisplayStyle,
   validateLoginImageFile,
@@ -33,6 +38,26 @@ function toIstValue(iso) {
 function mediaSrc(row, kind) {
   const path = kind === 'poster' ? (row?.poster_url || row?.image_url) : (row?.media_url || row?.image_url);
   return path ? `${API.replace(/\/api$/, '')}${path}` : null;
+}
+
+function hasMedia(row) {
+  return Boolean(row && (row.media_url || row.image_url));
+}
+
+function apiDetailMessage(error, fallback) {
+  const status = error?.response?.status;
+  if (status === 502 || status === 503 || error?.code === 'ERR_NETWORK') {
+    return 'Backend is unavailable. Retry once the service is healthy.';
+  }
+  const detail = error?.response?.data?.detail;
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (Array.isArray(detail) && detail.length) {
+    return detail.map((item) => item?.msg || item?.detail || String(item)).filter(Boolean).join('; ') || fallback;
+  }
+  if (detail && typeof detail === 'object' && (detail.message || detail.msg)) {
+    return detail.message || detail.msg;
+  }
+  return fallback;
 }
 
 function PreviewMedia({ row, alt }) {
@@ -79,15 +104,44 @@ export function LoginScreenManager() {
   const [cropJob, setCropJob] = useState(null);
 
   const load = async () => {
-    const res = await axios.get(`${API}/login-screen/manage`);
-    setState(res.data || { default: null, scheduled: null });
-    if (res.data?.scheduled?.start_at) setStartAt(toIstValue(res.data.scheduled.start_at));
-    if (res.data?.scheduled?.end_at) setEndAt(toIstValue(res.data.scheduled.end_at));
+    let manage = null;
+    let active = null;
+    let manageError = null;
+    try {
+      const res = await axios.get(`${API}/login-screen/manage`);
+      manage = res.data || {};
+    } catch (error) {
+      manageError = error;
+    }
+    try {
+      const res = await axios.get(`${API}/login-screen/active`);
+      active = res.data || null;
+    } catch {
+      active = manage?.active || null;
+    }
+    const activeRow = hasMedia(manage?.active) ? manage.active : (hasMedia(active) ? active : null);
+    const defaultRow = hasMedia(manage?.default)
+      ? manage.default
+      : (activeRow?.type === 'default' ? activeRow : manage?.default);
+    const scheduledRow = hasMedia(manage?.scheduled)
+      ? manage.scheduled
+      : (activeRow?.type === 'scheduled' ? activeRow : manage?.scheduled);
+    setState({
+      default: defaultRow || null,
+      scheduled: scheduledRow || null,
+      active: activeRow,
+    });
+    const scheduledTimes = scheduledRow || manage?.scheduled;
+    if (scheduledTimes?.start_at) setStartAt(toIstValue(scheduledTimes.start_at));
+    if (scheduledTimes?.end_at) setEndAt(toIstValue(scheduledTimes.end_at));
+    if (manageError && !hasMedia(activeRow) && !hasMedia(defaultRow) && !hasMedia(scheduledRow)) {
+      throw manageError;
+    }
   };
 
   useEffect(() => {
     if (user?.role !== 'master') return;
-    load().catch(() => toast.error('Could not load Login Screen media'));
+    load().catch((error) => toast.error(apiDetailMessage(error, 'Could not load Login Screen media')));
   }, [user?.role]);
 
   if (user?.role !== 'master') {
@@ -188,7 +242,7 @@ export function LoginScreenManager() {
           <ImageIcon className="h-5 w-5 nmts-module-header-icon" />
           <h1>Login Screen Manager</h1>
         </div>
-        <p>Images: JPG, PNG, WebP. Videos: MP4 H.264/AAC, max 30 seconds / 20 MB. Square 1:1, recommended 1080×1080. Crop, zoom, and reposition are saved for the login display. Dates and times are IST.</p>
+        <p>Images: JPG, PNG, WebP. Videos: MP4 H.264/AAC, max 30 seconds / 20 MB. Recommended aspect ratio {LOGIN_PROMO_ASPECT_LABEL}. Recommended output {LOGIN_PROMO_OUTPUT_WIDTH}×{LOGIN_PROMO_OUTPUT_HEIGHT} (alternative {LOGIN_PROMO_ALT_WIDTH}×{LOGIN_PROMO_ALT_HEIGHT}). Crop, zoom, and reposition are saved for the login display. Dates and times are IST.</p>
       </header>
 
       <div className="lsm-grid">

@@ -7,6 +7,7 @@ import { Button } from '../components/ui/button';
 import { toast } from 'sonner';
 import { NmtsConfirmDialog } from '../components/NmtsConfirmDialog';
 import { NmtsModal } from '../components/NmtsModal';
+import sleepingStockLoginLogo from '../branding/sleepingStockLogo';
 
 const HUB_COLORS = {
   card: '#DCE8D1',
@@ -35,6 +36,22 @@ const fmt = (v) => {
   }).format(new Date(utcValue));
 };
 const todayKey = (v=new Date()) => new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(v));
+
+function apiDetailMessage(error, fallback) {
+  const status = error?.response?.status;
+  if (status === 502 || status === 503 || error?.code === 'ERR_NETWORK') {
+    return 'Backend is unavailable. Retry once the service is healthy.';
+  }
+  const detail = error?.response?.data?.detail;
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (Array.isArray(detail) && detail.length) {
+    return detail.map((item) => item?.msg || item?.detail || String(item)).filter(Boolean).join('; ') || fallback;
+  }
+  if (detail && typeof detail === 'object' && (detail.message || detail.msg)) {
+    return detail.message || detail.msg;
+  }
+  return fallback;
+}
 
 export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false, sectionOverride = null }){
   const showMobileSections = variant !== 'audit';
@@ -182,7 +199,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       const r=await axios.post(`${API}/mobile/pairing/generate`,payload);
       setPairingResult({...r.data, brand_name:pairBrand, dealer_name:pairDealer, branch:pairBranch});
       toast.success('New-user pairing QR generated — valid for 10 minutes');
-    }catch(e){const d=e.response?.data?.detail;toast.error(typeof d==='string'?d:(d?.message||'Pairing code generation failed'))}
+    }catch(e){toast.error(apiDetailMessage(e,'Pairing code generation failed'))}
     finally{setCreatingUser(false)}
   };
 
@@ -298,7 +315,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       const r=await axios.post(`${API}/mobile/pairing/generate`,{pairing_type:'REPAIR',mobile_user_id:mu.mobile_user_id,brand_name:mu.brand_name,dealer_name:mu.dealer_name,branch:mu.branch});
       setPairingResult({mobile_user_id:mu.mobile_user_id, brand_name:mu.brand_name, dealer_name:mu.dealer_name, branch:mu.branch, ...r.data});
       toast.success('Re-pair QR generated — same Mobile User ID will be reused');
-    }catch(e){const d=e.response?.data?.detail;toast.error(typeof d==='string'?d:(d?.message||'Re-pair code generation failed'))}
+    }catch(e){toast.error(apiDetailMessage(e,'Re-pair code generation failed'))}
     finally{setPairingFor(null)}
   };
 
@@ -420,19 +437,19 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
 
     {showMobileSections && visibleSection==='mobile'&&<div className="space-y-5" style={hubTheme ? { color: HUB_COLORS.text } : undefined}>
       <div className="grid md:grid-cols-2 gap-5 items-stretch">
-      {canPair && <Card title="Pair Mobile User" themed={hubTheme}><div className="flex flex-col gap-3 h-full min-h-[160px] overflow-hidden">
-        <div><p className="font-medium">{isUser ? 'Generate one-time QR for your assigned Brand / Dealer / Branch.' : 'Generate one-time QR for the selected Brand / Dealer / Branch.'}</p><p className="text-xs mt-1" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }} >The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.{isUser ? ` Scope: ${pairBrand} / ${pairDealer} / ${pairBranch}.` : ''}</p></div>
-        <div className="mt-auto pt-2 w-full flex md:justify-end"><Button className="w-full md:w-auto" onClick={generateNewPairing} disabled={creatingUser||!pairReady} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button></div>
+      {canPair && <Card title="Pair Mobile User" themed={hubTheme}><div className="flex flex-col flex-1 gap-3">
+        <div className="flex-1 min-h-0"><p className="font-medium">{isUser ? 'Generate one-time QR for your assigned Brand / Dealer / Branch.' : 'Generate one-time QR for the selected Brand / Dealer / Branch.'}</p><p className="text-xs mt-1" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }} >The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.{isUser ? ` Scope: ${pairBrand} / ${pairDealer} / ${pairBranch}.` : ''}</p></div>
+        <div className="mt-auto pt-2 w-full flex shrink-0 md:justify-end"><Button className="w-full md:w-auto" onClick={generateNewPairing} disabled={creatingUser||!pairReady} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button></div>
       </div></Card>}
       <Card title="Download Mobile App" themed={hubTheme}>
-        {isMaster && <div className="mb-4 flex flex-wrap items-center gap-3">
+        <div className="flex flex-col flex-1 gap-4">
+        {isMaster && <div className="flex flex-wrap items-center gap-3 shrink-0">
           <input ref={apkFileRef} type="file" accept=".apk,application/vnd.android.package-archive" className="hidden" onChange={uploadApk}/>
           <Button onClick={()=>apkFileRef.current?.click()} disabled={apkUploading} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined} data-testid="user-hub-upload-apk"><Upload className="h-4 w-4 mr-2"/>{apkUploading?'Uploading...':'Upload APK'}</Button>
           <span className="text-xs" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }}>.apk only · Master Admin</span>
         </div>}
-        <div className="flex flex-col gap-4 h-full">
-          <div>{latestVersion ? <>Latest: <b>{latestVersion.version_name||latestVersion.apk_filename}</b><div className="text-xs mt-1" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }}>Released {fmt(latestVersion.release_date)}</div></> : 'No APK published yet.'}</div>
-          <div className="mt-auto flex flex-wrap gap-2">
+          <div className="flex-1 min-h-0">{latestVersion ? <>Latest: <b>{latestVersion.version_name||latestVersion.apk_filename}</b><div className="text-xs mt-1" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }}>Released {fmt(latestVersion.release_date)}</div></> : 'No APK published yet.'}</div>
+          <div className="mt-auto flex flex-wrap gap-2 shrink-0">
             {latestVersion && <Button onClick={downloadApk} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined} data-testid="user-hub-download-apk"><Download className="h-4 w-4 mr-2"/>Download APK</Button>}
             {latestVersion && <Button variant="outline" onClick={copyApkLink} data-testid="user-hub-copy-apk-link"><Copy className="h-4 w-4 mr-2"/>Copy Download Link</Button>}
           </div>
@@ -444,13 +461,13 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
         <div className="relative w-full max-w-[500px] max-h-[90vh] overflow-y-auto rounded-[24px] border border-white/20 bg-gradient-to-b from-[#1b1d1c] to-[#080a09] p-5 text-white shadow-2xl" onMouseDown={e=>e.stopPropagation()}>
           <button aria-label="Close pairing QR" onClick={()=>setPairingResult(null)} className="absolute right-4 top-4 rounded-full border border-white/30 bg-black/30 p-2 hover:bg-white/10"><X className="h-5 w-5"/></button>
           <div className="flex items-center justify-center gap-3 pr-10">
-            <img src="/sleeping-stock-logo-transparent.png" alt="Sleeping Stock" className="h-14 w-14 object-contain"/>
+            <img src={sleepingStockLoginLogo} alt="Sleeping Stock" className="h-14 w-14 object-contain"/>
             <div><div className="text-2xl font-black tracking-tight"><span className="text-white">Sleeping</span><span className="text-lime-400">Stock</span></div><div className="text-xs text-gray-300">Non moving Tracking System</div></div>
           </div>
           <div className="mt-4 text-center"><h2 className="text-2xl font-black">{pairingResult.pairing_type==='REPAIR'?'Re-pair':'Pair'} Your <span className="text-lime-400">Device</span></h2><p className="mt-1 text-sm text-gray-300">{pairingResult.pairing_type==='REPAIR'?`Existing ID ${pairingResult.mobile_user_id} will be reused.`:'Name and mobile number are entered in the app.'}</p></div>
           <div className="mt-3 text-center text-sm text-gray-200">{[pairingResult.brand_name, pairingResult.dealer_name, pairingResult.branch].filter(Boolean).join(' · ') || 'Branch details unavailable'}</div>
           <div className="mx-auto mt-4 w-fit rounded-[20px] border border-lime-400/70 bg-white p-3 shadow-[0_0_28px_rgba(163,230,53,0.28)]">
-            {pairingResult.qr_code_data_url ? <img src={pairingResult.qr_code_data_url} alt="Device pairing QR code" className="block h-auto w-[min(280px,70vw)] max-w-[280px] aspect-square object-contain image-render-pixel md:w-[250px] lg:w-[280px]"/> : <div className="flex h-[240px] w-[240px] items-center justify-center text-black">QR image unavailable</div>}
+            {pairingResult.qr_code_data_url ? <img src={pairingResult.qr_code_data_url} alt="Device pairing QR code" className="block aspect-square object-contain image-render-pixel w-[min(280px,70vw)] h-[min(280px,70vw)] md:h-[280px] md:w-[280px]"/> : <div className="flex h-[280px] w-[280px] items-center justify-center text-black">QR image unavailable</div>}
           </div>
           <div className="mt-4 rounded-2xl border border-white/15 bg-white/5 p-4">
             <div className="text-xs text-gray-300">Manual Pairing Code</div>
@@ -651,7 +668,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   </div>
 }
 
-const Card=({title,children,themed=false})=><div className={themed ? 'rounded-2xl p-5 shadow-sm h-full overflow-hidden' : 'bg-white rounded-xl border p-5 h-full'} style={themed ? { backgroundColor: HUB_COLORS.card, border: `1px solid ${HUB_COLORS.border}`, color: HUB_COLORS.text } : undefined}><h2 className="font-bold text-lg mb-4">{title}</h2>{children}</div>;
+const Card=({title,children,themed=false})=><div className={themed ? 'rounded-2xl p-5 shadow-sm h-full flex flex-col overflow-visible' : 'bg-white rounded-xl border p-5 h-full flex flex-col'} style={themed ? { backgroundColor: HUB_COLORS.card, border: `1px solid ${HUB_COLORS.border}`, color: HUB_COLORS.text } : undefined}><h2 className="font-bold text-lg mb-4 shrink-0">{title}</h2><div className="flex min-h-0 flex-1 flex-col">{children}</div></div>;
 const Tab=({active,onClick,icon:Icon,title})=><button onClick={onClick} className={`border rounded-xl p-4 flex gap-3 items-center ${active?'bg-green-50 ring-2 ring-green-500':'bg-white'}`}><Icon className="h-5 w-5 text-green-600"/><b>{title}</b></button>;
 const Info=({label,value})=><div className="border rounded-lg p-3 bg-gray-50"><div className="text-xs text-gray-500 mb-1">{label}</div><div className="font-semibold">{value}</div></div>;
 const SimpleTable=({headers,rows})=><div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr>{headers.map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{rows.map((r,i)=><tr className="border-t" key={i}>{r.map((v,j)=><td className="p-3" key={j}>{v}</td>)}</tr>)}{!rows.length&&<tr><td colSpan={headers.length} className="text-center py-8 text-gray-500">No records yet.</td></tr>}</tbody></table></div>;

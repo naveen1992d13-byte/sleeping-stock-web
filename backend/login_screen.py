@@ -7,6 +7,7 @@ Never copies Testing records or Testing S3 keys into Production.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime
 from io import BytesIO
@@ -23,6 +24,7 @@ except ImportError:
     import s3_storage
     import testing_runtime
 
+logger = logging.getLogger("nmts.login_screen")
 IST = ZoneInfo("Asia/Kolkata")
 COLLECTION = "login_screen_images"
 TYPE_DEFAULT = "default"
@@ -86,6 +88,13 @@ def _parse_ist(value: Optional[str]) -> Optional[datetime]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=IST)
     return dt.astimezone(IST)
+
+
+def _try_parse_ist(value: Optional[str]) -> Optional[datetime]:
+    try:
+        return _parse_ist(value)
+    except HTTPException:
+        return None
 
 
 def _now_ist() -> datetime:
@@ -278,8 +287,10 @@ async def purge_expired_scheduled(db) -> int:
     rows = await db[COLLECTION].find({"type": TYPE_SCHEDULED}, {"_id": 0}).to_list(20)
     removed = 0
     for row in rows:
-        end = _parse_ist(row.get("end_at"))
-        if end is None or now >= end:
+        end = _try_parse_ist(row.get("end_at"))
+        if end is None:
+            continue
+        if now >= end:
             await _delete_row(db, row)
             removed += 1
     return removed
@@ -365,8 +376,8 @@ async def choose_active(db) -> Optional[dict]:
     now = _now_ist()
     scheduled = await db[COLLECTION].find_one({"type": TYPE_SCHEDULED}, {"_id": 0})
     if scheduled:
-        start = _parse_ist(scheduled.get("start_at"))
-        end = _parse_ist(scheduled.get("end_at"))
+        start = _try_parse_ist(scheduled.get("start_at"))
+        end = _try_parse_ist(scheduled.get("end_at"))
         if start and end and start <= now < end:
             return scheduled
     return await db[COLLECTION].find_one({"type": TYPE_DEFAULT}, {"_id": 0})
@@ -376,6 +387,7 @@ async def active_payload(db) -> Dict[str, Any]:
     try:
         return _public_row(await choose_active(db))
     except Exception:
+        logger.exception("login-screen active lookup failed")
         return {
             "image_url": None,
             "media_url": None,
@@ -391,8 +403,8 @@ async def active_payload(db) -> Dict[str, Any]:
 def _row_visible_for_stream(row: dict) -> bool:
     if row.get("type") != TYPE_SCHEDULED:
         return True
-    start = _parse_ist(row.get("start_at"))
-    end = _parse_ist(row.get("end_at"))
+    start = _try_parse_ist(row.get("start_at"))
+    end = _try_parse_ist(row.get("end_at"))
     now = _now_ist()
     if start and end and start <= now < end:
         return True
@@ -445,7 +457,12 @@ async def manage_payload(db) -> Dict[str, Any]:
     await purge_expired_scheduled(db)
     default = await db[COLLECTION].find_one({"type": TYPE_DEFAULT}, {"_id": 0})
     scheduled = await db[COLLECTION].find_one({"type": TYPE_SCHEDULED}, {"_id": 0})
-    return {"default": _public_row(default), "scheduled": _public_row(scheduled)}
+    active = await choose_active(db)
+    return {
+        "default": _public_row(default),
+        "scheduled": _public_row(scheduled),
+        "active": _public_row(active),
+    }
 
 
 def _store_media(kind: str, data: bytes, ctype: str, ext: str) -> str:

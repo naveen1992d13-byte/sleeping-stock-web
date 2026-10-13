@@ -35,7 +35,7 @@ from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Header, Request, UploadFile, File, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError, OperationFailure
 
@@ -486,6 +486,14 @@ class PairingGenerateRequest(BaseModel):
     brand_name: Optional[str] = None
     dealer_name: Optional[str] = None
     branch: Optional[str] = None
+
+    @field_validator("pairing_type", "mobile_user_id", "brand_name", "dealer_name", "branch", mode="before")
+    @classmethod
+    def _coerce_optional_str(cls, value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
 
 class PairingVerifyRequest(BaseModel):
@@ -998,12 +1006,15 @@ async def generate_pairing_code(request: Request, payload: PairingGenerateReques
 
     mobile_user = None
     if pairing_type == "REPAIR":
-        if not payload.mobile_user_id:
+        uid = (payload.mobile_user_id or "").strip()
+        if not uid:
             raise HTTPException(400, "Mobile User ID is required for Re-pair")
-        mobile_user = await db.mobile_users.find_one({"mobile_user_id": payload.mobile_user_id.strip().upper()}, {"_id": 0})
+        mobile_user = await db.mobile_users.find_one({"mobile_user_id": uid}, {"_id": 0})
+        if not mobile_user:
+            mobile_user = await db.mobile_users.find_one({"mobile_user_id": _scope_ci(uid)}, {"_id": 0})
         if not mobile_user:
             raise HTTPException(404, "Mobile user not found")
-        if mobile_user.get("status") != "active":
+        if str(mobile_user.get("status") or "").strip().lower() != "active":
             raise HTTPException(400, "Mobile user is inactive")
 
     if current_user.role == "master":

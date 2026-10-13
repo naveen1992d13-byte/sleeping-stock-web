@@ -1,9 +1,12 @@
-/** Desktop promo media: square 1:1 card, recommended 1080×1080. */
-export const LOGIN_PROMO_ASPECT = 1;
-export const LOGIN_PROMO_WIDTH = 1080;
-export const LOGIN_PROMO_HEIGHT = 1080;
-export const LOGIN_PROMO_OUTPUT_WIDTH = 1080;
-export const LOGIN_PROMO_OUTPUT_HEIGHT = 1080;
+/** Uploaded login media crop/preview only. Public login keeps its responsive 70/30 layout. */
+export const LOGIN_PROMO_ASPECT = 6 / 5;
+export const LOGIN_PROMO_ASPECT_LABEL = '6:5';
+export const LOGIN_PROMO_WIDTH = 1920;
+export const LOGIN_PROMO_HEIGHT = 1600;
+export const LOGIN_PROMO_OUTPUT_WIDTH = 1920;
+export const LOGIN_PROMO_OUTPUT_HEIGHT = 1600;
+export const LOGIN_PROMO_ALT_WIDTH = 1440;
+export const LOGIN_PROMO_ALT_HEIGHT = 1200;
 export const LOGIN_PROMO_FILL = '#0b0f12';
 export const LOGIN_IMAGE_ACCEPT = 'image/png,image/jpeg,image/webp';
 export const LOGIN_MEDIA_ACCEPT = 'image/png,image/jpeg,image/webp,video/mp4,.mp4';

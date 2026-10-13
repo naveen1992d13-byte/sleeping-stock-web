@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   LOGIN_PROMO_ASPECT,
+  LOGIN_PROMO_ASPECT_LABEL,
   LOGIN_PROMO_HEIGHT,
   LOGIN_PROMO_WIDTH,
   captureLoginVideoPoster,
@@ -162,7 +163,7 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
           <button type="button" className="lsm-crop-close" onClick={onCancel} aria-label="Close">×</button>
         </div>
         <p className="lsm-crop-note">
-          {isVideo ? 'One muted looping video · poster used for the blurred background' : `Final preview · ${LOGIN_PROMO_WIDTH}×${LOGIN_PROMO_HEIGHT} square (1:1)`}
+          {isVideo ? 'One muted looping video · poster used for the blurred background' : `Final preview · ${LOGIN_PROMO_WIDTH}×${LOGIN_PROMO_HEIGHT} (${LOGIN_PROMO_ASPECT_LABEL})`}
         </p>
         <div
           ref={viewRef}
