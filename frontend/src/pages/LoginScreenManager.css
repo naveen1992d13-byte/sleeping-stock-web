@@ -166,6 +166,8 @@
   box-shadow: 0 0 0 3px rgba(133, 200, 8, 0.18);
 }
 
+.lsm-input[type="date"],
+.lsm-input[type="time"],
 .lsm-input[type="datetime-local"] {
   color-scheme: dark;
   background: #151b21 !important;
@@ -173,12 +175,16 @@
   min-height: 42px;
 }
 
+.lsm-input[type="date"]::-webkit-calendar-picker-indicator,
+.lsm-input[type="time"]::-webkit-calendar-picker-indicator,
 .lsm-input[type="datetime-local"]::-webkit-calendar-picker-indicator {
   opacity: 1;
   cursor: pointer;
   filter: invert(1) brightness(1.6);
 }
 
+.lsm-input[type="date"]::-webkit-datetime-edit,
+.lsm-input[type="time"]::-webkit-datetime-edit,
 .lsm-input[type="datetime-local"]::-webkit-datetime-edit,
 .lsm-input[type="datetime-local"]::-webkit-datetime-edit-fields-wrapper,
 .lsm-input[type="datetime-local"]::-webkit-datetime-edit-text,

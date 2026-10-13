@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import axios from 'axios';
 import { API, useAuth } from '../App';
@@ -70,6 +70,8 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   const [historyRecords,setHistoryRecords]=useState([]);
   const [autoSuggestions,setAutoSuggestions]=useState([]);
   const [suggestionDetail,setSuggestionDetail]=useState(null);
+  const [auditUserFilter,setAuditUserFilter]=useState('');
+  const [todayRecords,setTodayRecords]=useState([]);
   const [sendBusy,setSendBusy]=useState(false);
   const [autoGenerating,setAutoGenerating]=useState(false);
   const [autoRecalcBusy,setAutoRecalcBusy]=useState(false);
@@ -137,6 +139,14 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       setHistoryRecords(r.data||[]);
     }catch(e){ toast.error(e.response?.data?.detail||'History load failed'); setHistoryRecords([]); }
   };
+  const loadTodayRecords=async()=>{
+    if(!scopeReady){ setTodayRecords([]); return; }
+    try{
+      const day=todayKey();
+      const r=await axios.get(`${API}/mobile/perpetual-stock/verification-history`,{params:{brand,dealer,branch,date_from:day,date_to:day,limit:500}});
+      setTodayRecords(Array.isArray(r.data)?r.data:[]);
+    }catch{ setTodayRecords([]); }
+  };
   const loadApkLink=async()=>{
     try{
       const r=await axios.get(`${API}/mobile/app-versions/download-link/latest`);
@@ -153,7 +163,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   useEffect(()=>{
     setPairingResult(null);setPairingFor(null);setPending([]);setSnapshot(null);
     loadMobileUsers();loadAppVersions();loadTodayAttendance();
-    if (showAuditSections) { loadSessions(); loadAutoPerpetual(); loadHistoryRecords(); }
+    if (showAuditSections) { loadSessions(); loadAutoPerpetual(); loadHistoryRecords(); loadTodayRecords(); }
     /* eslint-disable-next-line */
   },[scopeBrand,scopeDealer,scopeBranch,user?.id, showAuditSections]);
 
@@ -170,7 +180,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     try{
       const payload = {pairing_type:'NEW',brand_name:pairBrand,dealer_name:pairDealer,branch:pairBranch};
       const r=await axios.post(`${API}/mobile/pairing/generate`,payload);
-      setPairingResult(r.data);
+      setPairingResult({...r.data, brand_name:pairBrand, dealer_name:pairDealer, branch:pairBranch});
       toast.success('New-user pairing QR generated — valid for 10 minutes');
     }catch(e){const d=e.response?.data?.detail;toast.error(typeof d==='string'?d:(d?.message||'Pairing code generation failed'))}
     finally{setCreatingUser(false)}
@@ -266,6 +276,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   const openSuggestion=async(id)=>{
     try{
       const r=await axios.get(`${API}/mobile/auto-perpetual/suggestions/${id}`);
+      setAuditUserFilter('');
       setSuggestionDetail(r.data);
     }catch(e){toast.error('Could not load suggestion details')}
   };
@@ -285,7 +296,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     setPairingFor(mu.mobile_user_id);
     try{
       const r=await axios.post(`${API}/mobile/pairing/generate`,{pairing_type:'REPAIR',mobile_user_id:mu.mobile_user_id,brand_name:mu.brand_name,dealer_name:mu.dealer_name,branch:mu.branch});
-      setPairingResult({mobile_user_id:mu.mobile_user_id,...r.data});
+      setPairingResult({mobile_user_id:mu.mobile_user_id, brand_name:mu.brand_name, dealer_name:mu.dealer_name, branch:mu.branch, ...r.data});
       toast.success('Re-pair QR generated — same Mobile User ID will be reused');
     }catch(e){const d=e.response?.data?.detail;toast.error(typeof d==='string'?d:(d?.message||'Re-pair code generation failed'))}
     finally{setPairingFor(null)}
@@ -381,14 +392,14 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   const lookup=async()=>{if(!scopeReady)return toast.error('Select exact Dashboard Brand, Dealer and Branch');if(!clean(partNumber))return toast.error('Enter Part Number');try{const r=await axios.get(`${API}/mobile/perpetual-stock/lookup`,{params:{part_number:clean(partNumber),brand,dealer,branch}});setSnapshot(r.data);setPhysicalLocation(r.data.pin_location||'');setPhysicalQty('');setRemarks('')}catch(e){setSnapshot(null);toast.error(e.response?.data?.detail||'Part not found')}};
   const scan=async(e)=>{const file=e.target.files?.[0];e.target.value='';if(!file)return;if(!('TextDetector'in window))return toast.info('OCR is not supported in this browser. Enter Part Number manually.');try{const bitmap=await createImageBitmap(file);const result=await new window.TextDetector().detect(bitmap);const candidates=result.map(x=>x.rawValue).join(' ').match(/[A-Z0-9][A-Z0-9\-_/]{4,}/gi)||[];if(!candidates.length)return toast.error('Part Number not detected');setPartNumber(candidates.sort((a,b)=>b.length-a.length)[0])}catch{toast.error('OCR scan failed')}};
   const calc=useMemo(()=>{if(!snapshot||physicalQty==='')return null;const sys=Number(snapshot.system_quantity||0),phy=Number(physicalQty),mav=Number(snapshot.mav||0),diff=phy-sys;return{difference:diff,shortage_qty:diff<0?-diff:0,excess_qty:diff>0?diff:0,shortage_value:(diff<0?-diff:0)*mav,excess_value:(diff>0?diff:0)*mav}},[snapshot,physicalQty]);
-  const addItem=()=>{if(!snapshot||!calc||Number.isNaN(Number(physicalQty)))return toast.error('Enter valid Physical Quantity');if(pending.some(x=>clean(x.part_number).toLowerCase()===clean(snapshot.part_number).toLowerCase()))return toast.error('Part already added');setPending(p=>[...p,{...snapshot,physical_quantity:Number(physicalQty),scanned_location:physicalLocation,remarks,...calc}]);setPartNumber('');setSnapshot(null);setPhysicalQty('');setPhysicalLocation('');setRemarks('');toast.success('Added to temporary verification list')};
+  const addItem=()=>{if(!snapshot||!calc||Number.isNaN(Number(physicalQty)))return toast.error('Enter valid Physical Quantity');if(pending.some(x=>clean(x.part_number).toLowerCase()===clean(snapshot.part_number).toLowerCase()))return toast.error('Part already added');setPending(p=>[...p,{...snapshot,physical_quantity:Number(physicalQty),scanned_location:physicalLocation,remarks,...calc}]);setPartNumber('');setSnapshot(null);setPhysicalQty('');setPhysicalLocation('');setRemarks('');toast.success('Added to pending verification')};
   const uploadSession=async()=>{if(!pending.length)return toast.error('Add at least one item');try{const r=await axios.post(`${API}/mobile/perpetual-stock/sessions`,{brand,dealer,branch,items:pending.map(x=>({part_number:x.part_number,physical_quantity:x.physical_quantity,scanned_location:x.scanned_location,remarks:x.remarks}))});toast.success(`Uploaded ${r.data.session_id}`);setPending([]);loadSessions()}catch(e){toast.error(e.response?.data?.detail||'Upload failed')}};
   const openSession=async(s)=>{try{const r=await axios.get(`${API}/mobile/perpetual-stock/sessions/${s.session_id}`);setViewSession(r.data)}catch(e){toast.error(e.response?.data?.detail||'Session load failed')}};
   const updateCorrection=async(row,method)=>{try{const status=method==='no_action'?'pending':'corrected';const r=await axios.put(`${API}/mobile/perpetual-stock/${row.id}/correction`,{correction_status:status,correction_method:method,correction_remarks:''});setViewSession(v=>({...v,items:(v.items||[]).map(x=>x.id===row.id?r.data:x)}));toast.success('Correction updated')}catch(e){toast.error(e.response?.data?.detail||'Correction update failed')}};
   const canExportExcel = user?.role === 'master' || user?.role === 'admin';
   const excel=async(s)=>{if(!canExportExcel)return toast.error('Excel download restricted to Admin / Master Admin');try{const r=await axios.get(`${API}/mobile/perpetual-stock/sessions/${s.session_id}/excel`,{responseType:'blob'});const url=URL.createObjectURL(r.data);const a=document.createElement('a');a.href=url;a.download=`${s.session_id}.xlsx`;a.click();URL.revokeObjectURL(url)}catch(e){toast.error(e.response?.data?.detail||'Excel download failed')}};
   const exportAllExcel=async()=>{if(!canExportExcel)return toast.error('Excel download restricted to Admin / Master Admin');try{const params={date_from:filters.date_from||undefined,date_to:filters.date_to||undefined};if(exact(brand))params.brand=brand;if(exact(dealer))params.dealer=dealer;if(exact(branch))params.branch=branch;const r=await axios.get(`${API}/mobile/perpetual-stock/export-all/excel`,{params,responseType:'blob'});const url=URL.createObjectURL(r.data);const a=document.createElement('a');a.href=url;a.download=user?.role==='master'?'perpetual_stock_master.xlsx':user?.role==='admin'?'perpetual_stock_admin.xlsx':'perpetual_stock_branch.xlsx';a.click();URL.revokeObjectURL(url);toast.success('Complete Perpetual Stock Excel downloaded')}catch(e){toast.error(e.response?.data?.detail||'Complete Excel download failed')}};
-  const todayItems=useMemo(()=>sessions.filter(s=>todayKey(s.created_at)===todayKey()).reduce((n,s)=>n+Number(s.total_items||0),0),[sessions]);
+  const todayItems=useMemo(()=>todayRecords.length,[todayRecords]);
 
   const latestVersion = appVersions[0];
   const visibleSection = sectionOverride || section;
@@ -409,9 +420,9 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
 
     {showMobileSections && visibleSection==='mobile'&&<div className="space-y-5" style={hubTheme ? { color: HUB_COLORS.text } : undefined}>
       <div className="grid md:grid-cols-2 gap-5 items-stretch">
-      {canPair && <Card title="Pair Mobile User" themed={hubTheme}><div className="flex flex-col gap-3 h-full">
+      {canPair && <Card title="Pair Mobile User" themed={hubTheme}><div className="flex flex-col gap-3 h-full min-h-[160px] overflow-hidden">
         <div><p className="font-medium">{isUser ? 'Generate one-time QR for your assigned Brand / Dealer / Branch.' : 'Generate one-time QR for the selected Brand / Dealer / Branch.'}</p><p className="text-xs mt-1" style={{ color: hubTheme ? HUB_COLORS.muted : undefined }} >The Mobile User ID is created only after the user enters Name + Mobile Number and scans this QR.{isUser ? ` Scope: ${pairBrand} / ${pairDealer} / ${pairBranch}.` : ''}</p></div>
-        <div className="mt-auto"><Button onClick={generateNewPairing} disabled={creatingUser||!pairReady} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button></div>
+        <div className="mt-auto pt-2 w-full flex md:justify-end"><Button className="w-full md:w-auto" onClick={generateNewPairing} disabled={creatingUser||!pairReady} style={hubTheme ? { backgroundColor: HUB_COLORS.button } : undefined}><QrCode className="h-4 w-4 mr-2"/>{creatingUser?'Generating...':'Generate New Pairing QR'}</Button></div>
       </div></Card>}
       <Card title="Download Mobile App" themed={hubTheme}>
         {isMaster && <div className="mb-4 flex flex-wrap items-center gap-3">
@@ -430,21 +441,23 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       </div>
 
       {pairingResult && <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/75 backdrop-blur-sm p-4" onMouseDown={()=>setPairingResult(null)}>
-        <div className="relative w-full max-w-[720px] overflow-hidden rounded-[28px] border border-white/20 bg-gradient-to-b from-[#1b1d1c] to-[#080a09] p-6 md:p-8 text-white shadow-2xl" onMouseDown={e=>e.stopPropagation()}>
-          <button aria-label="Close pairing QR" onClick={()=>setPairingResult(null)} className="absolute right-5 top-5 rounded-full border border-white/30 bg-black/30 p-2 hover:bg-white/10"><X className="h-6 w-6"/></button>
-          <div className="flex items-center justify-center gap-4 pr-10">
-            <img src="/sleeping-stock-logo-transparent.png" alt="Sleeping Stock" className="h-20 w-20 object-contain"/>
-            <div><div className="text-3xl font-black tracking-tight"><span className="text-white">Sleeping</span><span className="text-lime-400">Stock</span></div><div className="text-sm text-gray-300">Non moving Tracking System</div></div>
+        <div className="relative w-full max-w-[500px] max-h-[90vh] overflow-y-auto rounded-[24px] border border-white/20 bg-gradient-to-b from-[#1b1d1c] to-[#080a09] p-5 text-white shadow-2xl" onMouseDown={e=>e.stopPropagation()}>
+          <button aria-label="Close pairing QR" onClick={()=>setPairingResult(null)} className="absolute right-4 top-4 rounded-full border border-white/30 bg-black/30 p-2 hover:bg-white/10"><X className="h-5 w-5"/></button>
+          <div className="flex items-center justify-center gap-3 pr-10">
+            <img src="/sleeping-stock-logo-transparent.png" alt="Sleeping Stock" className="h-14 w-14 object-contain"/>
+            <div><div className="text-2xl font-black tracking-tight"><span className="text-white">Sleeping</span><span className="text-lime-400">Stock</span></div><div className="text-xs text-gray-300">Non moving Tracking System</div></div>
           </div>
-          <div className="mt-5 text-center"><h2 className="text-3xl md:text-4xl font-black">{pairingResult.pairing_type==='REPAIR'?'Re-pair':'Pair'} Your <span className="text-lime-400">Device</span></h2><p className="mt-2 text-sm md:text-base text-gray-300">{pairingResult.pairing_type==='REPAIR'?`Existing ID ${pairingResult.mobile_user_id} will be reused.`:'Name and mobile number are entered in the app.'}</p></div>
-          <div className="mx-auto mt-6 w-fit rounded-[24px] border border-lime-400/70 bg-white p-4 shadow-[0_0_35px_rgba(163,230,53,0.35)]">
-            {pairingResult.qr_code_data_url ? <img src={pairingResult.qr_code_data_url} alt="Device pairing QR code" className="h-[300px] w-[300px] md:h-[380px] md:w-[380px] image-render-pixel"/> : <div className="flex h-[300px] w-[300px] items-center justify-center text-black">QR image unavailable</div>}
+          <div className="mt-4 text-center"><h2 className="text-2xl font-black">{pairingResult.pairing_type==='REPAIR'?'Re-pair':'Pair'} Your <span className="text-lime-400">Device</span></h2><p className="mt-1 text-sm text-gray-300">{pairingResult.pairing_type==='REPAIR'?`Existing ID ${pairingResult.mobile_user_id} will be reused.`:'Name and mobile number are entered in the app.'}</p></div>
+          <div className="mt-3 text-center text-sm text-gray-200">{[pairingResult.brand_name, pairingResult.dealer_name, pairingResult.branch].filter(Boolean).join(' · ') || 'Branch details unavailable'}</div>
+          <div className="mx-auto mt-4 w-fit rounded-[20px] border border-lime-400/70 bg-white p-3 shadow-[0_0_28px_rgba(163,230,53,0.28)]">
+            {pairingResult.qr_code_data_url ? <img src={pairingResult.qr_code_data_url} alt="Device pairing QR code" className="block h-auto w-[min(280px,70vw)] max-w-[280px] aspect-square object-contain image-render-pixel md:w-[250px] lg:w-[280px]"/> : <div className="flex h-[240px] w-[240px] items-center justify-center text-black">QR image unavailable</div>}
           </div>
-          <div className="mt-6 rounded-2xl border border-white/15 bg-white/5 p-4 md:p-5">
-            <div className="text-sm text-gray-300">Manual Pairing Code</div>
-            <div className="mt-1 flex items-center justify-between gap-3"><span className="break-all font-mono text-2xl md:text-4xl font-black tracking-widest text-white">{pairingResult.pairing_code}</span><button className="shrink-0 rounded-xl border border-lime-400/40 p-3 text-lime-400 hover:bg-lime-400/10" onClick={()=>{navigator.clipboard.writeText(pairingResult.pairing_code);toast.success('Pairing code copied')}}><Copy className="h-6 w-6"/></button></div>
+          <div className="mt-4 rounded-2xl border border-white/15 bg-white/5 p-4">
+            <div className="text-xs text-gray-300">Manual Pairing Code</div>
+            <div className="mt-1 flex items-center justify-between gap-3"><span className="break-all font-mono text-xl md:text-2xl font-black tracking-widest text-white">{pairingResult.pairing_code}</span><button className="shrink-0 rounded-xl border border-lime-400/40 p-2 text-lime-400 hover:bg-lime-400/10" onClick={()=>{navigator.clipboard.writeText(pairingResult.pairing_code);toast.success('Pairing code copied')}}><Copy className="h-5 w-5"/></button></div>
           </div>
-          <div className="mt-4 text-center text-sm text-gray-400">One-time code · Expires {fmt(pairingResult.expires_at)}</div>
+          <div className="mt-3 text-center text-sm text-gray-400">One-time code · Expires {fmt(pairingResult.expires_at)}</div>
+          <div className="mt-4 flex justify-center"><Button variant="outline" onClick={()=>setPairingResult(null)}>Close</Button></div>
         </div>
       </div>}
 
@@ -494,8 +507,8 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
     {showAuditSections && section==='physical'&&<div className="space-y-5">
       <Card title="Physical Perpetual"><div className="flex flex-wrap gap-2"><input className="border rounded h-10 px-3 flex-1 min-w-64" value={partNumber} onChange={e=>setPartNumber(e.target.value.toUpperCase())} placeholder="Manual Part Number"/><Button onClick={lookup}><ScanLine className="h-4 w-4 mr-2"/>Lookup</Button></div>
       {snapshot&&<div className="mt-4 space-y-4"><div className="grid md:grid-cols-4 gap-3"><Info label="Part Number" value={snapshot.part_number}/><Info label="Part Name" value={snapshot.part_name}/><Info label="System Quantity" value={snapshot.system_quantity}/><Info label="MAV" value={money(snapshot.mav)}/><Info label="PIN Location" value={snapshot.pin_location||'-'}/><Info label="Physical Quantity" value={<input type="number" className="border rounded h-9 px-2 w-full" value={physicalQty} onChange={e=>setPhysicalQty(e.target.value)}/>}/><Info label="Physical Location" value={<input className="border rounded h-9 px-2 w-full" value={physicalLocation} onChange={e=>setPhysicalLocation(e.target.value)}/>}/><Info label="Remarks" value={<input className="border rounded h-9 px-2 w-full" value={remarks} onChange={e=>setRemarks(e.target.value)}/>} /></div>{calc&&<div className="grid md:grid-cols-5 gap-3"><Info label="Difference" value={calc.difference}/><Info label="Shortage Qty" value={calc.shortage_qty}/><Info label="Excess Qty" value={calc.excess_qty}/><Info label="Shortage Value" value={money(calc.shortage_value)}/><Info label="Excess Value" value={money(calc.excess_value)}/></div>}<Button onClick={addItem}><Plus className="h-4 w-4 mr-2"/>Add to Verification List</Button></div>}</Card>
-      <Card title={`Temporary Verification List (${pending.length})`}><DetailTable rows={pending} removable onRemove={i=>setPending(p=>p.filter((_,x)=>x!==i))}/><div className="flex justify-end mt-4"><Button onClick={uploadSession} disabled={!pending.length}><Upload className="h-4 w-4 mr-2"/>Finish Upload</Button></div></Card>
-      <Card title="Today's Verification"><p className="text-sm text-gray-500 mb-3">All verified line items for today. Total items: {todayItems}</p><DetailTable rows={sessions.filter(s=>todayKey(s.created_at)===todayKey()).flatMap(s=>s.items||[])} empty="Open History and View a session to inspect its items."/></Card>
+      <Card title={`Pending Verification (${pending.length})`}><DetailTable rows={pending} removable onRemove={i=>setPending(p=>p.filter((_,x)=>x!==i))}/><div className="flex justify-end mt-4"><Button onClick={uploadSession} disabled={!pending.length}><Upload className="h-4 w-4 mr-2"/>Submit Verification</Button></div></Card>
+      <Card title="Today's Verification"><p className="text-sm text-gray-500 mb-3">Completed verification records for today. Total items: {todayItems}</p><DetailTable rows={todayRecords} empty="No completed verification records for today."/></Card>
     </div>}
 
     {showAuditSections && section==='auto'&&<div className="space-y-5">
@@ -522,24 +535,25 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
           <Button variant="outline" onClick={loadAutoPerpetual} disabled={!scopeReady}><RefreshCw className="h-4 w-4 mr-2"/>Refresh</Button>
         </div>
       </Card>
-      <Card title="Auto suggestions (summary)">
-        <div className="space-y-3">
-          {autoSuggestions.map(s=>(
-            <div key={s.id} className="border rounded-lg p-4 bg-gray-50 flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <div className="font-semibold">{s.suggestion_number}</div>
-                <div className="text-xs text-gray-500">{s.allocation_date} · {s.status}</div>
-                <div className="text-sm mt-1">Items: {s.total_items} · Qty: {s.total_qty} · Value: ₹{money(s.total_value)}</div>
-                <div className="text-xs text-gray-600">Loc {s.location_count} · ↑ {s.increased_count} · ↓ {s.decreased_count}</div>
-              </div>
-              <div className="flex gap-2">
-                <Button size="sm" variant="outline" onClick={()=>openSuggestion(s.id)}><Eye className="h-4 w-4 mr-1"/>View</Button>
-                {s.status==='DRAFT' && <Button size="sm" onClick={()=>sendSuggestion(s.id)} disabled={sendBusy}><ArrowRightLeft className="h-4 w-4 mr-1"/>Send to Mobile</Button>}
-              </div>
-            </div>
-          ))}
-          {!autoSuggestions.length && <p className="text-center text-gray-500 py-6">No Auto suggestions yet. Generate a draft after marking attendance.</p>}
-        </div>
+      <Card title="Audit Sessions">
+        <div className="overflow-x-auto"><table className="w-full text-sm min-w-[900px]"><thead><tr>{['Audit ID','Date','Users','Assigned','Completed','Pending','Status','View'].map(h=><th key={h} className="text-left p-2 whitespace-nowrap">{h}</th>)}</tr></thead><tbody>
+          {autoSuggestions.map(s=>{
+            const assigned=s.assigned_count ?? s.assignments_created ?? s.total_items ?? 0;
+            const completed=s.completed_count ?? 0;
+            const pendingCount=s.pending_count ?? Math.max(0, assigned-completed);
+            return <tr key={s.id} className="border-t">
+              <td className="p-2 font-mono"><button className="text-emerald-700 font-semibold underline" onClick={()=>openSuggestion(s.id)}>{s.audit_id||s.suggestion_number}</button></td>
+              <td className="p-2 whitespace-nowrap">{s.allocation_date||'-'}</td>
+              <td className="p-2">{s.users_label || s.user_names?.join(', ') || (s.user_count ?? '-')}</td>
+              <td className="p-2">{assigned}</td>
+              <td className="p-2">{completed}</td>
+              <td className="p-2">{pendingCount}</td>
+              <td className="p-2">{s.status}</td>
+              <td className="p-2 whitespace-nowrap"><Button size="sm" variant="outline" onClick={()=>openSuggestion(s.id)}><Eye className="h-4 w-4 mr-1"/>View</Button>{s.status==='DRAFT' && <Button size="sm" className="ml-2" onClick={()=>sendSuggestion(s.id)} disabled={sendBusy}>Send</Button>}</td>
+            </tr>;
+          })}
+          {!autoSuggestions.length && <tr><td colSpan={8} className="text-center py-6 text-gray-500">No Audit Sessions yet. Generate a draft after marking attendance.</td></tr>}
+        </tbody></table></div>
       </Card>
       <Card title={`Today&apos;s assignments (${autoAssignments.length})`}>
         <div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr>{['User','Part','LOC','Status'].map(h=><th key={h} className="text-left p-2">{h}</th>)}</tr></thead><tbody>
@@ -559,7 +573,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
       <Card title={`Audit records (${historyRecords.length})`}><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1600px]"><thead><tr>{['Session','Type','Date','User','Part','LOC','System','Physical','Short','Excess','Damage','Result','Remark'].map(h=><th key={h} className="text-left p-2">{h}</th>)}</tr></thead><tbody>{historyRecords.map(r=><tr key={r.id||`${r.session_id}-${r.part_number}`} className="border-t"><td className="p-2 font-mono text-xs">{r.session_id}</td><td className="p-2">{r.coverage_kind==='recheck'?'Recheck':r.verification_type||'-'}</td><td className="p-2">{fmt(r.verified_at||r.created_at)}</td><td className="p-2">{r.verified_by_name||r.verified_user}</td><td className="p-2">{r.part_number}</td><td className="p-2">{r.pin_location||r.system_location||'-'}</td><td className="p-2">{r.system_quantity}</td><td className="p-2">{r.physical_quantity}</td><td className="p-2">{r.shortage_qty}</td><td className="p-2">{r.excess_qty}</td><td className="p-2">{r.damage_qty||0}</td><td className="p-2">{r.quantity_status||r.overall_status}</td><td className="p-2">{r.remark||r.remarks||'-'}</td></tr>)}</tbody></table></div></Card>
       <Card title="Session summary"><div className="flex flex-wrap items-center justify-between gap-3 mb-4">{canExportExcel && <Button onClick={exportAllExcel}><Download className="h-4 w-4 mr-2"/>Download Complete Excel</Button>}</div><div className="overflow-x-auto"><table className="w-full text-sm min-w-[1350px]"><thead><tr>{['Session ID','Date','Brand','Dealer','Branch','User','Total Items','Shortage Qty','Excess Qty','Status','View'].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{sessions.map(s=><tr key={s.session_id} className="border-t"><td className="p-3 font-semibold">{s.session_id}</td><td>{fmt(s.created_at)}</td><td>{s.brand_name}</td><td>{s.dealer_name}</td><td>{s.branch}</td><td>{s.verified_by_name}</td><td>{s.total_items}</td><td>{s.total_shortage_qty}</td><td>{s.total_excess_qty}</td><td>{s.status}</td><td><Button size="sm" variant="outline" onClick={()=>openSession(s)}><Eye className="h-4 w-4"/></Button></td></tr>)}</tbody></table></div></Card></div>}
 
-    {showAuditSections && suggestionDetail&&<div className="fixed inset-0 bg-black/50 z-50 p-4 overflow-auto"><div className="bg-white rounded-xl max-w-6xl mx-auto p-5 border shadow-lg"><div className="flex justify-between mb-4"><div><h2 className="text-xl font-bold">{suggestionDetail.suggestion_number}</h2><p className="text-gray-500">{suggestionDetail.status} · {suggestionDetail.total_items} items · ₹{money(suggestionDetail.total_value)}</p></div><div className="flex gap-2"><Button variant="outline" onClick={()=>setSuggestionDetail(null)}><X className="h-4 w-4"/></Button>{suggestionDetail.status==='DRAFT'&&<Button onClick={()=>sendSuggestion(suggestionDetail.id)} disabled={sendBusy}>Send to Mobile Users</Button>}</div></div><div className="overflow-x-auto max-h-[70vh]"><table className="w-full text-sm min-w-[900px]"><thead><tr>{['Part','Description','Sys Qty','Location','Type','User','Batch','Status'].map(h=><th key={h} className="text-left p-2">{h}</th>)}</tr></thead><tbody>{(suggestionDetail.items||[]).map((it,i)=><tr key={i} className="border-t"><td className="p-2">{it.part_number}</td><td className="p-2">{it.part_name}</td><td className="p-2">{it.system_qty}</td><td className="p-2">{it.system_location}</td><td className="p-2">{it.suggestion_type}</td><td className="p-2 font-mono text-xs">{it.mobile_user_id||'-'}</td><td className="p-2">{it.batch_no||'-'}</td><td className="p-2">{it.verification_status||'-'}</td></tr>)}</tbody></table></div></div></div>}
+    {showAuditSections && suggestionDetail&&<AuditAllocationDetail suggestion={suggestionDetail} userFilter={auditUserFilter} onFilterUser={setAuditUserFilter} onClose={()=>{setSuggestionDetail(null); setAuditUserFilter('');}} onSend={()=>sendSuggestion(suggestionDetail.id)} sendBusy={sendBusy}/>}
 
     {showAuditSections && viewSession&&<div className="fixed inset-0 bg-black/50 z-50 p-4 overflow-auto"><div className="bg-white rounded-xl max-w-7xl mx-auto p-5 border shadow-lg"><div className="flex justify-between mb-4"><div><h2 className="text-xl font-bold">{viewSession.session_id}</h2><p className="text-gray-500">{fmt(viewSession.created_at)}</p></div><Button variant="outline" onClick={()=>setViewSession(null)}><X className="h-4 w-4"/></Button></div><DetailTable rows={viewSession.items||[]} canManage={canManage} onCorrection={updateCorrection}/></div></div>}
 
@@ -637,8 +651,55 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   </div>
 }
 
-const Card=({title,children,themed=false})=><div className={themed ? 'rounded-2xl p-5 shadow-sm h-full' : 'bg-white rounded-xl border p-5 h-full'} style={themed ? { backgroundColor: HUB_COLORS.card, border: `1px solid ${HUB_COLORS.border}`, color: HUB_COLORS.text } : undefined}><h2 className="font-bold text-lg mb-4">{title}</h2>{children}</div>;
+const Card=({title,children,themed=false})=><div className={themed ? 'rounded-2xl p-5 shadow-sm h-full overflow-hidden' : 'bg-white rounded-xl border p-5 h-full'} style={themed ? { backgroundColor: HUB_COLORS.card, border: `1px solid ${HUB_COLORS.border}`, color: HUB_COLORS.text } : undefined}><h2 className="font-bold text-lg mb-4">{title}</h2>{children}</div>;
 const Tab=({active,onClick,icon:Icon,title})=><button onClick={onClick} className={`border rounded-xl p-4 flex gap-3 items-center ${active?'bg-green-50 ring-2 ring-green-500':'bg-white'}`}><Icon className="h-5 w-5 text-green-600"/><b>{title}</b></button>;
 const Info=({label,value})=><div className="border rounded-lg p-3 bg-gray-50"><div className="text-xs text-gray-500 mb-1">{label}</div><div className="font-semibold">{value}</div></div>;
 const SimpleTable=({headers,rows})=><div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr>{headers.map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{rows.map((r,i)=><tr className="border-t" key={i}>{r.map((v,j)=><td className="p-3" key={j}>{v}</td>)}</tr>)}{!rows.length&&<tr><td colSpan={headers.length} className="text-center py-8 text-gray-500">No records yet.</td></tr>}</tbody></table></div>;
-function DetailTable({rows=[],removable=false,onRemove,empty='No verified items',canManage=false,onCorrection}){return <div className="overflow-x-auto"><table className="w-full text-sm min-w-[1500px]"><thead><tr>{['Part Number','Part Name','MAV','System Qty','Physical Qty','Difference','Shortage Qty','Excess Qty','Shortage Value','Excess Value','PIN Location','Status','Correction Status','Correction Method','Remarks',...(removable?['Action']:[]),...(canManage?['Correction']:[])].map(h=><th key={h} className="text-left p-3">{h}</th>)}</tr></thead><tbody>{rows.map((r,i)=><tr className="border-t" key={r.id||r.part_number||i}><td className="p-3 font-medium">{r.part_number}</td><td>{r.part_name||r.item_name||r.description||r.part_description||'-'}</td><td>{money(r.mav)}</td><td>{r.system_quantity}</td><td>{r.physical_quantity}</td><td>{r.difference}</td><td>{r.shortage_qty}</td><td>{r.excess_qty}</td><td>{money(r.shortage_value)}</td><td>{money(r.excess_value)}</td><td>{r.pin_location||r.system_location||'-'}</td><td>{r.overall_status||r.quantity_status||'-'}</td><td>{r.correction_status||'-'}</td><td>{r.correction_method||'-'}</td><td>{r.remarks||r.remark||'-'}</td>{removable&&<td><Button size="sm" variant="outline" onClick={()=>onRemove(i)}><Trash2 className="h-4 w-4"/></Button></td>}{canManage&&<td><select className="border rounded h-9 px-2" defaultValue="" onChange={e=>{if(e.target.value)onCorrection(r,e.target.value);e.target.value=''}}><option value="">Update...</option><option value="system_corrected">System corrected</option><option value="physical_relocated">Physical relocated</option><option value="both">Both corrected</option><option value="no_action">No action</option></select></td>}</tr>)}{!rows.length&&<tr><td colSpan={17} className="text-center py-8 text-gray-500">{empty}</td></tr>}</tbody></table></div>}
+function AuditAllocationDetail({suggestion, userFilter, onFilterUser, onClose, onSend, sendBusy}){
+  const items = suggestion.items || [];
+  const grouped = {};
+  items.forEach((it)=>{
+    const id = it.mobile_user_id || 'unassigned';
+    if (!grouped[id]) grouped[id] = { mobile_user_id: id, name: it.mobile_user_name || id, task_id: it.task_id, items: [] };
+    grouped[id].items.push(it);
+    if (it.mobile_user_name) grouped[id].name = it.mobile_user_name;
+    if (it.task_id) grouped[id].task_id = it.task_id;
+  });
+  const users = Object.values(grouped);
+  const visibleItems = userFilter ? (grouped[userFilter]?.items || []) : items;
+  const showingUser = userFilter && grouped[userFilter];
+  return <div className="fixed inset-0 bg-black/50 z-50 p-4 overflow-auto"><div className="bg-white rounded-xl max-w-6xl mx-auto p-5 border shadow-lg">
+    <div className="flex justify-between mb-4"><div>
+      <h2 className="text-xl font-bold">{suggestion.audit_id || suggestion.suggestion_number}</h2>
+      <p className="text-gray-500">{suggestion.status} · {suggestion.allocation_date} · {suggestion.total_items} items</p>
+      {showingUser && <p className="text-sm mt-1">Showing {showingUser.name} · {showingUser.task_id || showingUser.mobile_user_id}</p>}
+    </div><div className="flex gap-2">{userFilter && <Button variant="outline" onClick={()=>onFilterUser('')}>All users</Button>}<Button variant="outline" onClick={onClose}><X className="h-4 w-4"/></Button>{suggestion.status==='DRAFT'&&<Button onClick={onSend} disabled={sendBusy}>Send to Mobile Users</Button>}</div></div>
+    {!userFilter && <div className="overflow-x-auto mb-4"><table className="w-full text-sm"><thead><tr>{['User','Task ID','Assigned','Completed','Pending'].map(h=><th key={h} className="text-left p-2">{h}</th>)}</tr></thead><tbody>
+      {users.map(u=>{
+        const assigned=u.items.length;
+        const completed=u.items.filter(it=>String(it.verification_status||'').toLowerCase()==='completed' || String(it.verification_status||'').toLowerCase()==='verified').length;
+        return <tr key={u.mobile_user_id} className="border-t"><td className="p-2"><button className="text-emerald-700 underline font-semibold" onClick={()=>onFilterUser(u.mobile_user_id)}>{u.name}</button><div className="text-xs text-gray-500 font-mono">{u.mobile_user_id}</div></td><td className="p-2 font-mono text-xs">{u.task_id||'-'}</td><td className="p-2">{assigned}</td><td className="p-2">{completed}</td><td className="p-2">{Math.max(0,assigned-completed)}</td></tr>;
+      })}
+      {!users.length && <tr><td colSpan={5} className="text-center py-6 text-gray-500">No user allocation yet.</td></tr>}
+    </tbody></table></div>}
+    <div className="overflow-x-auto max-h-[60vh]"><table className="w-full text-sm min-w-[1100px]"><thead><tr>{['Part','Description','Sys Qty','Location','Type','User','Task','Status','Edits'].map(h=><th key={h} className="text-left p-2 whitespace-nowrap">{h}</th>)}</tr></thead><tbody>
+      {visibleItems.map((it,i)=>(
+        <Fragment key={`${it.part_number}-${i}`}>
+        <tr className="border-t"><td className="p-2">{it.part_number}</td><td className="p-2">{it.part_name}</td><td className="p-2">{it.system_qty}</td><td className="p-2">{it.system_location}</td><td className="p-2">{it.suggestion_type}</td><td className="p-2"><button className="text-emerald-700 underline" onClick={()=>it.mobile_user_id && onFilterUser(it.mobile_user_id)}>{it.mobile_user_name||it.mobile_user_id||'-'}</button></td><td className="p-2 font-mono text-xs">{it.task_id||'-'}</td><td className="p-2">{it.verification_status||'-'}</td><td className="p-2">{it.edit_count||0}{it.quantity_edit_status?` · ${it.quantity_edit_status}`:''}</td></tr>
+        {!!(it.quantity_edit_history||[]).length && <tr><td colSpan={9} className="p-2 bg-gray-50 text-xs">Original: {it.original_physical_quantity ?? '-'} · Current: {it.physical_quantity ?? '-'}
+          <ul className="mt-1 list-disc pl-5">{it.quantity_edit_history.map((h,idx)=><li key={idx}>{h.status}: {h.previous_quantity} → {h.new_quantity} · {h.correction_reason} · {h.user_name||h.mobile_user_id} · {h.device_id||'-'} · {h.edited_at?fmt(h.edited_at):'-'}</li>)}</ul>
+        </td></tr>}
+        </Fragment>
+      ))}
+      {!visibleItems.length && <tr><td colSpan={9} className="text-center py-8 text-gray-500">No parts for this view.</td></tr>}
+    </tbody></table></div>
+  </div></div>;
+}
+function DetailTable({rows=[],removable=false,onRemove,empty='No verified items',canManage=false,onCorrection}){return <div className="overflow-x-auto"><table className="w-full text-sm min-w-[1680px]"><thead><tr>{['Part Number','Part Name','MAV','System Qty','Physical Qty','Difference','Shortage Qty','Excess Qty','Shortage Value','Excess Value','PIN Location','Status','Edits','Correction Status','Correction Method','Remarks',...(removable?['Action']:[]),...(canManage?['Correction']:[])].map(h=><th key={h} className="text-left p-3 whitespace-nowrap">{h}</th>)}</tr></thead><tbody>{rows.map((r,i)=>(
+  <Fragment key={r.id||r.part_number||i}>
+  <tr className="border-t"><td className="p-3 font-medium">{r.part_number}</td><td>{r.part_name||r.item_name||r.description||r.part_description||'-'}</td><td>{money(r.mav)}</td><td>{r.system_quantity}</td><td>{r.physical_quantity}</td><td>{r.difference}</td><td>{r.shortage_qty}</td><td>{r.excess_qty}</td><td>{money(r.shortage_value)}</td><td>{money(r.excess_value)}</td><td>{r.pin_location||r.system_location||'-'}</td><td>{r.overall_status||r.quantity_status||'-'}</td><td>{r.edit_count||0}{r.quantity_edit_status?` · ${r.quantity_edit_status}`:''}</td><td>{r.correction_status||'-'}</td><td>{r.correction_method||'-'}</td><td>{r.remarks||r.remark||'-'}</td>{removable&&<td><Button size="sm" variant="outline" onClick={()=>onRemove(i)}><Trash2 className="h-4 w-4"/></Button></td>}{canManage&&<td><select className="border rounded h-9 px-2" defaultValue="" onChange={e=>{if(e.target.value)onCorrection(r,e.target.value);e.target.value=''}}><option value="">Update...</option><option value="system_corrected">System corrected</option><option value="physical_relocated">Physical relocated</option><option value="both">Both corrected</option><option value="no_action">No action</option></select></td>}</tr>
+  {!!(r.quantity_edit_history||[]).length && <tr><td colSpan={18} className="p-3 bg-gray-50 text-xs">Original qty: {r.original_physical_quantity ?? '-'}
+    <ul className="mt-1 list-disc pl-5">{r.quantity_edit_history.map((h,idx)=><li key={idx}>{h.status}: {h.previous_quantity} → {h.new_quantity} · {h.correction_reason} · {h.user_name||h.mobile_user_id} · {h.device_id||'-'} · {h.edited_at?fmt(h.edited_at):'-'}</li>)}</ul>
+  </td></tr>}
+  </Fragment>
+))}{!rows.length&&<tr><td colSpan={18} className="text-center py-8 text-gray-500">{empty}</td></tr>}</tbody></table></div>}

@@ -47,7 +47,7 @@
 }
 
 .nmts-login-panel--split {
-  width: min(820px, 94vw);
+  width: min(1100px, 94vw);
 }
 
 .nmts-login-panel-run {
@@ -142,8 +142,8 @@
 .nmts-login-promo {
   position: relative;
   z-index: 2;
-  flex: 0 0 50%;
-  width: 50%;
+  flex: 0 0 70%;
+  width: 70%;
   min-width: 0;
   overflow: hidden;
   display: flex;
@@ -226,8 +226,8 @@
 }
 
 .nmts-login-panel--split .nmts-login-card {
-  flex: 0 0 50%;
-  width: 50%;
+  flex: 0 0 30%;
+  width: 30%;
 }
 
 .nmts-login-card-glow {

@@ -31,7 +31,7 @@ from io import BytesIO
 import qrcode
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Header, Request, UploadFile, File, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -557,6 +557,7 @@ class StockVerificationSubmit(BaseModel):
     client_id: Optional[str] = None  # offline-queue idempotency key (Part 22)
     damage_qty: Optional[float] = 0
     verification_type: Optional[str] = "physical"  # physical | auto
+    correction_reason: Optional[str] = None
     # Accepted for mobile offline-queue compatibility; backend remains session-authoritative.
     part_name: Optional[str] = None
     verification_session_id: Optional[str] = None
@@ -1559,7 +1560,57 @@ async def list_auto_suggestions(
         {"brand_name": brand_name, "dealer_name": dealer_name, "branch": branch},
         {"_id": 0, "items": 0},
     ).sort("created_at", -1).limit(min(limit, 50)).to_list(50)
-    return rows
+    from auto_perpetual_suggestions import _mobile_user_name_map
+
+    suggestion_ids = [r.get("id") for r in rows if r.get("id")]
+    numbers = [r.get("suggestion_number") for r in rows if r.get("suggestion_number")]
+    assigns = []
+    or_filters = []
+    if suggestion_ids:
+        or_filters.append({"suggestion_id": {"$in": suggestion_ids}})
+    if numbers:
+        or_filters.append({"suggestion_number": {"$in": numbers}})
+    if or_filters:
+        assigns = await db.auto_perpetual_assignments.find(
+            {"$or": or_filters} if len(or_filters) > 1 else or_filters[0],
+            {"_id": 0, "suggestion_id": 1, "suggestion_number": 1, "mobile_user_id": 1, "status": 1},
+        ).to_list(20000)
+    names = await _mobile_user_name_map(db, [a.get("mobile_user_id") for a in assigns])
+    stats: Dict[str, dict] = {}
+    for a in assigns:
+        key = a.get("suggestion_id") or a.get("suggestion_number")
+        bucket = stats.setdefault(key, {"assigned": 0, "completed": 0, "users": {}})
+        bucket["assigned"] += 1
+        if (a.get("status") or "") == "completed":
+            bucket["completed"] += 1
+        mu = a.get("mobile_user_id")
+        if mu:
+            bucket["users"][mu] = names.get(mu) or mu
+    enriched = []
+    for row in rows:
+        bucket = stats.get(row.get("id")) or stats.get(row.get("suggestion_number")) or {}
+        assigned = int(bucket.get("assigned") or row.get("assignments_created") or row.get("total_items") or 0)
+        completed = int(bucket.get("completed") or 0)
+        user_map = bucket.get("users") or {}
+        if not user_map:
+            for mu in row.get("active_user_ids") or []:
+                user_map[mu] = mu
+            if user_map:
+                extra_names = await _mobile_user_name_map(db, list(user_map.keys()))
+                user_map = {k: extra_names.get(k) or k for k in user_map}
+        status = row.get("status") or "DRAFT"
+        enriched.append({
+            **row,
+            "audit_id": row.get("suggestion_number"),
+            "assigned_count": assigned,
+            "completed_count": completed,
+            "pending_count": max(0, assigned - completed),
+            "user_count": len(user_map),
+            "user_names": [user_map[k] for k in user_map],
+            "users_label": ", ".join(user_map.values()) if user_map else "-",
+            "status": status,
+        })
+    return enriched
 
 
 @router.get("/auto-perpetual/suggestions/{suggestion_id}")
@@ -1722,7 +1773,8 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
         [row.get("part_number") for row in rows], brand_name, dealer_name, branch
     )
 
-    if allocation_date == today:
+    session_id = next((r.get("session_id") for r in rows if r.get("session_id")), None)
+    if not session_id:
         session_id = await get_or_create_auto_daily_session(
             db,
             mobile_user_id=mu,
@@ -1731,22 +1783,6 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
             branch=branch,
             device_id=session["device"]["device_id"],
         )
-        if rows:
-            await db.auto_perpetual_assignments.update_many(
-                scope_q,
-                {"$set": {"session_id": session_id}},
-            )
-    else:
-        session_id = next((r.get("session_id") for r in rows if r.get("session_id")), None)
-        if not session_id:
-            session_id = await get_or_create_auto_daily_session(
-                db,
-                mobile_user_id=mu,
-                brand_name=brand_name,
-                dealer_name=dealer_name,
-                branch=branch,
-                device_id=session["device"]["device_id"],
-            )
 
     assigned = await db.auto_perpetual_assignments.count_documents(scope_q)
     completed = await db.auto_perpetual_assignments.count_documents({**scope_q, "status": "completed"})
@@ -1810,17 +1846,17 @@ async def auto_perpetual_session_today(session=Depends(get_device_session)):
         dealer_name=dealer_name,
         branch=branch,
     )
-    if allocation_date and allocation_date != today:
-        row = await db.auto_perpetual_assignments.find_one(
-            {
-                "allocation_date": allocation_date,
-                "mobile_user_id": mu,
-                "status": "pending",
-            },
-            {"_id": 0, "session_id": 1},
-        )
-        if row and row.get("session_id"):
-            return {"session_id": row["session_id"], "allocation_date": allocation_date}
+    row = await db.auto_perpetual_assignments.find_one(
+        {
+            "allocation_date": allocation_date or today,
+            "mobile_user_id": mu,
+            "session_id": {"$exists": True, "$nin": [None, ""]},
+        },
+        {"_id": 0, "session_id": 1},
+        sort=[("assigned_at", -1)],
+    )
+    if row and row.get("session_id"):
+        return {"session_id": row["session_id"], "allocation_date": allocation_date or today}
     session_id = await get_or_create_auto_daily_session(
         db,
         mobile_user_id=mu,
@@ -3462,20 +3498,32 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
 
     assignment = None
     coverage_kind = "monthly"
+    part_key = str(clean_part).strip().upper()
     if vtype == "auto":
-        from auto_perpetual import ist_date_key
-
         assignment = await db.auto_perpetual_assignments.find_one(
             {
-                "allocation_date": ist_date_key(),
                 "mobile_user_id": mobile_user_id,
-                "part_number": str(clean_part).strip().upper(),
+                "part_number": part_key,
                 "status": "pending",
+                "branch": session["branch"],
             },
             {"_id": 0},
+            sort=[("allocation_date", -1)],
         )
+        if not assignment:
+            assignment = await db.auto_perpetual_assignments.find_one(
+                {
+                    "mobile_user_id": mobile_user_id,
+                    "part_number": part_key,
+                    "branch": session["branch"],
+                },
+                {"_id": 0},
+                sort=[("allocation_date", -1)],
+            )
         if assignment:
             coverage_kind = assignment.get("coverage_kind") or "monthly"
+            if assignment.get("session_id"):
+                session_id = assignment["session_id"]
     system_qty = _mobile_stock_qty(system_record)
     difference = physical_qty - system_qty
     part_found = bool(system_record)
@@ -3499,6 +3547,82 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
         mav = 0.0
     shortage_qty = abs(difference) if difference < 0 else 0.0
     excess_qty = difference if difference > 0 else 0.0
+
+    if vtype == "auto":
+        existing_auto = await db.stock_verification_history.find_one(
+            {
+                "verification_type": "auto",
+                "mobile_user_id": mobile_user_id,
+                "part_number": part_key,
+                "branch": session["branch"],
+            },
+            {"_id": 0},
+            sort=[("verified_at", -1)],
+        )
+        if existing_auto:
+            prev_qty = float(existing_auto.get("physical_quantity") or 0)
+            if abs(prev_qty - physical_qty) < 1e-9:
+                await _mirror_mobile_verification_to_web(existing_auto)
+                return {
+                    "success": True, "message": "Verification recorded", "id": existing_auto["id"],
+                    "verification_id": existing_auto["id"], "duplicate": True,
+                    "session_id": existing_auto.get("session_id") or session_id,
+                    "system_qty": existing_auto.get("system_quantity", 0),
+                    "physical_qty": existing_auto.get("physical_quantity", 0),
+                    "difference_qty": existing_auto.get("difference", 0),
+                    "verification_status": existing_auto.get("verification_status") or existing_auto.get("quantity_status"),
+                    "part_found_in_system": existing_auto.get("part_found_in_system", False),
+                }
+            reason = str(payload.correction_reason or "").strip()
+            if not reason:
+                raise HTTPException(400, "Correction reason is required to change physical quantity")
+            original = existing_auto.get("original_physical_quantity")
+            if original is None:
+                original = prev_qty
+            history = list(existing_auto.get("quantity_edit_history") or [])
+            edit_count = int(existing_auto.get("edit_count") or 0) + 1
+            edit_status = "Edited" if edit_count == 1 else "Re-edited"
+            history.append(
+                {
+                    "previous_quantity": prev_qty,
+                    "new_quantity": physical_qty,
+                    "correction_reason": reason,
+                    "user_name": session["mobile_user"]["name"],
+                    "mobile_user_id": mobile_user_id,
+                    "device_id": device_id,
+                    "edited_at": now,
+                    "status": edit_status,
+                }
+            )
+            update = {
+                "physical_quantity": physical_qty,
+                "difference": difference,
+                "shortage_qty": shortage_qty,
+                "excess_qty": excess_qty,
+                "shortage_value": shortage_qty * mav,
+                "excess_value": excess_qty * mav,
+                "quantity_status": quantity_status,
+                "verification_status": verification_status,
+                "overall_status": overall_status,
+                "original_physical_quantity": original,
+                "quantity_edit_history": history,
+                "edit_count": edit_count,
+                "quantity_edit_status": edit_status,
+                "correction_reason": reason,
+                "updated_at": now,
+            }
+            await db.stock_verification_history.update_one({"id": existing_auto["id"]}, {"$set": update})
+            updated = {**existing_auto, **update}
+            await _mirror_mobile_verification_to_web(updated)
+            return {
+                "success": True, "message": "Verification updated", "id": existing_auto["id"],
+                "verification_id": existing_auto["id"], "duplicate": False, "edited": True,
+                "session_id": existing_auto.get("session_id") or session_id,
+                "system_qty": system_qty, "physical_qty": physical_qty,
+                "difference_qty": difference, "verification_status": verification_status,
+                "part_found_in_system": part_found,
+                "edit_count": edit_count,
+            }
 
     doc = {
         "id": str(uuid.uuid4()), "session_id": session_id, "client_id": payload.client_id,
@@ -3529,6 +3653,12 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
         "suggestion_number": (assignment or {}).get("suggestion_number"),
         "batch_no": (assignment or {}).get("batch_no"),
         "suggestion_type": (assignment or {}).get("suggestion_type"),
+        "task_id": (assignment or {}).get("task_id"),
+        "audit_id": (assignment or {}).get("audit_id") or (assignment or {}).get("suggestion_number"),
+        "original_physical_quantity": physical_qty,
+        "quantity_edit_history": [],
+        "edit_count": 0,
+        "quantity_edit_status": "",
         "qty_result": quantity_status.upper(),
         "location_result": "LOCATION MATCHED" if location_status == "matched" else "LOCATION MISMATCH",
         "final_result": overall_status.upper().replace("_", " "),
@@ -3594,12 +3724,11 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
             },
         )
     if vtype == "auto":
+        assign_q = {"mobile_user_id": mobile_user_id, "part_number": part_key, "branch": session["branch"]}
+        if assignment and assignment.get("id"):
+            assign_q = {"id": assignment["id"]}
         await db.auto_perpetual_assignments.update_many(
-            {
-                "allocation_date": ist_date_key(),
-                "mobile_user_id": mobile_user_id,
-                "part_number": part_key,
-            },
+            assign_q,
             {"$set": {"status": "completed", "completed_at": now, "verified_by_mobile_user_id": mobile_user_id}},
         )
         sid = (assignment or {}).get("suggestion_id")
@@ -3607,10 +3736,8 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
             from auto_perpetual_suggestions import refresh_suggestion_status
 
             await refresh_suggestion_status(db, sid)
-        # Mark work started, but get_or_create_auto_daily_session must still
-        # reuse this same session_id for every later part on the IST day.
         await db.stock_verification_sessions.update_one(
-            {"session_id": session_id},
+            {"session_id": session_id, "status": {"$nin": ["CLOSED", "COMPLETED"]}},
             {"$set": {"status": "IN_PROGRESS", "updated_at": now}},
         )
         await db.stock_verification_history.update_one(

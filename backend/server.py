@@ -7723,6 +7723,8 @@ class StockVerificationCorrection(BaseModel):
     correction_status: str = "pending"  # pending, corrected, not_required
     correction_method: str = ""  # system_corrected, physical_relocated, both, no_action
     correction_remarks: str = ""
+    physical_quantity: Optional[float] = None
+    correction_reason: Optional[str] = None
 
 
 def _mobile_dashboard_scope_query(
@@ -8371,7 +8373,59 @@ async def update_stock_verification_correction(
         "correction_updated_by_name": current_user.username,
         "correction_updated_at": datetime.now(timezone.utc),
     }
+    if payload.physical_quantity is not None:
+        try:
+            new_qty = float(payload.physical_quantity)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Physical quantity must be a valid number")
+        prev_qty = float(record.get("physical_quantity") or 0)
+        if abs(prev_qty - new_qty) > 1e-9:
+            reason = (payload.correction_reason or payload.correction_remarks or "").strip()
+            if not reason:
+                raise HTTPException(status_code=400, detail="Correction reason is required to change physical quantity")
+            original = record.get("original_physical_quantity")
+            if original is None:
+                original = prev_qty
+            history = list(record.get("quantity_edit_history") or [])
+            edit_count = int(record.get("edit_count") or 0) + 1
+            edit_status = "Edited" if edit_count == 1 else "Re-edited"
+            history.append(
+                {
+                    "previous_quantity": prev_qty,
+                    "new_quantity": new_qty,
+                    "correction_reason": reason,
+                    "user_name": current_user.username,
+                    "mobile_user_id": record.get("mobile_user_id") or current_user.id,
+                    "device_id": record.get("device_id") or "",
+                    "edited_at": datetime.now(timezone.utc),
+                    "status": edit_status,
+                }
+            )
+            system_qty = float(record.get("system_quantity") or 0)
+            difference = new_qty - system_qty
+            mav = float(record.get("mav") or 0)
+            shortage_qty = abs(difference) if difference < 0 else 0.0
+            excess_qty = difference if difference > 0 else 0.0
+            update.update(
+                {
+                    "physical_quantity": new_qty,
+                    "difference": difference,
+                    "shortage_qty": shortage_qty,
+                    "excess_qty": excess_qty,
+                    "shortage_value": shortage_qty * mav,
+                    "excess_value": excess_qty * mav,
+                    "quantity_status": "matched" if difference == 0 else ("shortage" if difference < 0 else "excess"),
+                    "original_physical_quantity": original,
+                    "quantity_edit_history": history,
+                    "edit_count": edit_count,
+                    "quantity_edit_status": edit_status,
+                    "correction_reason": reason,
+                }
+            )
     await db.stock_verifications.update_one({"id": verification_id}, {"$set": update})
+    history_id = record.get("id")
+    if history_id:
+        await db.stock_verification_history.update_one({"id": history_id}, {"$set": update})
     return await db.stock_verifications.find_one({"id": verification_id}, {"_id": 0})
 
 

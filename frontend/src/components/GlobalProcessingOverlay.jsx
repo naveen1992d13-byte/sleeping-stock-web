@@ -35,13 +35,24 @@ export function ProcessingProvider({ children }) {
   const showTimer = useRef(null);
   const originalFetch = useRef(null);
 
-  const begin = useCallback((copy = {}, immediate = false) => {
+  const overlayWatchdog = useRef(null);
+
+  const begin = useCallback((copy = {}, immediate = false, timeoutMs = 0) => {
     activeCount.current += 1;
     const show = () => setState({ visible: true, progress: null, ...copy });
     if (immediate) show();
     else {
       clearTimeout(showTimer.current);
       showTimer.current = setTimeout(show, 220);
+    }
+    const wait = Number(timeoutMs || 0);
+    if (wait > 0) {
+      clearTimeout(overlayWatchdog.current);
+      overlayWatchdog.current = setTimeout(() => {
+        activeCount.current = 0;
+        clearTimeout(showTimer.current);
+        setState(DEFAULT_STATE);
+      }, wait);
     }
   }, []);
 
@@ -53,6 +64,7 @@ export function ProcessingProvider({ children }) {
     activeCount.current = Math.max(0, activeCount.current - 1);
     if (activeCount.current === 0) {
       clearTimeout(showTimer.current);
+      clearTimeout(overlayWatchdog.current);
       setState(DEFAULT_STATE);
     }
   }, []);
@@ -71,7 +83,8 @@ export function ProcessingProvider({ children }) {
         config.timeout = 90000;
       }
       const copy = operationCopy(config);
-      begin(copy);
+      const overlayTimeout = Number(config.timeout || 0) || (url.includes('/auto-perpetual/generate') ? 90000 : 60000);
+      begin(copy, false, overlayTimeout + 4000);
       config.__nmtsGlobalProcessing = true;
 
       const existingDownload = config.onDownloadProgress;
@@ -87,7 +100,11 @@ export function ProcessingProvider({ children }) {
 
     const responseId = axios.interceptors.response.use(
       (response) => { if (response?.config?.__nmtsGlobalProcessing) end(); return response; },
-      (error) => { if (error?.config?.__nmtsGlobalProcessing) end(); return Promise.reject(error); }
+      (error) => {
+        if (error?.config?.__nmtsGlobalProcessing) end();
+        else if (error?.code === 'ECONNABORTED' || /timeout/i.test(String(error?.message || ''))) end();
+        return Promise.reject(error);
+      }
     );
 
     originalFetch.current = window.fetch.bind(window);
@@ -104,6 +121,7 @@ export function ProcessingProvider({ children }) {
       axios.interceptors.response.eject(responseId);
       if (originalFetch.current) window.fetch = originalFetch.current;
       clearTimeout(showTimer.current);
+      clearTimeout(overlayWatchdog.current);
     };
   }, [begin, end, update]);
 

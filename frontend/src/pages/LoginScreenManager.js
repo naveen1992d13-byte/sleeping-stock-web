@@ -221,11 +221,17 @@ export function LoginScreenManager() {
               <p className="lsm-empty">No Scheduled Media.</p>
             )}
           </div>
-          <label className="lsm-field">Start Date/Time (IST)
-            <input className="lsm-input" type="datetime-local" value={startAt} onChange={(e) => setStartAt(e.target.value)} />
+          <label className="lsm-field">Start Date (IST)
+            <input className="lsm-input" type="date" value={(startAt.split('T')[0] || '')} onChange={(e) => setStartAt(`${e.target.value}T${(startAt.split('T')[1] || '00:00').slice(0,5)}`)} />
           </label>
-          <label className="lsm-field">End Date/Time (IST)
-            <input className="lsm-input" type="datetime-local" value={endAt} onChange={(e) => setEndAt(e.target.value)} />
+          <label className="lsm-field">Start Time (IST)
+            <input className="lsm-input" type="time" value={(startAt.split('T')[1] || '').slice(0,5)} onChange={(e) => setStartAt(`${startAt.split('T')[0] || ''}T${e.target.value}`)} />
+          </label>
+          <label className="lsm-field">End Date (IST)
+            <input className="lsm-input" type="date" value={(endAt.split('T')[0] || '')} onChange={(e) => setEndAt(`${e.target.value}T${(endAt.split('T')[1] || '00:00').slice(0,5)}`)} />
+          </label>
+          <label className="lsm-field">End Time (IST)
+            <input className="lsm-input" type="time" value={(endAt.split('T')[1] || '').slice(0,5)} onChange={(e) => setEndAt(`${endAt.split('T')[0] || ''}T${e.target.value}`)} />
           </label>
           <label className="lsm-file" data-busy={busy ? 'true' : 'false'}>
             <span className="nmts-btn-primary lsm-file-btn">{busy ? 'Uploading…' : 'Upload Scheduled Media'}</span>

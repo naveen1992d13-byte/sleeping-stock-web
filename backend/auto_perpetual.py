@@ -157,6 +157,13 @@ def yymmdd_key(dt: Optional[datetime] = None) -> str:
     return (dt or _ist_now()).strftime("%y%m%d")
 
 
+def yyyymmdd_key(dt: Optional[datetime] = None) -> str:
+    return (dt or _ist_now()).strftime("%Y%m%d")
+
+
+PARENT_AUDIT_USER_ID = "__AUDIT_PARENT__"
+
+
 def branch_code(branch_name: str) -> str:
     letters = re.sub(r"[^A-Za-z0-9]", "", (branch_name or "").upper())
     code = (letters[:3] or "GEN").ljust(3, "X")
@@ -286,6 +293,135 @@ async def get_or_create_auto_daily_session(
             return raced["session_id"]
         raise
     return session_id
+
+
+async def get_or_create_auto_parent_session(
+    db,
+    *,
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    audit_id: str,
+    suggestion_id: str,
+) -> str:
+    """One parent Auto Perpetual session per Branch + IST date. session_id is the Audit ID."""
+    verification_date = ist_date_key()
+    day_scope = {
+        "session_kind": "auto_perpetual",
+        "verification_date": verification_date,
+        "mobile_user_id": PARENT_AUDIT_USER_ID,
+        "brand_id": brand_name,
+        "dealer_id": dealer_name,
+        "branch_id": branch,
+    }
+    existing = await db.stock_verification_sessions.find_one(
+        day_scope,
+        {"_id": 0, "session_id": 1, "status": 1},
+        sort=[("created_at", 1)],
+    )
+    now = _now()
+    if existing and existing.get("session_id"):
+        await db.stock_verification_sessions.update_one(
+            {"session_id": existing["session_id"]},
+            {
+                "$set": {
+                    "updated_at": now,
+                    "suggestion_id": suggestion_id,
+                    "suggestion_number": audit_id,
+                    "audit_id": audit_id,
+                    "is_parent_audit": True,
+                    "status": existing.get("status") if existing.get("status") not in (None, "", "CLOSED") else "SENT",
+                }
+            },
+        )
+        return existing["session_id"]
+
+    session_doc = {
+        "id": str(uuid.uuid4()),
+        "session_id": audit_id,
+        "session_kind": "auto_perpetual",
+        "verification_type": "auto",
+        "verification_date": verification_date,
+        "mobile_user_id": PARENT_AUDIT_USER_ID,
+        "brand_id": brand_name,
+        "dealer_id": dealer_name,
+        "branch_id": branch,
+        "brand_name": brand_name,
+        "dealer_name": dealer_name,
+        "branch": branch,
+        "status": "SENT",
+        "total_items": 0,
+        "source": "AUTO_PERPETUAL",
+        "information_only": True,
+        "affects_stock": False,
+        "is_parent_audit": True,
+        "suggestion_id": suggestion_id,
+        "suggestion_number": audit_id,
+        "audit_id": audit_id,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        await db.stock_verification_sessions.insert_one(session_doc)
+        return audit_id
+    except DuplicateKeyError:
+        raced = await db.stock_verification_sessions.find_one(
+            day_scope,
+            {"_id": 0, "session_id": 1},
+            sort=[("created_at", 1)],
+        )
+        if raced and raced.get("session_id"):
+            return raced["session_id"]
+        by_id = await db.stock_verification_sessions.find_one(
+            {"session_id": audit_id}, {"_id": 0, "session_id": 1}
+        )
+        if by_id and by_id.get("session_id"):
+            return by_id["session_id"]
+        raise
+
+
+async def close_stale_auto_parent_sessions(
+    db,
+    *,
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    keep_session_id: str,
+) -> None:
+    """Close leftover parent Auto sessions that have no pending assignments."""
+    today = ist_date_key()
+    stale = await db.stock_verification_sessions.find(
+        {
+            "session_kind": "auto_perpetual",
+            "is_parent_audit": True,
+            "brand_id": brand_name,
+            "dealer_id": dealer_name,
+            "branch_id": branch,
+            "session_id": {"$ne": keep_session_id},
+            "status": {"$nin": ["CLOSED"]},
+        },
+        {"_id": 0, "session_id": 1, "verification_date": 1},
+    ).to_list(200)
+    now = _now()
+    for row in stale:
+        sid = row.get("session_id")
+        if not sid:
+            continue
+        pending = await db.auto_perpetual_assignments.count_documents(
+            {"session_id": sid, "status": "pending"}
+        )
+        if pending:
+            continue
+        if (row.get("verification_date") or "") >= today and sid == keep_session_id:
+            continue
+        await db.stock_verification_sessions.update_one(
+            {"session_id": sid},
+            {"$set": {"status": "CLOSED", "closed_at": now, "updated_at": now}},
+        )
+        await db.auto_perpetual_suggestions.update_one(
+            {"suggestion_number": sid, "status": {"$in": ["COMPLETED", "SENT"]}},
+            {"$set": {"status": "CLOSED", "closed_at": now}},
+        )
 
 
 def _working_days_left_in_month(dt: datetime) -> int:

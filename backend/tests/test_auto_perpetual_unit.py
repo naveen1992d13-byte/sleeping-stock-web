@@ -106,6 +106,8 @@ class FakeDB:
         self.products = FakeCollection(products)
         self.auto_perpetual_assignments = FakeCollection(assignments)
         self.auto_perpetual_suggestions = FakeCollection(suggestions)
+        self.mobile_users = FakeCollection([])
+        self.stock_verification_history = FakeCollection([])
 
 
 def _match(row, query):
@@ -212,3 +214,35 @@ def test_natural_sort_accepts_numeric_locations():
 
     assert isinstance(_natural_sort_key(12), tuple)
     assert isinstance(_natural_sort_key("A-01"), tuple)
+
+
+def test_audit_id_has_no_hyphen():
+    from auto_perpetual_suggestions import _prefix_audit_id
+
+    assert _prefix_audit_id("APSVAN20261013001") == "APSVAN20261013001" or _prefix_audit_id("APSVAN20261013001").startswith("TS")
+    assert "-" not in _prefix_audit_id("APSVAN20261013001")
+
+
+def test_allocate_contiguous_equal_blocks():
+    from auto_perpetual_suggestions import allocate_contiguous_location_blocks
+
+    items = [{"part_number": str(i), "loc": f"{i:02d}"} for i in range(1, 61)]
+    blocks = allocate_contiguous_location_blocks(items, ["u1", "u2", "u3"])
+    assert [len(blocks[u]) for u in ("u1", "u2", "u3")] == [20, 20, 20]
+    assert [r["part_number"] for r in blocks["u1"]] == [str(i) for i in range(1, 21)]
+    assert [r["part_number"] for r in blocks["u2"]] == [str(i) for i in range(21, 41)]
+    assert [r["part_number"] for r in blocks["u3"]] == [str(i) for i in range(41, 61)]
+
+
+def test_allocate_keeps_location_row_together():
+    from auto_perpetual_suggestions import allocate_contiguous_location_blocks
+
+    items = (
+        [{"part_number": f"A{i}", "loc": "A-01-B01"} for i in range(8)]
+        + [{"part_number": f"B{i}", "loc": "A-02-B01"} for i in range(8)]
+        + [{"part_number": f"C{i}", "loc": "A-03-B01"} for i in range(8)]
+    )
+    blocks = allocate_contiguous_location_blocks(items, ["u1", "u2", "u3"])
+    assert {r["part_number"][:1] for r in blocks["u1"]} == {"A"}
+    assert {r["part_number"][:1] for r in blocks["u2"]} == {"B"}
+    assert {r["part_number"][:1] for r in blocks["u3"]} == {"C"}
