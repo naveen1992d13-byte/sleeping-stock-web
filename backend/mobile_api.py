@@ -52,6 +52,12 @@ from auto_perpetual_blind import (
     public_auto_task,
     quantities_equal,
 )
+from auto_perpetual_sessions import (
+    TODAY_SESSION_NOT_CREATED,
+    filter_session_tasks,
+    session_task_flags,
+    summarize_auto_sessions,
+)
 
 logger = logging.getLogger("nmts.mobile")
 
@@ -592,11 +598,13 @@ class AutoCountSaveRequest(BaseModel):
     correction_reason: Optional[str] = None
     client_id: Optional[str] = None
     entry_method: Optional[str] = "MANUAL"
+    session_id: Optional[str] = None  # original session; omitted by old APKs
 
 
 class AutoFinalizeRequest(BaseModel):
     part_numbers: Optional[List[str]] = None
     client_id: Optional[str] = None
+    session_id: Optional[str] = None  # original session; omitted by old APKs
 
 
 class StockVerificationBatchSubmit(BaseModel):
@@ -1760,83 +1768,62 @@ async def _pending_auto_assignment_rows(scope_q: dict, brand_name: str, dealer_n
     return rows, matched
 
 
-@router.get("/auto-perpetual/tasks")
-async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
-    from auto_perpetual import (
-        get_or_create_auto_daily_session,
-        ist_date_key,
-        resolve_pending_auto_assignment_date,
-    )
-
-    mu = session["mobile_user"]["mobile_user_id"]
-    brand_name = session["brand_name"]
-    dealer_name = session["dealer_name"]
-    branch = session["branch"]
-    today = ist_date_key()
-    allocation_date = await resolve_pending_auto_assignment_date(
-        db,
-        mobile_user_id=mu,
-        brand_name=brand_name,
-        dealer_name=dealer_name,
-        branch=branch,
-    )
-    if not allocation_date:
-        session_id = await get_or_create_auto_daily_session(
-            db,
-            mobile_user_id=mu,
-            brand_name=brand_name,
-            dealer_name=dealer_name,
-            branch=branch,
-            device_id=session["device"]["device_id"],
-        )
-        return {
-            "tasks": [],
-            "count": 0,
-            "session_id": session_id,
-            "allocation_date": today,
-            "assigned_count": 0,
-            "completed_count": 0,
-        }
-
-    scope_q = {
-        "allocation_date": allocation_date,
-        "mobile_user_id": mu,
-        "brand_name": brand_name,
-        "dealer_name": dealer_name,
-        "branch": branch,
+async def _auto_assignment_rows(
+    scope_q: dict,
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    *,
+    pending_only: bool = False,
+    limit: int = 2000,
+):
+    query = dict(scope_q)
+    if pending_only:
+        query["status"] = "pending"
+    rows = await db.auto_perpetual_assignments.find(query, {"_id": 0}).to_list(limit)
+    if rows:
+        return rows, query
+    loose_q = {
+        "mobile_user_id": scope_q.get("mobile_user_id"),
+        "brand_name": {"$regex": f"^{re.escape(str(brand_name or ''))}$", "$options": "i"},
+        "dealer_name": {"$regex": f"^{re.escape(str(dealer_name or ''))}$", "$options": "i"},
+        "branch": {"$regex": f"^{re.escape(str(branch or ''))}$", "$options": "i"},
     }
-    rows, scope_q = await _pending_auto_assignment_rows(scope_q, brand_name, dealer_name, branch)
-    rows.sort(key=lambda r: str(r.get("loc") or r.get("part_number") or "").upper())
-    products_by_part = await _scoped_products_by_part(
-        [row.get("part_number") for row in rows], brand_name, dealer_name, branch
-    )
+    if scope_q.get("allocation_date"):
+        loose_q["allocation_date"] = scope_q.get("allocation_date")
+    if scope_q.get("session_id"):
+        loose_q["session_id"] = scope_q.get("session_id")
+    if pending_only:
+        loose_q["status"] = "pending"
+    rows = await db.auto_perpetual_assignments.find(loose_q, {"_id": 0}).to_list(limit)
+    if not rows:
+        return [], query
+    matched = {
+        "mobile_user_id": scope_q.get("mobile_user_id"),
+        "brand_name": rows[0].get("brand_name"),
+        "dealer_name": rows[0].get("dealer_name"),
+        "branch": rows[0].get("branch"),
+    }
+    if scope_q.get("allocation_date"):
+        matched["allocation_date"] = scope_q.get("allocation_date")
+    if scope_q.get("session_id"):
+        matched["session_id"] = scope_q.get("session_id")
+    return rows, matched
 
-    session_id = next((r.get("session_id") for r in rows if r.get("session_id")), None)
-    if not session_id:
-        session_id = await get_or_create_auto_daily_session(
-            db,
-            mobile_user_id=mu,
-            brand_name=brand_name,
-            dealer_name=dealer_name,
-            branch=branch,
-            device_id=session["device"]["device_id"],
-        )
 
-    assigned = await db.auto_perpetual_assignments.count_documents(scope_q)
-    completed = await db.auto_perpetual_assignments.count_documents({**scope_q, "status": "completed"})
-    part_keys = [_normalize_part_number(row.get("part_number", "")) for row in rows]
-    part_keys = [key for key in part_keys if key]
-    hist_rows = []
-    if part_keys:
-        hist_rows = await db.stock_verification_history.find(
-            {
-                "verification_type": {"$in": ["auto", "recheck"]},
-                "mobile_user_id": mu,
-                "branch": branch,
-                "part_number": {"$in": part_keys},
-            },
-            {"_id": 0},
-        ).to_list(max(len(part_keys) * 3, 50))
+async def _auto_history_by_part(mobile_user_id: str, branch: str, part_keys, session_id: Optional[str] = None):
+    keys = [key for key in part_keys if key]
+    if not keys:
+        return {}
+    query = {
+        "verification_type": {"$in": ["auto", "recheck"]},
+        "mobile_user_id": mobile_user_id,
+        "branch": branch,
+        "part_number": {"$in": keys},
+    }
+    if session_id:
+        query["session_id"] = session_id
+    hist_rows = await db.stock_verification_history.find(query, {"_id": 0}).to_list(max(len(keys) * 3, 50))
     hist_by_part = {}
     for hist in hist_rows:
         key = _normalize_part_number(hist.get("part_number", ""))
@@ -1845,6 +1832,16 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
             previous.get("verified_at") or previous.get("updated_at") or ""
         ):
             hist_by_part[key] = hist
+    return hist_by_part
+
+
+async def _enrich_auto_tasks(rows, *, session_id, brand_name, dealer_name, branch, mobile_user_id):
+    products_by_part = await _scoped_products_by_part(
+        [row.get("part_number") for row in rows], brand_name, dealer_name, branch
+    )
+    part_keys = [_normalize_part_number(row.get("part_number", "")) for row in rows]
+    hist_by_part = await _auto_history_by_part(mobile_user_id, branch, part_keys, session_id=session_id)
+    live_qty_by_part = {}
     enriched = []
     for row in rows:
         part_key = _normalize_part_number(row.get("part_number", ""))
@@ -1852,23 +1849,157 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
         loc = row.get("loc")
         if loc is None or loc == "":
             loc = _product_pin_location(product or {})
+        live_qty = _mobile_stock_qty(product)
+        live_qty_by_part[part_key] = live_qty
+        # Live qty (including zero) is used after first Save. Pre-Save public_auto_task omits it.
         enriched.append(
             public_auto_task(
                 row,
                 loc=loc,
-                session_id=session_id,
+                session_id=session_id or row.get("session_id"),
                 part_name=resolve_product_part_name(product or {}),
-                system_qty=_mobile_stock_qty(product),
+                system_qty=live_qty,
                 history=hist_by_part.get(part_key),
             )
         )
+    return enriched, live_qty_by_part
+
+
+def _empty_today_tasks(today: str) -> dict:
+    return {
+        "tasks": [],
+        "count": 0,
+        "session_id": None,
+        "allocation_date": today,
+        "today": today,
+        "today_created": False,
+        "is_today": True,
+        "editable": False,
+        "read_only": True,
+        "reaudit": False,
+        "mode": "view",
+        "assigned_count": 0,
+        "completed_count": 0,
+        "message": TODAY_SESSION_NOT_CREATED,
+    }
+
+
+@router.get("/auto-perpetual/tasks")
+async def auto_perpetual_tasks_device(
+    session=Depends(get_device_session),
+    session_id: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+):
+    """Return Auto Perpetual parts for one session.
+
+    Default (no session_id): IST-today pending tasks only. Never falls back to
+    yesterday's pending allocation. Extra fields are additive for old APKs.
+    mode=view: all parts for the session (read-only when not today).
+    mode=reaudit: pending parts only, editable, linked to the original session.
+    """
+    from auto_perpetual import ist_date_key
+
+    mu = session["mobile_user"]["mobile_user_id"]
+    brand_name = session["brand_name"]
+    dealer_name = session["dealer_name"]
+    branch = session["branch"]
+    today = ist_date_key()
+    wanted_mode = str(mode or "view").strip().lower()
+    if wanted_mode not in ("view", "reaudit"):
+        wanted_mode = "view"
+    requested_session = str(session_id or "").strip() or None
+
+    scope_q = {
+        "mobile_user_id": mu,
+        "brand_name": brand_name,
+        "dealer_name": dealer_name,
+        "branch": branch,
+    }
+    if requested_session:
+        scope_q["session_id"] = requested_session
+    else:
+        scope_q["allocation_date"] = today
+
+    pending_only = (not requested_session) or wanted_mode == "reaudit"
+    rows, matched_q = await _auto_assignment_rows(
+        scope_q, brand_name, dealer_name, branch, pending_only=False
+    )
+    if not rows:
+        payload = _empty_today_tasks(today)
+        if requested_session:
+            payload.update({
+                "session_id": requested_session,
+                "today_created": False,
+                "is_today": False,
+                "message": "Session not found",
+            })
+        return payload
+
+    allocation_date = next((str(r.get("allocation_date") or "") for r in rows if r.get("allocation_date")), today)
+    resolved_session = requested_session or next((r.get("session_id") for r in rows if r.get("session_id")), None)
+    flags = session_task_flags(allocation_date=allocation_date, mode=wanted_mode, today=today)
+    if not requested_session:
+        flags = session_task_flags(allocation_date=today, mode="view", today=today)
+        allocation_date = today
+        rows = [r for r in rows if str(r.get("allocation_date") or "") == today]
+        if not rows:
+            return _empty_today_tasks(today)
+        pending_only = True
+
+    live_qty_by_part = {}
+    products_preview = await _scoped_products_by_part(
+        [row.get("part_number") for row in rows], brand_name, dealer_name, branch
+    )
+    for row in rows:
+        key = _normalize_part_number(row.get("part_number", ""))
+        live_qty_by_part[key] = _mobile_stock_qty(products_preview.get(key))
+
+    selected = filter_session_tasks(
+        rows,
+        mode="reaudit" if flags["reaudit"] or pending_only else "view",
+        include_zero_live=True,
+        live_qty_by_part=live_qty_by_part,
+    )
+    if pending_only and not flags["reaudit"]:
+        selected = [row for row in selected if str(row.get("status") or "").lower() not in ("completed", "verified")]
+    selected.sort(key=lambda r: str(r.get("loc") or r.get("part_number") or "").upper())
+
+    assigned = await db.auto_perpetual_assignments.count_documents(matched_q if requested_session else {**matched_q, "allocation_date": today})
+    completed = await db.auto_perpetual_assignments.count_documents(
+        {**(matched_q if requested_session else {**matched_q, "allocation_date": today}), "status": "completed"}
+    )
+    enriched, _ = await _enrich_auto_tasks(
+        selected,
+        session_id=resolved_session,
+        brand_name=brand_name,
+        dealer_name=dealer_name,
+        branch=branch,
+        mobile_user_id=mu,
+    )
+    for task in enriched:
+        task["editable"] = flags["editable"]
+        task["read_only"] = flags["read_only"]
+        task["reaudit"] = flags["reaudit"]
+        # Double-check restricted fields stay omitted until first Save.
+        if not task.get("count_saved"):
+            for key in ("system_qty", "difference", "quantity_status", "shortage_qty", "excess_qty"):
+                task.pop(key, None)
+
     return {
         "tasks": enriched,
         "count": len(enriched),
-        "session_id": session_id,
+        "session_id": resolved_session,
         "allocation_date": allocation_date,
+        "today": today,
+        "today_created": allocation_date == today,
+        "is_today": flags["is_today"],
+        "editable": flags["editable"],
+        "read_only": flags["read_only"],
+        "reaudit": flags["reaudit"],
+        "mode": flags["mode"],
         "assigned_count": assigned,
         "completed_count": completed,
+        "message": None if (allocation_date == today or requested_session) else TODAY_SESSION_NOT_CREATED,
     }
 
 
@@ -1887,44 +2018,72 @@ async def finish_auto_perpetual_session(session=Depends(get_device_session)):
 
 @router.get("/auto-perpetual/session/today")
 async def auto_perpetual_session_today(session=Depends(get_device_session)):
-    from auto_perpetual import (
-        get_or_create_auto_daily_session,
-        ist_date_key,
-        resolve_pending_auto_assignment_date,
-    )
+    """IST-today session only. Never returns yesterday's pending allocation as today.
+
+    Additive fields keep old APKs working when session_id is null.
+    """
+    from auto_perpetual import ist_date_key
 
     mu = session["mobile_user"]["mobile_user_id"]
     brand_name = session["brand_name"]
     dealer_name = session["dealer_name"]
     branch = session["branch"]
     today = ist_date_key()
-    allocation_date = await resolve_pending_auto_assignment_date(
-        db,
-        mobile_user_id=mu,
-        brand_name=brand_name,
-        dealer_name=dealer_name,
-        branch=branch,
-    )
-    row = await db.auto_perpetual_assignments.find_one(
+    rows, matched = await _auto_assignment_rows(
         {
-            "allocation_date": allocation_date or today,
+            "allocation_date": today,
             "mobile_user_id": mu,
-            "session_id": {"$exists": True, "$nin": [None, ""]},
+            "brand_name": brand_name,
+            "dealer_name": dealer_name,
+            "branch": branch,
         },
-        {"_id": 0, "session_id": 1},
-        sort=[("assigned_at", -1)],
+        brand_name,
+        dealer_name,
+        branch,
+        pending_only=False,
     )
-    if row and row.get("session_id"):
-        return {"session_id": row["session_id"], "allocation_date": allocation_date or today}
-    session_id = await get_or_create_auto_daily_session(
-        db,
-        mobile_user_id=mu,
-        brand_name=brand_name,
-        dealer_name=dealer_name,
-        branch=branch,
-        device_id=session["device"]["device_id"],
+    assigned = len(rows)
+    completed = sum(1 for row in rows if str(row.get("status") or "").lower() in ("completed", "verified"))
+    pending = assigned - completed
+    session_id = next((row.get("session_id") for row in rows if row.get("session_id")), None)
+    created = bool(rows)
+    return {
+        "session_id": session_id,
+        "allocation_date": today,
+        "today": today,
+        "today_created": created,
+        "assigned_count": assigned,
+        "completed_count": completed,
+        "pending_count": pending,
+        "message": None if created else TODAY_SESSION_NOT_CREATED,
+    }
+
+
+@router.get("/auto-perpetual/sessions")
+async def auto_perpetual_sessions(session=Depends(get_device_session)):
+    """Collapsed session cards: today (if created) plus previous sessions."""
+    from auto_perpetual import ist_date_key
+
+    mu = session["mobile_user"]["mobile_user_id"]
+    brand_name = session["brand_name"]
+    dealer_name = session["dealer_name"]
+    branch = session["branch"]
+    today = ist_date_key()
+    rows, _matched = await _auto_assignment_rows(
+        {
+            "mobile_user_id": mu,
+            "brand_name": brand_name,
+            "dealer_name": dealer_name,
+            "branch": branch,
+        },
+        brand_name,
+        dealer_name,
+        branch,
+        pending_only=False,
+        limit=5000,
     )
-    return {"session_id": session_id, "allocation_date": allocation_date or today}
+    summary = summarize_auto_sessions(rows, today=today)
+    return summary
 
 
 # ==================== NOTIFICATIONS (BRANCH-SCOPED, MOBILE SIDE) ====================
@@ -3581,15 +3740,6 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
                 "part_found_in_system": existing.get("part_found_in_system", False),
             }
 
-    session_id = await _get_or_create_mobile_daily_verification_session(
-        mobile_user_id,
-        device_id,
-        session["brand_name"],
-        session["dealer_name"],
-        session["branch"],
-        verification_type=payload.verification_type or "physical",
-    )
-
     try:
         damage_qty = max(0.0, float(payload.damage_qty or 0))
     except (TypeError, ValueError):
@@ -3607,31 +3757,46 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
     assignment = None
     coverage_kind = "monthly"
     part_key = str(clean_part).strip().upper()
+    requested_session_id = str(getattr(payload, "verification_session_id", None) or "").strip() or None
+    reaudit_save = False
     if vtype == "auto":
+        assign_filter = {
+            "mobile_user_id": mobile_user_id,
+            "part_number": part_key,
+            "branch": session["branch"],
+        }
+        if requested_session_id:
+            assign_filter["session_id"] = requested_session_id
         assignment = await db.auto_perpetual_assignments.find_one(
-            {
-                "mobile_user_id": mobile_user_id,
-                "part_number": part_key,
-                "status": "pending",
-                "branch": session["branch"],
-            },
+            {**assign_filter, "status": "pending"},
             {"_id": 0},
             sort=[("allocation_date", -1)],
         )
         if not assignment:
             assignment = await db.auto_perpetual_assignments.find_one(
-                {
-                    "mobile_user_id": mobile_user_id,
-                    "part_number": part_key,
-                    "branch": session["branch"],
-                },
+                assign_filter,
                 {"_id": 0},
                 sort=[("allocation_date", -1)],
             )
         if assignment:
             coverage_kind = assignment.get("coverage_kind") or "monthly"
+            from auto_perpetual import ist_date_key as _ist_today
+            if assignment.get("allocation_date") and str(assignment.get("allocation_date")) != _ist_today():
+                reaudit_save = True
             if assignment.get("session_id"):
-                session_id = assignment["session_id"]
+                requested_session_id = assignment["session_id"]
+
+    if requested_session_id:
+        session_id = requested_session_id
+    else:
+        session_id = await _get_or_create_mobile_daily_verification_session(
+            mobile_user_id,
+            device_id,
+            session["brand_name"],
+            session["dealer_name"],
+            session["branch"],
+            verification_type=payload.verification_type or "physical",
+        )
     count_phase = auto_count_phase(getattr(payload, "auto_count_phase", None)) if vtype == "auto" else "finalize"
     finalize_requested = count_phase == "finalize"
     system_qty = _mobile_stock_qty(system_record)
@@ -3659,13 +3824,16 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
     excess_qty = difference if difference > 0 else 0.0
 
     if vtype == "auto":
+        hist_q = {
+            "verification_type": "auto",
+            "mobile_user_id": mobile_user_id,
+            "part_number": part_key,
+            "branch": session["branch"],
+        }
+        if session_id:
+            hist_q["session_id"] = session_id
         existing_auto = await db.stock_verification_history.find_one(
-            {
-                "verification_type": "auto",
-                "mobile_user_id": mobile_user_id,
-                "part_number": part_key,
-                "branch": session["branch"],
-            },
+            hist_q,
             {"_id": 0},
             sort=[("verified_at", -1)],
         )
@@ -3741,7 +3909,12 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
                 "correction_reason": reason,
                 "quantity_finalized": False,
                 "updated_at": now,
+                "session_id": existing_auto.get("session_id") or session_id,
             }
+            if reaudit_save:
+                update["system_quantity"] = system_qty
+                update["reaudit"] = True
+                update["reaudit_of_session_id"] = existing_auto.get("session_id") or session_id
             await db.stock_verification_history.update_one({"id": existing_auto["id"]}, {"$set": update})
             await db.auto_perpetual_assignments.update_one(
                 {"id": (assignment or {}).get("id")} if assignment and assignment.get("id") else {
@@ -3800,6 +3973,8 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
         "edit_count": 0,
         "quantity_edit_status": "",
         "quantity_finalized": bool(vtype == "auto" and finalize_requested),
+        "reaudit": bool(vtype == "auto" and reaudit_save),
+        "reaudit_of_session_id": session_id if (vtype == "auto" and reaudit_save) else None,
         "qty_result": quantity_status.upper(),
         "location_result": "LOCATION MATCHED" if location_status == "matched" else "LOCATION MISMATCH",
         "final_result": overall_status.upper().replace("_", " "),
@@ -3921,6 +4096,7 @@ async def save_auto_perpetual_count(payload: AutoCountSaveRequest, session=Depen
         entry_method=payload.entry_method or "MANUAL",
         verification_type="auto",
         auto_count_phase="save",
+        verification_session_id=payload.session_id,
     )
     return await _process_stock_verification_submit(submit, session)
 
@@ -3937,20 +4113,22 @@ async def finalize_auto_perpetual_counts(payload: AutoFinalizeRequest, session=D
         "branch": branch,
         "quantity_finalized": {"$ne": True},
     }
+    if payload.session_id:
+        query["session_id"] = payload.session_id
     if requested:
         query["part_number"] = {"$in": requested}
     rows = await db.stock_verification_history.find(query, {"_id": 0}).to_list(500)
     # Include legacy saved rows that predate quantity_finalized.
     if requested:
-        extra = await db.stock_verification_history.find(
-            {
-                "verification_type": "auto",
-                "mobile_user_id": mobile_user_id,
-                "branch": branch,
-                "part_number": {"$in": requested},
-            },
-            {"_id": 0},
-        ).to_list(500)
+        extra_q = {
+            "verification_type": "auto",
+            "mobile_user_id": mobile_user_id,
+            "branch": branch,
+            "part_number": {"$in": requested},
+        }
+        if payload.session_id:
+            extra_q["session_id"] = payload.session_id
+        extra = await db.stock_verification_history.find(extra_q, {"_id": 0}).to_list(500)
         by_id = {row.get("id"): row for row in rows}
         for row in extra:
             by_id.setdefault(row.get("id"), row)
@@ -3970,6 +4148,7 @@ async def finalize_auto_perpetual_counts(payload: AutoFinalizeRequest, session=D
             entry_method=row.get("entry_method") or "MANUAL",
             verification_type="auto",
             auto_count_phase="finalize",
+            verification_session_id=payload.session_id or row.get("session_id"),
         )
         results.append(await _process_stock_verification_submit(submit, session))
     return {
