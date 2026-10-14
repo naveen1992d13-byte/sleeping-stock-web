@@ -44,6 +44,15 @@ try:
 except ImportError:
     import testing_runtime
 
+from auto_perpetual_blind import (
+    apply_quantity_edit,
+    auto_count_phase,
+    compact_edit_status,
+    is_quantity_finalized,
+    public_auto_task,
+    quantities_equal,
+)
+
 logger = logging.getLogger("nmts.mobile")
 
 router = APIRouter(prefix="/mobile", tags=["Sleeping Stock Mobile"])
@@ -566,10 +575,28 @@ class StockVerificationSubmit(BaseModel):
     damage_qty: Optional[float] = 0
     verification_type: Optional[str] = "physical"  # physical | auto
     correction_reason: Optional[str] = None
+    # Auto Perpetual only. Pre-change APKs omit this and keep one-shot finalize.
+    auto_count_phase: Optional[str] = None  # save | finalize
     # Accepted for mobile offline-queue compatibility; backend remains session-authoritative.
     part_name: Optional[str] = None
     verification_session_id: Optional[str] = None
     is_new_part: Optional[bool] = None
+
+
+class AutoCountSaveRequest(BaseModel):
+    part_number: str
+    physical_qty: float
+    location: Optional[str] = None
+    remark: Optional[str] = None
+    damage_qty: Optional[float] = 0
+    correction_reason: Optional[str] = None
+    client_id: Optional[str] = None
+    entry_method: Optional[str] = "MANUAL"
+
+
+class AutoFinalizeRequest(BaseModel):
+    part_numbers: Optional[List[str]] = None
+    client_id: Optional[str] = None
 
 
 class StockVerificationBatchSubmit(BaseModel):
@@ -1797,6 +1824,27 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
 
     assigned = await db.auto_perpetual_assignments.count_documents(scope_q)
     completed = await db.auto_perpetual_assignments.count_documents({**scope_q, "status": "completed"})
+    part_keys = [_normalize_part_number(row.get("part_number", "")) for row in rows]
+    part_keys = [key for key in part_keys if key]
+    hist_rows = []
+    if part_keys:
+        hist_rows = await db.stock_verification_history.find(
+            {
+                "verification_type": {"$in": ["auto", "recheck"]},
+                "mobile_user_id": mu,
+                "branch": branch,
+                "part_number": {"$in": part_keys},
+            },
+            {"_id": 0},
+        ).to_list(max(len(part_keys) * 3, 50))
+    hist_by_part = {}
+    for hist in hist_rows:
+        key = _normalize_part_number(hist.get("part_number", ""))
+        previous = hist_by_part.get(key)
+        if not previous or str(hist.get("verified_at") or hist.get("updated_at") or "") >= str(
+            previous.get("verified_at") or previous.get("updated_at") or ""
+        ):
+            hist_by_part[key] = hist
     enriched = []
     for row in rows:
         part_key = _normalize_part_number(row.get("part_number", ""))
@@ -1805,14 +1853,14 @@ async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
         if loc is None or loc == "":
             loc = _product_pin_location(product or {})
         enriched.append(
-            {
-                **row,
-                "session_id": session_id,
-                "part_name": resolve_product_part_name(product or {}),
-                "system_qty": _mobile_stock_qty(product),
-                "system_location": loc,
-                "loc": loc,
-            }
+            public_auto_task(
+                row,
+                loc=loc,
+                session_id=session_id,
+                part_name=resolve_product_part_name(product or {}),
+                system_qty=_mobile_stock_qty(product),
+                history=hist_by_part.get(part_key),
+            )
         )
     return {
         "tasks": enriched,
@@ -3435,6 +3483,55 @@ async def _mirror_mobile_verification_to_web(doc: dict):
         )
 
 
+def _auto_submit_response(doc: dict, *, message: str, duplicate: bool = False, edited: bool = False) -> dict:
+    return {
+        "success": True,
+        "message": message,
+        "id": doc.get("id"),
+        "verification_id": doc.get("id"),
+        "duplicate": duplicate,
+        "edited": edited,
+        "session_id": doc.get("session_id"),
+        "system_qty": doc.get("system_quantity", 0),
+        "physical_qty": doc.get("physical_quantity", 0),
+        "difference_qty": doc.get("difference", 0),
+        "verification_status": doc.get("verification_status") or doc.get("quantity_status"),
+        "part_found_in_system": doc.get("part_found_in_system", False),
+        "count_saved": True,
+        "quantity_finalized": bool(doc.get("quantity_finalized")),
+        "original_physical_quantity": doc.get("original_physical_quantity"),
+        "edit_count": int(doc.get("edit_count") or 0),
+        "edit_status_label": compact_edit_status(doc.get("quantity_edit_history")),
+        "quantity_edit_history": list(doc.get("quantity_edit_history") or []),
+    }
+
+
+async def _complete_auto_assignment(assignment, *, mobile_user_id: str, part_key: str, branch: str, session_id: str, now) -> None:
+    assign_q = {"mobile_user_id": mobile_user_id, "part_number": part_key, "branch": branch}
+    if assignment and assignment.get("id"):
+        assign_q = {"id": assignment["id"]}
+    await db.auto_perpetual_assignments.update_many(
+        assign_q,
+        {
+            "$set": {
+                "status": "completed",
+                "completed_at": now,
+                "verified_by_mobile_user_id": mobile_user_id,
+                "quantity_finalized": True,
+            }
+        },
+    )
+    sid = (assignment or {}).get("suggestion_id")
+    if sid:
+        from auto_perpetual_suggestions import refresh_suggestion_status
+
+        await refresh_suggestion_status(db, sid)
+    await db.stock_verification_sessions.update_one(
+        {"session_id": session_id, "status": {"$nin": ["CLOSED", "COMPLETED"]}},
+        {"$set": {"status": "IN_PROGRESS", "updated_at": now}},
+    )
+
+
 async def _process_stock_verification_submit(payload: StockVerificationSubmit, session: dict) -> dict:
     """Core stock-verification save used by single + batch endpoints.
 
@@ -3535,6 +3632,8 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
             coverage_kind = assignment.get("coverage_kind") or "monthly"
             if assignment.get("session_id"):
                 session_id = assignment["session_id"]
+    count_phase = auto_count_phase(getattr(payload, "auto_count_phase", None)) if vtype == "auto" else "finalize"
+    finalize_requested = count_phase == "finalize"
     system_qty = _mobile_stock_qty(system_record)
     difference = physical_qty - system_qty
     part_found = bool(system_record)
@@ -3571,40 +3670,60 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
             sort=[("verified_at", -1)],
         )
         if existing_auto:
-            prev_qty = float(existing_auto.get("physical_quantity") or 0)
-            if abs(prev_qty - physical_qty) < 1e-9:
-                await _mirror_mobile_verification_to_web(existing_auto)
-                return {
-                    "success": True, "message": "Verification recorded", "id": existing_auto["id"],
-                    "verification_id": existing_auto["id"], "duplicate": True,
-                    "session_id": existing_auto.get("session_id") or session_id,
-                    "system_qty": existing_auto.get("system_quantity", 0),
-                    "physical_qty": existing_auto.get("physical_quantity", 0),
-                    "difference_qty": existing_auto.get("difference", 0),
-                    "verification_status": existing_auto.get("verification_status") or existing_auto.get("quantity_status"),
-                    "part_found_in_system": existing_auto.get("part_found_in_system", False),
+            locked = is_quantity_finalized(assignment, existing_auto)
+            latest_qty = float(existing_auto.get("physical_quantity") or 0)
+            if locked:
+                if finalize_requested:
+                    await _mirror_mobile_verification_to_web(existing_auto)
+                    return _auto_submit_response(
+                        {**existing_auto, "session_id": existing_auto.get("session_id") or session_id},
+                        message="Already submitted",
+                        duplicate=True,
+                    )
+                raise HTTPException(400, "Quantity editing is locked after Final Submit")
+            if finalize_requested:
+                if not quantities_equal(latest_qty, physical_qty):
+                    raise HTTPException(
+                        400,
+                        "Final quantity does not match the latest saved physical quantity",
+                    )
+                from auto_perpetual import month_key as _auto_month_key
+                final_update = {
+                    "quantity_finalized": True,
+                    "updated_at": now,
+                    "month_key": _auto_month_key(),
                 }
+                await db.stock_verification_history.update_one({"id": existing_auto["id"]}, {"$set": final_update})
+                finalized = {**existing_auto, **final_update}
+                await _complete_auto_assignment(
+                    assignment,
+                    mobile_user_id=mobile_user_id,
+                    part_key=part_key,
+                    branch=session["branch"],
+                    session_id=existing_auto.get("session_id") or session_id,
+                    now=now,
+                )
+                await _mirror_mobile_verification_to_web(finalized)
+                return _auto_submit_response(finalized, message="Verification submitted")
+            edit = apply_quantity_edit(
+                existing_auto,
+                new_qty=physical_qty,
+                correction_reason=str(payload.correction_reason or "").strip(),
+                user_name=session["mobile_user"]["name"],
+                mobile_user_id=mobile_user_id,
+                device_id=device_id,
+                edited_at=now,
+            )
+            if edit["same_value"]:
+                await _mirror_mobile_verification_to_web(existing_auto)
+                return _auto_submit_response(
+                    {**existing_auto, "session_id": existing_auto.get("session_id") or session_id},
+                    message="Verification recorded",
+                    duplicate=True,
+                )
             reason = str(payload.correction_reason or "").strip()
             if not reason:
                 raise HTTPException(400, "Correction reason is required to change physical quantity")
-            original = existing_auto.get("original_physical_quantity")
-            if original is None:
-                original = prev_qty
-            history = list(existing_auto.get("quantity_edit_history") or [])
-            edit_count = int(existing_auto.get("edit_count") or 0) + 1
-            edit_status = "Edited" if edit_count == 1 else "Re-edited"
-            history.append(
-                {
-                    "previous_quantity": prev_qty,
-                    "new_quantity": physical_qty,
-                    "correction_reason": reason,
-                    "user_name": session["mobile_user"]["name"],
-                    "mobile_user_id": mobile_user_id,
-                    "device_id": device_id,
-                    "edited_at": now,
-                    "status": edit_status,
-                }
-            )
             update = {
                 "physical_quantity": physical_qty,
                 "difference": difference,
@@ -3615,25 +3734,35 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
                 "quantity_status": quantity_status,
                 "verification_status": verification_status,
                 "overall_status": overall_status,
-                "original_physical_quantity": original,
-                "quantity_edit_history": history,
-                "edit_count": edit_count,
-                "quantity_edit_status": edit_status,
+                "original_physical_quantity": edit["original_physical_quantity"],
+                "quantity_edit_history": edit["quantity_edit_history"],
+                "edit_count": edit["edit_count"],
+                "quantity_edit_status": edit["quantity_edit_status"],
                 "correction_reason": reason,
+                "quantity_finalized": False,
                 "updated_at": now,
             }
             await db.stock_verification_history.update_one({"id": existing_auto["id"]}, {"$set": update})
+            await db.auto_perpetual_assignments.update_one(
+                {"id": (assignment or {}).get("id")} if assignment and assignment.get("id") else {
+                    "mobile_user_id": mobile_user_id,
+                    "part_number": part_key,
+                    "branch": session["branch"],
+                },
+                {
+                    "$set": {
+                        "count_saved": True,
+                        "physical_quantity": physical_qty,
+                        "original_physical_quantity": edit["original_physical_quantity"],
+                        "quantity_edit_history": edit["quantity_edit_history"],
+                        "edit_count": edit["edit_count"],
+                        "updated_at": now,
+                    }
+                },
+            )
             updated = {**existing_auto, **update}
             await _mirror_mobile_verification_to_web(updated)
-            return {
-                "success": True, "message": "Verification updated", "id": existing_auto["id"],
-                "verification_id": existing_auto["id"], "duplicate": False, "edited": True,
-                "session_id": existing_auto.get("session_id") or session_id,
-                "system_qty": system_qty, "physical_qty": physical_qty,
-                "difference_qty": difference, "verification_status": verification_status,
-                "part_found_in_system": part_found,
-                "edit_count": edit_count,
-            }
+            return _auto_submit_response(updated, message="Verification updated", edited=True)
 
     doc = {
         "id": str(uuid.uuid4()), "session_id": session_id, "client_id": payload.client_id,
@@ -3670,6 +3799,7 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
         "quantity_edit_history": [],
         "edit_count": 0,
         "quantity_edit_status": "",
+        "quantity_finalized": bool(vtype == "auto" and finalize_requested),
         "qty_result": quantity_status.upper(),
         "location_result": "LOCATION MATCHED" if location_status == "matched" else "LOCATION MISMATCH",
         "final_result": overall_status.upper().replace("_", " "),
@@ -3698,7 +3828,10 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
     from auto_perpetual import month_key, ist_date_key
 
     part_key = str(doc["part_number"]).strip().upper()
-    if coverage_kind == "monthly" and vtype in ("auto", "physical"):
+    mark_pool = coverage_kind == "recheck" or (
+        coverage_kind == "monthly" and (vtype == "physical" or (vtype == "auto" and finalize_requested))
+    )
+    if mark_pool and coverage_kind == "monthly" and vtype in ("auto", "physical"):
         await db.auto_perpetual_pool.update_one(
             {
                 "month_key": month_key(),
@@ -3716,7 +3849,7 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
                 }
             },
         )
-    elif coverage_kind == "recheck":
+    elif mark_pool and coverage_kind == "recheck":
         await db.auto_perpetual_pool.update_one(
             {
                 "month_key": month_key(),
@@ -3738,29 +3871,111 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
         assign_q = {"mobile_user_id": mobile_user_id, "part_number": part_key, "branch": session["branch"]}
         if assignment and assignment.get("id"):
             assign_q = {"id": assignment["id"]}
-        await db.auto_perpetual_assignments.update_many(
-            assign_q,
-            {"$set": {"status": "completed", "completed_at": now, "verified_by_mobile_user_id": mobile_user_id}},
-        )
-        sid = (assignment or {}).get("suggestion_id")
-        if sid:
-            from auto_perpetual_suggestions import refresh_suggestion_status
-
-            await refresh_suggestion_status(db, sid)
-        await db.stock_verification_sessions.update_one(
-            {"session_id": session_id, "status": {"$nin": ["CLOSED", "COMPLETED"]}},
-            {"$set": {"status": "IN_PROGRESS", "updated_at": now}},
-        )
+        if finalize_requested:
+            await _complete_auto_assignment(
+                assignment,
+                mobile_user_id=mobile_user_id,
+                part_key=part_key,
+                branch=session["branch"],
+                session_id=session_id,
+                now=now,
+            )
+        else:
+            await db.auto_perpetual_assignments.update_many(
+                assign_q,
+                {
+                    "$set": {
+                        "count_saved": True,
+                        "physical_quantity": physical_qty,
+                        "original_physical_quantity": physical_qty,
+                        "quantity_finalized": False,
+                        "updated_at": now,
+                    }
+                },
+            )
         await db.stock_verification_history.update_one(
             {"id": doc["id"]},
             {"$set": {"month_key": month_key()}},
         )
+        return _auto_submit_response(doc, message="Verification recorded")
     return {
         "success": True, "message": "Verification recorded", "id": doc["id"], "verification_id": doc["id"],
         "session_id": session_id,
         "duplicate": False, "system_qty": system_qty, "physical_qty": physical_qty,
         "difference_qty": difference, "verification_status": verification_status,
         "part_found_in_system": part_found,
+    }
+
+
+@router.post("/auto-perpetual/count")
+async def save_auto_perpetual_count(payload: AutoCountSaveRequest, session=Depends(get_device_session)):
+    """First Save / quantity edit for Auto Perpetual. Does not Final Submit."""
+    submit = StockVerificationSubmit(
+        part_number=payload.part_number,
+        physical_qty=payload.physical_qty,
+        location=payload.location,
+        remark=payload.remark,
+        damage_qty=payload.damage_qty,
+        correction_reason=payload.correction_reason,
+        client_id=payload.client_id,
+        entry_method=payload.entry_method or "MANUAL",
+        verification_type="auto",
+        auto_count_phase="save",
+    )
+    return await _process_stock_verification_submit(submit, session)
+
+
+@router.post("/auto-perpetual/finalize")
+async def finalize_auto_perpetual_counts(payload: AutoFinalizeRequest, session=Depends(get_device_session)):
+    """Final Submit using the latest quantity already saved on the server."""
+    mobile_user_id = session["mobile_user"]["mobile_user_id"]
+    branch = session["branch"]
+    requested = [_normalize_part_number(part) for part in (payload.part_numbers or []) if str(part or "").strip()]
+    query = {
+        "verification_type": "auto",
+        "mobile_user_id": mobile_user_id,
+        "branch": branch,
+        "quantity_finalized": {"$ne": True},
+    }
+    if requested:
+        query["part_number"] = {"$in": requested}
+    rows = await db.stock_verification_history.find(query, {"_id": 0}).to_list(500)
+    # Include legacy saved rows that predate quantity_finalized.
+    if requested:
+        extra = await db.stock_verification_history.find(
+            {
+                "verification_type": "auto",
+                "mobile_user_id": mobile_user_id,
+                "branch": branch,
+                "part_number": {"$in": requested},
+            },
+            {"_id": 0},
+        ).to_list(500)
+        by_id = {row.get("id"): row for row in rows}
+        for row in extra:
+            by_id.setdefault(row.get("id"), row)
+        rows = list(by_id.values())
+    if requested and not rows:
+        raise HTTPException(400, "Save a physical count before Final Submit")
+    results = []
+    for row in rows:
+        latest = float(row.get("physical_quantity") or 0)
+        submit = StockVerificationSubmit(
+            part_number=row.get("part_number"),
+            physical_qty=latest,
+            location=row.get("physical_location") or row.get("location"),
+            remark=row.get("remark") or row.get("remarks"),
+            damage_qty=row.get("damage_qty") or 0,
+            client_id=payload.client_id,
+            entry_method=row.get("entry_method") or "MANUAL",
+            verification_type="auto",
+            auto_count_phase="finalize",
+        )
+        results.append(await _process_stock_verification_submit(submit, session))
+    return {
+        "success": True,
+        "count": len(results),
+        "results": results,
     }
 
 

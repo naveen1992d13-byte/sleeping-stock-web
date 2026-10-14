@@ -36,6 +36,20 @@ const fmt = (v) => {
   }).format(new Date(utcValue));
 };
 const todayKey = (v=new Date()) => new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(v));
+function formatQtyLabel(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value);
+  return Number.isInteger(number) ? String(number) : String(number);
+}
+function compactEditStatus(row) {
+  if (row?.edit_status_label) return row.edit_status_label;
+  const values = (row?.quantity_edit_history || [])
+    .map((entry) => formatQtyLabel(entry?.new_quantity))
+    .filter((value) => value !== '');
+  if (!values.length) return 'Not Edited';
+  return `Edited ${values.map((value) => `[${value}]`).join(' ')}`;
+}
 
 function apiDetailMessage(error, fallback) {
   const status = error?.response?.status;
@@ -699,23 +713,23 @@ function AuditAllocationDetail({suggestion, userFilter, onFilterUser, onClose, o
       })}
       {!users.length && <tr><td colSpan={5} className="text-center py-6 text-gray-500">No user allocation yet.</td></tr>}
     </tbody></table></div>}
-    <div className="overflow-x-auto max-h-[60vh]"><table className="w-full text-sm min-w-[1100px]"><thead><tr>{['Part','Description','Sys Qty','Location','Type','User','Task','Status','Edits'].map(h=><th key={h} className="text-left p-2 whitespace-nowrap">{h}</th>)}</tr></thead><tbody>
+    <div className="overflow-x-auto max-h-[60vh]"><table className="w-full text-sm min-w-[1100px]"><thead><tr>{['Part','Description','Sys Qty','Physical Qty','Location','Type','User','Task','Status','Edit Status'].map(h=><th key={h} className="text-left p-2 whitespace-nowrap">{h}</th>)}</tr></thead><tbody>
       {visibleItems.map((it,i)=>(
         <Fragment key={`${it.part_number}-${i}`}>
-        <tr className="border-t"><td className="p-2">{it.part_number}</td><td className="p-2">{it.part_name}</td><td className="p-2">{it.system_qty}</td><td className="p-2">{it.system_location}</td><td className="p-2">{it.suggestion_type}</td><td className="p-2"><button className="text-emerald-700 underline" onClick={()=>it.mobile_user_id && onFilterUser(it.mobile_user_id)}>{it.mobile_user_name||it.mobile_user_id||'-'}</button></td><td className="p-2 font-mono text-xs">{it.task_id||'-'}</td><td className="p-2">{it.verification_status||'-'}</td><td className="p-2">{it.edit_count||0}{it.quantity_edit_status?` · ${it.quantity_edit_status}`:''}</td></tr>
-        {!!(it.quantity_edit_history||[]).length && <tr><td colSpan={9} className="p-2 bg-gray-50 text-xs">Original: {it.original_physical_quantity ?? '-'} · Current: {it.physical_quantity ?? '-'}
+        <tr className="border-t"><td className="p-2">{it.part_number}</td><td className="p-2">{it.part_name}</td><td className="p-2">{it.system_qty}</td><td className="p-2">{it.physical_quantity ?? '-'}</td><td className="p-2">{it.system_location}</td><td className="p-2">{it.suggestion_type}</td><td className="p-2"><button className="text-emerald-700 underline" onClick={()=>it.mobile_user_id && onFilterUser(it.mobile_user_id)}>{it.mobile_user_name||it.mobile_user_id||'-'}</button></td><td className="p-2 font-mono text-xs">{it.task_id||'-'}</td><td className="p-2">{it.verification_status||'-'}</td><td className="p-2" title={`First count: ${it.original_physical_quantity ?? '-'}`}>{compactEditStatus(it)}</td></tr>
+        {!!(it.quantity_edit_history||[]).length && <tr><td colSpan={10} className="p-2 bg-gray-50 text-xs">First count: {it.original_physical_quantity ?? '-'} · Physical Qty: {it.physical_quantity ?? '-'}
           <ul className="mt-1 list-disc pl-5">{it.quantity_edit_history.map((h,idx)=><li key={idx}>{h.status}: {h.previous_quantity} → {h.new_quantity} · {h.correction_reason} · {h.user_name||h.mobile_user_id} · {h.device_id||'-'} · {h.edited_at?fmt(h.edited_at):'-'}</li>)}</ul>
         </td></tr>}
         </Fragment>
       ))}
-      {!visibleItems.length && <tr><td colSpan={9} className="text-center py-8 text-gray-500">No parts for this view.</td></tr>}
+      {!visibleItems.length && <tr><td colSpan={10} className="text-center py-8 text-gray-500">No parts for this view.</td></tr>}
     </tbody></table></div>
   </div></div>;
 }
-function DetailTable({rows=[],removable=false,onRemove,empty='No verified items',canManage=false,onCorrection}){return <div className="overflow-x-auto"><table className="w-full text-sm min-w-[1680px]"><thead><tr>{['Part Number','Part Name','MAV','System Qty','Physical Qty','Difference','Shortage Qty','Excess Qty','Shortage Value','Excess Value','PIN Location','Status','Edits','Correction Status','Correction Method','Remarks',...(removable?['Action']:[]),...(canManage?['Correction']:[])].map(h=><th key={h} className="text-left p-3 whitespace-nowrap">{h}</th>)}</tr></thead><tbody>{rows.map((r,i)=>(
+function DetailTable({rows=[],removable=false,onRemove,empty='No verified items',canManage=false,onCorrection}){return <div className="overflow-x-auto"><table className="w-full text-sm min-w-[1680px]"><thead><tr>{['Part Number','Part Name','MAV','System Qty','Physical Qty','Difference','Shortage Qty','Excess Qty','Shortage Value','Excess Value','PIN Location','Status','Edit Status','Correction Status','Correction Method','Remarks',...(removable?['Action']:[]),...(canManage?['Correction']:[])].map(h=><th key={h} className="text-left p-3 whitespace-nowrap">{h}</th>)}</tr></thead><tbody>{rows.map((r,i)=>(
   <Fragment key={r.id||r.part_number||i}>
-  <tr className="border-t"><td className="p-3 font-medium">{r.part_number}</td><td>{r.part_name||r.item_name||r.description||r.part_description||'-'}</td><td>{money(r.mav)}</td><td>{r.system_quantity}</td><td>{r.physical_quantity}</td><td>{r.difference}</td><td>{r.shortage_qty}</td><td>{r.excess_qty}</td><td>{money(r.shortage_value)}</td><td>{money(r.excess_value)}</td><td>{r.pin_location||r.system_location||'-'}</td><td>{r.overall_status||r.quantity_status||'-'}</td><td>{r.edit_count||0}{r.quantity_edit_status?` · ${r.quantity_edit_status}`:''}</td><td>{r.correction_status||'-'}</td><td>{r.correction_method||'-'}</td><td>{r.remarks||r.remark||'-'}</td>{removable&&<td><Button size="sm" variant="outline" onClick={()=>onRemove(i)}><Trash2 className="h-4 w-4"/></Button></td>}{canManage&&<td><select className="border rounded h-9 px-2" defaultValue="" onChange={e=>{if(e.target.value)onCorrection(r,e.target.value);e.target.value=''}}><option value="">Update...</option><option value="system_corrected">System corrected</option><option value="physical_relocated">Physical relocated</option><option value="both">Both corrected</option><option value="no_action">No action</option></select></td>}</tr>
-  {!!(r.quantity_edit_history||[]).length && <tr><td colSpan={18} className="p-3 bg-gray-50 text-xs">Original qty: {r.original_physical_quantity ?? '-'}
+  <tr className="border-t"><td className="p-3 font-medium">{r.part_number}</td><td>{r.part_name||r.item_name||r.description||r.part_description||'-'}</td><td>{money(r.mav)}</td><td>{r.system_quantity}</td><td>{r.physical_quantity}</td><td>{r.difference}</td><td>{r.shortage_qty}</td><td>{r.excess_qty}</td><td>{money(r.shortage_value)}</td><td>{money(r.excess_value)}</td><td>{r.pin_location||r.system_location||'-'}</td><td>{r.overall_status||r.quantity_status||'-'}</td><td title={`First count: ${r.original_physical_quantity ?? '-'}`}>{compactEditStatus(r)}</td><td>{r.correction_status||'-'}</td><td>{r.correction_method||'-'}</td><td>{r.remarks||r.remark||'-'}</td>{removable&&<td><Button size="sm" variant="outline" onClick={()=>onRemove(i)}><Trash2 className="h-4 w-4"/></Button></td>}{canManage&&<td><select className="border rounded h-9 px-2" defaultValue="" onChange={e=>{if(e.target.value)onCorrection(r,e.target.value);e.target.value=''}}><option value="">Update...</option><option value="system_corrected">System corrected</option><option value="physical_relocated">Physical relocated</option><option value="both">Both corrected</option><option value="no_action">No action</option></select></td>}</tr>
+  {!!(r.quantity_edit_history||[]).length && <tr><td colSpan={18} className="p-3 bg-gray-50 text-xs">First count: {r.original_physical_quantity ?? '-'} · Physical Qty: {r.physical_quantity ?? '-'}
     <ul className="mt-1 list-disc pl-5">{r.quantity_edit_history.map((h,idx)=><li key={idx}>{h.status}: {h.previous_quantity} → {h.new_quantity} · {h.correction_reason} · {h.user_name||h.mobile_user_id} · {h.device_id||'-'} · {h.edited_at?fmt(h.edited_at):'-'}</li>)}</ul>
   </td></tr>}
   </Fragment>

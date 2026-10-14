@@ -15,6 +15,7 @@ try:
 except ImportError:
     import testing_runtime
 
+from auto_perpetual_blind import compact_edit_status
 from auto_perpetual import (
     IST,
     _attendance_active_users,
@@ -84,6 +85,7 @@ def assignment_as_suggestion_item(row: dict) -> dict:
         "edit_count": int(row.get("edit_count") or 0),
         "quantity_edit_history": list(row.get("quantity_edit_history") or []),
         "quantity_edit_status": row.get("quantity_edit_status") or "",
+        "edit_status_label": compact_edit_status(row.get("quantity_edit_history")),
         "original_physical_quantity": row.get("original_physical_quantity"),
         "physical_quantity": row.get("physical_quantity"),
     }
@@ -166,6 +168,7 @@ async def suggestion_with_line_items(db, suggestion_id: str) -> dict:
             it["quantity_edit_status"] = hist.get("quantity_edit_status") or ""
             it["original_physical_quantity"] = hist.get("original_physical_quantity")
             it["physical_quantity"] = hist.get("physical_quantity")
+        it["edit_status_label"] = compact_edit_status(it.get("quantity_edit_history"))
     items.sort(key=lambda r: _natural_sort_key(r.get("system_location") or r.get("loc") or ""))
     row["items"] = items
     row["audit_id"] = row.get("suggestion_number")
