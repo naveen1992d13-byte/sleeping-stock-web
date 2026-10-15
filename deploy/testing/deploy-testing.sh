@@ -77,14 +77,29 @@ fi
 
 pid_on_port() {
   local port="$1"
-  ss -lptn "sport = :${port}" 2>/dev/null | awk '
-    /pid=/ {
-      if (match($0, /pid=[0-9]+/)) {
-        print substr($0, RSTART+4, RLENGTH-4)
-        exit
-      }
-    }
-  '
+  python3 - "$port" <<'PY'
+import glob, os, sys
+port = int(sys.argv[1])
+hexport = f"{port:04X}"
+inodes = set()
+for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try:
+        lines = open(path).read().splitlines()[1:]
+    except OSError:
+        continue
+    for line in lines:
+        parts = line.split()
+        if parts[1].split(":")[-1].upper() == hexport and parts[3] == "0A":
+            inodes.add(parts[9])
+for fd in glob.glob("/proc/[0-9]*/fd/[0-9]*"):
+    try:
+        target = os.readlink(fd)
+    except OSError:
+        continue
+    if target.startswith("socket:[") and target[8:-1] in inodes:
+        print(fd.split("/")[2])
+        break
+PY
 }
 
 PROD_PID_BEFORE="$(pid_on_port "$PROD_PORT" || true)"
@@ -104,6 +119,8 @@ HOST_ENV_KEEP="$(mktemp /tmp/nmts-testing-env.XXXXXX)"
 chmod 600 "$HOST_ENV_KEEP"
 if [[ -f "$HOST_ENV" ]]; then
   cp -a "$HOST_ENV" "$HOST_ENV_KEEP"
+  # Discard tracked local edits so checkout can remove backend/.env from the tree.
+  git checkout -- backend/.env >/dev/null 2>&1 || true
 fi
 
 git fetch origin --prune
