@@ -96,6 +96,16 @@ fi
 
 cd "$ROOT"
 
+# Host Testing secrets live in this untracked file. Preserve them across
+# git checkout so removing tracked backend/.env from the repo cannot wipe
+# the Testing runtime environment. Never print the file.
+HOST_ENV="$ROOT/backend/.env"
+HOST_ENV_KEEP="$(mktemp /tmp/nmts-testing-env.XXXXXX)"
+chmod 600 "$HOST_ENV_KEEP"
+if [[ -f "$HOST_ENV" ]]; then
+  cp -a "$HOST_ENV" "$HOST_ENV_KEEP"
+fi
+
 git fetch origin --prune
 
 if [[ -n "$HEAD_SHA" ]]; then
@@ -121,6 +131,13 @@ elif [[ -n "$HEAD_REF" ]]; then
 else
   git pull --ff-only || true
 fi
+
+if [[ ! -f "$HOST_ENV" && -s "$HOST_ENV_KEEP" ]]; then
+  cp -a "$HOST_ENV_KEEP" "$HOST_ENV"
+  chmod 600 "$HOST_ENV"
+  echo "Restored untracked Testing host environment after git checkout"
+fi
+rm -f "$HOST_ENV_KEEP"
 
 RESOLVED_SHA="$(git rev-parse HEAD)"
 RESOLVED_SHORT="$(git rev-parse --short=7 HEAD)"
