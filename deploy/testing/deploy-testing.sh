@@ -119,7 +119,8 @@ HOST_ENV_KEEP="$(mktemp /tmp/nmts-testing-env.XXXXXX)"
 chmod 600 "$HOST_ENV_KEEP"
 if [[ -f "$HOST_ENV" ]]; then
   cp -a "$HOST_ENV" "$HOST_ENV_KEEP"
-  # Discard tracked local edits so checkout can remove backend/.env from the tree.
+  git update-index --no-skip-worktree backend/.env >/dev/null 2>&1 || true
+  git update-index --no-assume-unchanged backend/.env >/dev/null 2>&1 || true
   git checkout -- backend/.env >/dev/null 2>&1 || true
 fi
 
