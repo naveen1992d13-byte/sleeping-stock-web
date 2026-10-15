@@ -7,6 +7,7 @@ from datetime import datetime, timezone, date, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import openpyxl
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
@@ -42,7 +43,13 @@ CATALOGUE = [
 ]
 CATALOGUE_MAP = {k: (n, t) for k, n, t in CATALOGUE}
 BUCKETS = ["0–30 Days", "31–90 Days", "91–180 Days", "181–360 Days", "Above 360 Days"]
-TERMINAL_MISSED = {"rejected", "cancelled", "closed", "not accepted", "expired"}
+UNKNOWN_BUCKET = "Unknown"
+TERMINAL_MISSED = {"rejected", "cancelled", "closed", "not accepted", "expired", "failed"}
+IST = ZoneInfo("Asia/Kolkata")
+STOCK_MOVEMENT_UNAVAILABLE = (
+    "Stock Movement requires dated complete snapshots. "
+    "This report is disabled until reliable snapshot data exists."
+)
 
 
 def init_reports_center(db, get_current_user, UserResponse):
@@ -53,15 +60,43 @@ def init_reports_center(db, get_current_user, UserResponse):
     globals()["_AUTH_DEP"] = get_current_user
 
 
+def first_present(*values):
+    """Return the first value that is not None and not an empty/whitespace string."""
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, str) and not str(v).strip():
+            continue
+        return v
+    return None
+
+
 def _num(v, default=0.0):
-    try: return float(v if v not in (None, "") else default)
+    chosen = first_present(v)
+    try: return float(default if chosen is None else chosen)
     except (TypeError, ValueError): return float(default)
 
 
+def _num_alias(*values, default=0.0):
+    return _num(first_present(*values), default)
+
+
 def _text(*values):
-    for v in values:
-        if v is not None and str(v).strip(): return str(v).strip()
-    return ""
+    chosen = first_present(*values)
+    return str(chosen).strip() if chosen is not None else ""
+
+
+def ist_now() -> datetime:
+    return datetime.now(IST)
+
+
+def ist_today() -> date:
+    return ist_now().date()
+
+
+def ist_month_start(day: Optional[date] = None) -> date:
+    d = day or ist_today()
+    return d.replace(day=1)
 
 
 def _dt(v):
@@ -78,9 +113,11 @@ def _dt(v):
 
 
 def _bucket(v):
-    if v in (None, "", "-"): return ""
+    if v in (None, "", "-"):
+        return UNKNOWN_BUCKET
     d = _num(v, -1)
-    if d < 0: return ""
+    if d < 0:
+        return UNKNOWN_BUCKET
     if d <= 30: return BUCKETS[0]
     if d <= 90: return BUCKETS[1]
     if d <= 180: return BUCKETS[2]
@@ -129,20 +166,25 @@ def _aging_days(row, aging_type):
     source = _aging_source_date(row, aging_type)
     parsed = _dt(source)
     if parsed:
-        return max(0, (datetime.now(timezone.utc).date() - parsed.date()).days)
+        return max(0, (ist_today() - parsed.date()).days)
     return ""
 
 
 def _period(from_date: str, to_date: str, current_only=True):
-    try: start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except Exception: raise HTTPException(400, "Invalid From Date")
-    try: end = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
-    except Exception: raise HTTPException(400, "Invalid To Date")
-    today = datetime.now(timezone.utc).date()
-    first = today.replace(day=1)
-    if current_only and (start.date() < first or end.date() - timedelta(days=1) > today):
+    try:
+        start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=IST)
+    except Exception:
+        raise HTTPException(400, "Invalid From Date")
+    try:
+        end = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=IST) + timedelta(days=1)
+    except Exception:
+        raise HTTPException(400, "Invalid To Date")
+    today = ist_today()
+    first = ist_month_start(today)
+    if current_only and (start.date() < first or (end.date() - timedelta(days=1)) > today):
         raise HTTPException(400, "Reports tab permits only the current month up to today")
-    if start >= end: raise HTTPException(400, "From Date must be on or before To Date")
+    if start >= end:
+        raise HTTPException(400, "From Date must be on or before To Date")
     return start, end
 
 
@@ -236,29 +278,45 @@ async def _requests(scope,start,end):
     return await db.order_requests.find(_and(dateq,*side),{"_id":0}).sort("requested_at",-1).to_list(length=500000)
 
 
+def _request_identity(row: dict) -> Tuple[str, str, str]:
+    """Deterministic identity that never concatenates possibly-null strings."""
+    return (
+        str(first_present(row.get("id"), row.get("request_id")) or ""),
+        str(first_present(row.get("request_number")) or ""),
+        str(first_present(row.get("part_number")) or ""),
+    )
+
+
 def _missed(reqs, inventory):
     inv={(_text(x.get("brand_name")).casefold(),_text(x.get("dealer_name")).casefold(),_text(x.get("branch")).casefold(),_text(x.get("part_number")).casefold()):x for x in inventory if x.get("qty",0)>0}
     out=[]; seen=set()
     for r in reqs:
-        key=_text(r.get("id"),r.get("request_number")+"|"+_text(r.get("part_number")))
+        key=_request_identity(r)
         if key in seen: continue
         seen.add(key)
-        requested=_num(r.get("requested_qty",r.get("quantity",r.get("required_qty",0))))
-        supplied=max(_num(r.get("completed_qty",0)),_num(r.get("received_qty",0)),_num(r.get("dispatched_qty",0)),_num(r.get("accepted_qty",r.get("approved_qty",0))))
+        requested=_num_alias(r.get("requested_qty"), r.get("quantity"), r.get("required_qty"))
+        supplied=max(
+            _num(r.get("completed_qty")),
+            _num(r.get("received_qty")),
+            _num(r.get("dispatched_qty")),
+            _num_alias(r.get("accepted_qty"), r.get("approved_qty")),
+        )
         unfulfilled=max(0,requested-supplied)
         status=_text(r.get("status")).lower()
-        if unfulfilled<=0 or not (status in TERMINAL_MISSED or supplied<requested): continue
+        if unfulfilled<=0 or status not in TERMINAL_MISSED: continue
         ik=(_text(r.get("supplying_brand"),r.get("requesting_brand")).casefold(),_text(r.get("supplying_dealer")).casefold(),_text(r.get("supplying_branch")).casefold(),_text(r.get("part_number")).casefold())
         stock=inv.get(ik)
         if not stock: continue
         eligible=min(unfulfilled,stock["qty"])
         if eligible<=0: continue
-        unit=_num(r.get("part_value",r.get("unit_value",stock["unit"])))
+        unit=_num_alias(r.get("part_value"), r.get("unit_value"), stock.get("unit"))
         out.append({**r,"unfulfilled":unfulfilled,"current_available":stock["qty"],"eligible":eligible,"unit":unit,"missed_value":eligible*unit,"stock":stock})
     return out
 
 
 def _rows(report, inventory, orders, order_items, reqs):
+    if report in {"inventory", "aging", "stock-value"} and not inventory:
+        return ["Message"], [["Today’s stock not uploaded"]]
     if report=="inventory":
         headers=["Part Number","Part Name","Available Quantity","Unit Value","Total Value","Part Category","FMS / ABC","Location / LOC","Brand","Dealer","Branch","Uploaded Date","Uploaded User","Active Status","Last Receipt Date","Purchase Aging","Last Sales Date","Sales Aging"]
         data=[[
@@ -310,23 +368,62 @@ def _rows(report, inventory, orders, order_items, reqs):
     else:
         level={"branch-summary":"branch","dealer-summary":"dealer_name","brand-summary":"brand_name"}.get(report)
         if report=="stock-movement":
-            headers=["Aging Bucket","Opening Line Items","Opening Quantity","Opening Value","Added Line Items","Added Quantity","Added Value","Reduced Line Items","Reduced Quantity","Reduced Value","Closing Line Items","Closing Quantity","Closing Value","Balance"]
-            data=[]
-            for b in BUCKETS:
-                rr=[x for x in inventory if _bucket(x["pa"])==b]; q=sum(x["qty"] for x in rr); v=sum(x["total"] for x in rr)
-                data.append([b,0,0,0,len(rr),q,v,0,0,0,len(rr),q,v,v])
+            headers=["Message"]
+            data=[[STOCK_MOVEMENT_UNAVAILABLE]]
             return headers,data
-        headers=["Brand","Dealer","Branch / Scope","Current Inventory Line Items","Current Available Quantity","Current Inventory Value","0–30 Day Value","31–90 Day Value","91–180 Day Value","181–360 Day Value","Above 360 Day Value","Orders Created","Order Line Items","Requests Sent","Requests Received","Requested Quantity","Approved Quantity","Rejected Request Count","Completed Request Count","Completed Transfer Value","Current Missed Opportunity Value"]
+        headers=["Brand","Dealer","Branch / Scope","Current Inventory Line Items","Current Available Quantity","Current Inventory Value","0–30 Day Value","31–90 Day Value","91–180 Day Value","181–360 Day Value","Above 360 Day Value","Unknown Aging Value","Orders Created","Order Line Items","Requests Sent","Requests Received","Requested Quantity","Approved Quantity","Rejected Request Count","Completed Request Count","Completed Transfer Value","Current Missed Opportunity Value"]
         groups=defaultdict(list)
-        for x in inventory: groups[_text(x.get(level))].append(x)
+        for x in inventory:
+            groups[_composite_scope_key(x, level)].append(x)
         missed=_missed(reqs,inventory)
         data=[]
         for key,items in groups.items():
-            first=items[0]; branches={x.get("branch") for x in items}; scope_req=[r for r in reqs if key in (_text(r.get("requesting_branch")),_text(r.get("supplying_branch")),_text(r.get("requesting_dealer")),_text(r.get("supplying_dealer")),_text(r.get("requesting_brand")),_text(r.get("supplying_brand")))]
-            scope_orders=[o for o in orders if key in (_text(o.get("branch")),_text(o.get("dealer_name")),_text(o.get("brand_name")))]
+            first=items[0]
+            scope_req=[r for r in reqs if _request_matches_scope(r, key, level)]
+            scope_orders=[o for o in orders if _order_matches_scope(o, key, level)]
             vals=[sum(x["total"] for x in items if _bucket(x["pa"])==b) for b in BUCKETS]
-            data.append([first.get("brand_name"),first.get("dealer_name"),key if level!="branch" else first.get("branch"),len(items),sum(x["qty"] for x in items),sum(x["total"] for x in items),*vals,len(scope_orders),sum(_num(o.get("item_count")) for o in scope_orders),len({r.get("request_number") for r in scope_req if _text(r.get("requesting_branch")) in branches}),len({r.get("request_number") for r in scope_req if _text(r.get("supplying_branch")) in branches}),sum(_num(r.get("requested_qty",r.get("quantity"))) for r in scope_req),sum(_num(r.get("accepted_qty",r.get("approved_qty"))) for r in scope_req),len({r.get("request_number") for r in scope_req if _text(r.get("status")).lower()=="rejected"}),len({r.get("request_number") for r in scope_req if _text(r.get("status")).lower()=="completed"}),sum(_num(r.get("part_value",r.get("unit_value")))*_num(r.get("accepted_qty",r.get("approved_qty"))) for r in scope_req if _text(r.get("status")).lower()=="completed"),sum(m["missed_value"] for m in missed if key in (_text(m.get("supplying_branch")),_text(m.get("supplying_dealer")),_text(m.get("supplying_brand"))))])
+            unknown_val=sum(x["total"] for x in items if _bucket(x["pa"])==UNKNOWN_BUCKET)
+            display_branch = first.get("branch") if level=="branch" else (key[-1] if key else "")
+            data.append([first.get("brand_name"),first.get("dealer_name"),display_branch,len(items),sum(x["qty"] for x in items),sum(x["total"] for x in items),*vals,unknown_val,len(scope_orders),sum(_num(o.get("item_count")) for o in scope_orders),len({r.get("request_number") for r in scope_req if _request_side_matches(r, key, level, "requesting")}),len({r.get("request_number") for r in scope_req if _request_side_matches(r, key, level, "supplying")}),sum(_num_alias(r.get("requested_qty"), r.get("quantity")) for r in scope_req),sum(_num_alias(r.get("accepted_qty"), r.get("approved_qty")) for r in scope_req),len({r.get("request_number") for r in scope_req if _text(r.get("status")).lower()=="rejected"}),len({r.get("request_number") for r in scope_req if _text(r.get("status")).lower()=="completed"}),sum(_num_alias(r.get("part_value"), r.get("unit_value"))*_num_alias(r.get("accepted_qty"), r.get("approved_qty")) for r in scope_req if _text(r.get("status")).lower()=="completed"),sum(m["missed_value"] for m in missed if _request_side_matches(m, key, level, "supplying"))])
     return headers,data
+
+
+def _composite_scope_key(row, level):
+    brand = _text(row.get("brand_name"))
+    dealer = _text(row.get("dealer_name"))
+    branch = _text(row.get("branch"))
+    if level == "branch":
+        return (brand, dealer, branch)
+    if level == "dealer_name":
+        return (brand, dealer)
+    return (brand,)
+
+
+def _order_matches_scope(order, key, level):
+    ident = _composite_scope_key(order, level)
+    return ident == key
+
+
+def _request_side_tuple(row, side):
+    prefix = "requesting" if side == "requesting" else "supplying"
+    return (
+        _text(row.get(f"{prefix}_brand")),
+        _text(row.get(f"{prefix}_dealer")),
+        _text(row.get(f"{prefix}_branch")),
+    )
+
+
+def _request_side_matches(row, key, level, side):
+    brand, dealer, branch = _request_side_tuple(row, side)
+    if level == "branch":
+        return (brand, dealer, branch) == key
+    if level == "dealer_name":
+        return (brand, dealer) == key
+    return (brand,) == key
+
+
+def _request_matches_scope(row, key, level):
+    return _request_side_matches(row, key, level, "requesting") or _request_side_matches(row, key, level, "supplying")
 
 
 def _workbook(title,number,headers,data,meta,summary=None):
@@ -347,6 +444,8 @@ def _workbook(title,number,headers,data,meta,summary=None):
     if data:
         total_row=hr+len(data)+1; ws.cell(total_row,1,"TOTAL").font=Font(bold=True)
         for ci,h in enumerate(headers,1):
+            if any(term in h for term in ("Unit Value", "MAV", "Part Value")):
+                continue
             if any(x in h for x in ("Quantity","Value","Line Items","Count","Orders","Requests")):
                 letter=get_column_letter(ci); ws.cell(total_row,ci,f"=SUM({letter}{hr+1}:{letter}{total_row-1})").font=Font(bold=True); ws.cell(total_row,ci).number_format='#,##0.00'
     ws.freeze_panes=f"A{hr+1}"; ws.auto_filter.ref=f"A{hr}:{get_column_letter(len(headers))}{hr+len(data)}"
@@ -414,7 +513,7 @@ async def analytics(from_date:str,to_date:str,brand:Optional[str]=None,dealer:Op
     start,end=_period(from_date,to_date,True); scope=_scope(current_user,brand,dealer,branch)
     inv=await _inventory(scope); orders=await _orders(scope,start,end); reqs=await _requests(scope,start,end); missed=_missed(reqs,inv)
     aging=[]
-    for b in BUCKETS:
+    for b in [*BUCKETS, UNKNOWN_BUCKET]:
         rows=[x for x in inv if _bucket(x["pa"])==b]; aging.append({"bucket":b,"quantity":sum(x["qty"] for x in rows),"value":sum(x["total"] for x in rows),"line_items":len(rows)})
     branches=[]
     for name in sorted({_text(x.get("branch")) for x in inv if x.get("branch")}):
@@ -430,7 +529,7 @@ async def analytics(from_date:str,to_date:str,brand:Optional[str]=None,dealer:Op
     pa=[_num(x["pa"]) for x in inv if x["pa"] not in (None,"")]; sa=[_num(x["sa"]) for x in inv if x["sa"] not in (None,"")]
     statuses=defaultdict(set)
     for r in reqs: statuses[_text(r.get("status"),"Unknown")].add(r.get("request_number"))
-    return {"scope":scope,"stock":{"line_items":len(inv),"quantity":sum(x["qty"] for x in inv),"value":sum(x["total"] for x in inv),"avg_purchase_aging":sum(pa)/len(pa) if pa else 0,"avg_sales_aging":sum(sa)/len(sa) if sa else 0},"aging":aging,"movement":{"added_line_items":len(inv),"added_quantity":sum(x["qty"] for x in inv),"added_value":sum(x["total"] for x in inv),"reduced_line_items":0,"reduced_quantity":0,"reduced_value":0},"orders":{"total":len(orders),"line_items":sum(_num(o.get("item_count")) for o in orders),"requested_qty":sum(_num(o.get("total_required_qty")) for o in orders),"available_qty":sum(_num(o.get("total_available_qty")) for o in orders),"not_available_qty":sum(_num(o.get("total_not_available_qty")) for o in orders),"reserved_qty":sum(_num(o.get("total_reserved_qty")) for o in orders),"value":sum(_num(o.get("total_order_value")) for o in orders)},"requests":{"total":len({r.get("request_number") for r in reqs}),"requested_qty":sum(_num(r.get("requested_qty",r.get("quantity"))) for r in reqs),"approved_qty":sum(_num(r.get("accepted_qty",r.get("approved_qty"))) for r in reqs),"statuses":{k:len(v) for k,v in statuses.items()},"value":sum(_num(r.get("part_value",r.get("unit_value")))*_num(r.get("requested_qty",r.get("quantity"))) for r in reqs),"completed_value":sum(_num(r.get("part_value",r.get("unit_value")))*_num(r.get("accepted_qty",r.get("approved_qty"))) for r in reqs if _text(r.get("status")).lower()=="completed")},"missed":{"requests":len({m.get("request_number") for m in missed}),"line_items":len(missed),"quantity":sum(m["eligible"] for m in missed),"value":sum(m["missed_value"] for m in missed)},"branches":branches,"daily":result_daily}
+    return {"scope":scope,"stock":{"line_items":len(inv),"quantity":sum(x["qty"] for x in inv),"value":sum(x["total"] for x in inv),"avg_purchase_aging":sum(pa)/len(pa) if pa else 0,"avg_sales_aging":sum(sa)/len(sa) if sa else 0},"aging":aging,"movement":{"available":False,"message":STOCK_MOVEMENT_UNAVAILABLE,"opening_quantity":None,"added_quantity":None,"reduced_quantity":None,"closing_quantity":None},"orders":{"total":len(orders),"line_items":sum(_num(o.get("item_count")) for o in orders),"requested_qty":sum(_num(o.get("total_required_qty")) for o in orders),"available_qty":sum(_num(o.get("total_available_qty")) for o in orders),"not_available_qty":sum(_num(o.get("total_not_available_qty")) for o in orders),"reserved_qty":sum(_num(o.get("total_reserved_qty")) for o in orders),"value":sum(_num(o.get("total_order_value")) for o in orders)},"requests":{"total":len({r.get("request_number") for r in reqs}),"requested_qty":sum(_num(r.get("requested_qty",r.get("quantity"))) for r in reqs),"approved_qty":sum(_num(r.get("accepted_qty",r.get("approved_qty"))) for r in reqs),"statuses":{k:len(v) for k,v in statuses.items()},"value":sum(_num(r.get("part_value",r.get("unit_value")))*_num(r.get("requested_qty",r.get("quantity"))) for r in reqs),"completed_value":sum(_num(r.get("part_value",r.get("unit_value")))*_num(r.get("accepted_qty",r.get("approved_qty"))) for r in reqs if _text(r.get("status")).lower()=="completed")},"missed":{"requests":len({m.get("request_number") for m in missed}),"line_items":len(missed),"quantity":sum(m["eligible"] for m in missed),"value":sum(m["missed_value"] for m in missed)},"branches":branches,"daily":result_daily}
 
 async def _next_old_number():
     key=datetime.now(timezone.utc).strftime("%y%m%d"); doc=await db.counters.find_one_and_update({"_id":f"old_report_{key}"},{"$inc":{"seq":1}},upsert=True,return_document=ReturnDocument.AFTER); return testing_runtime.prefix_business_id(f"OR{key}{int(doc.get('seq',1)):04d}")

@@ -1,6 +1,7 @@
 """NMTS Query Desk — common support queries visible to all authenticated roles."""
 from __future__ import annotations
 
+import logging
 import os
 import re
 import uuid
@@ -22,6 +23,7 @@ except ImportError:
     import testing_runtime
 
 router = APIRouter(prefix="/queries", tags=["Query Desk"])
+logger = logging.getLogger("nmts.query_desk")
 QUERY_STORAGE = Path(os.getenv("QUERY_DESK_STORAGE_DIR", Path(__file__).parent / "query_attachments"))
 QUERY_STORAGE.mkdir(parents=True, exist_ok=True)
 
@@ -206,7 +208,8 @@ async def _save_attachment(file: UploadFile, prefix: str) -> dict:
             content_type=file.content_type or CONTENT_TYPES.get(ext, "application/octet-stream"),
         )
     except Exception:
-        stored = {}
+        logger.exception("query attachment durable storage failed")
+        raise HTTPException(status_code=502, detail={"code": "STORAGE_FAILURE", "message": "Attachment storage failed"})
 
     return {
         "file_id": file_id,
@@ -447,11 +450,38 @@ async def similar_queries(subject: str = "", current_user=Depends(_current_user)
     return {"records": rows}
 
 
+def _can_access_query(current_user, doc: dict) -> bool:
+    if not doc:
+        return False
+    role = (current_user.role or "").lower()
+    if role == "master":
+        return True
+    if _is_query_creator(current_user, doc):
+        return True
+    scope = doc.get("scope") or {}
+    brand = str(scope.get("brand_name") or "").strip().casefold()
+    dealer = str(scope.get("dealer_name") or "").strip().casefold()
+    branch = str(scope.get("branch_name") or "").strip().casefold()
+    user_brand = str(getattr(current_user, "brand", "") or "").strip().casefold()
+    user_dealer = str(getattr(current_user, "group", "") or "").strip().casefold()
+    user_branch = str(getattr(current_user, "location", "") or "").strip().casefold()
+    if role == "admin":
+        return (not brand or brand == user_brand) and (not dealer or dealer == user_dealer)
+    return (
+        (not brand or brand == user_brand)
+        and (not dealer or dealer == user_dealer)
+        and (not branch or branch == user_branch)
+    )
+
+
 @router.get("/attachments/{file_id}")
 async def download_attachment(file_id: str, current_user=Depends(_current_user)):
     meta = await db.query_attachments.find_one({"file_id": file_id})
     if not meta:
-        raise HTTPException(status_code=404, detail="Attachment not found")
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Attachment not found"})
+    query = await db.queries.find_one({"id": meta.get("query_id")}, {"_id": 0})
+    if not query or not _can_access_query(current_user, query):
+        raise HTTPException(status_code=403, detail="Not authorized to access this attachment")
     try:
         import file_objects
     except ImportError:
@@ -459,10 +489,11 @@ async def download_attachment(file_id: str, current_user=Depends(_current_user))
     if meta.get("storage_path") and not meta.get("attachment_storage_path"):
         meta = {**meta, "attachment_storage_path": meta.get("storage_path")}
     if not file_objects.meta_has_readable_bytes(meta):
-        raise HTTPException(status_code=404, detail="Attachment file not found")
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Attachment file not found"})
     return file_objects.streaming_response_from_meta(
         meta,
         filename=meta.get("file_name") or "attachment.bin",
+        preview=True,
     )
 
 

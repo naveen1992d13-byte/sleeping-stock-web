@@ -17,6 +17,7 @@ import {
 import { toast } from 'sonner';
 
 import { resolveBackendUrl } from '@/backendUrl';
+import { openInlineAttachment, parseBlobError } from '@/utils/blobResponse';
 
 const QUERY_TYPES = ['System', 'General', 'Guidance'];
 const STATUS_STYLES = {
@@ -182,17 +183,9 @@ function AttachmentLink({ attachment }) {
   const download = async (e) => {
     e.preventDefault();
     try {
-      const res = await axios.get(href, { responseType: 'blob' });
-      const blobUrl = window.URL.createObjectURL(new Blob([res.data]));
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.setAttribute('download', attachment.file_name || 'attachment');
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(blobUrl);
-    } catch {
-      toast.error('Unable to download attachment');
+      await openInlineAttachment(href, attachment.file_name || 'attachment');
+    } catch (error) {
+      toast.error(await parseBlobError(error, error.message || 'Unable to open attachment'));
     }
   };
 
@@ -203,7 +196,7 @@ function AttachmentLink({ attachment }) {
       className="inline-flex items-center gap-1 text-sm font-medium text-emerald-700 hover:underline"
     >
       <Paperclip className="h-4 w-4" />
-      {attachment.file_name || 'Download'}
+      {attachment.file_name || 'Open'}
     </button>
   );
 }

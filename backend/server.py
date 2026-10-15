@@ -358,13 +358,21 @@ def hash_password(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
+def validate_password_policy(password: str) -> str:
+    text = str(password or "").strip()
+    if len(text) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    return text
+
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
+    now = datetime.now(timezone.utc)
     if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
+        expire = now + expires_delta
     else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
+        expire = now + timedelta(minutes=15)
+    to_encode.update({"exp": expire, "iat": int(now.timestamp())})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -386,6 +394,23 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     user = await db.users.find_one({"id": user_id}, {"_id": 0})
     if user is None:
         raise credentials_exception
+    changed = user.get("password_changed_at")
+    iat = payload.get("iat")
+    if changed is not None and iat is not None:
+        if isinstance(changed, str):
+            try:
+                changed = datetime.fromisoformat(changed.replace("Z", "+00:00"))
+            except ValueError:
+                changed = None
+        if isinstance(changed, datetime):
+            if changed.tzinfo is None:
+                changed = changed.replace(tzinfo=timezone.utc)
+            try:
+                issued = datetime.fromtimestamp(float(iat), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                issued = None
+            if issued is not None and issued < changed:
+                raise credentials_exception
     _apply_testing_master_permissions(user)
     return UserResponse(**user)
 
@@ -1855,15 +1880,28 @@ async def update_user_profile(
     update_data: UserUpdate,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    # Users can only edit their own profile unless they're admin/master
-    if current_user.role not in ["master", "admin"] and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized to edit this profile")
-    
-    update_dict = {k: v for k, v in update_data.model_dump().items() if v is not None}
-    if not update_dict:
+    if current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Self-profile edits are limited to your own account")
+    payload = update_data.model_dump()
+    allowed = {}
+    if payload.get("username") is not None:
+        allowed["username"] = str(payload["username"]).strip()
+    if payload.get("phone") is not None:
+        allowed["phone"] = str(payload["phone"]).strip()
+    if payload.get("email") is not None:
+        email = str(payload["email"]).strip().lower()
+        if not email:
+            raise HTTPException(status_code=400, detail="Email is required")
+        existing = await db.users.find_one(
+            {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}, "id": {"$ne": user_id}},
+            {"_id": 0, "id": 1},
+        )
+        if existing:
+            raise HTTPException(status_code=400, detail="Email is already in use")
+        allowed["email"] = email
+    if not allowed:
         raise HTTPException(status_code=400, detail="No data to update")
-    
-    result = await db.users.update_one({"id": user_id}, {"$set": update_dict})
+    result = await db.users.update_one({"id": user_id}, {"$set": allowed})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
     
@@ -1894,11 +1932,11 @@ async def change_password(
     if not verify_password(password_data.old_password, user["password"]):
         raise HTTPException(status_code=400, detail="Incorrect old password")
     
-    # Update password
-    new_hashed_password = hash_password(password_data.new_password)
+    new_password = validate_password_policy(password_data.new_password)
+    new_hashed_password = hash_password(new_password)
     await db.users.update_one(
         {"id": user_id},
-        {"$set": {"password": new_hashed_password}}
+        {"$set": {"password": new_hashed_password, "password_changed_at": datetime.now(timezone.utc)}}
     )
     
     # Log activity
@@ -1933,13 +1971,13 @@ async def reset_user_password(
         if target_user.get("brand") != current_user.brand or target_user.get("group") != current_user.group:
             raise HTTPException(status_code=403, detail="Not authorized for this user")
 
-    if not data.password or len(data.password.strip()) < 4:
-        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    password = validate_password_policy(data.password)
 
     await db.users.update_one(
         {"id": user_id},
         {"$set": {
-            "password": hash_password(data.password.strip()),
+            "password": hash_password(password),
+            "password_changed_at": datetime.now(timezone.utc),
             "passwordResetAt": datetime.now(timezone.utc).isoformat(),
             "passwordResetBy": current_user.id
         }}
@@ -5219,8 +5257,28 @@ async def order_desk_paste(payload: dict, current_user: UserResponse = Depends(g
     return await _create_order_v2(clean_rows, current_user, 'Copy From Excel', scope={'brand': payload.get('brand'), 'dealer': payload.get('dealer'), 'branch': payload.get('branch')})
 
 
+ORDER_HISTORY_STATUSES = [
+    "Order Created",
+    "Availability Checked",
+    "Source Selected",
+    "Requested",
+    "Accepted",
+    "Partially Accepted",
+    "Completed",
+    "Finished",
+]
+
+
 @api_router.get('/order-desk/orders')
-async def order_desk_orders(brand: Optional[str] = None, dealer: Optional[str] = None, branch: Optional[str] = None, current_user: UserResponse = Depends(get_current_user)):
+async def order_desk_orders(
+    brand: Optional[str] = None,
+    dealer: Optional[str] = None,
+    branch: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
     role = (current_user.role or '').lower()
     query = {} if role == 'master' else ({'dealer_name': current_user.group} if role == 'admin' else {'created_by': current_user.id})
     if brand and not str(brand).startswith('All '): query['brand_name'] = brand
@@ -5228,6 +5286,23 @@ async def order_desk_orders(brand: Optional[str] = None, dealer: Optional[str] =
     if branch and not str(branch).startswith('All '): query['branch'] = branch
     if role == 'admin': query['dealer_name'] = current_user.group
     if role == 'user': query.update({'created_by': current_user.id, 'branch': current_user.location})
+    if date_from or date_to:
+        from zoneinfo import ZoneInfo
+        ist = ZoneInfo("Asia/Kolkata")
+        created = {}
+        try:
+            if date_from:
+                start = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=ist).astimezone(timezone.utc)
+                created["$gte"] = start
+            if date_to:
+                end = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=ist) + timedelta(days=1)
+                created["$lt"] = end.astimezone(timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date range")
+        if created:
+            query["created_at"] = created
+    if status and str(status).strip() and str(status).strip().lower() not in {"all", "all statuses"}:
+        query["status"] = str(status).strip()
     rows = await db.order_headers.find(query, {'_id': 0}).sort('created_at', -1).limit(1000).to_list(1000)
     # Enrich for Order History (batched — avoid N+1 that stalls the page).
     order_ids = [r.get('id') for r in rows if r.get('id')]
@@ -5276,6 +5351,11 @@ async def order_desk_order_detail(
 ):
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
+        order = await db.order_headers.find_one(
+            {'order_number': {'$regex': f'^{re.escape(str(order_id).strip())}$', '$options': 'i'}},
+            {'_id': 0},
+        )
+    if not order:
         try:
             packed = await hybrid_order_history.read_order_package(db, order_id)
         except Exception:
@@ -5288,6 +5368,7 @@ async def order_desk_order_detail(
                 "archive_source": "s3",
             }
         raise HTTPException(status_code=404, detail='Order not found')
+    order_id = order.get('id') or order_id
     role = (current_user.role or '').lower()
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
@@ -7720,7 +7801,7 @@ class StockVerificationSessionCreate(BaseModel):
 
 
 class StockVerificationCorrection(BaseModel):
-    correction_status: str = "pending"  # pending, corrected, not_required
+    correction_status: str = "pending"  # pending, corrected, no_correction_needed
     correction_method: str = ""  # system_corrected, physical_relocated, both, no_action
     correction_remarks: str = ""
     physical_quantity: Optional[float] = None
@@ -8087,6 +8168,7 @@ async def list_verification_history_records(
     mobile_user_id: str = None,
     verification_type: str = None,
     result_filter: str = None,
+    correction_status: str = None,
     part_number: str = None,
     loc: str = None,
     limit: int = 500,
@@ -8121,15 +8203,23 @@ async def list_verification_history_records(
         else:
             query["verification_type"] = vt
     if result_filter and result_filter.lower() != "all":
-        rf = result_filter.lower()
-        if rf == "match":
+        rf = result_filter.lower().replace(" ", "_")
+        if rf in {"match", "matched"}:
             query["quantity_status"] = "matched"
         elif rf == "shortage":
             query["quantity_status"] = "shortage"
         elif rf == "excess":
             query["quantity_status"] = "excess"
+        elif rf in {"location_mismatch", "loc_mismatch", "location"}:
+            query["location_status"] = {"$in": ["mismatch", "location_mismatch"]}
         elif rf == "damage":
             query["has_damage"] = True
+    if correction_status and str(correction_status).lower() not in {"", "all"}:
+        cs = str(correction_status).strip().lower().replace(" ", "_")
+        if cs in {"no_correction_needed", "not_required", "not_required".replace("-", "_")}:
+            query["correction_status"] = {"$in": ["no_correction_needed", "not_required"]}
+        else:
+            query["correction_status"] = cs
     rows = await db.stock_verification_history.find(query, {"_id": 0}).sort("verified_at", -1).limit(min(limit, 2000)).to_list(2000)
     return rows
 
@@ -8351,27 +8441,46 @@ async def update_stock_verification_correction(
     payload: StockVerificationCorrection,
     current_user: UserResponse = Depends(get_current_user),
 ):
-    if current_user.role not in {"master", "admin"}:
-        raise HTTPException(status_code=403, detail="Only Master/Admin can update correction information")
     record = await db.stock_verifications.find_one({"id": verification_id}, {"_id": 0})
     if not record:
+        record = await db.stock_verification_history.find_one({"id": verification_id}, {"_id": 0})
+    if not record:
         raise HTTPException(status_code=404, detail="Verification record not found")
-    scope_query = _verification_scope_query(current_user)
-    if scope_query and not await db.stock_verifications.find_one({"id": verification_id, **scope_query}, {"_id": 0, "id": 1}):
-        raise HTTPException(status_code=403, detail="Verification is outside your permitted scope")
+    role = (current_user.role or "").lower()
+    if role not in {"master", "admin", "user"}:
+        raise HTTPException(status_code=403, detail="Not authorized to update correction information")
+    if role == "admin":
+        if current_user.brand and str(record.get("brand_name") or "").casefold() != str(current_user.brand).casefold():
+            raise HTTPException(status_code=403, detail="Verification is outside your permitted scope")
+        if current_user.group and str(record.get("dealer_name") or "").casefold() != str(current_user.group).casefold():
+            raise HTTPException(status_code=403, detail="Verification is outside your permitted scope")
+    if role == "user":
+        if current_user.location and str(record.get("branch") or "").casefold() != str(current_user.location).casefold():
+            raise HTTPException(status_code=403, detail="Verification is outside your permitted scope")
+    existing_status = str(record.get("correction_status") or "").strip().lower()
+    if existing_status in {"corrected", "no_correction_needed", "not_required"}:
+        raise HTTPException(status_code=409, detail="Correction is closed and cannot be repeated")
     correction_status = (payload.correction_status or "pending").strip().lower()
+    if correction_status in {"not_required", "not required"}:
+        correction_status = "no_correction_needed"
     correction_method = (payload.correction_method or "").strip().lower()
-    if correction_status not in {"pending", "corrected", "not_required"}:
+    remarks = (payload.correction_remarks or payload.correction_reason or "").strip()
+    if correction_status in {"corrected", "no_correction_needed"} and not remarks:
+        raise HTTPException(status_code=400, detail="Remarks are required")
+    if correction_status not in {"pending", "corrected", "no_correction_needed"}:
         raise HTTPException(status_code=400, detail="Invalid correction status")
     if correction_method not in {"", "system_corrected", "physical_relocated", "both", "no_action"}:
         raise HTTPException(status_code=400, detail="Invalid correction method")
     update = {
         "correction_status": correction_status,
         "correction_method": correction_method,
-        "correction_remarks": (payload.correction_remarks or "").strip(),
+        "correction_remarks": remarks,
         "correction_updated_by": current_user.id,
         "correction_updated_by_name": current_user.username,
         "correction_updated_at": datetime.now(timezone.utc),
+        "corrected_by": current_user.id,
+        "corrected_by_name": current_user.username,
+        "corrected_at": datetime.now(timezone.utc),
     }
     if payload.physical_quantity is not None:
         try:

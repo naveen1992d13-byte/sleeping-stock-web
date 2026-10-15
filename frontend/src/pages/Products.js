@@ -7,6 +7,7 @@ import { isTestingUiEnabled } from '@/testingUi';
 import { Button } from '@/components/ui/button';
 import { Package, Search, Download, Archive, Boxes } from 'lucide-react';
 import { toast } from 'sonner';
+import { parseBlobError } from '@/utils/blobResponse';
 
 const COLORS = { primary: '#059669', dark: '#047857', soft: '#ECFDF5', border: '#D1D5DB', text: '#1F2937', muted: '#6B7280', danger: '#DC2626', warning: '#D97706', blue: '#2563EB' };
 const isAll = (v) => !v || String(v).startsWith('All ') || v === 'N/A';
@@ -48,6 +49,14 @@ async function authenticatedDownload(url, fallbackFileName, onProgress) {
       onProgress(Math.round((event.loaded * 100) / event.total));
     },
   });
+  const ctype = String(res.headers?.['content-type'] || '').toLowerCase();
+  if (ctype.includes('application/json')) {
+    const text = await res.data.text();
+    let parsed = {};
+    try { parsed = JSON.parse(text); } catch { parsed = {}; }
+    const detail = parsed?.detail;
+    throw new Error((typeof detail === 'string' && detail) || detail?.message || parsed?.message || 'Export failed');
+  }
   const disposition = res.headers?.['content-disposition'] || '';
   const match = /filename="?([^"]+)"?/i.exec(disposition);
   const fileName = match?.[1] || fallbackFileName;
@@ -100,10 +109,10 @@ export function Products() {
     setPage(1);
   }, [dataOrigin]);
 
-  useEffect(() => {
-    const t = setTimeout(() => { setSearch(searchInput.trim()); setPage(1); }, 400);
-    return () => clearTimeout(t);
-  }, [searchInput]);
+  const applySearch = () => {
+    setSearch(searchInput.trim());
+    setPage(1);
+  };
 
   const scopeParams = (extra = {}) => {
     const params = new URLSearchParams();
@@ -189,7 +198,7 @@ export function Products() {
       if (testingUi && isMaster && dataOrigin && dataOrigin !== 'all') params.append('data_origin', dataOrigin);
       await authenticatedDownload(`${API}/product-hub/export/branch?${params.toString()}`, `ProductHub_${branchName}.xlsx`);
       toast.success('Branch export downloaded');
-    } catch (e) { toast.error(e.response?.data?.detail || 'Export failed'); }
+    } catch (e) { toast.error(await parseBlobError(e, e.message || 'Export failed')); }
     finally { setExporting(false); }
   };
 
@@ -203,7 +212,7 @@ export function Products() {
       if (testingUi && isMaster && dataOrigin && dataOrigin !== 'all') params.append('data_origin', dataOrigin);
       await authenticatedDownload(`${API}/product-hub/export/master?${params.toString()}`, 'ProductHub_Full_Export.xlsx');
       toast.success('Full export downloaded');
-    } catch (e) { toast.error(e.response?.data?.detail || 'Full export failed'); }
+    } catch (e) { toast.error(await parseBlobError(e, e.message || 'Full export failed')); }
     finally { setExporting(false); }
   };
 
@@ -228,8 +237,18 @@ export function Products() {
         <div className="flex gap-2 w-full md:w-auto flex-wrap">
           <div className="relative flex-1 md:w-64">
             <Search className="h-4 w-4 absolute left-3 top-3" style={{ color: COLORS.muted }} />
-            <input value={searchInput} onChange={(e) => setSearchInput(e.target.value)} placeholder="Search Part No / Part Name" className="w-full pl-9 pr-4 py-2 rounded-xl border" />
+            <input
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); applySearch(); } }}
+              placeholder="Search Part No / Part Name"
+              className="w-full pl-9 pr-4 py-2 rounded-xl border"
+              data-testid="product-hub-search-input"
+            />
           </div>
+          <Button type="button" onClick={applySearch} className="gap-2" data-testid="product-hub-search-button">
+            <Search className="h-4 w-4" /> Search
+          </Button>
           <select value={partTypeOptions.includes(category) ? category : 'All'} onChange={(e) => setCategory(e.target.value)} className="px-3 py-2 rounded-xl border text-sm" title="Part Type" data-testid="product-hub-part-type">
             {partTypeOptions.map(c => <option key={c} value={c}>{c === 'All' ? 'All Part Types' : c}</option>)}
           </select>

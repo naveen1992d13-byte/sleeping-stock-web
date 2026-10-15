@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import { useOutletContext } from 'react-router-dom';
 import { API } from '../App';
@@ -29,9 +29,9 @@ import {
   BarChart,
 } from 'recharts';
 
-const AGING_BUCKETS = ['0–90 Days', '91–180 Days', '181–270 Days', '271–361 Days', '>361 Days'];
-// Sample image palette: green / blue / orange / purple / red
-const AGING_COLORS = ['#22c55e', '#3b82f6', '#f59e0b', '#a855f7', '#ef4444'];
+const AGING_BUCKETS = ['0–90 Days', '91–180 Days', '181–270 Days', '271–361 Days', '>361 Days', 'Unknown'];
+// Sample image palette: green / blue / orange / purple / red + gray for Unknown
+const AGING_COLORS = ['#22c55e', '#3b82f6', '#f59e0b', '#a855f7', '#ef4444', '#9ca3af'];
 const ORDER_COLORS = {
   original: '#3b82f6',
   reduced: '#ef4444',
@@ -47,21 +47,30 @@ const FULFILL_COLORS = {
 // Same Part Type options / source as Product Hub (All | OE Parts | Accessories | Others).
 const PART_TYPE_OPTIONS = ['All', 'OE Parts', 'Accessories', 'Others'];
 
-const today = new Date();
-const isoLocal = (d) => {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+const istYmd = (d = new Date()) =>
+  new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
+const istParts = (d = new Date()) => {
+  const [y, m, day] = istYmd(d).split('-').map(Number);
+  return { y, m, day };
 };
-const monthValue = (d = today) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+const today = new Date();
+const monthValue = (d = today) => {
+  const { y, m } = istParts(d);
+  return `${y}-${String(m).padStart(2, '0')}`;
+};
 
 const monthBounds = (ym) => {
   const [y, m] = String(ym).split('-').map(Number);
-  const from = new Date(y, m - 1, 1);
-  const last = new Date(y, m, 0);
-  const end = last > today ? today : last;
-  return { from_date: isoLocal(from), to_date: isoLocal(end) };
+  const from = `${y}-${String(m).padStart(2, '0')}-01`;
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const now = istParts();
+  const toDay = now.y === y && now.m === m ? now.day : lastDay;
+  return { from_date: from, to_date: `${y}-${String(m).padStart(2, '0')}-${String(toDay).padStart(2, '0')}` };
 };
 
 export const formatINR = (n) =>
@@ -151,7 +160,7 @@ function UnitBadge({ metricMode }) {
   );
 }
 
-function SectionCard({ title, hint, metricMode, children, footer, testId }) {
+function SectionCard({ title, hint, metricMode, children, footer, testId, loading, error }) {
   return (
     <section
       className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-gray-200 bg-white shadow-sm"
@@ -165,9 +174,11 @@ function SectionCard({ title, hint, metricMode, children, footer, testId }) {
               <Info className="h-3.5 w-3.5" />
             </span>
           ) : null}
+          {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin text-gray-400" /> : null}
         </div>
         <UnitBadge metricMode={metricMode} />
       </div>
+      {error ? <div className="px-3 py-1.5 text-[11px] text-rose-700 bg-rose-50">{error}</div> : null}
       <div className="flex min-h-0 flex-1 flex-col gap-2 p-2.5">{children}</div>
       {footer ? (
         <div className="border-t border-gray-200 bg-gray-50 px-3 py-1.5 text-[10px] font-semibold text-gray-700">
@@ -271,11 +282,16 @@ export function Analytics() {
   const [month, setMonth] = useState(monthValue());
   const [metricMode, setMetricMode] = useState('value');
   const [partType, setPartType] = useState('All');
+  const [agingType, setAgingType] = useState('purchase');
   const [loading, setLoading] = useState(false);
+  const [sectionLoading, setSectionLoading] = useState({ stock: false, aging: false, orders: false, requests: false });
+  const [sectionError, setSectionError] = useState({ stock: null, aging: null, orders: null, requests: null });
   const [stockTrend, setStockTrend] = useState(null);
   const [agingTrend, setAgingTrend] = useState(null);
   const [orderSaving, setOrderSaving] = useState(null);
   const [requestAcceptance, setRequestAcceptance] = useState(null);
+  const requestSeq = useRef(0);
+  const abortRef = useRef(null);
 
   const bounds = useMemo(() => monthBounds(month), [month]);
   const isValue = metricMode === 'value';
@@ -307,37 +323,50 @@ export function Analytics() {
     // Wait until layout finishes hydrating scope (initial placeholder is "N/A").
     if (!scopeBrand || !scopeDealer || !scopeBranch) return;
     if ([scopeBrand, scopeDealer, scopeBranch].some((v) => String(v) === 'N/A')) return;
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const seq = requestSeq.current + 1;
+    requestSeq.current = seq;
     setLoading(true);
-    try {
-      // Backend contract (same as previous Analytics): metric_type + category + aging_type.
-      // Omit All* scope filters so authorized scope is consolidated server-side.
-      const common = {
-        ...bounds,
-        ...scopeParams,
-        metric_type: metricMode,
-        aging_type: 'purchase',
-        ...(partType && partType !== 'All' ? { category: partType } : {}),
-      };
-      const [st, ag, os, ra] = await Promise.all([
-        axios.get(`${API}/analytics/stock-trend`, { params: common }),
-        axios.get(`${API}/analytics/aging-trend`, { params: common }),
-        axios.get(`${API}/analytics/order-saving`, { params: common }),
-        axios.get(`${API}/analytics/request-acceptance`, {
-          params: { ...common, request_direction: 'received' },
-        }),
-      ]);
-      setStockTrend(st.data);
-      setAgingTrend(ag.data);
-      setOrderSaving(os.data);
-      setRequestAcceptance(ra.data);
-    } catch (err) {
-      console.error(err);
-      const detail = err?.response?.data?.detail;
-      toast.error(typeof detail === 'string' ? detail : 'Failed to load analytics');
-    } finally {
-      setLoading(false);
-    }
-  }, [bounds, scopeParams, scopeBrand, scopeDealer, scopeBranch, partType, metricMode]);
+    setSectionLoading({ stock: true, aging: true, orders: true, requests: true });
+    const common = {
+      ...bounds,
+      ...scopeParams,
+      metric_type: metricMode,
+      aging_type: agingType === 'sales' ? 'sales' : 'purchase',
+      ...(partType && partType !== 'All' ? { category: partType } : {}),
+    };
+    const fetchOne = async (key, promise, setter) => {
+      try {
+        const res = await promise;
+        if (seq !== requestSeq.current) return;
+        setter(res.data);
+        setSectionError((prev) => ({ ...prev, [key]: null }));
+      } catch (err) {
+        if (axios.isCancel?.(err) || err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError' || err?.name === 'AbortError') return;
+        if (seq !== requestSeq.current) return;
+        const detail = err?.response?.data?.detail;
+        const message = typeof detail === 'string' ? detail : (detail?.message || 'Failed to load this section');
+        setSectionError((prev) => ({ ...prev, [key]: message }));
+        toast.error(message);
+      } finally {
+        if (seq === requestSeq.current) {
+          setSectionLoading((prev) => ({ ...prev, [key]: false }));
+        }
+      }
+    };
+    await Promise.all([
+      fetchOne('stock', axios.get(`${API}/analytics/stock-trend`, { params: common, signal: controller.signal }), setStockTrend),
+      fetchOne('aging', axios.get(`${API}/analytics/aging-trend`, { params: common, signal: controller.signal }), setAgingTrend),
+      fetchOne('orders', axios.get(`${API}/analytics/order-saving`, { params: common, signal: controller.signal }), setOrderSaving),
+      fetchOne('requests', axios.get(`${API}/analytics/request-acceptance`, {
+        params: { ...common, request_direction: 'received' },
+        signal: controller.signal,
+      }), setRequestAcceptance),
+    ]);
+    if (seq === requestSeq.current) setLoading(false);
+  }, [bounds, scopeParams, scopeBrand, scopeDealer, scopeBranch, partType, metricMode, agingType]);
 
   useEffect(() => {
     load();
@@ -499,7 +528,7 @@ export function Analytics() {
     let agingOver180 = null;
     let agingPct = null;
     if (lastAging) {
-      const over = AGING_BUCKETS.slice(2).reduce(
+      const over = ['181–270 Days', '271–361 Days', '>361 Days'].reduce(
         (sum, b) => sum + Number(lastAging[`${b}__raw`] || 0),
         0
       );
@@ -570,6 +599,17 @@ export function Analytics() {
           ))}
         </select>
 
+        <select
+          className={selectClass}
+          value={agingType}
+          onChange={(e) => setAgingType(e.target.value)}
+          data-testid="analytics-aging-type"
+          aria-label="Aging Type"
+        >
+          <option value="purchase">Purchase Aging</option>
+          <option value="sales">Sales Aging</option>
+        </select>
+
         <div className="ml-auto">
           <MetricToggle value={metricMode} onChange={setMetricMode} />
         </div>
@@ -637,6 +677,8 @@ export function Analytics() {
           hint="Stock value by upload date for the selected month. Days with no upload are not shown."
           metricMode={metricMode}
           testId="analytics-section-stock-trend"
+          loading={sectionLoading.stock}
+          error={sectionError.stock}
         >
           <div className="h-[210px] w-full">
             {stockPoints.length ? (
@@ -692,9 +734,11 @@ export function Analytics() {
         {/* 2. Stock Aging Analysis */}
         <SectionCard
           title="Stock Aging Analysis"
-          hint="Daily stacked aging distribution across slabs."
+          hint="Daily stacked aging distribution across slabs. Unknown aging is kept as its own bucket."
           metricMode={metricMode}
           testId="analytics-section-aging"
+          loading={sectionLoading.aging}
+          error={sectionError.aging}
         >
           <div className="h-[210px] w-full">
             {agingPoints.length ? (
@@ -754,6 +798,8 @@ export function Analytics() {
           hint="Final / Net Order = Original Order − Reduced / Cut. NMTS purchase reduction."
           metricMode={metricMode}
           testId="analytics-section-orders"
+          loading={sectionLoading.orders}
+          error={sectionError.orders}
           footer={
             <div className="flex flex-wrap gap-x-4 gap-y-1">
               <span>
@@ -882,6 +928,8 @@ export function Analytics() {
           hint="Total Request = Fulfilled + Not Fulfilled. Fulfilled = Branches + Dealers / Co-Dealers."
           metricMode={metricMode}
           testId="analytics-section-requests"
+          loading={sectionLoading.requests}
+          error={sectionError.requests}
           footer={
             <div className="flex flex-wrap gap-x-4 gap-y-1">
               <span>

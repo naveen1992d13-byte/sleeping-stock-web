@@ -657,7 +657,11 @@ async def download_attachment(file_id: str, current_user=Depends(_current_user))
         meta = {**meta, "attachment_storage_path": meta.get("storage_path")}
     if not file_objects.meta_has_readable_bytes(meta):
         raise HTTPException(status_code=404, detail="File not found")
-    return file_objects.streaming_response_from_meta(meta, filename=meta.get("file_name") or "notice.pdf")
+    return file_objects.streaming_response_from_meta(
+        meta,
+        filename=meta.get("file_name") or "notice.pdf",
+        preview=True,
+    )
 
 
 async def _mark_read(notice_id: str, user, source: str = "detail"):

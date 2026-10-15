@@ -11,7 +11,6 @@ import { DashboardLayout } from './pages/DashboardLayout';
 import NoticeBoard from './pages/NoticeBoard';
 import { Products } from './pages/Products';
 import { ProductHubHistory } from './pages/ProductHubHistory';
-import { Orders } from './pages/Orders';
 import UploadCenter from "./pages/Upload";
 import { Notifications } from './pages/Notifications';
 import Users from './pages/Users';
@@ -179,8 +178,15 @@ function AuthProvider({ children }) {
     setUser(null);
   };
 
+  const refreshUser = async () => {
+    const token = localStorage.getItem('token');
+    if (!token) return null;
+    const res = await axios.get(`${API}/auth/me`);
+    return saveUserSession(token, res.data);
+  };
+
   return (
-    <AuthContext.Provider value={{ user, login, logout, loading }}>
+    <AuthContext.Provider value={{ user, login, logout, loading, refreshUser }}>
       {children}
     </AuthContext.Provider>
   );
@@ -287,7 +293,7 @@ function App() {
             } />
             <Route path="orders" element={
               <ProtectedRoute permission="Order Desk">
-                <Orders />
+                {null}
               </ProtectedRoute>
             } />
             <Route path="order-history" element={

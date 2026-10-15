@@ -213,11 +213,16 @@ function compactRequestedFrom(item, selectedAllocations = []) {
   return parts.join(' | ') || '—';
 }
 
-export function Orders() {
+export function Orders({ scopeOverride } = {}) {
   const { user } = useAuth();
   const canSaveSystemOrder = ['master', 'admin'].includes(String(user?.role || '').toLowerCase());
   const isMaster = String(user?.role || '').toLowerCase() === 'master';
-  const { scopeBrand = 'All Brands', scopeDealer = 'All Dealers', scopeBranch = 'All Branches' } = useOutletContext() || {};
+  const outletScope = useOutletContext() || {};
+  const {
+    scopeBrand = 'All Brands',
+    scopeDealer = 'All Dealers',
+    scopeBranch = 'All Branches',
+  } = scopeOverride || outletScope;
   const isAllScope = value => !value || String(value).startsWith('All ') || value === 'N/A';
   const scopeReady = !isAllScope(scopeBrand) && !isAllScope(scopeDealer) && !isAllScope(scopeBranch);
   const fileRef = useRef(null);
@@ -242,6 +247,7 @@ export function Orders() {
   const [partSearch, setPartSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('All');
   const [stageFilter, setStageFilter] = useState('All');
+  const [orderNumberInput, setOrderNumberInput] = useState('');
 
   const [pasteOpen, setPasteOpen] = useState(false);
   const [pasteText, setPasteText] = useState('');
@@ -713,9 +719,15 @@ export function Orders() {
     });
   };
 
+  const openByOrderNumber = () => {
+    const number = String(orderNumberInput || '').trim();
+    if (!number) return toast.error('Enter an Order Number');
+    loadOrder(number, true);
+  };
+
   return (
-    <div className="space-y-3" data-testid="orders-page">
-      <div className="rounded-xl border bg-white p-3 shadow-sm">
+    <div className="space-y-2" data-testid="orders-page">
+      <div className="rounded-xl border bg-white p-2.5 shadow-sm">
         <div className="flex flex-wrap items-center gap-2">
           <input ref={fileRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={handleUpload} />
           <Button onClick={() => fileRef.current?.click()} disabled={loading || orderFinished}><FileSpreadsheet className="mr-2 h-4 w-4" />Upload Excel</Button>
@@ -723,10 +735,18 @@ export function Orders() {
           <Button variant="outline" onClick={exportTemplate}>Download Template</Button>
           <Button variant="outline" onClick={downloadCurrentOrder} disabled={!currentOrder || loading}><Download className="mr-2 h-4 w-4" />Download Excel</Button>
           <Button variant="outline" onClick={() => setAddItemsOpen(true)} disabled={!currentOrder || loading || orderFinished}><Plus className="mr-2 h-4 w-4" />Add Items</Button>
-          <div className="ml-auto text-sm">
-            <span className="text-slate-500">Order Number: </span>
-            <span className="font-bold text-emerald-700">{currentOrder?.order_number || 'Created after upload'}</span>
-          </div>
+          <label className="ml-auto flex items-center gap-2 text-sm">
+            <span className="text-slate-500 whitespace-nowrap">Order Number</span>
+            <input
+              value={orderNumberInput}
+              onChange={(e) => setOrderNumberInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); openByOrderNumber(); } }}
+              placeholder={currentOrder?.order_number || 'Paste or type'}
+              className="h-9 w-48 rounded-md border px-2 text-sm font-semibold text-emerald-800"
+              data-testid="order-desk-order-number"
+            />
+            <Button type="button" variant="outline" onClick={openByOrderNumber} disabled={loading}>Open</Button>
+          </label>
         </div>
       </div>
 

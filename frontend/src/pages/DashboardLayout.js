@@ -25,6 +25,7 @@ import {
 import { toast } from 'sonner';
 import { clearAuthStorage } from '../utils/sessionActivity';
 import { NoticeLoginPopup } from '../components/NoticeLoginPopup';
+import { Orders } from './Orders';
 
 export function DashboardLayout() {
   const { user, logout } = useAuth();
@@ -697,21 +698,39 @@ export function DashboardLayout() {
               />
             </div>
           ) : (
-            <Outlet
-              context={{
-                scopeBrand,
-                scopeDealer,
-                scopeBranch,
-                setScopeBrand,
-                setScopeDealer,
-                setScopeBranch,
-                brandOptions,
-                dealerOptions,
-                branchOptions,
-                isMaster,
-                isAdmin,
-              }}
-            />
+            <>
+              {(() => {
+                const outletContext = {
+                  scopeBrand,
+                  scopeDealer,
+                  scopeBranch,
+                  setScopeBrand,
+                  setScopeDealer,
+                  setScopeBranch,
+                  brandOptions,
+                  dealerOptions,
+                  branchOptions,
+                  isMaster,
+                  isAdmin,
+                };
+                const orderDeskTabOpen = tabs.some((tab) => tab.id === 'orders' || tab.path === '/orders');
+                const orderDeskActive = location.pathname === '/orders';
+                const canOrderDesk = canAccessPermission(user, 'Order Desk');
+                const mountOrderDesk = canOrderDesk && (orderDeskTabOpen || orderDeskActive);
+                return (
+                  <>
+                    {mountOrderDesk ? (
+                      <div hidden={!orderDeskActive} aria-hidden={!orderDeskActive} data-testid="order-desk-keepalive">
+                        <Orders scopeOverride={outletContext} />
+                      </div>
+                    ) : null}
+                    <div hidden={mountOrderDesk && orderDeskActive}>
+                      <Outlet context={outletContext} />
+                    </div>
+                  </>
+                );
+              })()}
+            </>
           )}
         </main>
       </div>

@@ -1,6 +1,7 @@
 """NMTS Analytics APIs — scope-aware dashboards using published Product Hub history."""
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone, date
@@ -17,6 +18,7 @@ except ImportError:
     import part_category as pc
 
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
+logger = logging.getLogger("nmts.analytics")
 _security = HTTPBearer()
 _AUTH_DEP = None
 db = None
@@ -43,14 +45,20 @@ _query = rc._query
 _and = rc._and
 
 
+ANALYTICS_UNKNOWN_BUCKET = "Unknown"
+ANALYTICS_CHART_BUCKETS = [*ANALYTICS_AGING_BUCKETS, ANALYTICS_UNKNOWN_BUCKET]
+
+
 def _analytics_bucket(days) -> str:
     """Map aging days into the Analytics stacked-column buckets."""
     if days is None or days == "":
-        return ANALYTICS_AGING_BUCKETS[0]
+        return ANALYTICS_UNKNOWN_BUCKET
     try:
         d = float(days)
     except (TypeError, ValueError):
-        return ANALYTICS_AGING_BUCKETS[0]
+        return ANALYTICS_UNKNOWN_BUCKET
+    if d < 0:
+        return ANALYTICS_UNKNOWN_BUCKET
     if d <= 90:
         return ANALYTICS_AGING_BUCKETS[0]
     if d <= 180:
@@ -90,11 +98,11 @@ def _safe_pct(num: float, den: float) -> float:
 
 def _parse_period(from_date: str, to_date: str) -> Tuple[datetime, datetime, List[str]]:
     try:
-        start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=rc.IST)
     except Exception:
         raise HTTPException(400, "Invalid From Date (use YYYY-MM-DD)")
     try:
-        end_day = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_day = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=rc.IST)
     except Exception:
         raise HTTPException(400, "Invalid To Date (use YYYY-MM-DD)")
     end = end_day + timedelta(days=1)
@@ -142,10 +150,13 @@ def _row_category(row: dict) -> str:
 
 
 def _row_qty_unit(row: dict) -> Tuple[float, float]:
-    qty = _num(row.get("available_qty_number"), _num(row.get("quantity"), 0))
-    unit = _num(
+    qty = rc._num_alias(row.get("available_qty_number"), row.get("quantity"), row.get("available_qty"), row.get("qty"))
+    unit = rc._num_alias(
         row.get("unit_value_number"),
-        _num(row.get("mav_value"), _num(row.get("unit_value"), _num(row.get("price"), 0))),
+        row.get("mav_value"),
+        row.get("unit_value"),
+        row.get("price"),
+        row.get("cost"),
     )
     return qty, unit
 
@@ -261,7 +272,23 @@ async def _aggregate_latest_parts_for_date_keys(
                 }
             },
         ]
-        rows = await db.products.aggregate(pipeline, allowDiskUse=True).to_list(500000)
+        try:
+            rows = await db.products.aggregate(pipeline, allowDiskUse=True).to_list(500000)
+        except Exception as exc:
+            logger.warning("analytics $top aggregation unsupported; using $sort+$first fallback: %s", exc)
+            fallback = [
+                pipeline[0],
+                pipeline[1],
+                {"$sort": {"published_at": -1, "updated_at": -1}},
+                {
+                    "$group": {
+                        "_id": pipeline[2]["$group"]["_id"],
+                        "doc": {"$first": "$$ROOT"},
+                    }
+                },
+                pipeline[3],
+            ]
+            rows = await db.products.aggregate(fallback, allowDiskUse=True).to_list(500000)
         for r in rows:
             row_dk = _text(r.get("active_date_key"))
             pk = (
@@ -799,14 +826,11 @@ async def _part_type_lookup(part_numbers: List[str], scope: Optional[dict] = Non
     for i in range(0, len(nums), 2000):
         chunk = nums[i : i + 2000]
         q = _and(_query(scope or {}), {"part_number": {"$in": chunk}})
-        rows = (
-            await db.products.find(
-                q,
-                {"_id": 0, "part_number": 1, "part_category": 1, "category": 1, "parts_type": 1, "active_date_key": 1},
-            )
-            .sort("active_date_key", -1)
-            .to_list(100000)
-        )
+        cursor = db.products.find(
+            q,
+            {"_id": 0, "part_number": 1, "part_category": 1, "category": 1, "parts_type": 1, "active_date_key": 1},
+        ).sort("active_date_key", -1)
+        rows = await cursor.to_list(None)
         for row in rows:
             pn = _text(row.get("part_number")).casefold()
             if not pn or pn in out:
@@ -830,18 +854,20 @@ async def _filter_rows_by_part_type(rows: List[dict], category: Optional[str], s
 
 
 def _request_unit(row: dict) -> float:
-    return _num(
+    return rc._num_alias(
         row.get("value"),
-        _num(row.get("part_value"), _num(row.get("unit_value_at_request"), _num(row.get("unit_value"), 0))),
+        row.get("part_value"),
+        row.get("unit_value_at_request"),
+        row.get("unit_value"),
     )
 
 
 def _approved_qty(row: dict) -> float:
-    return _num(row.get("accepted_qty"), _num(row.get("approved_qty"), 0))
+    return rc._num_alias(row.get("accepted_qty"), row.get("approved_qty"))
 
 
 def _requested_qty(row: dict) -> float:
-    return _num(row.get("requested_qty"), _num(row.get("quantity"), 0))
+    return rc._num_alias(row.get("requested_qty"), row.get("quantity"), row.get("required_qty"))
 
 
 def _is_completed_request(row: dict) -> bool:
@@ -1100,7 +1126,7 @@ async def analytics_aging_trend(
     if not date_keys:
         return {
             "buckets": [],
-            "bucket_keys": list(ANALYTICS_AGING_BUCKETS),
+            "bucket_keys": list(ANALYTICS_CHART_BUCKETS),
             "stacked": [],
             "daily": [],
             "data_coverage": {},
@@ -1110,14 +1136,14 @@ async def analytics_aging_trend(
     # Item Wise = distinct part-line count (quantity of line items), Value Wise = stock value.
     use_items = metric_type == "quantity"
     last_row = ctx["daily"][-1]
-    bucket_totals = {b: {"value": None, "quantity": None, "items": None} for b in ANALYTICS_AGING_BUCKETS}
-    stacked = defaultdict(lambda: {b: None for b in ANALYTICS_AGING_BUCKETS})
+    bucket_totals = {b: {"value": None, "quantity": None, "items": None} for b in ANALYTICS_CHART_BUCKETS}
+    stacked = defaultdict(lambda: {b: None for b in ANALYTICS_CHART_BUCKETS})
     if last_row["data_status"] != "NO_UPLOAD":
         dk = _iso_to_date_key(last_row["date"])
         status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
         curr_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
-        bucket_totals = {b: {"value": 0.0, "quantity": 0.0, "items": 0.0} for b in ANALYTICS_AGING_BUCKETS}
-        stacked = defaultdict(lambda: {b: 0.0 for b in ANALYTICS_AGING_BUCKETS})
+        bucket_totals = {b: {"value": 0.0, "quantity": 0.0, "items": 0.0} for b in ANALYTICS_CHART_BUCKETS}
+        stacked = defaultdict(lambda: {b: 0.0 for b in ANALYTICS_CHART_BUCKETS})
         for row in curr_map.values():
             days = _aging_days_row(row, aging_type)
             b = _analytics_bucket(days)
@@ -1133,7 +1159,7 @@ async def analytics_aging_trend(
     else:
         cat_total = 1.0
     buckets_out = []
-    for b in ANALYTICS_AGING_BUCKETS:
+    for b in ANALYTICS_CHART_BUCKETS:
         v = bucket_totals[b]["value"]
         q = bucket_totals[b]["quantity"]
         items = bucket_totals[b]["items"]
@@ -1150,7 +1176,7 @@ async def analytics_aging_trend(
             }
         )
     stacked_out = [
-        {"category": c, **{b: stacked[c][b] for b in ANALYTICS_AGING_BUCKETS}}
+        {"category": c, **{b: stacked[c][b] for b in ANALYTICS_CHART_BUCKETS}}
         for c in sorted(stacked.keys())
     ]
     daily = []
@@ -1161,14 +1187,14 @@ async def analytics_aging_trend(
                     "date": pt["date"],
                     "data_status": "NO_UPLOAD",
                     "total": None,
-                    **{b: None for b in ANALYTICS_AGING_BUCKETS},
+                    **{b: None for b in ANALYTICS_CHART_BUCKETS},
                 }
             )
             continue
         dk = _iso_to_date_key(pt["date"])
         status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
         curr_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
-        day_buckets = {b: 0.0 for b in ANALYTICS_AGING_BUCKETS}
+        day_buckets = {b: 0.0 for b in ANALYTICS_CHART_BUCKETS}
         for row in curr_map.values():
             b = _analytics_bucket(_aging_days_row(row, aging_type))
             day_buckets[b] += row["value"] if use_value else 1.0
@@ -1178,12 +1204,12 @@ async def analytics_aging_trend(
                 "date": pt["date"],
                 "data_status": pt["data_status"],
                 "total": total,
-                **{b: day_buckets[b] for b in ANALYTICS_AGING_BUCKETS},
+                **{b: day_buckets[b] for b in ANALYTICS_CHART_BUCKETS},
             }
         )
     return {
         "buckets": buckets_out,
-        "bucket_keys": list(ANALYTICS_AGING_BUCKETS),
+        "bucket_keys": list(ANALYTICS_CHART_BUCKETS),
         "stacked": stacked_out,
         "daily": daily,
         "data_coverage": ctx["coverage"],
@@ -1236,29 +1262,38 @@ async def analytics_order_saving(
         orders = [o for o in orders if o.get("id") in keep_ids]
 
     if part_type_filter:
-        original_value = sum(_num(i.get("required_qty")) * _num(i.get("value"), _num(i.get("unit_value"))) for i in order_item_rows)
-        original_items = sum(_num(i.get("required_qty")) for i in order_item_rows)
+        original_value = sum(_num(i.get("required_qty")) * rc._num_alias(i.get("value"), i.get("unit_value")) for i in order_item_rows)
+        original_qty = sum(_num(i.get("required_qty")) for i in order_item_rows)
+        line_item_count = len(order_item_rows)
     else:
         original_value = sum(_num(o.get("total_order_value")) for o in orders)
-        original_items = sum(_num(o.get("item_count"), _num(o.get("total_required_qty"), 0)) for o in orders)
+        original_qty = sum(_num(o.get("total_required_qty")) for o in orders)
+        line_item_count = sum(_num(o.get("item_count")) for o in orders)
     reduced_value = 0.0
-    reduced_items = 0.0
+    reduced_qty = 0.0
     for r in linked:
         sq, sv = _nmts_sourced_qty_value(r)
         reduced_value += sv
-        reduced_items += sq
-    # Cap reduced so Final never goes negative from noisy source rows.
-    reduced_value = min(reduced_value, original_value) if original_value > 0 else reduced_value
-    reduced_items = min(reduced_items, original_items) if original_items > 0 else reduced_items
-    final_value = max(0.0, original_value - reduced_value)
-    final_items = max(0.0, original_items - reduced_items)
+        reduced_qty += sq
+    recon_failed = False
+    if original_value > 0 and reduced_value > original_value + 1e-6:
+        recon_failed = True
+        logger.warning("order-saving value reconciliation failed: reduced exceeds original")
+    if original_qty > 0 and reduced_qty > original_qty + 1e-6:
+        recon_failed = True
+        logger.warning("order-saving quantity reconciliation failed: reduced exceeds original")
+    original_items = original_qty
+    reduced_items = reduced_qty
+    final_value = original_value - reduced_value
+    final_items = original_qty - reduced_qty
 
     series_map = defaultdict(
         lambda: {
             "original_value": 0.0,
-            "original_items": 0.0,
+            "original_qty": 0.0,
+            "line_item_count": 0.0,
             "reduced_value": 0.0,
-            "reduced_items": 0.0,
+            "reduced_qty": 0.0,
             "order_count": 0,
         }
     )
@@ -1273,68 +1308,77 @@ async def analytics_order_saving(
             if oid and oid not in counted_orders:
                 series_map[d]["order_count"] += 1
                 counted_orders.add(oid)
-            series_map[d]["original_value"] += _num(i.get("required_qty")) * _num(i.get("value"), _num(i.get("unit_value")))
-            series_map[d]["original_items"] += _num(i.get("required_qty"))
+            series_map[d]["original_value"] += _num(i.get("required_qty")) * rc._num_alias(i.get("value"), i.get("unit_value"))
+            series_map[d]["original_qty"] += _num(i.get("required_qty"))
+            series_map[d]["line_item_count"] += 1
     else:
         for o in orders:
             d = (_dt(o.get("created_at")) or start).date().isoformat()
             series_map[d]["order_count"] += 1
             series_map[d]["original_value"] += _num(o.get("total_order_value"))
-            series_map[d]["original_items"] += _num(o.get("item_count"), _num(o.get("total_required_qty"), 0))
+            series_map[d]["original_qty"] += _num(o.get("total_required_qty"))
+            series_map[d]["line_item_count"] += _num(o.get("item_count"))
     for r in linked:
         d = (_dt(r.get("requested_at") or r.get("created_at")) or start).date().isoformat()
         sq, sv = _nmts_sourced_qty_value(r)
         series_map[d]["reduced_value"] += sv
-        series_map[d]["reduced_items"] += sq
+        series_map[d]["reduced_qty"] += sq
 
     series = []
     for d in sorted(series_map.keys()):
         v = series_map[d]
         ov = v["original_value"]
-        rv = min(v["reduced_value"], ov) if ov > 0 else v["reduced_value"]
-        oi = v["original_items"]
-        ri = min(v["reduced_items"], oi) if oi > 0 else v["reduced_items"]
-        fv = max(0.0, ov - rv)
-        fi = max(0.0, oi - ri)
+        rv = v["reduced_value"]
+        oq = v["original_qty"]
+        rq = v["reduced_qty"]
+        fv = ov - rv
+        fq = oq - rq
         series.append(
             {
                 "date": d,
                 "order_count": v["order_count"],
+                "line_item_count": v["line_item_count"],
                 "original_order_value": ov,
                 "reduced_value": rv,
                 "final_order_value": fv,
-                "reduction_pct": _safe_pct(rv, ov),
-                "original_order_items": oi,
-                "reduced_items": ri,
-                "final_order_items": fi,
-                # Backward-compatible aliases used by older UI fragments.
+                "reduction_pct": _safe_pct(rv, ov) if ov > 0 else 0.0,
+                "original_order_qty": oq,
+                "reduced_qty": rq,
+                "final_order_qty": fq,
+                "original_order_items": oq,
+                "reduced_items": rq,
+                "final_order_items": fq,
                 "order_value": ov,
                 "sourced_value": rv,
                 "external_avoided_value": rv,
                 "unfulfilled_value": fv,
-                "saving_pct": _safe_pct(rv, ov),
-                "original": ov if metric_type == "value" else oi,
-                "reduced": rv if metric_type == "value" else ri,
-                "final": fv if metric_type == "value" else fi,
+                "saving_pct": _safe_pct(rv, ov) if ov > 0 else 0.0,
+                "original": ov if metric_type == "value" else oq,
+                "reduced": rv if metric_type == "value" else rq,
+                "final": fv if metric_type == "value" else fq,
             }
         )
 
     return {
         "summary": {
             "total_order_count": len(orders),
+            "line_item_count": line_item_count,
             "original_order_value": original_value,
             "reduced_value": reduced_value,
             "final_order_value": final_value,
-            "reduction_pct": _safe_pct(reduced_value, original_value),
-            "original_order_items": original_items,
-            "reduced_items": reduced_items,
-            "final_order_items": final_items,
-            # Aliases
+            "reduction_pct": _safe_pct(reduced_value, original_value) if original_value else 0.0,
+            "original_order_qty": original_qty,
+            "reduced_qty": reduced_qty,
+            "final_order_qty": original_qty - reduced_qty,
+            "original_order_items": original_qty,
+            "reduced_items": reduced_qty,
+            "final_order_items": original_qty - reduced_qty,
+            "reconciliation_failed": recon_failed,
             "total_order_value": original_value,
             "nmts_sourced_value": reduced_value,
             "external_purchase_avoided_value": reduced_value,
             "unfulfilled_value": final_value,
-            "saving_pct": _safe_pct(reduced_value, original_value),
+            "saving_pct": _safe_pct(reduced_value, original_value) if original_value else 0.0,
         },
         "series": series,
         "metric_type": metric_type,
