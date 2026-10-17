@@ -5997,7 +5997,16 @@ async def _auto_source_send_destination(order: dict, destination: dict, current_
     if not pairs:
         return {'sent': False, 'reason': 'no_live_qty'}
 
-    group_doc = await _create_request_group(order, pairs, current_user, now)
+    try:
+        group_doc = await _create_request_group(order, pairs, current_user, now)
+    except RuntimeError as exc:
+        if str(exc).startswith('stock_reservation_conflict:'):
+            return {'sent': False, 'reason': 'stock_reservation_conflict', 'detail': str(exc)}
+        raise
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            return {'sent': False, 'reason': 'stock_reservation_conflict', 'detail': str(exc.detail)}
+        raise
     attempt_id = (group_doc or {}).get('attempt_id') or (group_doc or {}).get('id')
     request_number = (group_doc or {}).get('request_number')  # None until acceptance
     routing_ref = request_number or attempt_id
@@ -6131,19 +6140,23 @@ async def _auto_source_advance(order_id: str, actor: UserResponse = None, reason
 
         send = await _auto_source_send_destination(order, best, actor, last_chance=last_chance)
         if not send.get('sent'):
-            # Exclude empty destination and retry once
+            # Exclude empty / conflicted destination and retry within this lock
+            # (do NOT re-enter _auto_source_advance — that would fail the lock).
             for line in best.get('lines') or []:
                 await db.order_items.update_one({'id': line['item']['id']}, {
                     '$addToSet': {'excluded_sources': {
                         'dealer_name': best.get('dealer_name'),
                         'branch': best.get('branch'),
-                        'reason': 'stock_changed_during_response',
+                        'reason': send.get('reason') or 'stock_changed_during_response',
                     }},
                     '$set': {'updated_at': datetime.now(timezone.utc).isoformat()},
                 })
             await oas.append_sourcing_event(db, order, 'Auto Sourcing skipped destination (stock changed)', {
                 'dealer': best.get('dealer_name'), 'branch': best.get('branch'), 'phase': phase,
+                'reason': send.get('reason'),
             }, actor)
+            # Refresh order/items and loop by tail-calling after releasing lock.
+            await _auto_source_release_lock(order_id)
             return await _auto_source_advance(order_id, actor=actor, reason='stock_changed_retry')
 
         return {'ok': True, 'state': oas.AUTO_SOURCE_WAITING if not last_chance else oas.AUTO_SOURCE_LAST_CHANCE, **send, 'phase': phase}
@@ -6355,7 +6368,7 @@ async def _active_recipients_for_scope(brand: str = None, dealer: str = None, br
 
 
 async def _insert_reservations_atomic(reservation_docs: list) -> tuple:
-    """Insert reservations and roll back any stock_id that exceeds live qty.
+    """Insert reservations and roll back if any stock_id exceeds live qty.
 
     Prevents two concurrent orders from over-allocating the same stock while a
     supplier response is pending. Does not modify product available quantities.
@@ -6363,23 +6376,43 @@ async def _insert_reservations_atomic(reservation_docs: list) -> tuple:
     """
     if not reservation_docs:
         return True, []
-    ids = [d['id'] for d in reservation_docs]
-    await db.stock_reservations.insert_many([dict(d) for d in reservation_docs])
-    stock_ids = sorted({d.get('stock_id') for d in reservation_docs if d.get('stock_id')})
-    reserved_map = await _reservation_qty_map(stock_ids)
-    over = []
-    for stock_id in stock_ids:
+    kept = []
+    for doc in reservation_docs:
+        stock_id = doc.get('stock_id')
+        qty = float(doc.get('qty') or 0)
+        if not stock_id or qty <= 0:
+            continue
         product = await db.products.find_one(
             {'id': stock_id},
             {'_id': 0, 'available_qty_number': 1, 'quantity': 1},
         )
         avail = float((product or {}).get('available_qty_number', (product or {}).get('quantity') or 0) or 0)
-        if float(reserved_map.get(stock_id) or 0) > avail + 1e-9:
-            over.append(stock_id)
-    if over:
-        await db.stock_reservations.delete_many({'id': {'$in': ids}})
-        return False, f'over_allocated:{",".join(over)}'
-    return True, reservation_docs
+        won = False
+        last_reason = f'over_allocated:{stock_id}'
+        for _spin in range(8):
+            reserved_before = float((await _reservation_qty_map([stock_id])).get(stock_id) or 0)
+            if reserved_before + qty > avail + 1e-9:
+                last_reason = f'over_allocated:{stock_id}'
+                break
+            try:
+                await db.stock_reservations.insert_one(dict(doc))
+            except DuplicateKeyError:
+                await asyncio.sleep(0.01 * (_spin + 1))
+                continue
+            reserved_after = float((await _reservation_qty_map([stock_id])).get(stock_id) or 0)
+            if reserved_after <= avail + 1e-9:
+                won = True
+                kept.append(doc)
+                break
+            # Lost the race — remove our row and retry so one winner can settle.
+            await db.stock_reservations.delete_one({'id': doc['id']})
+            last_reason = f'over_allocated:{stock_id}'
+            await asyncio.sleep(0.01 * (_spin + 1))
+        if not won:
+            if kept:
+                await db.stock_reservations.delete_many({'id': {'$in': [d['id'] for d in kept]}})
+            return False, last_reason
+    return True, kept
 
 
 async def _promote_attempt_to_official_request(group_doc: dict, *, now: str = None) -> dict:
@@ -6618,10 +6651,9 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         # Roll back the attempt — competing order won the stock.
         await db.order_requests.delete_many({'id': {'$in': order_request_ids}})
         await db.request_headers.delete_one({'id': group_id})
-        raise HTTPException(
-            status_code=409,
-            detail=f'Stock no longer available for reservation ({reserve_result}). Retry Auto Sourcing.',
-        )
+        # Raise a dedicated error type so Auto Sourcing can skip/retry the
+        # destination instead of aborting the whole advance with HTTP 409.
+        raise RuntimeError(f'stock_reservation_conflict:{reserve_result}')
 
     # Attempt alert only (no official email/PDF until acceptance).
     try:
