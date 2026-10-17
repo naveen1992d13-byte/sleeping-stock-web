@@ -582,7 +582,15 @@ def _extract_sort_limit(stages: Sequence[Mapping[str, Any]]):
     sort_spec = None
     skip_n = 0
     limit_n = None
-    for stage in stages or []:
+    stages = list(stages or [])
+    # Only trailing page stages can be applied after merging; an earlier $sort
+    # feeds a later stage such as $group/$first and must stay in place.
+    cut = len(stages)
+    while cut and isinstance(stages[cut - 1], Mapping) and len(stages[cut - 1]) == 1 \
+            and next(iter(stages[cut - 1])) in ("$sort", "$skip", "$limit"):
+        cut -= 1
+    core.extend(stages[:cut])
+    for stage in stages[cut:]:
         if not isinstance(stage, Mapping) or len(stage) != 1:
             core.append(stage)
             continue

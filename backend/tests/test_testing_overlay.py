@@ -717,3 +717,17 @@ def test_descending_sort_merges_production_and_testing_rows_newest_first():
         return [row["id"] for row in await col.find({}).sort("created_at", -1).to_list(10)]
 
     assert asyncio.run(_go()) == ["TS-1", "p2", "p1"]
+
+
+def test_extract_sort_limit_keeps_sort_that_feeds_a_group():
+    stages = [
+        {"$project": {"a": 1}},
+        {"$sort": {"published_at": -1}},
+        {"$group": {"_id": "$p", "doc": {"$first": "$$ROOT"}}},
+        {"$replaceRoot": {"newRoot": "$doc"}},
+        {"$sort": {"a": 1}},
+        {"$limit": 5},
+    ]
+    core, sort_spec, skip_n, limit_n = ov._extract_sort_limit(stages)
+    assert core == stages[:4]
+    assert sort_spec == {"a": 1} and limit_n == 5 and skip_n == 0
