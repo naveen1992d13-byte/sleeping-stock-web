@@ -178,8 +178,8 @@ async def _aggregate_latest_parts_for_date_keys(
 ) -> Dict[str, Dict[Tuple[str, str, str, str], dict]]:
     """Latest published part rows per date/branch, scoped and de-duplicated.
 
-    Uses `$top` (no separate `$sort`) so Atlas shared-tier 32MB sort limits are
-    avoided, and still processes one `active_date_key` at a time for safety.
+    DocumentDB rejects `$top` (code 306), so the latest row per part is picked
+    with `$sort` + `$first`, one `active_date_key` at a time.
     """
     if not date_keys:
         return {}
@@ -222,6 +222,7 @@ async def _aggregate_latest_parts_for_date_keys(
                     "last_sales_date": 1,
                 }
             },
+            {"$sort": {"published_at": -1, "updated_at": -1}},
             {
                 "$group": {
                     "_id": {
@@ -231,12 +232,7 @@ async def _aggregate_latest_parts_for_date_keys(
                         "branch": "$branch",
                         "part": "$part_number",
                     },
-                    "doc": {
-                        "$top": {
-                            "output": "$$ROOT",
-                            "sortBy": {"published_at": -1, "updated_at": -1},
-                        }
-                    },
+                    "doc": {"$first": "$$ROOT"},
                 }
             },
             {
@@ -272,23 +268,7 @@ async def _aggregate_latest_parts_for_date_keys(
                 }
             },
         ]
-        try:
-            rows = await db.products.aggregate(pipeline, allowDiskUse=True).to_list(500000)
-        except Exception as exc:
-            logger.warning("analytics $top aggregation unsupported; using $sort+$first fallback: %s", exc)
-            fallback = [
-                pipeline[0],
-                pipeline[1],
-                {"$sort": {"published_at": -1, "updated_at": -1}},
-                {
-                    "$group": {
-                        "_id": pipeline[2]["$group"]["_id"],
-                        "doc": {"$first": "$$ROOT"},
-                    }
-                },
-                pipeline[3],
-            ]
-            rows = await db.products.aggregate(fallback, allowDiskUse=True).to_list(500000)
+        rows = await db.products.aggregate(pipeline, allowDiskUse=True).to_list(500000)
         for r in rows:
             row_dk = _text(r.get("active_date_key"))
             pk = (
