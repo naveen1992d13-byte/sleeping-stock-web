@@ -462,6 +462,22 @@ def _scoped_query_for_user(current_user, brand=None, dealer=None, branch=None) -
     return q
 
 
+def _require_branch_scope(current_user, brand=None, dealer=None, branch=None) -> None:
+    q = _scoped_query_for_user(current_user, brand, dealer, branch)
+    for key, value, label in (("brand_name", brand, "Brand"), ("dealer_name", dealer, "Dealer"), ("branch", branch, "Branch")):
+        if q.get(key) and not _same_text(q[key], value):
+            raise HTTPException(403, f"{label} outside scope")
+
+
+async def _load_scoped_suggestion(current_user, suggestion_id: str) -> None:
+    sug = await db.auto_perpetual_suggestions.find_one(
+        {"id": suggestion_id}, {"_id": 0, "brand_name": 1, "dealer_name": 1, "branch": 1}
+    )
+    if not sug:
+        raise HTTPException(404, "Suggestion not found")
+    _require_branch_scope(current_user, sug.get("brand_name"), sug.get("dealer_name"), sug.get("branch"))
+
+
 # ==================== MODELS ====================
 
 class MobileUserCreate(BaseModel):
@@ -1602,6 +1618,7 @@ async def list_auto_suggestions(
     limit: int = 20,
     current_user: UserResponse = Depends(_web_current_user),
 ):
+    _require_branch_scope(current_user, brand_name, dealer_name, branch)
     rows = await db.auto_perpetual_suggestions.find(
         {"brand_name": brand_name, "dealer_name": dealer_name, "branch": branch},
         {"_id": 0, "items": 0},
@@ -1666,6 +1683,7 @@ async def get_auto_suggestion_detail(
 ):
     from auto_perpetual_suggestions import suggestion_with_line_items
 
+    await _load_scoped_suggestion(current_user, suggestion_id)
     return await suggestion_with_line_items(db, suggestion_id)
 
 
@@ -1676,6 +1694,8 @@ async def send_auto_suggestion(
 ):
     from auto_perpetual_suggestions import send_suggestion_to_mobile
     from mobile_push import notify_auto_perpetual_assignments
+
+    await _load_scoped_suggestion(current_user, suggestion_id)
 
     async def _notify(**kwargs):
         await notify_auto_perpetual_assignments(db, **kwargs)
@@ -1696,9 +1716,7 @@ async def auto_perpetual_user_performance(
     month: Optional[str] = None,
     current_user: UserResponse = Depends(_web_current_user),
 ):
-    q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
-    if q.get("brand_name") and q["brand_name"] != brand_name:
-        raise HTTPException(403, "Brand outside scope")
+    _require_branch_scope(current_user, brand_name, dealer_name, branch)
     from auto_perpetual import user_performance_summary
 
     return await user_performance_summary(db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, month=month)
@@ -1711,9 +1729,7 @@ async def auto_perpetual_summary(
     branch: str,
     current_user: UserResponse = Depends(_web_current_user),
 ):
-    q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
-    if q.get("brand_name") and q["brand_name"] != brand_name:
-        raise HTTPException(403, "Brand outside scope")
+    _require_branch_scope(current_user, brand_name, dealer_name, branch)
     from auto_perpetual import branch_monthly_summary
 
     return await branch_monthly_summary(db, brand_name=brand_name, dealer_name=dealer_name, branch=branch)
@@ -1728,6 +1744,7 @@ async def auto_perpetual_assignments_today(
 ):
     from auto_perpetual import ist_date_key
 
+    _require_branch_scope(current_user, brand_name, dealer_name, branch)
     rows = await db.auto_perpetual_assignments.find(
         {
             "allocation_date": ist_date_key(),
