@@ -7557,6 +7557,10 @@ async def request_center_group_picking_finished(request_number: str, current_use
     return {'message': f'Picking finished for {updated} item(s)', 'request_number': request_number}
 
 
+DISPATCH_DOCUMENT_EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg', '.xls', '.xlsx'}
+DISPATCH_DOCUMENT_MAX_BYTES = 10 * 1024 * 1024
+
+
 async def _ingest_dispatch_document(
     *,
     request_number: str,
@@ -7575,10 +7579,14 @@ async def _ingest_dispatch_document(
         float(str(document_value).replace(',', '').replace('₹', '').strip())
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail=rff.DISPATCH_INCOMPLETE_MESSAGE)
+    ext = Path(file.filename or '').suffix.lower()
+    if ext not in DISPATCH_DOCUMENT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail='Dispatch document must be PDF, JPG, PNG or Excel')
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail=rff.DISPATCH_INCOMPLETE_MESSAGE)
-    ext = Path(file.filename or 'document.bin').suffix or '.bin'
+    if len(content) > DISPATCH_DOCUMENT_MAX_BYTES:
+        raise HTTPException(status_code=400, detail='Dispatch document exceeds 10 MB limit')
     safe = f"{request_number}_{part_or_id}_{uuid.uuid4().hex[:8]}{ext}"
     stored = await file_objects.store_bytes(
         module='request-dispatch-documents',
@@ -7662,6 +7670,26 @@ async def request_center_group_dispatch_document(
         records=target,
     )
     return {'message': 'Dispatch document saved', 'dispatch_document': payload}
+
+
+@api_router.get('/requests/group/{request_number}/dispatch-document')
+async def request_center_view_dispatch_document(request_number: str, current_user: UserResponse = Depends(get_current_user)):
+    header = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0}) or {}
+    items = await db.order_requests.find({'request_number': request_number}, {'_id': 0}).to_list(10000)
+    if not header and not items:
+        raise HTTPException(status_code=404, detail='Request not found')
+    sample = items[0] if items else header
+    role = (current_user.role or '').lower()
+    is_requester = (
+        sample.get('requested_by') == current_user.id
+        or (role != 'user' and sample.get('requesting_dealer') == current_user.group)
+    )
+    if not (_is_request_supplier(sample, current_user) or is_requester):
+        raise HTTPException(status_code=403, detail='Not authorized for this request')
+    doc = header.get('dispatch_document') or next((i.get('dispatch_document') for i in items if i.get('dispatch_document')), None)
+    if not doc or not file_objects.meta_has_readable_bytes(doc):
+        raise HTTPException(status_code=404, detail='No dispatch document for this request')
+    return file_objects.streaming_response_from_meta(doc)
 
 
 @api_router.post('/requests/{request_id}/approve')

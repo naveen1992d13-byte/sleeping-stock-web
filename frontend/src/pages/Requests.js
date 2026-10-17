@@ -3,9 +3,10 @@ import { useOutletContext, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { API } from '@/App';
 import { Button } from '@/components/ui/button';
-import { RefreshCw, Search, Send, Ban, ChevronDown, ChevronRight, ArrowRight, Package, Printer } from 'lucide-react';
+import { RefreshCw, Search, Send, Ban, ChevronDown, ChevronRight, ArrowRight, Package, Printer, Eye } from 'lucide-react';
 import { toast } from 'sonner';
 import { displayRequestStatus, openRequestPrint } from '@/utils/requestPrint';
+import { openInlineAttachment } from '@/utils/blobResponse';
 
 const CLOSED_STATUSES = new Set(['Rejected', 'Cancelled', 'Completed']);
 const STATUS_STYLES = {
@@ -439,6 +440,20 @@ export function Requests() {
                               </tbody>
                             </table>
                           </div>
+                          {(() => {
+                            const doc = g.items.map((i) => i.dispatch_document).find(Boolean);
+                            if (!doc || !g.request_number) return null;
+                            return (
+                              <div className="mt-3 flex flex-wrap items-center justify-end gap-3 text-xs text-slate-600">
+                                <span>Dispatch Document {doc.document_no || '-'} · {doc.document_date || '-'} · {valueCell(doc.document_value)}</span>
+                                <Button size="sm" variant="outline" onClick={async () => {
+                                  try {
+                                    await openInlineAttachment(`${API}/requests/group/${encodeURIComponent(g.request_number)}/dispatch-document`, doc.original_filename || 'dispatch-document');
+                                  } catch (e) { toast.error(e.message || 'Unable to open dispatch document'); }
+                                }}><Eye className="mr-1 h-4 w-4"/>View Document</Button>
+                              </div>
+                            );
+                          })()}
                           <div className="mt-4 flex flex-wrap justify-end gap-2">
                             <Button variant="outline" onClick={()=>openRequestCenterPdf(g)}><Printer className="mr-1 h-4 w-4"/>Print Request</Button>
                             {tab === 'incoming' && g.items.some((i)=>['Approved','Partially Approved'].includes(i.status) && !i.picking_finished_at) && (
@@ -450,7 +465,7 @@ export function Requests() {
                                   <label className="text-xs">Document No<input className="mt-1 h-9 rounded border px-2" value={dispatchForm.document_no} onChange={(e)=>setDispatchForm((p)=>({...p, document_no:e.target.value}))}/></label>
                                   <label className="text-xs">Document Date<input type="date" className="mt-1 h-9 rounded border px-2" value={dispatchForm.document_date} onChange={(e)=>setDispatchForm((p)=>({...p, document_date:e.target.value}))}/></label>
                                   <label className="text-xs">Document Value<input className="mt-1 h-9 rounded border px-2" value={dispatchForm.document_value} onChange={(e)=>setDispatchForm((p)=>({...p, document_value:e.target.value}))}/></label>
-                                  <label className="text-xs">Document<input type="file" className="mt-1 block" onChange={(e)=>setDispatchForm((p)=>({...p, file:e.target.files?.[0] || null}))}/></label>
+                                  <label className="text-xs">Document<input type="file" accept=".pdf,.png,.jpg,.jpeg,.xls,.xlsx" className="mt-1 block" onChange={(e)=>setDispatchForm((p)=>({...p, file:e.target.files?.[0] || null}))}/></label>
                                   <Button disabled={loading} onClick={()=>submitDispatch(g)}>Dispatch</Button>
                                   <Button variant="outline" onClick={()=>setDispatchForm(null)}>Cancel</Button>
                                 </div>
