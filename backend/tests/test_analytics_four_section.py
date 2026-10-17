@@ -38,7 +38,9 @@ def test_aging_buckets_exact_labels():
         (361, "271–361 Days"),
         (362, ">361 Days"),
         (500, ">361 Days"),
-        (None, "Unknown"),
+        (None, ">361 Days"),
+        ("", ">361 Days"),
+        (-5, ">361 Days"),
     ],
 )
 def test_analytics_bucket_mapping(days, expected):

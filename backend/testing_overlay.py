@@ -56,6 +56,10 @@ LOCAL_ONLY_COLLECTIONS = frozenset({
     "auto_perpetual_suggestions",
     "auto_perpetual_daily_runs",
     "auto_perpetual_branch_planner",
+    # Finalized Analytics rollups are written/read only from Testing so upserts
+    # and status tracking never touch Production through the overlay.
+    "analytics_stock_daily_snapshots",
+    "analytics_rollup_status",
 })
 
 # Business collections merged from production + testing deltas.

@@ -29,8 +29,8 @@ import {
   BarChart,
 } from 'recharts';
 
-const AGING_BUCKETS = ['0–90 Days', '91–180 Days', '181–270 Days', '271–361 Days', '>361 Days', 'Unknown'];
-// Sample image palette: green / blue / orange / purple / red + gray for Unknown
+const AGING_BUCKETS = ['0–90 Days', '91–180 Days', '181–270 Days', '271–361 Days', '>361 Days'];
+// Sample image palette: green / blue / orange / purple / red (Above 361)
 const AGING_COLORS = ['#22c55e', '#3b82f6', '#f59e0b', '#a855f7', '#ef4444', '#9ca3af'];
 const ORDER_COLORS = {
   original: '#3b82f6',
@@ -283,6 +283,7 @@ export function Analytics() {
   const [metricMode, setMetricMode] = useState('value');
   const [partType, setPartType] = useState('All');
   const [agingType, setAgingType] = useState('purchase');
+  const [agingDays, setAgingDays] = useState('all');
   const [loading, setLoading] = useState(false);
   const [sectionLoading, setSectionLoading] = useState({ stock: false, aging: false, orders: false, requests: false });
   const [sectionError, setSectionError] = useState({ stock: null, aging: null, orders: null, requests: null });
@@ -336,6 +337,7 @@ export function Analytics() {
       metric_type: metricMode,
       aging_type: agingType === 'sales' ? 'sales' : 'purchase',
       ...(partType && partType !== 'All' ? { category: partType } : {}),
+      ...(agingDays && agingDays !== 'all' ? { aging_days: agingDays } : {}),
     };
     const fetchOne = async (key, promise, setter) => {
       try {
@@ -366,24 +368,52 @@ export function Analytics() {
       }), setRequestAcceptance),
     ]);
     if (seq === requestSeq.current) setLoading(false);
-  }, [bounds, scopeParams, scopeBrand, scopeDealer, scopeBranch, partType, metricMode, agingType]);
+  }, [bounds, scopeParams, scopeBrand, scopeDealer, scopeBranch, partType, metricMode, agingType, agingDays]);
 
   useEffect(() => {
     load();
   }, [load]);
 
-  // —— Daily stock: series[].closing; hide NO_UPLOAD days (sample note) ——
+  // —— Daily stock: missing snapshot = No Data (omit from line); actual zero stays 0 ——
   const stockPoints = useMemo(() => {
-    return (stockTrend?.series || [])
-      .filter((d) => d.data_status !== 'NO_UPLOAD' && !isNullMetric(d.closing))
-      .map((d) => ({
+    const rows = (stockTrend?.series || []).map((d, idx, arr) => {
+      const missing = d.data_status === 'NO_UPLOAD' || isNullMetric(d.closing);
+      const raw = missing ? null : Number(d.closing);
+      let change = 'no-change';
+      if (!missing) {
+        // Find previous non-missing point
+        let prev = null;
+        for (let i = idx - 1; i >= 0; i -= 1) {
+          const p = arr[i];
+          if (p.data_status !== 'NO_UPLOAD' && !isNullMetric(p.closing)) {
+            prev = Number(p.closing);
+            break;
+          }
+        }
+        if (prev == null) change = 'no-change';
+        else if (raw > prev) change = 'up';
+        else if (raw < prev) change = 'down';
+      }
+      return {
         date: d.date,
         label: dayLabel(d.date),
-        value: fmtChart(d.closing),
-        raw: d.closing,
-        data_status: d.data_status,
-      }));
+        value: missing ? null : fmtChart(raw),
+        raw,
+        data_status: missing ? 'NO_UPLOAD' : d.data_status,
+        change,
+      };
+    });
+    return rows;
   }, [stockTrend, fmtChart]);
+  const stockChartPoints = useMemo(
+    () => stockPoints.filter((d) => d.data_status !== 'NO_UPLOAD' && !isNullMetric(d.raw)),
+    [stockPoints]
+  );
+  const dataUpdatedUpTo = stockTrend?.data_updated_up_to
+    || agingTrend?.data_updated_up_to
+    || orderSaving?.data_updated_up_to
+    || requestAcceptance?.data_updated_up_to
+    || null;
 
   // —— Aging: daily[] with bucket keys on the row; hide NO_UPLOAD ——
   const agingPoints = useMemo(() => {
@@ -431,17 +461,23 @@ export function Analytics() {
 
   const orderSummary = useMemo(() => {
     const s = orderSaving?.summary || {};
-    const original = isValue ? s.original_order_value : s.original_order_items;
-    const reduced = isValue ? s.reduced_value : s.reduced_items;
-    const finalOrder = isValue ? s.final_order_value : s.final_order_items;
+    const original = isValue ? s.original_order_value : (s.original_order_items ?? s.original_order_qty);
+    const own = isValue ? s.own_branch_saved_value : s.own_branch_saved_qty;
+    const same = isValue ? s.same_dealer_saved_value : s.same_dealer_saved_qty;
+    const other = isValue ? s.other_dealer_saved_value : s.other_dealer_saved_qty;
+    const reduced = isValue ? (s.total_saved_value ?? s.reduced_value) : (s.total_saved_qty ?? s.reduced_qty);
+    const finalOrder = isValue ? (s.balance_order_value ?? s.final_order_value) : (s.balance_order_qty ?? s.final_order_qty);
     const finalVal = isNullMetric(finalOrder)
       ? Number(original || 0) - Number(reduced || 0)
       : finalOrder;
     return {
       original: original || 0,
+      own: own || 0,
+      same: same || 0,
+      other: other || 0,
       reduced: reduced || 0,
       final: finalVal || 0,
-      reduction_pct: Number(s.reduction_pct || 0),
+      reduction_pct: Number(s.saving_pct ?? s.reduction_pct ?? 0),
     };
   }, [orderSaving, isValue]);
 
@@ -452,7 +488,7 @@ export function Analytics() {
       const branch = isValue ? d.given_to_branches_value : d.given_to_branches_items;
       const dealer = isValue ? d.given_to_dealers_value : d.given_to_dealers_items;
       const fulfilled = isValue ? d.total_fulfilled_value : d.total_fulfilled_items;
-      const notFulfilled = isValue ? d.not_fulfilled_value : d.not_fulfilled_items;
+      const notFulfilled = isValue ? (d.lost_opportunity_value ?? d.not_fulfilled_value) : (d.lost_opportunity_items ?? d.not_fulfilled_items);
       const fulfilledVal = isNullMetric(fulfilled)
         ? Number(branch || 0) + Number(dealer || 0)
         : fulfilled;
@@ -478,7 +514,7 @@ export function Analytics() {
     const branch = isValue ? s.given_to_branches_value : s.given_to_branches_items;
     const dealer = isValue ? s.given_to_dealers_value : s.given_to_dealers_items;
     const fulfilled = isValue ? s.total_fulfilled_value : s.total_fulfilled_items;
-    const notFulfilled = isValue ? s.not_fulfilled_value : s.not_fulfilled_items;
+    const notFulfilled = isValue ? (s.lost_opportunity_value ?? s.not_fulfilled_value) : (s.lost_opportunity_items ?? s.not_fulfilled_items);
     const fulfilledVal = isNullMetric(fulfilled)
       ? Number(branch || 0) + Number(dealer || 0)
       : fulfilled;
@@ -502,52 +538,11 @@ export function Analytics() {
   const donutData = useMemo(
     () => [
       { name: 'Total Fulfilled', value: Math.max(0, Number(requestSummary.fulfilled) || 0) },
-      { name: 'Not Fulfilled', value: Math.max(0, Number(requestSummary.notFulfilled) || 0) },
+      { name: 'Lost Opportunity', value: Math.max(0, Number(requestSummary.notFulfilled) || 0) },
     ],
     [requestSummary]
   );
 
-  // —— KPI row (live data, sample layout) ——
-  const kpis = useMemo(() => {
-    const summaryStock = stockTrend?.summary?.current_total;
-    const lastStock = stockPoints.length ? stockPoints[stockPoints.length - 1] : null;
-    const firstStock = stockPoints.length ? stockPoints[0] : null;
-    const stockValue = !isNullMetric(summaryStock)
-      ? summaryStock
-      : lastStock
-        ? lastStock.raw
-        : null;
-    let stockDelta = null;
-    if (lastStock && firstStock && firstStock.raw) {
-      stockDelta = ((Number(lastStock.raw) - Number(firstStock.raw)) / Number(firstStock.raw)) * 100;
-    } else if (!isNullMetric(stockTrend?.summary?.change_pct)) {
-      stockDelta = Number(stockTrend.summary.change_pct);
-    }
-
-    const lastAging = agingPoints.length ? agingPoints[agingPoints.length - 1] : null;
-    let agingOver180 = null;
-    let agingPct = null;
-    if (lastAging) {
-      const over = ['181–270 Days', '271–361 Days', '>361 Days'].reduce(
-        (sum, b) => sum + Number(lastAging[`${b}__raw`] || 0),
-        0
-      );
-      agingOver180 = over;
-      agingPct = lastAging.totalRaw > 0 ? (over / lastAging.totalRaw) * 100 : 0;
-    }
-
-    return {
-      stockValue,
-      stockDelta,
-      ordersOriginal: orderSummary.original,
-      ordersReduced: orderSummary.reduced,
-      ordersReductionPct: orderSummary.reduction_pct,
-      requestsReceived: requestSummary.received,
-      requestsFulfillmentPct: requestSummary.fulfillment_pct,
-      agingOver180,
-      agingPct,
-    };
-  }, [stockPoints, agingPoints, orderSummary, requestSummary, stockTrend]);
 
   const axisTick = { fontSize: 9, fill: '#6b7280' };
   const yTickFormatter = (v) => `${v}`;
@@ -610,58 +605,35 @@ export function Analytics() {
           <option value="sales">Sales Aging</option>
         </select>
 
+        <select
+          className={selectClass}
+          value={agingDays}
+          onChange={(e) => setAgingDays(e.target.value)}
+          data-testid="analytics-aging-days"
+          aria-label="Aging Days"
+        >
+          <option value="all">Aging Days: All</option>
+          <option value="0-90">0–90</option>
+          <option value="91-180">91–180</option>
+          <option value="181-270">181–270</option>
+          <option value="271-361">271–361</option>
+          <option value="above-361">Above 361</option>
+        </select>
+
         <div className="ml-auto">
           <MetricToggle value={metricMode} onChange={setMetricMode} />
         </div>
       </div>
 
-      {/* KPI summary row — sample pattern */}
-      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4" data-testid="analytics-kpi-row">
-        <KpiCard
-          icon={Warehouse}
-          iconBg="bg-emerald-500"
-          title="Current Stock Value"
-          value={loading ? '…' : isValue ? formatINRCompact(kpis.stockValue) : formatINR(kpis.stockValue)}
-          sub={
-            kpis.stockDelta == null
-              ? 'vs month open —'
-              : `vs month open ${kpis.stockDelta >= 0 ? '⬆' : '⬇'} ${Math.abs(kpis.stockDelta).toFixed(2)}%`
-          }
-          subTone={kpis.stockDelta == null ? 'muted' : kpis.stockDelta >= 0 ? 'up' : 'down'}
-          testId="analytics-kpi-stock"
-        />
-        <KpiCard
-          icon={ShoppingCart}
-          iconBg="bg-blue-500"
-          title="Total Orders (This Month)"
-          value={loading ? '…' : fmtMetric(kpis.ordersOriginal)}
-          sub={`Reduction Achieved ${fmtMetric(kpis.ordersReduced)} (${Number(kpis.ordersReductionPct || 0).toFixed(2)}%)`}
-          subTone="accent"
-          testId="analytics-kpi-orders"
-        />
-        <KpiCard
-          icon={Package}
-          iconBg="bg-violet-500"
-          title="Total Requests (This Month)"
-          value={loading ? '…' : fmtMetric(kpis.requestsReceived)}
-          sub={`Fulfillment % ${Number(kpis.requestsFulfillmentPct || 0).toFixed(2)}%`}
-          subTone="accent"
-          testId="analytics-kpi-requests"
-        />
-        <KpiCard
-          icon={TrendingDown}
-          iconBg="bg-amber-500"
-          title="Stock Aging > 180 Days"
-          value={loading ? '…' : fmtMetric(kpis.agingOver180)}
-          sub={
-            kpis.agingPct == null
-              ? '% of Total Stock —'
-              : `% of Total Stock Value ${Number(kpis.agingPct).toFixed(2)}%`
-          }
-          subTone="warn"
-          testId="analytics-kpi-aging"
-        />
+      <div
+        className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] text-emerald-900"
+        data-testid="analytics-data-updated-up-to"
+      >
+        Data updated up to:{' '}
+        <span className="font-semibold">{dataUpdatedUpTo ? displayDate(dataUpdatedUpTo) : '—'}</span>
+        <span className="text-emerald-700"> · finalized snapshots only (today excluded)</span>
       </div>
+
 
       {loading && (
         <div className="flex items-center gap-2 text-xs text-gray-500" data-testid="analytics-loading">
@@ -681,9 +653,9 @@ export function Analytics() {
           error={sectionError.stock}
         >
           <div className="h-[210px] w-full">
-            {stockPoints.length ? (
+            {stockChartPoints.length ? (
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={stockPoints} margin={{ top: 18, right: 12, left: 0, bottom: 0 }}>
+                <LineChart data={stockChartPoints} margin={{ top: 18, right: 12, left: 0, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
                   <XAxis dataKey="label" tick={axisTick} />
                   <YAxis tick={axisTick} tickFormatter={yTickFormatter} width={36} />
@@ -723,18 +695,29 @@ export function Analytics() {
                 label: isValue ? 'Stock Value' : 'Stock Qty',
                 align: 'right',
                 mono: true,
-                render: (r) => fmtMetric(r.raw),
+                render: (r) => (r.data_status === 'NO_UPLOAD' || isNullMetric(r.raw) ? 'No Data' : fmtMetric(r.raw)),
+              },
+              {
+                key: 'change',
+                label: 'Δ',
+                align: 'center',
+                render: (r) => {
+                  if (r.data_status === 'NO_UPLOAD' || isNullMetric(r.raw)) return '—';
+                  if (r.change === 'up') return '⬆';
+                  if (r.change === 'down') return '⬇';
+                  return '●';
+                },
               },
             ]}
             rows={stockPoints}
           />
-          <p className="text-[9px] text-gray-400">Note: Days with no upload are not shown.</p>
+          <p className="text-[9px] text-gray-400">Missing snapshot = No Data (omitted from chart). Actual zero is shown as 0.</p>
         </SectionCard>
 
         {/* 2. Stock Aging Analysis */}
         <SectionCard
           title="Stock Aging Analysis"
-          hint="Daily stacked aging distribution across slabs. Unknown aging is kept as its own bucket."
+          hint="Daily stacked aging distribution. Missing/invalid aging is counted under Above 361."
           metricMode={metricMode}
           testId="analytics-section-aging"
           loading={sectionLoading.aging}
@@ -795,7 +778,7 @@ export function Analytics() {
         {/* 3. Orders & Savings Analysis */}
         <SectionCard
           title="Orders & Savings Analysis"
-          hint="Final / Net Order = Original Order − Reduced / Cut. NMTS purchase reduction."
+          hint="Original, Own Branch / Same Dealer / Other Dealer Saved, Balance Order and Saving %. Accepted quantities only."
           metricMode={metricMode}
           testId="analytics-section-orders"
           loading={sectionLoading.orders}
@@ -803,17 +786,26 @@ export function Analytics() {
           footer={
             <div className="flex flex-wrap gap-x-4 gap-y-1">
               <span>
-                Total Original: <span className="text-gray-900">{fmtMetric(orderSummary.original)}</span>
+                Original Order: <span className="text-gray-900">{fmtMetric(orderSummary.original)}</span>
               </span>
               <span>
-                Total Reduced: <span className="text-gray-900">{fmtMetric(orderSummary.reduced)}</span>
+                Own Branch Saved: <span className="text-gray-900">{fmtMetric(orderSummary.own)}</span>
               </span>
               <span>
-                Total Final Order:{' '}
+                Same Dealer Saved: <span className="text-gray-900">{fmtMetric(orderSummary.same)}</span>
+              </span>
+              <span>
+                Other Dealer Saved: <span className="text-gray-900">{fmtMetric(orderSummary.other)}</span>
+              </span>
+              <span>
+                Total Saved: <span className="text-gray-900">{fmtMetric(orderSummary.reduced)}</span>
+              </span>
+              <span>
+                Balance Order:{' '}
                 <span className="text-gray-900">{fmtMetric(orderSummary.final)}</span>
               </span>
               <span>
-                Avg Reduction:{' '}
+                Saving %:{' '}
                 <span className="text-gray-900">{Number(orderSummary.reduction_pct || 0).toFixed(2)}%</span>
               </span>
             </div>
@@ -853,14 +845,14 @@ export function Analytics() {
                   <Bar
                     yAxisId="left"
                     dataKey="reduced"
-                    name="Reduced / Cut"
+                    name="Total Saved"
                     fill={ORDER_COLORS.reduced}
                     maxBarSize={16}
                   />
                   <Bar
                     yAxisId="left"
                     dataKey="final"
-                    name="Final / Net Order"
+                    name="Balance Order"
                     fill={ORDER_COLORS.final}
                     maxBarSize={16}
                   />
@@ -898,21 +890,21 @@ export function Analytics() {
               },
               {
                 key: 'r',
-                label: 'Reduced',
+                label: 'Saved',
                 align: 'right',
                 mono: true,
                 render: (r) => fmtMetric(r.reducedRaw),
               },
               {
                 key: 'f',
-                label: 'Final',
+                label: 'Balance',
                 align: 'right',
                 mono: true,
                 render: (r) => fmtMetric(r.finalRaw),
               },
               {
                 key: 'p',
-                label: 'Red. %',
+                label: 'Save %',
                 align: 'right',
                 mono: true,
                 render: (r) => `${Number(r.reduction_pct || 0).toFixed(2)}%`,
@@ -925,7 +917,7 @@ export function Analytics() {
         {/* 4. Request Fulfillment Analysis */}
         <SectionCard
           title="Request Fulfillment Analysis"
-          hint="Total Request = Fulfilled + Not Fulfilled. Fulfilled = Branches + Dealers / Co-Dealers."
+          hint="Fulfilled = Branches + Dealers. Lost Opportunity excludes pending — only rejected/timed-out/closed unfulfilled."
           metricMode={metricMode}
           testId="analytics-section-requests"
           loading={sectionLoading.requests}
@@ -949,7 +941,7 @@ export function Analytics() {
                 <span className="text-gray-900">{fmtMetric(requestSummary.fulfilled)}</span>
               </span>
               <span>
-                Not Fulfilled:{' '}
+                Lost Opportunity:{' '}
                 <span className="text-gray-900">{fmtMetric(requestSummary.notFulfilled)}</span>
               </span>
               <span>
@@ -1073,7 +1065,7 @@ export function Analytics() {
               },
               {
                 key: 'nf',
-                label: 'Not Fulfilled',
+                label: 'Lost Opportunity',
                 align: 'right',
                 mono: true,
                 render: (r) => fmtMetric(r.notFulfilledRaw),
