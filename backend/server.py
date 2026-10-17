@@ -7888,6 +7888,15 @@ def _mobile_dashboard_scope_query(
 # Perpetual Stock (web-authenticated verification/correction workflow) below is preserved unchanged.
 
 
+async def _find_current_stock_product(query: dict) -> Optional[dict]:
+    # Older and superseded uploads keep their rows with is_active_today=False.
+    return await db.products.find_one(
+        {**query, "publish_status": "Published", "is_active_today": True},
+        {"_id": 0},
+        sort=[("updated_at", -1)],
+    )
+
+
 def _stock_snapshot_quantity(product: dict) -> float:
     for field in ("available_qty_number", "available_quantity", "available_qty", "quantity"):
         value = product.get(field)
@@ -7933,7 +7942,7 @@ async def lookup_mobile_stock_snapshot(
 
     query = _mobile_dashboard_scope_query(current_user, brand, dealer, branch)
     query["part_number"] = {"$regex": f"^{re.escape(clean_part)}$", "$options": "i"}
-    product = await db.products.find_one(query, {"_id": 0}, sort=[("updated_at", -1)])
+    product = await _find_current_stock_product(query)
     if not product:
         raise HTTPException(
             status_code=404,
@@ -8044,7 +8053,7 @@ async def _build_verification_record(item, scope_query, current_user, session_id
         raise HTTPException(status_code=400, detail="Part number is required for every item")
     query = dict(scope_query)
     query["part_number"] = {"$regex": f"^{re.escape(clean_part)}$", "$options": "i"}
-    product = await db.products.find_one(query, {"_id": 0}, sort=[("updated_at", -1)])
+    product = await _find_current_stock_product(query)
     if not product:
         raise HTTPException(status_code=404, detail=f"Part {clean_part} not found in the selected Dashboard scope")
     system_qty = _stock_snapshot_quantity(product)
@@ -8395,7 +8404,7 @@ async def create_mobile_stock_verification(payload: StockVerificationCreate, cur
     )
     clean_part = payload.part_number.strip()
     query["part_number"] = {"$regex": f"^{re.escape(clean_part)}$", "$options": "i"}
-    product = await db.products.find_one(query, {"_id": 0}, sort=[("updated_at", -1)])
+    product = await _find_current_stock_product(query)
     if not product:
         raise HTTPException(status_code=404, detail="Part not found in your permitted stock scope")
 
