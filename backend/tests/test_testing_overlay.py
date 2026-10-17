@@ -669,3 +669,20 @@ def test_stock_trend_and_aging_query_shapes_unchanged():
     assert ov._doc_matches(row, stock_q) is True
     assert ov._doc_matches(row, aging_q) is True
     assert ov._doc_matches({**row, "active_date_key": "20261010"}, stock_q) is False
+
+
+def test_strip_overlay_flags_reads_flag_nested_by_merge_query():
+    import testing_runtime as tr
+    query = {"publish_status": "Published", "branch": "Vanagaram"}
+    tr.merge_query(query, {ov.QUERY_TESTING_ONLY: True})
+    raw, base_only, testing_only = ov._strip_overlay_flags(query)
+    assert testing_only is True and base_only is False
+    assert raw == {"$and": [{"publish_status": "Published", "branch": "Vanagaram"}]}
+    assert ov.QUERY_TESTING_ONLY not in str(raw)
+
+
+def test_strip_overlay_flags_keeps_other_and_parts():
+    query = {"$and": [{"a": 1}, {ov.QUERY_BASE_ONLY: True}, {"b": 2}]}
+    raw, base_only, testing_only = ov._strip_overlay_flags(query)
+    assert base_only is True and testing_only is False
+    assert raw == {"$and": [{"a": 1}, {"b": 2}]}

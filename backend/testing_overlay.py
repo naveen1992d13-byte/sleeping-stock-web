@@ -84,6 +84,21 @@ def _strip_overlay_flags(query: Optional[Mapping[str, Any]]) -> tuple[dict, bool
     payload = dict(query or {})
     base_only = bool(payload.pop(QUERY_BASE_ONLY, False))
     testing_only = bool(payload.pop(QUERY_TESTING_ONLY, False))
+    # merge_query nests the origin flag inside $and when the query already has keys.
+    if isinstance(payload.get("$and"), list):
+        parts = []
+        for part in payload["$and"]:
+            if isinstance(part, Mapping) and (QUERY_BASE_ONLY in part or QUERY_TESTING_ONLY in part):
+                part = dict(part)
+                base_only = bool(part.pop(QUERY_BASE_ONLY, False)) or base_only
+                testing_only = bool(part.pop(QUERY_TESTING_ONLY, False)) or testing_only
+                if not part:
+                    continue
+            parts.append(part)
+        if parts:
+            payload["$and"] = parts
+        else:
+            payload.pop("$and")
     return payload, base_only, testing_only
 
 
@@ -380,6 +395,11 @@ class OverlayCursor:
     def allow_disk_use(self, _value=True):
         if self._inner is not None and hasattr(self._inner, "allow_disk_use"):
             self._inner.allow_disk_use(_value)
+        return self
+
+    def batch_size(self, size):
+        if self._inner is not None and hasattr(self._inner, "batch_size"):
+            self._inner.batch_size(size)
         return self
 
     def _project(self, doc: dict) -> dict:
@@ -1140,8 +1160,17 @@ class OverlayCollection:
         )
 
     def aggregate(self, pipeline, *args, **kwargs):
+        base_only = testing_only = False
+        if pipeline and isinstance(pipeline[0], Mapping) and isinstance(pipeline[0].get("$match"), Mapping):
+            raw, base_only, testing_only = _strip_overlay_flags(pipeline[0]["$match"])
+            pipeline = [{"$match": raw}] + list(pipeline[1:])
         if self._local_only():
             return OverlayCursor(inner=self._test.aggregate(pipeline, *args, **kwargs))
+        if testing_only:
+            created = [{"$match": self._testing_created_query(pipeline[0]["$match"])}] + list(pipeline[1:])
+            return OverlayCursor(inner=self._test.aggregate(created, *args, **kwargs))
+        if base_only:
+            return OverlayCursor(inner=self._prod.aggregate(pipeline, *args, **kwargs))
         cursor = OverlayCursor(prepare=None)
 
         async def prepare():
