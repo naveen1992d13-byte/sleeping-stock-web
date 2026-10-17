@@ -499,6 +499,68 @@
   min-height: 2.5em;
 }
 
+/* Compact top-left Menu dropdown (replaces sidebar drawer navigation). */
+.nmts-app-shell--menu-dropdown .nmts-main-column {
+  width: 100%;
+}
+
+.nmts-app-menu-dropdown {
+  z-index: 80 !important;
+  min-width: 14.5rem;
+  max-width: min(20rem, calc(100vw - 1.5rem));
+  max-height: min(70vh, var(--radix-dropdown-menu-content-available-height, 70vh));
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0.35rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(15, 20, 25, 0.12);
+  background: #fff;
+  box-shadow: 0 12px 32px rgba(15, 20, 25, 0.16);
+}
+
+.nmts-app-menu-item {
+  display: flex !important;
+  align-items: center;
+  gap: 0.65rem;
+  width: 100%;
+  cursor: pointer;
+  border-radius: 0.55rem !important;
+  padding: 0.55rem 0.7rem !important;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: #111827;
+}
+
+.nmts-app-menu-item svg {
+  width: 1.1rem;
+  height: 1.1rem;
+  flex-shrink: 0;
+  color: var(--nmts-green);
+}
+
+.nmts-app-menu-item:focus,
+.nmts-app-menu-item[data-highlighted] {
+  background: rgba(5, 150, 105, 0.1) !important;
+  color: #065f46;
+}
+
+.nmts-app-menu-item--active {
+  background: rgba(5, 150, 105, 0.14) !important;
+  color: #065f46;
+  font-weight: 600;
+}
+
+.nmts-app-menu-item--active svg {
+  color: #047857;
+}
+
+@media (max-width: 640px) {
+  .nmts-app-menu-dropdown {
+    min-width: min(16rem, calc(100vw - 1rem));
+    max-height: min(65vh, var(--radix-dropdown-menu-content-available-height, 65vh));
+  }
+}
+
 .nmts-menu-toggle {
   display: inline-flex;
   align-items: center;

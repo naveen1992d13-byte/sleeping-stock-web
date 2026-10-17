@@ -35,16 +35,8 @@ export function DashboardLayout() {
   const [unreadCount, setUnreadCount] = useState(0);
   const [bellOpen, setBellOpen] = useState(false);
   const [alerts, setAlerts] = useState([]);
-  const [sidebarOpen, setSidebarOpen] = useState(() => {
-    try {
-      const stored = localStorage.getItem('nmtsSidebarOpen');
-      if (stored === 'false') return false;
-      if (stored === 'true') return true;
-    } catch {
-      /* ignore */
-    }
-    return typeof window !== 'undefined' ? window.innerWidth >= 1024 : true;
-  });
+  // Compact top-left Menu dropdown (sidebar drawer retired for navigation).
+  const [menuOpen, setMenuOpen] = useState(false);
   const [tabs, setTabs] = useState([]);
   const [activeTabId, setActiveTabId] = useState(null);
 
@@ -205,18 +197,6 @@ export function DashboardLayout() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAdmin, scopeMasters, user?.group, user?.dealer, user?.location, user?.branch]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem('nmtsSidebarOpen', sidebarOpen ? 'true' : 'false');
-    } catch {
-      /* ignore */
-    }
-  }, [sidebarOpen]);
-
-  const toggleSidebar = () => {
-    setSidebarOpen((prev) => !prev);
-  };
 
   useEffect(() => {
     fetchUnreadCount();
@@ -446,70 +426,54 @@ export function DashboardLayout() {
   };
 
   return (
-    <div className="nmts-app-shell" data-testid="dashboard-layout">
-      {!sidebarOpen ? null : (
-        <button
-          type="button"
-          className="nmts-sidebar-backdrop lg:hidden"
-          aria-label="Close navigation menu"
-          onClick={() => setSidebarOpen(false)}
-        />
-      )}
-
-      <aside
-        className={`nmts-sidebar${sidebarOpen ? '' : ' nmts-sidebar--collapsed'}`}
-        aria-hidden={!sidebarOpen}
-      >
-        <div className="nmts-sidebar-brand">
-          <img src="/sleeping-stock-logo.png" alt="Sleeping Stock" />
-          <div className="nmts-sidebar-brand-title">
-            Sleeping <span>Stock</span>
-          </div>
-          <div className="nmts-sidebar-brand-sub">Non Moving Tracking System</div>
-        </div>
-
-        <nav className="nmts-sidebar-nav" aria-label="Main navigation">
-          {filteredNavItems.map((item) => {
-            const Icon = item.icon;
-            const isActive =
-              location.pathname === item.path ||
-              (item.path === '/analytics' &&
-                (location.pathname === '/' || location.pathname === '/dashboard'));
-
-            return (
-              <button
-                key={item.id}
-                type="button"
-                className={`nmts-sidebar-link${isActive ? ' nmts-sidebar-link--active' : ''}`}
-                onClick={() => {
-                  openTab(item.id, item.label, item.path, item.permissionLabel);
-                  setSidebarOpen(false);
-                }}
-              >
-                <Icon aria-hidden="true" />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
-        </nav>
-
-        <div className="nmts-sidebar-footer">© 2026 NMTS. All rights reserved.</div>
-      </aside>
-
+    <div className="nmts-app-shell nmts-app-shell--menu-dropdown" data-testid="dashboard-layout">
       <div className="nmts-main-column">
         <header className="nmts-topbar">
           <div className="nmts-topbar-inner">
             <div className="nmts-topbar-left">
-              <button
-                type="button"
-                className="nmts-menu-toggle"
-                data-testid="sidebar-menu-toggle"
-                aria-expanded={sidebarOpen}
-                aria-label={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
-                onClick={toggleSidebar}
-              >
-                <Menu className="h-5 w-5" />
-              </button>
+              <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="nmts-menu-toggle"
+                    data-testid="sidebar-menu-toggle"
+                    aria-expanded={menuOpen}
+                    aria-haspopup="menu"
+                    aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+                  >
+                    <Menu className="h-5 w-5" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="start"
+                  side="bottom"
+                  sideOffset={8}
+                  className="nmts-app-menu-dropdown"
+                  aria-label="Main navigation"
+                  onCloseAutoFocus={(e) => e.preventDefault()}
+                >
+                  {filteredNavItems.map((item) => {
+                    const Icon = item.icon;
+                    const isActive =
+                      location.pathname === item.path ||
+                      (item.path === '/analytics' &&
+                        (location.pathname === '/' || location.pathname === '/dashboard'));
+                    return (
+                      <DropdownMenuItem
+                        key={item.id}
+                        className={`nmts-app-menu-item${isActive ? ' nmts-app-menu-item--active' : ''}`}
+                        onSelect={() => {
+                          openTab(item.id, item.label, item.path, item.permissionLabel);
+                          setMenuOpen(false);
+                        }}
+                      >
+                        <Icon aria-hidden="true" />
+                        <span>{item.label}</span>
+                      </DropdownMenuItem>
+                    );
+                  })}
+                </DropdownMenuContent>
+              </DropdownMenu>
 
               <Button variant="ghost" size="sm" className="p-1 hidden sm:flex" onClick={goHome} title="Home">
                 <Home className="h-5 w-5" style={{ color: '#059669' }} />
