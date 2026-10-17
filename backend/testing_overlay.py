@@ -12,6 +12,7 @@ Viewing production data does not insert testing records.
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 import os
 import re
@@ -551,12 +552,29 @@ def _sort_key_tuple(doc: Mapping[str, Any], pairs: Sequence[tuple[str, int]]):
 
 
 def _doc_sort_before(left: Mapping[str, Any], right: Mapping[str, Any], pairs) -> bool:
-    lkey = _sort_key_tuple(left, pairs)
-    rkey = _sort_key_tuple(right, pairs)
-    try:
-        return lkey < rkey
-    except TypeError:
-        return str(lkey) < str(rkey)
+    lkeys = _sort_key_tuple(left, pairs)
+    rkeys = _sort_key_tuple(right, pairs)
+    for (_field, direction), lkey, rkey in zip(pairs, lkeys, rkeys):
+        try:
+            if lkey == rkey:
+                continue
+            less = lkey < rkey
+        except TypeError:
+            if str(lkey) == str(rkey):
+                continue
+            less = str(lkey) < str(rkey)
+        return less if int(direction) >= 0 else not less
+    return False
+
+
+def _doc_sort_cmp(pairs):
+    def _cmp(left, right):
+        if _doc_sort_before(left, right, pairs):
+            return -1
+        if _doc_sort_before(right, left, pairs):
+            return 1
+        return 0
+    return functools.cmp_to_key(_cmp)
 
 
 def _extract_sort_limit(stages: Sequence[Mapping[str, Any]]):
@@ -851,7 +869,7 @@ class OverlayCollection:
             merged = self._apply_overlay_row(orig, overlay)
             if _doc_matches(merged, raw):
                 overlay_docs.append(merged)
-        overlay_docs.sort(key=lambda d: _sort_key_tuple(d, pairs))
+        overlay_docs.sort(key=_doc_sort_cmp(pairs))
         streams = []
         try:
             prod_cursor = _apply_sort(self._prod.find(prod_query, {"_id": 0}), pairs)

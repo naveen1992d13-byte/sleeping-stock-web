@@ -18,7 +18,7 @@ class FakeCursor:
         spec = [(key_or_list, direction)] if direction is not None else key_or_list
         pairs = ov._sort_pairs(spec)
         if pairs:
-            self._rows.sort(key=lambda row: ov._sort_key_tuple(row, pairs))
+            self._rows.sort(key=ov._doc_sort_cmp(pairs))
         return self
 
     def skip(self, count):
@@ -700,3 +700,20 @@ def test_attachment_metadata_keyed_by_file_id_is_readable():
     created, base = asyncio.run(_go())
     assert created and created["query_id"] == "q1"
     assert base and base["query_id"] == "q0"
+
+
+def test_descending_sort_merges_production_and_testing_rows_newest_first():
+    prod = FakeCollection([
+        {"id": "p1", "created_at": "2026-09-19"},
+        {"id": "p2", "created_at": "2026-09-20"},
+    ])
+    created = FakeCollection([{"id": "TS-1", "created_at": "2026-10-17", "data_origin": "testing"}])
+    overlays = FakeCollection([
+        {"collection": "x_rows", "production_id": "p1", "payload": {"note": "edited"}},
+    ])
+    col = ov.OverlayCollection("x_rows", prod, created, overlays, FakeCollection())
+
+    async def _go():
+        return [row["id"] for row in await col.find({}).sort("created_at", -1).to_list(10)]
+
+    assert asyncio.run(_go()) == ["TS-1", "p2", "p1"]
