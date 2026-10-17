@@ -394,6 +394,8 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     user = await db.users.find_one({"id": user_id}, {"_id": 0})
     if user is None:
         raise credentials_exception
+    if str(user.get("status") or "").strip().lower() == "inactive":
+        raise credentials_exception
     changed = user.get("password_changed_at")
     iat = payload.get("iat")
     if changed is not None and iat is not None:
