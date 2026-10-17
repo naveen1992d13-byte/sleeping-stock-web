@@ -94,6 +94,8 @@ def _match(doc, query):
                 return False
             if "$lte" in v and str(doc.get(k) or "") > str(v["$lte"]):
                 return False
+            if "$gte" in v and str(doc.get(k) or "") < str(v["$gte"]):
+                return False
         elif doc.get(k) != v:
             return False
     return True
@@ -148,13 +150,19 @@ def test_finalize_rollup_idempotent_and_reconciled():
     assert first["status"] == ar.STATUS_SUCCESS
     assert first["reconciled"] is True
     assert first.get("snapshot_record_count") == 1
+    assert first.get("daily_agg_record_count") == 1
     assert abs(first["snapshot_total_value"] - 500) < 1e-6
+    assert abs(first["daily_agg_total_value"] - 500) < 1e-6
     assert len(db.analytics_stock_daily_snapshots.rows) == 1
+    assert len(db.analytics_daily_aggs.rows) == 1
+    assert db.analytics_daily_aggs.rows[0]["stock_value"] == 500.0
+    assert db.analytics_daily_aggs.rows[0]["line_count"] == 1
 
     second = asyncio.run(ar.finalize_analytics_rollup_for_date(db, "2026-10-16"))
     assert second.get("skipped") is True
     assert second["status"] == ar.STATUS_SUCCESS
     assert len(db.analytics_stock_daily_snapshots.rows) == 1
+    assert len(db.analytics_daily_aggs.rows) == 1
 
 
 def test_build_snapshot_docs_preserve_zero():
@@ -169,3 +177,67 @@ def test_build_snapshot_docs_preserve_zero():
     }])
     assert docs[0]["available_qty"] == 0.0
     assert docs[0]["total_value"] == 0.0
+
+
+def test_build_daily_agg_docs_buckets_and_totals():
+    snaps = ar.build_snapshot_docs("2026-10-16", [
+        {
+            "brand_name": "Hyundai",
+            "dealer_name": "FPL",
+            "branch": "Vanagaram",
+            "part_number": "A",
+            "part_category": "Fast Moving",
+            "quantity": 2,
+            "mav": 50,
+            "total_value": 100,
+            "purchase_aging_days": 10,
+            "sales_aging_days": 400,
+        },
+        {
+            "brand_name": "Hyundai",
+            "dealer_name": "FPL",
+            "branch": "Vanagaram",
+            "part_number": "B",
+            "part_category": "Fast Moving",
+            "quantity": 1,
+            "mav": 20,
+            "total_value": 20,
+            "purchase_aging_days": None,
+            "sales_aging_days": 50,
+        },
+    ])
+    aggs = ar.build_daily_agg_docs("2026-10-16", snaps)
+    assert len(aggs) == 1
+    g = aggs[0]
+    assert abs(g["stock_value"] - 120) < 1e-6
+    assert g["line_count"] == 2
+    assert abs(g["aging_purchase"]["0–90 Days"]["value"] - 100) < 1e-6
+    assert abs(g["aging_purchase"][">361 Days"]["value"] - 20) < 1e-6
+    assert abs(g["aging_sales"][">361 Days"]["value"] - 100) < 1e-6
+
+
+def test_query_daily_aggs_scope_filter():
+    db = FakeDB()
+    db[ar.DAILY_AGG_COLLECTION] = FakeColl([
+        {
+            "rollup_date_ist": "2026-10-16",
+            "brand_name": "Hyundai",
+            "dealer_name": "FPL",
+            "branch_name": "Vanagaram",
+            "category": "Fast Moving",
+            "stock_qty": 1,
+            "stock_value": 10,
+        },
+        {
+            "rollup_date_ist": "2026-10-16",
+            "brand_name": "Kia",
+            "dealer_name": "Other",
+            "branch_name": "X",
+            "category": "Others",
+            "stock_qty": 9,
+            "stock_value": 90,
+        },
+    ])
+    rows = asyncio.run(ar.query_daily_aggs(db, ["20261016"], {"brand": "Hyundai"}, None))
+    assert len(rows) == 1
+    assert rows[0]["stock_value"] == 10

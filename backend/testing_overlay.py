@@ -60,6 +60,7 @@ LOCAL_ONLY_COLLECTIONS = frozenset({
     # and status tracking never touch Production through the overlay.
     "analytics_stock_daily_snapshots",
     "analytics_rollup_status",
+    "analytics_daily_aggs",
 })
 
 # Business collections merged from production + testing deltas.

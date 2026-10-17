@@ -675,6 +675,79 @@ def _empty_daily_row(dk: str, status_info: dict) -> dict:
     }
 
 
+def _aging_field(aging_type: str) -> str:
+    return "aging_sales" if str(aging_type or "").lower() == "sales" else "aging_purchase"
+
+
+def _agg_metric_from_row(row: dict, aging_type: str, aging_bucket: Optional[str]) -> Tuple[float, float, float]:
+    """Return (qty, value, items) from one pre-aggregated daily row."""
+    if aging_bucket:
+        bucket = ((row.get(_aging_field(aging_type)) or {}).get(aging_bucket)) or {}
+        return _num(bucket.get("qty")), _num(bucket.get("value")), _num(bucket.get("items"))
+    return _num(row.get("stock_qty")), _num(row.get("stock_value")), _num(row.get("line_count"))
+
+
+def _aggs_to_branch_maps(
+    rows: List[dict],
+    aging_type: str,
+    aging_bucket: Optional[str] = None,
+) -> Dict[Tuple[str, str, str, str], dict]:
+    """Collapse daily-agg rows to a movement map keyed by brand/dealer/branch/category."""
+    out: Dict[Tuple[str, str, str, str], dict] = {}
+    for r in rows:
+        qty, value, items = _agg_metric_from_row(r, aging_type, aging_bucket)
+        key = (
+            _text(r.get("brand_name")).casefold(),
+            _text(r.get("dealer_name")).casefold(),
+            _text(r.get("branch_name")).casefold(),
+            _text(r.get("category")).casefold(),
+        )
+        cur = out.get(key)
+        if not cur:
+            out[key] = {
+                "brand_name": r.get("brand_name"),
+                "dealer_name": r.get("dealer_name"),
+                "branch": r.get("branch_name"),
+                "part_number": "",
+                "part_name": "",
+                "part_category": r.get("category"),
+                "category": r.get("category"),
+                "qty": qty,
+                "value": value,
+                "items": items,
+                "unit": (value / qty) if qty else 0.0,
+                "aging_purchase": r.get("aging_purchase") or {},
+                "aging_sales": r.get("aging_sales") or {},
+            }
+        else:
+            cur["qty"] += qty
+            cur["value"] += value
+            cur["items"] += items
+            cur["unit"] = (cur["value"] / cur["qty"]) if cur["qty"] else 0.0
+            # Merge aging bucket totals when no single-bucket filter is applied.
+            if not aging_bucket:
+                for side in ("aging_purchase", "aging_sales"):
+                    src = r.get(side) or {}
+                    dst = cur.setdefault(side, {})
+                    for bname, bvals in src.items():
+                        slot = dst.setdefault(bname, {"qty": 0.0, "value": 0.0, "items": 0.0})
+                        slot["qty"] = _num(slot.get("qty")) + _num((bvals or {}).get("qty"))
+                        slot["value"] = _num(slot.get("value")) + _num((bvals or {}).get("value"))
+                        slot["items"] = _num(slot.get("items")) + _num((bvals or {}).get("items"))
+    return out
+
+
+async def _successful_rollup_keys(date_keys: List[str]) -> set:
+    if not date_keys:
+        return set()
+    isos = sorted({rollup.date_key_to_iso(rollup.iso_to_date_key(dk)) for dk in date_keys})
+    rows = await db[rollup.STATUS_COLLECTION].find(
+        {"rollup_date_ist": {"$in": isos}, "status": rollup.STATUS_SUCCESS},
+        {"_id": 0, "rollup_date_ist": 1},
+    ).to_list(5000)
+    return {rollup.iso_to_date_key(r["rollup_date_ist"]) for r in rows if r.get("rollup_date_ist")}
+
+
 async def _build_daily_stock_series(
     scope: dict,
     date_keys: List[str],
@@ -686,9 +759,9 @@ async def _build_daily_stock_series(
     aging_bucket: Optional[str] = None,
     updated_up_to: Optional[str] = None,
 ) -> dict:
+    """Screen path: pre-aggregated daily rollups only (never 100k+ part rows)."""
     expected_branches = await _expected_branch_names(scope, current_user)
     consolidated = not bool(scope.get("branch"))
-    # Screen path: finalized rollups only. Do not scan live uploads/products for presence.
     prior_key = None
     if date_keys:
         prior_iso = await rollup.last_successful_rollup_date(
@@ -699,28 +772,50 @@ async def _build_daily_stock_series(
     load_keys = list(date_keys)
     if prior_key and prior_key not in load_keys:
         load_keys.append(prior_key)
-    by_date = await _aggregate_parts_for_dates(
-        load_keys, scope, category, True, allow_live_fallback=False, aging_bucket=aging_bucket
-    )
-    if aging_bucket:
-        by_date = {
-            dk: _filter_parts_by_aging_bucket(part_map, aging_type, aging_bucket)
-            for dk, part_map in by_date.items()
-        }
-    uploaded_by_date = {}
-    upload_meta = {}
-    for dk, part_map in by_date.items():
+
+    agg_rows = await rollup.query_daily_aggs(db, load_keys, scope, category)
+    success_keys = await _successful_rollup_keys(load_keys)
+
+    by_date_rows: Dict[str, List[dict]] = defaultdict(list)
+    for r in agg_rows:
+        dk = rollup.iso_to_date_key(_text(r.get("rollup_date_ist")))
+        if dk:
+            by_date_rows[dk].append(r)
+
+    by_date: Dict[str, Dict[Tuple[str, str, str, str], dict]] = {}
+    uploaded_by_date: Dict[str, set] = {}
+    upload_meta: Dict[str, Dict[str, dict]] = {}
+    for dk, rows in by_date_rows.items():
+        part_map = _aggs_to_branch_maps(rows, aging_type, aging_bucket)
+        by_date[dk] = part_map
         branches = {_text(row.get("branch")).casefold() for row in part_map.values() if _text(row.get("branch"))}
         uploaded_by_date[dk] = branches
         upload_meta[dk] = {
-            b: {"published_at": None, "total_value": sum(r["value"] for r in part_map.values() if _text(r.get("branch")).casefold() == b)}
+            b: {
+                "published_at": None,
+                "total_value": sum(
+                    r["value"] for r in part_map.values() if _text(r.get("branch")).casefold() == b
+                ),
+            }
             for b in branches
         }
+    # Finalized empty days (genuine zero stock) still count as present.
+    for dk in success_keys:
+        if dk not in by_date:
+            by_date[dk] = {}
+            uploaded_by_date.setdefault(dk, set())
+            upload_meta.setdefault(dk, {})
 
     last_avail_key: Optional[str] = prior_key
     if prior_key:
         prior_status = _day_upload_status(prior_key, uploaded_by_date, expected_branches, consolidated)
-        last_avail_map = _filter_map_branches(by_date.get(prior_key, {}), prior_status["allowed_branch_keys"])
+        if prior_key in success_keys and prior_key not in by_date_rows:
+            # Empty finalized prior day.
+            last_avail_map = {}
+        else:
+            last_avail_map = _filter_map_branches(by_date.get(prior_key, {}), prior_status["allowed_branch_keys"])
+            if prior_key in success_keys and not by_date.get(prior_key) and not prior_status["allowed_branch_keys"]:
+                last_avail_map = {}
     else:
         last_avail_map = {}
 
@@ -732,8 +827,8 @@ async def _build_daily_stock_series(
     period_added = period_reduced = 0.0
     for dk in date_keys:
         status_info = _day_upload_status(dk, uploaded_by_date, expected_branches, consolidated)
-        # Finalized-only: a calendar day without a successful rollup snapshot is No Data.
-        if dk not in by_date or not by_date.get(dk):
+        # Finalized-only: missing successful rollup => No Data; successful empty => 0.
+        if dk not in success_keys:
             status_info = {
                 **status_info,
                 "data_status": "NO_UPLOAD",
@@ -743,6 +838,18 @@ async def _build_daily_stock_series(
                 "uploaded_branches": [],
                 "missing_branches": status_info.get("missing_branches") or expected_branches,
                 "allowed_branch_keys": set(),
+            }
+        elif not by_date_rows.get(dk):
+            # Rollup succeeded with zero source rows — show 0, not No Data.
+            status_info = {
+                **status_info,
+                "data_status": "AVAILABLE",
+                "uploaded_branch_count": status_info.get("uploaded_branch_count") or 0,
+                "missing_branch_count": 0,
+                "coverage_percentage": 100.0 if not expected_branches else status_info.get("coverage_percentage") or 100.0,
+                "allowed_branch_keys": set(uploaded_by_date.get(dk) or set()) or (
+                    {_text(b).casefold() for b in expected_branches} if expected_branches else set()
+                ),
             }
         if status_info["data_status"] == "NO_UPLOAD":
             no_days += 1
@@ -754,11 +861,13 @@ async def _build_daily_stock_series(
             full_days += 1
         uploaded_branch_days += status_info["uploaded_branch_count"]
         curr_map = _filter_map_branches(by_date.get(dk, {}), status_info["allowed_branch_keys"])
+        if dk in success_keys and not by_date_rows.get(dk):
+            curr_map = {}
         stock_v, stock_q = _sum_map(curr_map)
         row = _empty_daily_row(dk, status_info)
         row["stock_value"] = stock_v
         row["stock_quantity"] = stock_q
-        if last_avail_key and last_avail_map is not None:
+        if last_avail_key is not None and last_avail_map is not None:
             mv = _compute_day_movement(last_avail_map, curr_map, aging_type, metric_type)
             ctype = _comparison_type_for(last_avail_key, dk)
             row["comparison_date"] = _date_key_to_iso(last_avail_key)
@@ -823,9 +932,11 @@ async def _build_daily_stock_series(
         for k in ("uploaded_branch_count", "expected_branch_count", "missing_branch_count", "coverage_percentage"):
             summary[k] = last_row.get(k)
     if last_row and last_row.get("comparison_date") and last_row["stock_value"] is not None:
-        # previous available from comparison row
         comp_key = _iso_to_date_key(last_row["comparison_date"])
-        comp_map = _filter_map_branches(by_date.get(comp_key, {}), _day_upload_status(comp_key, uploaded_by_date, expected_branches, consolidated)["allowed_branch_keys"])
+        comp_map = _filter_map_branches(
+            by_date.get(comp_key, {}),
+            _day_upload_status(comp_key, uploaded_by_date, expected_branches, consolidated)["allowed_branch_keys"],
+        )
         summary["previous_available_stock_value"], _ = _sum_map(comp_map)
 
     coverage = _coverage_payload(updated_up_to, coverage)
@@ -835,11 +946,15 @@ async def _build_daily_stock_series(
         "coverage": coverage,
         "summary": summary,
         "by_date_parts": by_date,
+        "by_date_aggs": dict(by_date_rows),
+        "success_keys": success_keys,
         "upload_meta": upload_meta,
         "uploaded_by_date": uploaded_by_date,
         "expected_branches": expected_branches,
         "consolidated": consolidated,
         "data_updated_up_to": updated_up_to,
+        "aging_type": aging_type,
+        "aging_bucket": aging_bucket,
     }
 
 
@@ -1287,13 +1402,15 @@ async def analytics_aging_trend(
             "from_date": from_date,
             "to_date": effective_to,
         }
+    # Aging panel needs full bucket breakdown — do not pre-filter the series by aging_days.
     ctx = await _build_daily_stock_series(
         scope, date_keys, category, aging_type, metric_type, current_user,
-        aging_bucket=aging_bucket, updated_up_to=updated_up_to,
+        aging_bucket=None, updated_up_to=updated_up_to,
     )
     use_value = metric_type == "value"
     # Item Wise = distinct part-line count (quantity of line items), Value Wise = stock value.
     use_items = metric_type == "quantity"
+    aging_side = _aging_field(aging_type)
     last_row = ctx["daily"][-1]
     bucket_totals = {b: {"value": None, "quantity": None, "items": None} for b in ANALYTICS_CHART_BUCKETS}
     stacked = defaultdict(lambda: {b: None for b in ANALYTICS_CHART_BUCKETS})
@@ -1304,17 +1421,28 @@ async def analytics_aging_trend(
         bucket_totals = {b: {"value": 0.0, "quantity": 0.0, "items": 0.0} for b in ANALYTICS_CHART_BUCKETS}
         stacked = defaultdict(lambda: {b: 0.0 for b in ANALYTICS_CHART_BUCKETS})
         for row in curr_map.values():
-            days = _aging_days_row(row, aging_type)
-            b = _analytics_bucket(days)
-            bucket_totals[b]["value"] += row["value"]
-            bucket_totals[b]["quantity"] += row["qty"]
-            bucket_totals[b]["items"] += 1.0
             cat = _row_category(row)
-            metric = row["value"] if use_value else (1.0 if use_items else row["qty"])
-            stacked[cat][b] += metric
-        cat_total = sum(
-            (x["value"] if use_value else 1.0) for x in curr_map.values()
-        ) or 1.0
+            aging = row.get(aging_side) or {}
+            for b in ANALYTICS_CHART_BUCKETS:
+                if aging_bucket and b != aging_bucket:
+                    continue
+                slot = aging.get(b) or {}
+                bv = _num(slot.get("value"))
+                bq = _num(slot.get("qty"))
+                bi = _num(slot.get("items"))
+                bucket_totals[b]["value"] += bv
+                bucket_totals[b]["quantity"] += bq
+                bucket_totals[b]["items"] += bi
+                metric = bv if use_value else (bi if use_items else bq)
+                stacked[cat][b] = (stacked[cat][b] or 0.0) + metric
+        if aging_bucket:
+            cat_total = bucket_totals[aging_bucket]["value"] if use_value else bucket_totals[aging_bucket]["items"]
+            cat_total = cat_total or 1.0
+        else:
+            cat_total = sum(
+                (bucket_totals[b]["value"] if use_value else bucket_totals[b]["items"])
+                for b in ANALYTICS_CHART_BUCKETS
+            ) or 1.0
     else:
         cat_total = 1.0
     buckets_out = []
@@ -1322,6 +1450,8 @@ async def analytics_aging_trend(
         v = bucket_totals[b]["value"]
         q = bucket_totals[b]["quantity"]
         items = bucket_totals[b]["items"]
+        if aging_bucket and b != aging_bucket and v is not None:
+            v = q = items = 0.0
         m = v if use_value else items
         buckets_out.append(
             {
@@ -1355,8 +1485,12 @@ async def analytics_aging_trend(
         curr_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
         day_buckets = {b: 0.0 for b in ANALYTICS_CHART_BUCKETS}
         for row in curr_map.values():
-            b = _analytics_bucket(_aging_days_row(row, aging_type))
-            day_buckets[b] += row["value"] if use_value else 1.0
+            aging = row.get(aging_side) or {}
+            for b in ANALYTICS_CHART_BUCKETS:
+                if aging_bucket and b != aging_bucket:
+                    continue
+                slot = aging.get(b) or {}
+                day_buckets[b] += _num(slot.get("value")) if use_value else _num(slot.get("items"))
         total = sum(day_buckets.values())
         daily.append(
             {
