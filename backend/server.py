@@ -6488,7 +6488,7 @@ async def resend_request_group_email(request_number: str, current_user: UserResp
     if not group_doc:
         raise HTTPException(status_code=404, detail='Request not found')
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or group_doc.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(group_doc, current_user)
     is_requester = group_doc.get('requested_by') == current_user.id or (role != 'user' and group_doc.get('requesting_dealer') == current_user.group)
     if not (is_supplier or is_requester):
         raise HTTPException(status_code=403, detail='Not authorized for this request')
@@ -6608,7 +6608,7 @@ async def request_group_detail(request_number: str, current_user: UserResponse =
     if not group_doc:
         raise HTTPException(status_code=404, detail='Request not found')
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or group_doc.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(group_doc, current_user)
     is_requester = group_doc.get('requested_by') == current_user.id or (role != 'user' and group_doc.get('requesting_dealer') == current_user.group)
     if not (is_supplier or is_requester):
         raise HTTPException(status_code=403, detail='Not authorized for this request')
@@ -7174,7 +7174,7 @@ async def request_center_detail(request_id: str, current_user: UserResponse = De
         req = dict(req)
         req["archive_source"] = "s3"
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or req.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(req, current_user)
     is_requester = req.get('requested_by') == current_user.id or (role != 'user' and req.get('requesting_dealer') == current_user.group)
     if not (is_supplier or is_requester):
         raise HTTPException(status_code=403, detail='Not authorized for this request')
@@ -7190,7 +7190,7 @@ async def request_center_print_pdf(request_number: str, current_user: UserRespon
         raise HTTPException(status_code=404, detail='Request not found')
     sample = items[0] if items else header or {}
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or sample.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(sample, current_user)
     is_requester = (
         sample.get('requested_by') == current_user.id
         or (role != 'user' and sample.get('requesting_dealer') == current_user.group)
@@ -7349,13 +7349,25 @@ async def _sync_request_header_after_item_decision(req: dict, now: str):
     )
 
 
+def _is_request_supplier(doc: dict, current_user: UserResponse) -> bool:
+    """Same scope as Request Center incoming: Admin by dealer, User by dealer + branch."""
+    role = (current_user.role or '').lower()
+    if role == 'master':
+        return True
+    if not doc or doc.get('supplying_dealer') != current_user.group:
+        return False
+    if role == 'admin':
+        return True
+    return str(doc.get('supplying_branch') or '').strip().casefold() == str(current_user.location or '').strip().casefold()
+
+
 async def _request_center_transition(request_id: str, new_status: str, remarks: str, current_user: UserResponse, accepted_qty=None):
     req = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
     if not req:
         raise HTTPException(status_code=404, detail='Request not found')
 
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or req.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(req, current_user)
     if new_status != 'Cancelled' and not is_supplier:
         raise HTTPException(status_code=403, detail='Only the supplying Admin/Master can approve or reject a request')
     is_requester = req.get('requested_by') == current_user.id or (role != 'user' and req.get('requesting_dealer') == current_user.group)
@@ -7476,7 +7488,7 @@ async def _notify_request_status_change(req: dict, event: str, actor_id: str = "
 
 async def _require_supplier_for_request(req: dict, current_user: UserResponse):
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or req.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(req, current_user)
     if not is_supplier:
         raise HTTPException(status_code=403, detail='Only the supplying scope can update picking / dispatch')
     return is_supplier
@@ -7690,7 +7702,7 @@ async def _request_logistics_transition(request_id: str, new_status: str, remark
     if not req:
         raise HTTPException(status_code=404, detail='Request not found')
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or req.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(req, current_user)
     is_requester = role == 'master' or req.get('requested_by') == current_user.id or (role != 'user' and req.get('requesting_dealer') == current_user.group)
     if new_status == 'Dispatched' and not is_supplier:
         raise HTTPException(status_code=403, detail='Only the supplying scope can dispatch accepted parts')
