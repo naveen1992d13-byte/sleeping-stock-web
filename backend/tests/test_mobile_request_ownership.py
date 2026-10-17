@@ -205,6 +205,7 @@ def _eligible_dev(device_id, token, uid, brand="Honda", dealer="D", branch="B", 
         "brand_name": brand,
         "dealer_name": dealer,
         "branch": branch,
+        "data_origin": "testing",
     }
     row.update(extra)
     return row
@@ -223,13 +224,30 @@ async def _test_request_picked_excludes_picker(monkeypatch):
                     ]
             return Cursor()
 
+    class FakeCycles:
+        async def find_one(self, query, proj=None):
+            return {"request_group_key": "G", "status": "ringing", "cycle_number": 1}
+
+        async def update_one(self, query, update, upsert=False):
+            return type("R", (), {"matched_count": 1})()
+
+    class EmptyActions:
+        def find(self, query, proj=None):
+            class Cursor:
+                async def to_list(self, n):
+                    return []
+            return Cursor()
+
     class FakeDB:
         mobile_devices = Devices()
+        mobile_notification_actions = EmptyActions()
+        mobile_request_cycles = FakeCycles()
 
     def capture(messages):
         sent.extend(messages)
-        return {"ok": True}
+        return {"ok": True, "sent": len(messages), "body": {}}
 
+    monkeypatch.setattr(mobile_push, "_post_expo_push_http", capture)
     monkeypatch.setattr(mobile_push, "send_expo_push_messages", capture)
     result = await mobile_push.notify_request_picked_push(
         FakeDB(),
@@ -237,9 +255,11 @@ async def _test_request_picked_excludes_picker(monkeypatch):
         picked_by_name="Ravi",
         exclude_device_id="winner",
     )
-    assert result["sent"] == 1
-    assert sent[0]["data"]["type"] == "request_picked"
-    assert sent[0]["to"] == "ExponentPushToken[o]"
+    # request_picked + request_closed to other devices
+    assert result["sent"] == 2
+    types = {m["data"]["type"] for m in sent}
+    assert types == {"request_picked", "request_closed"}
+    assert all(m["to"] == "ExponentPushToken[o]" for m in sent)
 
 
 def test_reminder_skips_picked_request():
@@ -372,15 +392,36 @@ async def _test_notify_skips_logged_out_wrong_brand_and_missing_scope(monkeypatc
         async def insert_one(self, doc):
             return None
 
+        async def update_many(self, query, update):
+            return type("R", (), {"modified_count": 0, "matched_count": 0})()
+
     class Logs:
         async def insert_one(self, doc):
             return None
 
+    class FakeCycles:
+        async def find_one(self, query, proj=None):
+            return None
+
+        async def update_one(self, query, update, upsert=False):
+            return type("R", (), {"matched_count": 1})()
+
+    class EmptyActions:
+        def find(self, query, proj=None):
+            class Cursor:
+                async def to_list(self, n):
+                    return []
+            return Cursor()
+
     class FakeDB:
         mobile_devices = Devices()
         mobile_push_delivery_logs = Logs()
+        mobile_request_cycles = FakeCycles()
+        mobile_notification_actions = EmptyActions()
 
-    monkeypatch.setattr(mobile_push, "send_expo_push_messages", lambda messages: sent.extend(messages) or {"ok": True})
+    capture = lambda messages: sent.extend(messages) or {"ok": True, "sent": len(messages), "body": {}}
+    monkeypatch.setattr(mobile_push, "_post_expo_push_http", capture)
+    monkeypatch.setattr(mobile_push, "send_expo_push_messages", capture)
     missing = await mobile_push.notify_branch_request_push(
         FakeDB(), {"id": "G", "request_number": "RQ1", "supplying_dealer": "D", "supplying_branch": "B"}, "new",
     )

@@ -51,6 +51,10 @@ try:
 except ImportError:
     import mobile_push
 try:
+    from . import mobile_request_cycle_scheduler
+except ImportError:
+    import mobile_request_cycle_scheduler
+try:
     from . import s3_storage
     from . import file_objects
     from . import archive_manifest
@@ -10293,6 +10297,13 @@ async def seed_master_user_on_startup():
         logger.info("Request SLA scheduler started")
         request_in_transit_reminder.start_in_transit_reminder_scheduler(db)
         logger.info("Request in-transit reminder scheduler started")
+        try:
+            from mobile_request_cycle import ensure_cycle_indexes
+            await ensure_cycle_indexes(db)
+        except Exception as exc:
+            logger.warning("mobile_request_cycles index creation failed: %s", exc)
+        mobile_request_cycle_scheduler.start_request_cycle_scheduler(db)
+        logger.info("Mobile request cycle scheduler started")
         exe = str(sys.executable or "").replace("\\", "/")
         if "/backend/venv/" not in exe:
             logger.warning(
@@ -10316,6 +10327,10 @@ async def seed_master_user_on_startup():
 async def shutdown_db_client():
     try:
         await archive_scheduler.stop_archive_scheduler()
+    except Exception:
+        pass
+    try:
+        await mobile_request_cycle_scheduler.stop_request_cycle_scheduler()
     except Exception:
         pass
     client.close()

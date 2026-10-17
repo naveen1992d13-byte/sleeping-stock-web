@@ -1259,6 +1259,11 @@ async def verify_pairing_and_register_device(payload: PairingVerifyRequest, requ
                 "created_at": now.isoformat(), "updated_at": now.isoformat(), "paired_device_count": 0, "active_device_count": 0, "last_active_at": None,
             }
             try:
+                import testing_runtime
+                mobile_user = testing_runtime.stamp_testing_origin(mobile_user)
+            except Exception:
+                pass
+            try:
                 await db.mobile_users.insert_one(dict(mobile_user))
             except DuplicateKeyError:
                 existing = await db.mobile_users.find_one(
@@ -1301,6 +1306,11 @@ async def verify_pairing_and_register_device(payload: PairingVerifyRequest, requ
             "branch": pairing_doc["branch"],
             "session_token_hash": _hash_token(raw_session_token),
         }
+        try:
+            import testing_runtime
+            device_doc = testing_runtime.stamp_testing_origin(device_doc)
+        except Exception:
+            pass
         await db.mobile_devices.insert_one(dict(device_doc))
         await db.mobile_sessions.insert_one({"session_token_hash": device_doc["session_token_hash"], "device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "created_at": now.isoformat()})
         await db.mobile_users.update_one({"mobile_user_id": mobile_user["mobile_user_id"]}, {"$inc": {"paired_device_count": 1}, "$set": {"active_device_count": 1, "last_active_at": now.isoformat(), "updated_at": now.isoformat()}})
@@ -2928,10 +2938,13 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         header_doc = {
             **header_doc,
             "request_number": live_lines[0].get("request_number") or header_doc.get("request_number"),
-            "id": payload.request_group_key,
+            "id": canonical_key,
             "supplying_brand": session["brand_name"],
             "supplying_dealer": dealer,
             "supplying_branch": branch,
+            "requesting_brand": live_lines[0].get("requesting_brand") or header_doc.get("requesting_brand"),
+            "requesting_dealer": live_lines[0].get("requesting_dealer") or header_doc.get("requesting_dealer"),
+            "requesting_branch": live_lines[0].get("requesting_branch") or header_doc.get("requesting_branch"),
         }
         await mobile_push.notify_request_picked_push(
             db, header_doc, picked_by_name=device_user_name, exclude_device_id=device_id,
@@ -3086,6 +3099,29 @@ async def reject_notification(payload: NotificationRejectRequest, session=Depend
             "lock_status": "picked",
         })
 
+    try:
+        from mobile_request_cycle import add_rejected_dealer
+        await add_rejected_dealer(db, canonical_key, dealer)
+    except Exception as exc:
+        logger.warning("add_rejected_dealer failed: %s", exc)
+
+    try:
+        from mobile_request_cycle_scheduler import process_all_rejected_if_needed
+        group_doc = {
+            **(header or {}),
+            "id": canonical_key,
+            "request_number": (live_lines[0].get("request_number") if live_lines else None) or (header or {}).get("request_number"),
+            "supplying_brand": session["brand_name"],
+            "requesting_brand": (live_lines[0].get("requesting_brand") if live_lines else None) or (header or {}).get("requesting_brand") or session["brand_name"],
+            "requesting_dealer": (live_lines[0].get("requesting_dealer") if live_lines else None) or (header or {}).get("requesting_dealer"),
+            "requesting_branch": (live_lines[0].get("requesting_branch") if live_lines else None) or (header or {}).get("requesting_branch"),
+        }
+        await process_all_rejected_if_needed(
+            db, canonical_key, group_doc, brand=session["brand_name"],
+        )
+    except Exception as exc:
+        logger.warning("all-rejected check failed: %s", exc)
+
     await _audit(None, "mobile_reject_request", mobile_user_id, {
         "request_group_key": canonical_key, "reason": reason, "dealer_level": True,
     })
@@ -3219,6 +3255,12 @@ async def complete_picking(payload: NotificationCompleteRequest, session=Depends
         if existing and str(existing.get("lock_status") or "") == "picking_completed" and _is_same_owner(existing, session):
             return {"message": "Picking already completed", "request_group_key": payload.request_group_key, "status": "picking_completed"}
         raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "This request can no longer be changed"))
+
+    try:
+        from mobile_request_cycle import mark_cycle_completed
+        await mark_cycle_completed(db, payload.request_group_key)
+    except Exception as exc:
+        logger.warning("mark_cycle_completed failed: %s", exc)
 
     await _audit(None, "mobile_picking_completed", session["mobile_user"]["mobile_user_id"], {
         "request_group_key": payload.request_group_key, "results": results,
@@ -4865,6 +4907,11 @@ async def _backfill_device_session_flags():
 # ==================== INDEXES ====================
 
 async def ensure_mobile_indexes():
+    try:
+        from mobile_request_cycle import ensure_cycle_indexes
+        await ensure_cycle_indexes(db)
+    except Exception as exc:
+        logger.warning("mobile_request_cycles indexes failed: %s", exc)
     from auto_perpetual import ensure_auto_perpetual_indexes
 
     await ensure_auto_perpetual_indexes(db)

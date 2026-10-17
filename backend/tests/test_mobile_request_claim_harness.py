@@ -267,6 +267,16 @@ def test_broadcast_pick_reject_flags_can_snooze_false(monkeypatch):
 async def _test_broadcast_pick_reject_flags_can_snooze_false(monkeypatch):
     sent = []
 
+    class FakeCycles:
+        async def find_one(self, query, proj=None):
+            return None
+
+        async def update_one(self, query, update, upsert=False):
+            return type("R", (), {"matched_count": 1})()
+
+        async def insert_one(self, doc):
+            return None
+
     class FakeDB:
         mobile_devices = FakeDevices([
             {
@@ -279,6 +289,7 @@ async def _test_broadcast_pick_reject_flags_can_snooze_false(monkeypatch):
                 "brand_name": "Honda",
                 "dealer_name": "Dealer A",
                 "branch": "Vanagaram",
+                "data_origin": "testing",
             },
             {
                 "device_id": "d2",
@@ -290,14 +301,20 @@ async def _test_broadcast_pick_reject_flags_can_snooze_false(monkeypatch):
                 "brand_name": "Honda",
                 "dealer_name": "Dealer B",
                 "branch": "Porur",
+                "data_origin": "testing",
             },
         ])
         mobile_push_delivery_logs = FakeLogs()
         mobile_notification_actions = FakeActions()
+        mobile_request_cycles = FakeCycles()
 
     monkeypatch.setattr(
+        mobile_push, "_post_expo_push_http",
+        lambda messages: sent.extend(messages) or {"ok": True, "sent": len(messages), "body": {}},
+    )
+    monkeypatch.setattr(
         mobile_push, "send_expo_push_messages",
-        lambda messages: sent.extend(messages) or {"ok": True},
+        lambda messages: sent.extend(messages) or {"ok": True, "sent": len(messages)},
     )
     result = await mobile_push.notify_branch_request_push(
         FakeDB(),
@@ -612,6 +629,16 @@ async def _test_broadcast_excludes_dismissed_dealers(monkeypatch):
         "dealer_name": "Dealer A",
     })
 
+    class FakeCycles:
+        async def find_one(self, query, proj=None):
+            return None
+
+        async def update_one(self, query, update, upsert=False):
+            return type("R", (), {"matched_count": 1})()
+
+        async def insert_one(self, doc):
+            return None
+
     class FakeDB:
         mobile_devices = FakeDevices([
             {
@@ -624,6 +651,7 @@ async def _test_broadcast_excludes_dismissed_dealers(monkeypatch):
                 "brand_name": "Honda",
                 "dealer_name": "Dealer A",
                 "branch": "Vanagaram",
+                "data_origin": "testing",
             },
             {
                 "device_id": "d2",
@@ -635,14 +663,20 @@ async def _test_broadcast_excludes_dismissed_dealers(monkeypatch):
                 "brand_name": "Honda",
                 "dealer_name": "Dealer B",
                 "branch": "Porur",
+                "data_origin": "testing",
             },
         ])
         mobile_push_delivery_logs = FakeLogs()
         mobile_notification_actions = actions
+        mobile_request_cycles = FakeCycles()
 
     monkeypatch.setattr(
+        mobile_push, "_post_expo_push_http",
+        lambda messages: sent.extend(messages) or {"ok": True, "sent": len(messages), "body": {}},
+    )
+    monkeypatch.setattr(
         mobile_push, "send_expo_push_messages",
-        lambda messages: sent.extend(messages) or {"ok": True},
+        lambda messages: sent.extend(messages) or {"ok": True, "sent": len(messages)},
     )
     result = await mobile_push.notify_branch_request_push(
         FakeDB(),
