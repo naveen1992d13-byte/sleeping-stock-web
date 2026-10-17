@@ -6072,94 +6072,103 @@ async def _auto_source_advance(order_id: str, actor: UserResponse = None, reason
         return {'ok': False, 'reason': 'locked'}
 
     try:
-        # Wait if an active Requested header still exists
-        pending = await db.request_headers.find_one(
-            {'order_id': order_id, 'status': 'Requested', 'auto_sourced': True},
-            {'_id': 0, 'request_number': 1, 'attempt_id': 1, 'id': 1, 'status': 1},
-        )
-        if pending:
-            waiting_on = pending.get('request_number') or pending.get('attempt_id') or pending.get('id')
-            return {'ok': True, 'state': oas.AUTO_SOURCE_WAITING, 'waiting_on': waiting_on}
-
-        items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
-        items = await odw.enrich_order_items(db, order, items)
-        remaining = oas.remaining_items(items)
-        if not remaining:
-            now = datetime.now(timezone.utc).isoformat()
-            await db.order_headers.update_one({'id': order_id}, {'$set': {
-                'auto_sourcing_state': oas.AUTO_SOURCE_COMPLETED,
-                'auto_sourcing_active': False,
-                'auto_sourcing_message': 'Auto Sourcing Completed',
-                'factory_decision_required': False,
-                'updated_at': now,
-            }})
-            await oas.append_sourcing_event(db, order, 'Auto Sourcing Completed', {'reason': reason}, actor)
-            return {'ok': True, 'state': oas.AUTO_SOURCE_COMPLETED}
-
-        aging_type = order.get('auto_sourcing_aging_type') or order.get('branch_aging_type') or 'purchase'
-        min_aging = float(order.get('auto_sourcing_min_aging_days') or 0)
-        freezes = await odw.load_today_freezes(db, [i.get('part_number') for i in remaining], order.get('brand_name') or '')
-
-        # Adjust pools for live reservations
-        all_stock_ids = []
-        for item in remaining:
-            for field in ('same_dealer_sources', 'other_dealer_sources'):
-                for s in item.get(field) or []:
-                    if s.get('stock_id'):
-                        all_stock_ids.append(s['stock_id'])
-        reserved_map = await _reservation_qty_map(all_stock_ids)
-        for item in remaining:
-            for field in ('same_dealer_sources', 'other_dealer_sources'):
-                item[field] = [_with_reservation_adjustment(s, reserved_map) for s in (item.get(field) or [])]
-
-        # 1) Own Branch first
-        own_candidates = oas.build_destination_candidates(
-            remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging, levels=['own'],
-        )
-        best = oas.select_best_destination(own_candidates, prefer_own=True)
-        phase = 'own'
-        last_chance = False
-        if not best:
-            # 2) Same-dealer branches, then other dealers
-            normal = oas.build_destination_candidates(
-                remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging, levels=['branch', 'dealer'],
+        for _attempt in range(6):
+            order = await db.order_headers.find_one({'id': order_id}, {'_id': 0}) or order
+            # Wait if an active Requested header still exists
+            pending = await db.request_headers.find_one(
+                {'order_id': order_id, 'status': 'Requested', 'auto_sourced': True},
+                {'_id': 0, 'request_number': 1, 'attempt_id': 1, 'id': 1, 'status': 1},
             )
-            best = oas.select_best_destination(normal, prefer_own=False)
-            phase = 'normal'
-        if not best:
-            # 3) Last Chance — unique holders only
-            unique = oas.find_unique_holder_candidates(
-                remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging,
+            if pending:
+                waiting_on = pending.get('request_number') or pending.get('attempt_id') or pending.get('id')
+                return {'ok': True, 'state': oas.AUTO_SOURCE_WAITING, 'waiting_on': waiting_on}
+
+            items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+            items = await odw.enrich_order_items(db, order, items)
+            remaining = oas.remaining_items(items)
+            if not remaining:
+                now = datetime.now(timezone.utc).isoformat()
+                await db.order_headers.update_one({'id': order_id}, {'$set': {
+                    'auto_sourcing_state': oas.AUTO_SOURCE_COMPLETED,
+                    'auto_sourcing_active': False,
+                    'auto_sourcing_message': 'Auto Sourcing Completed',
+                    'factory_decision_required': False,
+                    'updated_at': now,
+                }})
+                await oas.append_sourcing_event(db, order, 'Auto Sourcing Completed', {'reason': reason}, actor)
+                return {'ok': True, 'state': oas.AUTO_SOURCE_COMPLETED}
+
+            aging_type = order.get('auto_sourcing_aging_type') or order.get('branch_aging_type') or 'purchase'
+            min_aging = float(order.get('auto_sourcing_min_aging_days') or 0)
+            freezes = await odw.load_today_freezes(db, [i.get('part_number') for i in remaining], order.get('brand_name') or '')
+
+            # Adjust pools for live reservations
+            all_stock_ids = []
+            for item in remaining:
+                for field in ('same_dealer_sources', 'other_dealer_sources'):
+                    for s in item.get(field) or []:
+                        if s.get('stock_id'):
+                            all_stock_ids.append(s['stock_id'])
+            reserved_map = await _reservation_qty_map(all_stock_ids)
+            for item in remaining:
+                for field in ('same_dealer_sources', 'other_dealer_sources'):
+                    item[field] = [_with_reservation_adjustment(s, reserved_map) for s in (item.get(field) or [])]
+
+            # 1) Own Branch first
+            own_candidates = oas.build_destination_candidates(
+                remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging, levels=['own'],
             )
-            best = oas.select_best_destination(unique, prefer_own=False)
-            phase = 'last_chance'
-            last_chance = True
-        if not best:
-            result = await oas.mark_factory_decision_required(db, order, remaining, actor)
-            return {'ok': True, **result}
+            best = oas.select_best_destination(own_candidates, prefer_own=True)
+            phase = 'own'
+            last_chance = False
+            if not best:
+                # 2) Same-dealer branches, then other dealers
+                normal = oas.build_destination_candidates(
+                    remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging, levels=['branch', 'dealer'],
+                )
+                best = oas.select_best_destination(normal, prefer_own=False)
+                phase = 'normal'
+            if not best:
+                # 3) Last Chance — unique holders only
+                unique = oas.find_unique_holder_candidates(
+                    remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging,
+                )
+                best = oas.select_best_destination(unique, prefer_own=False)
+                phase = 'last_chance'
+                last_chance = True
+            if not best:
+                result = await oas.mark_factory_decision_required(db, order, remaining, actor)
+                return {'ok': True, **result}
 
-        send = await _auto_source_send_destination(order, best, actor, last_chance=last_chance)
-        if not send.get('sent'):
-            # Exclude empty / conflicted destination and retry within this lock
-            # (do NOT re-enter _auto_source_advance — that would fail the lock).
-            for line in best.get('lines') or []:
-                await db.order_items.update_one({'id': line['item']['id']}, {
-                    '$addToSet': {'excluded_sources': {
-                        'dealer_name': best.get('dealer_name'),
-                        'branch': best.get('branch'),
-                        'reason': send.get('reason') or 'stock_changed_during_response',
-                    }},
-                    '$set': {'updated_at': datetime.now(timezone.utc).isoformat()},
-                })
-            await oas.append_sourcing_event(db, order, 'Auto Sourcing skipped destination (stock changed)', {
-                'dealer': best.get('dealer_name'), 'branch': best.get('branch'), 'phase': phase,
-                'reason': send.get('reason'),
-            }, actor)
-            # Refresh order/items and loop by tail-calling after releasing lock.
-            await _auto_source_release_lock(order_id)
-            return await _auto_source_advance(order_id, actor=actor, reason='stock_changed_retry')
+            send = await _auto_source_send_destination(order, best, actor, last_chance=last_chance)
+            if not send.get('sent'):
+                # Exclude empty / conflicted destination and retry inside this lock.
+                for line in best.get('lines') or []:
+                    await db.order_items.update_one({'id': line['item']['id']}, {
+                        '$addToSet': {'excluded_sources': {
+                            'dealer_name': best.get('dealer_name'),
+                            'branch': best.get('branch'),
+                            'reason': send.get('reason') or 'stock_changed_during_response',
+                        }},
+                        '$set': {'updated_at': datetime.now(timezone.utc).isoformat()},
+                    })
+                await oas.append_sourcing_event(db, order, 'Auto Sourcing skipped destination (stock changed)', {
+                    'dealer': best.get('dealer_name'), 'branch': best.get('branch'), 'phase': phase,
+                    'reason': send.get('reason'),
+                }, actor)
+                continue
 
-        return {'ok': True, 'state': oas.AUTO_SOURCE_WAITING if not last_chance else oas.AUTO_SOURCE_LAST_CHANCE, **send, 'phase': phase}
+            return {
+                'ok': True,
+                'state': oas.AUTO_SOURCE_WAITING if not last_chance else oas.AUTO_SOURCE_LAST_CHANCE,
+                **send,
+                'phase': phase,
+            }
+
+        result = await oas.mark_factory_decision_required(
+            db, order, await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000), actor,
+        )
+        return {'ok': True, **result}
     finally:
         await _auto_source_release_lock(order_id)
 
@@ -6755,7 +6764,15 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
 
     created_group_docs = []
     for _key, pairs in groups.items():
-        group_doc = await _create_request_group(order, pairs, current_user, now)
+        try:
+            group_doc = await _create_request_group(order, pairs, current_user, now)
+        except RuntimeError as exc:
+            if str(exc).startswith('stock_reservation_conflict:'):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f'Stock no longer available for reservation. {exc}',
+                ) from exc
+            raise
         created_group_docs.append(group_doc)
         request_number = (group_doc or {}).get('request_number')
         attempt_id = (group_doc or {}).get('attempt_id') or (group_doc or {}).get('id')
