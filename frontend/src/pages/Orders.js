@@ -549,6 +549,18 @@ export function Orders({ scopeOverride } = {}) {
     } finally { setLoading(false); }
   };
 
+  const decideCancellation = async (item, decision) => {
+    if (!currentOrder?.id || !item?.cancellation_request_id) return;
+    setLoading(true);
+    try {
+      const res = await axios.post(`${API}/order-desk/cancellations/${item.cancellation_request_id}/decide`, { decision });
+      toast.success(res.data.message || 'Cancellation updated');
+      await loadOrder(currentOrder.id, false);
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Unable to update cancellation');
+    } finally { setLoading(false); }
+  };
+
   const updateAllocation = (item, source, value, level) => {
     if (item.qty_locked && Number(item.remaining_qty || 0) <= 0) {
       return toast.error(item.lock_reason || 'Quantity is locked');
@@ -1019,6 +1031,12 @@ export function Orders({ scopeOverride } = {}) {
                         )}
                         {!item.qty_locked && !orderFinished && !['Cancelled', 'Cancellation Requested', 'Accepted', 'Completed'].includes(item.request_status) && (
                           <Button size="sm" variant="outline" className="text-amber-800" onClick={() => { setCancelItem(item); setCancelOpen(true); setCancelReason(''); setCancelRemarks(''); }}>Request Cancellation</Button>
+                        )}
+                        {canSaveSystemOrder && !orderFinished && item.cancellation_status === 'pending' && item.cancellation_request_id && (
+                          <div className="flex gap-1">
+                            <Button size="sm" variant="outline" className="text-emerald-800" disabled={loading} onClick={() => decideCancellation(item, 'approve')}>Approve Cancel</Button>
+                            <Button size="sm" variant="outline" className="text-red-700" disabled={loading} onClick={() => decideCancellation(item, 'reject')}>Reject Cancel</Button>
+                          </div>
                         )}
                       </td>
                     </tr>

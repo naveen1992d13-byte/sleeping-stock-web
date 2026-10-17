@@ -6335,7 +6335,7 @@ async def order_desk_request_cancellation(order_id: str, item_id: str, payload: 
         raise HTTPException(status_code=400, detail='Accepted quantity is locked and cannot be cancelled')
 
     active_reservations = await db.stock_reservations.count_documents({'order_item_id': item_id, 'status': 'active'})
-    has_sent = any(r.get('status') not in (None, '') for r in item_reqs)
+    has_sent = any(r.get('status') not in (None, '', 'Rejected', 'Cancelled') for r in item_reqs)
     has_acceptance = any(float(r.get('accepted_qty') or r.get('approved_qty') or 0) > 0 for r in item_reqs)
     has_logistics = any(r.get('status') in ('Dispatched', 'Received', 'Completed') for r in item_reqs)
     safe_auto = (not has_sent) and active_reservations == 0 and (not has_acceptance) and (not has_logistics)
@@ -6424,6 +6424,8 @@ async def order_desk_decide_cancellation(cancellation_id: str, payload: dict, cu
     doc = await db.order_cancellation_requests.find_one({'id': cancellation_id}, {'_id': 0})
     if not doc:
         raise HTTPException(status_code=404, detail='Cancellation request not found')
+    if role == 'admin' and doc.get('dealer') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not authorized for this cancellation')
     if doc.get('approval_status') != 'pending':
         return {'message': f'Already {doc.get("approval_status")}', 'cancellation': doc}
 

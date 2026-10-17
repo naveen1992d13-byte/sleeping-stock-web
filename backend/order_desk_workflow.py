@@ -700,6 +700,11 @@ def compute_stage_flags(item: dict, order: dict, freezes: Set[str],
     }
 
 
+def is_item_cancelled(item: Dict[str, Any]) -> bool:
+    """An approved cancellation closes the item's outstanding (unaccepted) quantity."""
+    return _clean(item.get('cancellation_status')).lower() == 'approved'
+
+
 def evaluate_finish_readiness(order: Dict[str, Any], items: List[Dict[str, Any]], requests_by_item: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     """Order-level Finish is allowed only when no request is still open,
     remaining qty is zero, and every factory-required row has a Factory Order No.
@@ -709,7 +714,7 @@ def evaluate_finish_readiness(order: Dict[str, Any], items: List[Dict[str, Any]]
     remaining_open = []
     for item in items or []:
         item_id = item.get('id')
-        remaining = max(0, int(_f(item.get('remaining_qty'))))
+        remaining = 0 if is_item_cancelled(item) else max(0, int(_f(item.get('remaining_qty'))))
         if remaining > 0:
             remaining_open.append(item_id)
         for req in requests_by_item.get(item_id, []) if requests_by_item else []:
@@ -780,7 +785,9 @@ def build_fulfillment_line(order: Dict[str, Any], item: Dict[str, Any], reqs: Li
     factory_order_no = _clean(item.get('system_order_number'))
     remaining = _f(item.get('remaining_qty'))
     required = _f(item.get('required_qty') or item.get('requested_qty'))
-    if remaining > 0:
+    if is_item_cancelled(item):
+        final_status = 'Cancelled'
+    elif remaining > 0:
         final_status = 'Open'
     elif factory_qty > 0 and factory_order_no:
         final_status = 'Factory Completed'
@@ -819,7 +826,7 @@ def build_fulfillment_line(order: Dict[str, Any], item: Dict[str, Any], reqs: Li
         'system_order_number': factory_order_no,
         'final_status': final_status,
         'fulfilled_qty': accepted_qty + factory_qty,
-        'remaining_qty': max(0.0, required - accepted_qty - factory_qty),
+        'remaining_qty': 0.0 if is_item_cancelled(item) else max(0.0, required - accepted_qty - factory_qty),
         'request_status': item.get('request_status') or item.get('status') or final_status,
         'sources': sources,
     }
