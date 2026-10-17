@@ -699,6 +699,9 @@ class ReadOnlyDatabase:
         return self[name]
 
 
+_COLLECTIONS_WITH_DELTAS: set = set()
+
+
 class OverlayCollection:
     def __init__(self, name: str, prod, test, overlays, tombstones):
         self.name = name
@@ -970,14 +973,22 @@ class OverlayCollection:
         return rows
 
     async def _has_any_deltas(self) -> bool:
+        # Deltas are only ever added at runtime, and the split read path stays
+        # correct without them, so a positive answer is safe to keep. The
+        # unindexed testing-created scan costs ~2s per call on large collections.
+        if self.name in _COLLECTIONS_WITH_DELTAS:
+            return True
         try:
-            if int(await self._tombstones.count_documents({"collection": self.name})) > 0:
-                return True
-            if int(await self._overlays.count_documents({"collection": self.name})) > 0:
-                return True
-            return int(await self._test.count_documents(self._testing_created_query({}))) > 0
+            found = (
+                await self._tombstones.find_one({"collection": self.name}, {"_id": 1})
+                or await self._overlays.find_one({"collection": self.name}, {"_id": 1})
+                or await self._test.find_one(self._testing_created_query({}), {"_id": 1})
+            )
         except Exception:
             return False
+        if found:
+            _COLLECTIONS_WITH_DELTAS.add(self.name)
+        return bool(found)
 
     async def insert_one(self, doc, *args, **kwargs):
         if self._local_only():
