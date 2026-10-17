@@ -39,20 +39,28 @@ def request_push_scope(group_doc: Optional[dict]) -> tuple:
     return brand, dealer, branch
 
 
-def eligible_request_device_query(brand: str, dealer: str, branch: str) -> dict:
-    """Logged-in, push-enabled, admin-active devices on this Brand/Dealer/Branch."""
-    return {
+def eligible_request_device_query(brand: str, dealer: str = "", branch: str = "") -> dict:
+    """Logged-in, push-enabled devices.
+
+    New request alerts broadcast to ALL dealers under the Brand (simultaneous
+    Pick race). When dealer/branch are provided they further narrow the query
+    for legacy same-branch helpers (transfer targets, etc.).
+    """
+    q = {
         **_ci_exact("brand_name", brand),
-        **_ci_exact("dealer_name", dealer),
-        **_ci_exact("branch", branch),
         "status": "active",
         "session_active": True,
         "push_enabled": True,
         "push_token": {"$exists": True, "$ne": ""},
     }
+    if dealer:
+        q.update(_ci_exact("dealer_name", dealer))
+    if branch:
+        q.update(_ci_exact("branch", branch))
+    return q
 
 
-def is_eligible_request_device(dev: Optional[dict], brand: str, dealer: str, branch: str) -> bool:
+def is_eligible_request_device(dev: Optional[dict], brand: str, dealer: str = "", branch: str = "") -> bool:
     if not dev:
         return False
     if (dev.get("status") or "") != "active":
@@ -67,11 +75,13 @@ def is_eligible_request_device(dev: Optional[dict], brand: str, dealer: str, bra
     def _same(left, right):
         return (left or "").strip().casefold() == (right or "").strip().casefold()
 
-    return (
-        _same(dev.get("brand_name"), brand)
-        and _same(dev.get("dealer_name"), dealer)
-        and _same(dev.get("branch"), branch)
-    )
+    if not _same(dev.get("brand_name"), brand):
+        return False
+    if dealer and not _same(dev.get("dealer_name"), dealer):
+        return False
+    if branch and not _same(dev.get("branch"), branch):
+        return False
+    return True
 
 
 def _now():
@@ -275,24 +285,57 @@ def build_branch_request_push_message(token: str, group_doc: dict, kind: str = "
 
 
 async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
-    """High-priority request push to supplying-branch mobile devices. Never raises."""
+    """High-priority request push to ALL eligible dealers under the brand.
+
+    Reminder rounds are disabled for the Pick/Reject flow — only kind=new
+    (and explicit reopen) deliver. Never raises.
+    """
     try:
+        if str(kind or "new").startswith("reminder"):
+            return {"ok": True, "sent": 0, "skipped": True, "reason": "reminders_removed"}
         brand, dealer, branch = request_push_scope(group_doc)
         request_number = (group_doc or {}).get("request_number") or ""
         attempt_id = (group_doc or {}).get("attempt_id") or ""
         display_number = request_number or attempt_id
         request_group_key = (group_doc or {}).get("id") or request_number or attempt_id
-        if not brand or not dealer or not branch or not (request_number or attempt_id or request_group_key):
+        if not brand or not (request_number or attempt_id or request_group_key):
             return {"ok": False, "error": "missing_scope"}
-        preview = build_branch_request_push_message("ExponentPushToken[preview]", group_doc, kind)
+        preview = build_branch_request_push_message("ExponentPushToken[preview]", group_doc, "new")
         data = preview["data"]
+        # Force Pick/Reject actions only (no Snooze) for clients that read this flag.
+        data["actions"] = "pick_reject"
+        data["can_snooze"] = False
+        data["confirm_window_seconds"] = 50
         title = data.get("requestNumber") or display_number
         body = f"round={data.get('round')} {data.get('branchName') or ''} items={data.get('totalItems')} qty={data.get('totalQuantity')}"
+        # Broadcast to every active device on this Brand (all dealers).
         devices = await db.mobile_devices.find(
-            eligible_request_device_query(brand, dealer, branch),
+            eligible_request_device_query(brand),
             {"_id": 0, "device_id": 1, "push_token": 1, "mobile_user_id": 1, "brand_name": 1, "dealer_name": 1, "branch": 1, "session_active": 1, "push_enabled": 1, "status": 1},
-        ).to_list(100)
-        devices = [dev for dev in devices if is_eligible_request_device(dev, brand, dealer, branch)]
+        ).to_list(500)
+        devices = [dev for dev in devices if is_eligible_request_device(dev, brand)]
+        # Exclude the requesting branch so they are not alerted to fulfil their own request.
+        req_dealer = ((group_doc or {}).get("requesting_dealer") or "").strip().casefold()
+        req_branch = ((group_doc or {}).get("requesting_branch") or "").strip().casefold()
+        if req_dealer or req_branch:
+            devices = [
+                d for d in devices
+                if not (
+                    (d.get("dealer_name") or "").strip().casefold() == req_dealer
+                    and (d.get("branch") or "").strip().casefold() == req_branch
+                )
+            ]
+        # Exclude dealers that already Rejected this request.
+        try:
+            from mobile_request_claim import dismissed_dealer_keys
+            dismissed = await dismissed_dealer_keys(db, request_group_key)
+        except Exception:
+            dismissed = set()
+        if dismissed:
+            devices = [
+                d for d in devices
+                if (d.get("dealer_name") or "").strip().casefold() not in dismissed
+            ]
         if not devices:
             await log_push_attempt(
                 db,
@@ -307,10 +350,16 @@ async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
             )
             return {"ok": True, "sent": 0, "skipped": True}
         batch = [
-            build_branch_request_push_message(dev.get("push_token"), group_doc, kind)
+            build_branch_request_push_message(dev.get("push_token"), group_doc, "new")
             for dev in devices
             if dev.get("push_token")
         ]
+        # Stamp Pick/Reject-only flags onto each message.
+        for msg in batch:
+            msg.setdefault("data", {})
+            msg["data"]["actions"] = "pick_reject"
+            msg["data"]["can_snooze"] = False
+            msg["data"]["confirm_window_seconds"] = "50"
         result = send_expo_push_messages(batch)
         status = "sent" if result.get("ok") else "failed"
         detail = str(result.get("error") or result.get("body") or "")[:500]
@@ -326,9 +375,25 @@ async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
                 status=status,
                 detail=detail,
             )
-        return {"ok": result.get("ok"), "sent": len(batch), "kind": kind}
+        return {"ok": result.get("ok"), "sent": len(batch), "kind": "new", "broadcast": "brand_dealers"}
     except Exception as exc:
         logger.warning("branch request push failed: %s", exc)
+        return {"ok": False, "error": str(exc)[:300]}
+
+
+async def renotify_after_confirm_timeout(db, group_doc: dict, *, exclude_device_id: str = ""):
+    """Re-open the request for remaining eligible dealers after a 50s confirm miss."""
+    try:
+        result = await notify_branch_request_push(db, group_doc, kind="new")
+        if exclude_device_id:
+            logger.info(
+                "renotify after confirm timeout exclude=%s sent=%s",
+                exclude_device_id,
+                result.get("sent"),
+            )
+        return result
+    except Exception as exc:
+        logger.warning("renotify_after_confirm_timeout failed: %s", exc)
         return {"ok": False, "error": str(exc)[:300]}
 
 

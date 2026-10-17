@@ -48,8 +48,8 @@ def inventory_date_key(dt: Optional[datetime] = None) -> str:
 
 
 TODAY_STOCK_MISSING_MESSAGE = (
-    "Today's stock has not been uploaded for the selected Branch. "
-    "Upload today's stock before generating Auto Perpetual."
+    "Today's stock data is not uploaded. "
+    "Please ask the branch in-charge to upload today's stock data."
 )
 
 

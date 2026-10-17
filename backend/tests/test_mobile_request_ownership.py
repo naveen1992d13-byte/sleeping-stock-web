@@ -54,10 +54,22 @@ class FakeLocks:
         doc = self.docs.get(query.get("request_group_key"))
         if not doc:
             return None
-        nin = ((query.get("lock_status") or {}).get("$nin") or [])
-        if doc.get("lock_status") in nin:
+        status_q = query.get("lock_status")
+        if isinstance(status_q, dict):
+            nin = status_q.get("$nin") or []
+            if doc.get("lock_status") in nin:
+                return None
+        elif status_q is not None and doc.get("lock_status") != status_q:
+            return None
+        if "confirm_deadline_at" in query and doc.get("confirm_deadline_at") != query.get("confirm_deadline_at"):
+            return None
+        if query.get("device_id") and doc.get("device_id") != query.get("device_id"):
             return None
         return self.docs.pop(doc["request_group_key"])
+
+    async def delete_one(self, query):
+        removed = await self.find_one_and_delete(query)
+        return type("R", (), {"deleted_count": 1 if removed else 0})()
 
 
 def test_lock_alias_matches_header_id_or_request_number():
@@ -75,6 +87,15 @@ def test_already_picked_code():
     detail = mobile_api._already_picked_detail({"device_user_name": "Ravi"})
     assert detail["code"] == "ALREADY_PICKED"
     assert detail["picked_by_name"] == "Ravi"
+    assert detail["message"] == "This request was already picked by another dealer."
+
+
+def test_already_picked_message_exact():
+    assert mobile_api.ALREADY_PICKED_DEALER_MESSAGE == (
+        "This request was already picked by another dealer."
+    )
+    detail = mobile_api._already_picked_detail({"device_user_name": "Other"})
+    assert detail["message"] == mobile_api.ALREADY_PICKED_DEALER_MESSAGE
 
 
 def test_ownership_status_stays_picked_after_responses():
@@ -90,10 +111,11 @@ def test_ownership_status_picking_completed():
 
 
 def test_skip_limit_is_two_with_no_timeout_constant():
-    assert mobile_api.SKIP_LIMIT == 2
+    assert mobile_api.SKIP_LIMIT == 0
     src = Path(BACKEND_DIR / "mobile_api.py").read_text()
     assert "auto-stop" not in src.lower()
     assert "ring_timeout" not in src
+    assert "Snooze removed" in src or "SNOOZE_REMOVED" in src
     sla_src = Path(BACKEND_DIR / "request_sla_scheduler.py").read_text()
     assert "request_is_no_longer_new" in sla_src
 
