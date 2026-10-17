@@ -19,7 +19,8 @@ import {
   Upload,
   Download,
 } from "lucide-react";
-import { useNavigate, useOutletContext, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { useWorkspaceScope } from "../workspaceScope";
 import { Button } from "../components/ui/button";
 import { useAuth, API } from "../App";
 import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
@@ -77,7 +78,7 @@ function networkErrorMessage(error) {
 
 export default function UsersPage() {
   const { user } = useAuth();
-  const outletScope = useOutletContext() || {};
+  const outletScope = useWorkspaceScope();
   const isMaster = user?.role === "master";
   const isAdmin = user?.role === "admin";
   const navigate = useNavigate();

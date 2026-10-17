@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useMatch } from 'react-router-dom';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
@@ -9,7 +9,10 @@ import { Mail, Phone, Calendar, Activity, Lock, MapPin, Building, Users, Shield 
 import { toast } from 'sonner';
 
 export function Profile() {
-  const { userId } = useParams();
+  const params = useParams();
+  // Keep-alive mounts Profile outside <Outlet />, so also read :userId via useMatch.
+  const profileMatch = useMatch('/profile/:userId');
+  const userId = params.userId || profileMatch?.params?.userId;
   const { user: currentUser, refreshUser } = useAuth();
   const navigate = useNavigate();
   const [profile, setProfile] = useState(null);

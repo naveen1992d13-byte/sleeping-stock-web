@@ -1,16 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
-import { useOutletContext } from 'react-router-dom';
+import { useWorkspaceScope } from '../workspaceScope';
 import { API } from '../App';
 import { toast } from 'sonner';
-import {
-  Info,
-  Loader2,
-  Package,
-  ShoppingCart,
-  TrendingDown,
-  Warehouse,
-} from 'lucide-react';
+import { Info, Loader2 } from 'lucide-react';
 import {
   ResponsiveContainer,
   LineChart,
@@ -155,7 +148,7 @@ function MetricToggle({ value, onChange }) {
 function UnitBadge({ metricMode }) {
   return (
     <span className="rounded border border-gray-200 bg-gray-50 px-2 py-0.5 text-[10px] font-semibold text-gray-600">
-      {metricMode === 'value' ? '₹ Lakhs' : 'Qty'}
+      {metricMode === 'value' ? '₹ Full' : 'Qty'}
     </span>
   );
 }
@@ -231,38 +224,6 @@ function CompactTable({ columns, rows, emptyText = 'No data' }) {
   );
 }
 
-function KpiCard({ icon: Icon, iconBg, title, value, sub, subTone = 'muted', testId }) {
-  const tone =
-    subTone === 'up'
-      ? 'text-emerald-600'
-      : subTone === 'down'
-        ? 'text-red-500'
-        : subTone === 'warn'
-          ? 'text-amber-600'
-          : subTone === 'accent'
-            ? 'text-[#5a8a05]'
-            : 'text-gray-500';
-  return (
-    <div
-      className="flex min-w-0 items-start gap-2.5 rounded-lg border border-gray-200 bg-white px-3 py-2.5 shadow-sm"
-      data-testid={testId}
-    >
-      <div className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md ${iconBg}`}>
-        <Icon className="h-4 w-4 text-white" />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-[10px] font-semibold uppercase tracking-wide text-gray-500">
-          {title}
-        </div>
-        <div className="truncate text-lg font-bold leading-tight text-gray-900 tabular-nums">
-          {value}
-        </div>
-        {sub ? <div className={`mt-0.5 truncate text-[10px] font-medium ${tone}`}>{sub}</div> : null}
-      </div>
-    </div>
-  );
-}
-
 function ChartEmpty() {
   return (
     <div className="flex h-[200px] items-center justify-center text-[11px] text-gray-400">
@@ -272,7 +233,7 @@ function ChartEmpty() {
 }
 
 export function Analytics() {
-  const ctx = useOutletContext() || {};
+  const ctx = useWorkspaceScope();
   const {
     scopeBrand,
     scopeDealer,
@@ -301,15 +262,16 @@ export function Analytics() {
     [scopeBrand, scopeDealer, scopeBranch]
   );
 
+  // Tables / footers / labels: full rupee amounts (no K/L/Cr abbreviations).
   const fmtMetric = useCallback(
     (value) => {
       if (isNullMetric(value)) return 'NO DATA';
-      return isValue ? formatLakhs(value) : formatINR(value);
+      return isValue ? `₹ ${formatINR(value)}` : formatINR(value);
     },
     [isValue]
   );
 
-  // Charts show ₹ Lakhs in Value Wise (sample), raw qty in Item Wise.
+  // Charts only: Value Wise in ₹ Lakhs; Item Wise raw qty.
   const fmtChart = useCallback(
     (value) => {
       if (isNullMetric(value)) return null;
@@ -322,7 +284,7 @@ export function Analytics() {
 
   const load = useCallback(async () => {
     // Wait until layout finishes hydrating scope (initial placeholder is "N/A").
-    if (!scopeBrand || !scopeDealer || !scopeBranch) return;
+    // Empty dealer/branch means Master "All Dealers / All Branches" — still load.
     if ([scopeBrand, scopeDealer, scopeBranch].some((v) => String(v) === 'N/A')) return;
     if (abortRef.current) abortRef.current.abort();
     const controller = new AbortController();
@@ -575,9 +537,13 @@ export function Analytics() {
         <span
           className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-[11px] font-medium text-gray-700"
           data-testid="analytics-scope"
-          title="Scope is controlled by the header Brand → Dealer → Branch filter"
+          title="Scope is controlled by the header Brand → Dealer → Branch filter. Empty Master dealer/branch = full permitted aggregate."
         >
-          {[scopeBrand || 'Select Brand', scopeDealer || 'Select Dealer', scopeBranch || 'Select Branch'].join(' / ')}
+          {[
+            scopeBrand || 'All Brands',
+            scopeDealer || 'All Dealers',
+            scopeBranch || 'All Branches',
+          ].join(' / ')}
         </span>
 
         <select
@@ -670,7 +636,17 @@ export function Analytics() {
                     name={isValue ? 'Stock Value' : 'Stock Qty'}
                     stroke="#22c55e"
                     strokeWidth={2.2}
-                    dot={{ r: 3, fill: '#22c55e' }}
+                    dot={(props) => {
+                      const { cx, cy, payload } = props;
+                      if (cx == null || cy == null) return null;
+                      const fill =
+                        payload?.change === 'up'
+                          ? '#16a34a'
+                          : payload?.change === 'down'
+                            ? '#dc2626'
+                            : '#22c55e';
+                      return <circle cx={cx} cy={cy} r={3.5} fill={fill} stroke="#fff" strokeWidth={1} />;
+                    }}
                     activeDot={{ r: 5 }}
                     connectNulls={false}
                   >
@@ -703,15 +679,21 @@ export function Analytics() {
                 align: 'center',
                 render: (r) => {
                   if (r.data_status === 'NO_UPLOAD' || isNullMetric(r.raw)) return '—';
-                  if (r.change === 'up') return '⬆';
-                  if (r.change === 'down') return '⬇';
-                  return '●';
+                  if (r.change === 'up') {
+                    return <span className="font-bold text-emerald-600" title="Increase">⬆</span>;
+                  }
+                  if (r.change === 'down') {
+                    return <span className="font-bold text-red-600" title="Decrease">⬇</span>;
+                  }
+                  return <span className="text-gray-400" title="No change">●</span>;
                 },
               },
             ]}
             rows={stockPoints}
           />
-          <p className="text-[9px] text-gray-400">Missing snapshot = No Data (omitted from chart). Actual zero is shown as 0.</p>
+          <p className="text-[9px] text-gray-400">
+            Missing snapshot = No Data (omitted from chart). Actual zero is shown as 0. ⬆ increase / ⬇ decrease vs prior upload day.
+          </p>
         </SectionCard>
 
         {/* 2. Stock Aging Analysis */}
@@ -731,7 +713,13 @@ export function Analytics() {
                   <XAxis dataKey="label" tick={axisTick} />
                   <YAxis tick={axisTick} tickFormatter={yTickFormatter} width={36} />
                   <Tooltip
-                    formatter={(v, name) => [isValue ? `₹ ${v} L` : v, name]}
+                    formatter={(v, name, item) => {
+                      const raw = item?.payload?.[`${name}__raw`];
+                      const total = Number(item?.payload?.totalRaw || 0);
+                      const pct = total > 0 ? (Number(raw || 0) / total) * 100 : 0;
+                      const shown = isValue ? `₹ ${v} L` : v;
+                      return [`${shown} (${pct.toFixed(1)}%)`, name];
+                    }}
                     labelFormatter={(_, payload) => displayDate(payload?.[0]?.payload?.date)}
                     contentStyle={{ fontSize: 11 }}
                   />
@@ -761,7 +749,13 @@ export function Analytics() {
                 label: b.replace(' Days', ''),
                 align: 'right',
                 mono: true,
-                render: (r) => fmtMetric(r[`${b}__raw`]),
+                render: (r) => {
+                  const raw = r[`${b}__raw`];
+                  const pct = Number(r.totalRaw || 0) > 0
+                    ? (Number(raw || 0) / Number(r.totalRaw)) * 100
+                    : 0;
+                  return `${fmtMetric(raw)} (${pct.toFixed(1)}%)`;
+                },
               })),
               {
                 key: 'total',
@@ -773,6 +767,9 @@ export function Analytics() {
             ]}
             rows={agingPoints}
           />
+          <p className="text-[9px] text-gray-400">
+            Missing/invalid aging is counted under &gt;361 Days. Table shows full ₹; chart axis uses ₹ Lakhs.
+          </p>
         </SectionCard>
 
         {/* 3. Orders & Savings Analysis */}

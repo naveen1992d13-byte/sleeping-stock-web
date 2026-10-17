@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useOutletContext } from 'react-router-dom';
+import { useWorkspaceScope } from '../workspaceScope';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
@@ -57,7 +57,7 @@ async function authenticatedDownload(url, fallbackFileName, onProgress) {
 
 export function UploadCenter() {
   const { user } = useAuth();
-  const outletScope = useOutletContext() || {};
+  const outletScope = useWorkspaceScope();
   const scopeBrand = outletScope.scopeBrand || (user?.role === 'master' ? 'All Brands' : (user?.brand || ''));
   const scopeDealer = outletScope.scopeDealer || (user?.role === 'master' ? 'All Dealers' : (user?.dealer || user?.group || ''));
   const scopeBranch = outletScope.scopeBranch || (user?.role === 'master' ? 'All Branches' : (user?.branch || user?.location || ''));

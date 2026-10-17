@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useOutletContext } from 'react-router-dom';
+import { useWorkspaceScope } from '../workspaceScope';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
@@ -210,7 +210,7 @@ const emptyForm = () => ({
 
 export function QueryDesk() {
   const { user } = useAuth();
-  const { scopeBrand, scopeDealer, scopeBranch } = useOutletContext() || {};
+  const { scopeBrand, scopeDealer, scopeBranch } = useWorkspaceScope();
   const isMaster = user?.role === 'master';
 
   const [form, setForm] = useState(emptyForm());

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { useNavigate, useOutletContext } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
+import { useWorkspaceScope } from '../workspaceScope';
 import axios from 'axios';
 import { API } from '../App';
 import { Button } from '../components/ui/button';
@@ -25,7 +26,7 @@ const ORDER_HISTORY_STATUSES = [
 export function OrderHistory() {
   const navigate = useNavigate();
   const { scopeBrand = 'All Brands', scopeDealer = 'All Dealers', scopeBranch = 'All Branches' } =
-    useOutletContext() || {};
+    useWorkspaceScope();
   const isAllScope = (value) => !value || String(value).startsWith('All ') || value === 'N/A';
   const [orders, setOrders] = useState([]);
   const [expanded, setExpanded] = useState({});

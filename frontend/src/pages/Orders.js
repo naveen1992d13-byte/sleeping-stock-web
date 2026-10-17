@@ -2,7 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import * as XLSX from 'xlsx';
 import { API, useAuth } from '@/App';
-import { useLocation, useOutletContext } from 'react-router-dom';
+import { useLocation } from 'react-router-dom';
+import { useWorkspaceScope } from '../workspaceScope';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { openOrderDeskPrint } from '@/utils/orderDeskPrint';
@@ -217,7 +218,7 @@ export function Orders({ scopeOverride } = {}) {
   const { user } = useAuth();
   const canSaveSystemOrder = ['master', 'admin'].includes(String(user?.role || '').toLowerCase());
   const isMaster = String(user?.role || '').toLowerCase() === 'master';
-  const outletScope = useOutletContext() || {};
+  const outletScope = useWorkspaceScope();
   const {
     scopeBrand = 'All Brands',
     scopeDealer = 'All Dealers',

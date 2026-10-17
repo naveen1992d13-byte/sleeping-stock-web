@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth, API, canAccessPermission, canAccessMenuItem } from '../App';
 import axios from 'axios';
@@ -25,7 +25,62 @@ import {
 import { toast } from 'sonner';
 import { clearAuthStorage } from '../utils/sessionActivity';
 import { NoticeLoginPopup } from '../components/NoticeLoginPopup';
+import {
+  WorkspaceScopeProvider,
+  buildScopeKey,
+} from '../workspaceScope';
+
+import { Analytics } from './Analytics';
+import { Products } from './Products';
+import { ProductHubHistory } from './ProductHubHistory';
 import { Orders } from './Orders';
+import { OrderHistory } from './OrderHistory';
+import UploadCenter from './Upload';
+import UsersPage from './Users';
+import { Requests } from './Requests';
+import { Reports } from './Reports';
+import NoticeBoard from './NoticeBoard';
+import { QueryDesk } from './QueryDesk';
+import StockAudit from './StockAudit';
+import { StorageCostMonitor } from './StorageCostMonitor';
+import { LoginScreenManager } from './LoginScreenManager';
+import { Notifications } from './Notifications';
+import { Profile } from './Profile';
+
+/**
+ * Modules kept mounted while their tab is open (hidden via display:none when
+ * inactive). Unmount only on tab close. Remount when scopeKey changes
+ * (brand/dealer/branch/session).
+ */
+const KEEP_ALIVE_COMPONENTS = {
+  analytics: Analytics,
+  products: Products,
+  'product-history': ProductHubHistory,
+  orders: Orders,
+  'order-history': OrderHistory,
+  upload: UploadCenter,
+  users: UsersPage,
+  requests: Requests,
+  reports: Reports,
+  // menu id "dashboard" is Notice Board
+  dashboard: NoticeBoard,
+  query: QueryDesk,
+  'stock-audit': StockAudit,
+  'storage-cost-monitor': StorageCostMonitor,
+  'login-screen-manager': LoginScreenManager,
+  notifications: Notifications,
+  profile: Profile,
+};
+
+const KEEP_ALIVE_PATHS = new Set(
+  Object.keys(KEEP_ALIVE_COMPONENTS).flatMap((id) => {
+    const item = APPLICATION_MENU_ITEMS.find((m) => m.id === id);
+    const paths = [];
+    if (item?.path) paths.push(item.path);
+    if (id === 'analytics') paths.push('/dashboard', '/');
+    return paths;
+  })
+);
 
 export function DashboardLayout() {
   const { user, logout } = useAuth();
@@ -39,6 +94,8 @@ export function DashboardLayout() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [tabs, setTabs] = useState([]);
   const [activeTabId, setActiveTabId] = useState(null);
+  // Bumped on logout so keep-alive modules remount with a fresh session key.
+  const [sessionEpoch, setSessionEpoch] = useState(0);
 
   const [brandOptions, setBrandOptions] = useState([]);
   const [dealerOptions, setDealerOptions] = useState([]);
@@ -69,6 +126,48 @@ export function DashboardLayout() {
   const navItems = APPLICATION_MENU_ITEMS;
 
   const filteredNavItems = navItems.filter((item) => !item.sidebarHidden && canAccessMenuItem(user, item));
+
+  const scopeKey = useMemo(
+    () =>
+      buildScopeKey({
+        scopeBrand,
+        scopeDealer,
+        scopeBranch,
+        userId: user?.id || user?.email || user?.username,
+        sessionEpoch,
+      }),
+    [scopeBrand, scopeDealer, scopeBranch, user?.id, user?.email, user?.username, sessionEpoch]
+  );
+
+  const outletContext = useMemo(
+    () => ({
+      scopeBrand,
+      scopeDealer,
+      scopeBranch,
+      setScopeBrand,
+      setScopeDealer,
+      setScopeBranch,
+      brandOptions,
+      dealerOptions,
+      branchOptions,
+      isMaster,
+      isAdmin,
+      scopeKey,
+      sessionEpoch,
+    }),
+    [
+      scopeBrand,
+      scopeDealer,
+      scopeBranch,
+      brandOptions,
+      dealerOptions,
+      branchOptions,
+      isMaster,
+      isAdmin,
+      scopeKey,
+      sessionEpoch,
+    ]
+  );
 
   useEffect(() => {
     if (!user) return;
@@ -264,6 +363,42 @@ export function DashboardLayout() {
   useEffect(() => {
     const path = location.pathname;
     if (!path || path === '/' || path === '/login') return;
+    // /dashboard is Analytics home alias
+    if (path === '/dashboard') {
+      const analyticsItem = navItems.find((item) => item.id === 'analytics');
+      if (analyticsItem && canAccessMenuItem(user, analyticsItem)) {
+        setTabs((prev) => {
+          if (prev.some((t) => t.id === 'analytics')) return prev;
+          return [
+            ...prev,
+            {
+              id: 'analytics',
+              label: analyticsItem.label,
+              path: analyticsItem.path,
+              permission: analyticsItem.permissionLabel || analyticsItem.label,
+            },
+          ];
+        });
+        setActiveTabId('analytics');
+      }
+      return;
+    }
+    if (path.startsWith('/profile')) {
+      setTabs((prev) => {
+        if (prev.some((t) => t.id === 'profile')) return prev;
+        return [...prev, { id: 'profile', label: 'My Profile', path: '/profile', permission: 'My Profile' }];
+      });
+      setActiveTabId('profile');
+      return;
+    }
+    if (path === '/notifications') {
+      setTabs((prev) => {
+        if (prev.some((t) => t.id === 'notifications')) return prev;
+        return [...prev, { id: 'notifications', label: 'Notifications', path: '/notifications', permission: 'Notifications' }];
+      });
+      setActiveTabId('notifications');
+      return;
+    }
     const menuItem = navItems.find((item) => item.path === path);
     if (!menuItem || menuItem.sidebarHidden) return;
     if (!canAccessMenuItem(user, menuItem) && menuItem.id !== 'profile') return;
@@ -302,7 +437,16 @@ export function DashboardLayout() {
     }
   };
 
+  const clearWorkspaceCache = () => {
+    setTabs([]);
+    setActiveTabId(null);
+    localStorage.removeItem('openTabs');
+    localStorage.removeItem('activeTab');
+    setSessionEpoch((n) => n + 1);
+  };
+
   const handleLogout = () => {
+    clearWorkspaceCache();
     logout();
     clearAuthStorage();
     navigate('/login');
@@ -424,6 +568,12 @@ export function DashboardLayout() {
       return '';
     }
   };
+
+  // Deep-link fallback only when the active screen is not keep-alive mounted.
+  const activeIsKeepAlive = Boolean(activeTabId && KEEP_ALIVE_COMPONENTS[activeTabId]);
+  const showOutlet = !activeIsKeepAlive && (
+    location.pathname.startsWith('/profile') || location.pathname === '/notifications'
+  );
 
   return (
     <div className="nmts-app-shell nmts-app-shell--menu-dropdown" data-testid="dashboard-layout">
@@ -623,9 +773,9 @@ export function DashboardLayout() {
 
                   <div className="nmts-user-dropdown-body">
                     <InfoRow icon={Shield} label="Role" value={user?.role || 'N/A'} />
-                    <InfoRow icon={Building} label="Brand" value={scopeBrand} />
-                    <InfoRow icon={Users} label="Dealer" value={scopeDealer} />
-                    <InfoRow icon={MapPin} label="Branch" value={scopeBranch} />
+                    <InfoRow icon={Building} label="Brand" value={scopeBrand || 'All Brands'} />
+                    <InfoRow icon={Users} label="Dealer" value={scopeDealer || 'All Dealers'} />
+                    <InfoRow icon={MapPin} label="Branch" value={scopeBranch || 'All Branches'} />
                   </div>
 
                   <div className="p-2">
@@ -662,39 +812,29 @@ export function DashboardLayout() {
               />
             </div>
           ) : (
-            <>
-              {(() => {
-                const outletContext = {
-                  scopeBrand,
-                  scopeDealer,
-                  scopeBranch,
-                  setScopeBrand,
-                  setScopeDealer,
-                  setScopeBranch,
-                  brandOptions,
-                  dealerOptions,
-                  branchOptions,
-                  isMaster,
-                  isAdmin,
-                };
-                const orderDeskTabOpen = tabs.some((tab) => tab.id === 'orders' || tab.path === '/orders');
-                const orderDeskActive = location.pathname === '/orders';
-                const canOrderDesk = canAccessPermission(user, 'Order Desk');
-                const mountOrderDesk = canOrderDesk && (orderDeskTabOpen || orderDeskActive);
+            <WorkspaceScopeProvider value={outletContext}>
+              {tabs.map((tab) => {
+                const Comp = KEEP_ALIVE_COMPONENTS[tab.id];
+                if (!Comp) return null;
+                const active = activeTabId === tab.id;
                 return (
-                  <>
-                    {mountOrderDesk ? (
-                      <div hidden={!orderDeskActive} aria-hidden={!orderDeskActive} data-testid="order-desk-keepalive">
-                        <Orders scopeOverride={outletContext} />
-                      </div>
-                    ) : null}
-                    <div hidden={mountOrderDesk && orderDeskActive}>
-                      <Outlet context={outletContext} />
-                    </div>
-                  </>
+                  <div
+                    key={`${tab.id}::${scopeKey}`}
+                    style={{ display: active ? 'block' : 'none' }}
+                    aria-hidden={!active}
+                    data-testid={`keepalive-${tab.id}`}
+                    data-scope-key={scopeKey}
+                  >
+                    <Comp />
+                  </div>
                 );
-              })()}
-            </>
+              })}
+              {showOutlet ? (
+                <div data-testid="outlet-fallback">
+                  <Outlet context={outletContext} />
+                </div>
+              ) : null}
+            </WorkspaceScopeProvider>
           )}
         </main>
       </div>

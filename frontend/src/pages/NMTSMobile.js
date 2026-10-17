@@ -1,5 +1,5 @@
 import React, { Fragment, useEffect, useMemo, useRef, useState } from 'react';
-import { useOutletContext } from 'react-router-dom';
+import { useWorkspaceScope } from '../workspaceScope';
 import axios from 'axios';
 import { API, useAuth } from '../App';
 import { Download, Ban, Trash2, ScanLine, Copy, ClipboardCheck, Camera, History, Eye, Plus, Upload, X, RefreshCw, QrCode, CheckCircle2, ArrowRightLeft } from 'lucide-react';
@@ -71,7 +71,7 @@ export default function NMTSMobile({ variant = 'mobile', hideInternalNav = false
   const showMobileSections = variant !== 'audit';
   const showAuditSections = variant !== 'mobile';
   const { user } = useAuth();
-  const { scopeBrand, scopeDealer, scopeBranch } = useOutletContext();
+  const { scopeBrand, scopeDealer, scopeBranch } = useWorkspaceScope();
   const brand=clean(scopeBrand), dealer=clean(scopeDealer), branch=clean(scopeBranch);
   const scopeReady=exact(brand)&&exact(dealer)&&exact(branch);
   const canManage=['master','admin'].includes(user?.role);

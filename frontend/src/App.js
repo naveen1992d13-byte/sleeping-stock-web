@@ -5,23 +5,9 @@ import { Toaster } from 'sonner';
 import './App.css';
 import { ProcessingProvider } from './components/GlobalProcessingOverlay';
 
-// Import pages
+// Import pages — module screens mount via DashboardLayout keep-alive.
 import { LoginPage } from './pages/LoginPage';
 import { DashboardLayout } from './pages/DashboardLayout';
-import NoticeBoard from './pages/NoticeBoard';
-import { Products } from './pages/Products';
-import { ProductHubHistory } from './pages/ProductHubHistory';
-import UploadCenter from "./pages/Upload";
-import { Notifications } from './pages/Notifications';
-import Users from './pages/Users';
-import { Profile } from './pages/Profile';
-import { Reports } from './pages/Reports';
-import { Analytics } from './pages/Analytics';
-import { Requests } from './pages/Requests';
-import { QueryDesk } from './pages/QueryDesk';
-import { OrderHistory } from './pages/OrderHistory';
-import StockAudit from './pages/StockAudit';
-import { StorageCostMonitor } from './pages/StorageCostMonitor';
 import { SessionInactivityGuard } from './components/SessionInactivityGuard';
 import {
   touchSessionActivity,
@@ -32,7 +18,6 @@ import {
 import { resolveApiUrl, resolveBackendUrl } from '@/backendUrl';
 import { getFirstAllowedMenuItem } from './config/menuConfig';
 import { isTestingUiEnabled } from './testingUi';
-import { LoginScreenManager } from './pages/LoginScreenManager';
 import { TestingBanner } from './components/TestingBanner';
 
 const AuthContext = createContext(null);
@@ -271,84 +256,56 @@ function App() {
               <DashboardLayout />
             </ProtectedRoute>
           }>
+            {/* Keep-alive modules mount in DashboardLayout (display:none when inactive).
+                Routes stay for permission gates + deep links; element is null to avoid double mount. */}
             <Route path="dashboard" element={
-              <ProtectedRoute permission="Analytics">
-                <Analytics />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Analytics">{null}</ProtectedRoute>
             } />
             <Route path="notice-board" element={
-              <ProtectedRoute permission="Notice Board">
-                <NoticeBoard />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Notice Board">{null}</ProtectedRoute>
             } />
             <Route path="products" element={
-              <ProtectedRoute permission="Product Hub">
-                <Products />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Product Hub">{null}</ProtectedRoute>
             } />
             <Route path="product-history" element={
-              <ProtectedRoute permission="Product Hub History">
-                <ProductHubHistory />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Product Hub History">{null}</ProtectedRoute>
             } />
             <Route path="orders" element={
-              <ProtectedRoute permission="Order Desk">
-                {null}
-              </ProtectedRoute>
+              <ProtectedRoute permission="Order Desk">{null}</ProtectedRoute>
             } />
             <Route path="order-history" element={
-              <ProtectedRoute permission="Order Desk">
-                <OrderHistory />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Order Desk">{null}</ProtectedRoute>
             } />
             <Route path="upload" element={
-              <ProtectedRoute permission="Upload Center">
-                <UploadCenter />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Upload Center">{null}</ProtectedRoute>
             } />
-            <Route path="notifications" element={<Notifications />} />
+            <Route path="notifications" element={null} />
             <Route path="users" element={
-              <ProtectedRoute permission="User Hub" allowUser>
-                <Users />
-              </ProtectedRoute>
+              <ProtectedRoute permission="User Hub" allowUser>{null}</ProtectedRoute>
             } />
-            <Route path="profile/:userId?" element={<Profile />} />
+            <Route path="profile/:userId?" element={null} />
             <Route path="reports" element={
-              <ProtectedRoute permission="Reports">
-                <Reports />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Reports">{null}</ProtectedRoute>
             } />
             <Route path="analytics" element={
-              <ProtectedRoute permission="Analytics">
-                <Analytics />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Analytics">{null}</ProtectedRoute>
             } />
             <Route path="storage-cost-monitor" element={
-              <ProtectedRoute permission="Storage & Cost Monitor" masterOnly>
-                <StorageCostMonitor />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Storage & Cost Monitor" masterOnly>{null}</ProtectedRoute>
             } />
             <Route path="login-screen-manager" element={
-              <ProtectedRoute masterOnly>
-                <LoginScreenManager />
-              </ProtectedRoute>
+              <ProtectedRoute masterOnly>{null}</ProtectedRoute>
             } />
             <Route path="requests" element={
-              <ProtectedRoute permission="Request Center">
-                <Requests />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Request Center">{null}</ProtectedRoute>
             } />
             <Route path="sleeping-stock-mobile" element={<Navigate to="/users?section=mobile" replace />} />
             <Route path="stock-audit" element={
-              <ProtectedRoute>
-                <StockAudit />
-              </ProtectedRoute>
+              <ProtectedRoute>{null}</ProtectedRoute>
             } />
             <Route path="nmts-mobile" element={<Navigate to="/users?section=mobile" replace />} />
             <Route path="query" element={
-              <ProtectedRoute>
-                <QueryDesk />
-              </ProtectedRoute>
+              <ProtectedRoute>{null}</ProtectedRoute>
             } />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

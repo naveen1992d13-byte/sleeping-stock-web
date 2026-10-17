@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useOutletContext, useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router-dom';
+import { useWorkspaceScope } from '../workspaceScope';
 import axios from 'axios';
 import { API } from '@/App';
 import { Button } from '@/components/ui/button';
@@ -127,7 +128,7 @@ function inTransitLevel(group) {
 }
 
 export function Requests() {
-  const { scopeBrand, scopeDealer, scopeBranch, isMaster, isAdmin } = useOutletContext() || {};
+  const { scopeBrand, scopeDealer, scopeBranch, isMaster, isAdmin } = useWorkspaceScope();
   const canManageOwnership = Boolean(isMaster || isAdmin);
   const [searchParams] = useSearchParams();
   const highlightRequest = String(searchParams.get('highlight') || '').trim();
