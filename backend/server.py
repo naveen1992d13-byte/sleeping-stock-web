@@ -8491,7 +8491,7 @@ async def update_stock_verification_correction(
     role = (current_user.role or "").lower()
     if role not in {"master", "admin", "user"}:
         raise HTTPException(status_code=403, detail="Not authorized to update correction information")
-    if role == "admin":
+    if role in {"admin", "user"}:
         if current_user.brand and str(record.get("brand_name") or "").casefold() != str(current_user.brand).casefold():
             raise HTTPException(status_code=403, detail="Verification is outside your permitted scope")
         if current_user.group and str(record.get("dealer_name") or "").casefold() != str(current_user.group).casefold():
