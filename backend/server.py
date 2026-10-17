@@ -8874,8 +8874,12 @@ async def retry_failed_archive(archive_id: str, current_user: UserResponse = Dep
 
 
 @api_router.get("/storage/archives/{archive_id}/download")
-async def download_archive(archive_id: str, current_user: UserResponse = Depends(get_current_user)):
-    """Download archived dataset from REAL S3 (Master only). Local fallback is not offered as S3."""
+async def download_archive(archive_id: str, redirect: bool = True, current_user: UserResponse = Depends(get_current_user)):
+    """Download archived dataset from REAL S3 (Master only). Local fallback is not offered as S3.
+
+    redirect=false returns the presigned URL as JSON: the bucket has no CORS, so a
+    browser XHR cannot follow the 302, but it can navigate to the URL.
+    """
     await _ensure_master(current_user)
     from fastapi.responses import Response, RedirectResponse
     import archive_verify as av
@@ -8915,6 +8919,8 @@ async def download_archive(archive_id: str, current_user: UserResponse = Depends
             )
         except Exception:
             pass
+        if not redirect:
+            return {"url": url, "filename": key.split("/")[-1] or f"{archive_id}.jsonl.gz", "expires_seconds": 900}
         return RedirectResponse(url=url, status_code=302)
     try:
         data, ctype = storage.download_bytes(key)
