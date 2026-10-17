@@ -819,6 +819,7 @@ class OverlayCollection:
                 yield row
             return
         created_by_id: Dict[str, dict] = {}
+        created_without_id: List[dict] = []
         if not base_only:
             try:
                 created_cursor = self._test.find(self._testing_created_query(raw), {"_id": 0})
@@ -828,7 +829,10 @@ class OverlayCollection:
                     if not is_testing_created_doc(payload):
                         continue
                     ident = doc_id(payload)
-                    if ident and ident not in hidden:
+                    if not ident:
+                        payload.setdefault("data_origin", DATA_ORIGIN_TESTING)
+                        created_without_id.append(payload)
+                    elif ident not in hidden:
                         payload.setdefault("data_origin", DATA_ORIGIN_TESTING)
                         created_by_id[ident] = payload
             except Exception as exc:
@@ -856,6 +860,9 @@ class OverlayCollection:
             for ident, payload in created_by_id.items():
                 if ident in seen or ident in hidden:
                     continue
+                if _doc_matches(payload, raw):
+                    yield payload
+            for payload in created_without_id:
                 if _doc_matches(payload, raw):
                     yield payload
 

@@ -787,12 +787,16 @@ def test_overlay_database_runs_stats_commands_on_testing_only():
 
 def test_find_one_returns_production_row_without_overlay_identity_fields():
     prod = FakeCollection([{"archive_id": "a-1", "module": "orders"}])
-    created = FakeCollection([{"id": "TS-1", "archive_id": "a-2", "data_origin": "testing"}])
+    created = FakeCollection([
+        {"id": "TS-1", "archive_id": "a-2", "data_origin": "testing"},
+        {"archive_id": "a-3", "module": "uploads", "data_origin": "testing"},
+    ])
     col = ov.OverlayCollection("x_manifests", prod, created, FakeCollection(), FakeCollection())
 
     async def _go():
-        return await col.find_one({"archive_id": "a-1"}), await col.find_one({"archive_id": "a-2"})
+        return [await col.find_one({"archive_id": a}) for a in ("a-1", "a-2", "a-3")]
 
-    base, mine = asyncio.run(_go())
+    base, mine, anon = asyncio.run(_go())
     assert base and base["module"] == "orders"
     assert mine and mine["id"] == "TS-1"
+    assert anon and anon["module"] == "uploads"
