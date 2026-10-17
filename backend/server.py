@@ -1144,28 +1144,8 @@ async def get_uploads(
 
 @api_router.put("/uploads/{upload_id}/publish")
 async def publish_upload(upload_id: str, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Only Master/Admin can publish uploads")
-
-    upload = await db.uploads.find_one({"id": upload_id}, {"_id": 0})
-    if not upload:
-        raise HTTPException(status_code=404, detail="Upload not found")
-
-    if current_user.role == "admin":
-        if upload.get("brand_name") != current_user.brand or upload.get("dealer_name") != current_user.group:
-            raise HTTPException(status_code=403, detail="Not allowed to publish this upload")
-
-    now = datetime.now(timezone.utc).isoformat()
-    await db.uploads.update_one(
-        {"id": upload_id},
-        {"$set": {
-            "publish_status": "Published",
-            "published_at": now,
-            "published_by": current_user.id,
-            "published_user_name": current_user.username,
-        }}
-    )
-    return {"message": "Upload published successfully"}
+    """Legacy path; marking Published without building product rows left stock missing."""
+    return await publish_upload_v2(upload_id, current_user)
 
 
 @api_router.delete("/uploads/reset")
@@ -1232,8 +1212,7 @@ async def export_uploaded_products(current_user: UserResponse = Depends(get_curr
     from fastapi.responses import StreamingResponse
     excel_permissions.require_excel_export(current_user)
     
-    # Fetch all products
-    products = await db.products.find({}, {"_id": 0}).to_list(10000)
+    products = await db.products.find(_apply_role_scope_v2({}, current_user), {"_id": 0}).to_list(10000)
     
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -3595,9 +3574,16 @@ async def upload_product_center_v2(
     now = _nmts_now()
     context = await _build_upload_context_v2(current_user)
     context = await _apply_selected_upload_scope(context, current_user, brand, dealer, branch)
-    upload_no = await generate_upload_no("product", context["brand_code"])
     raw_bytes = await file.read()
     file_size = len(raw_bytes)
+    try:
+        wb = openpyxl.load_workbook(BytesIO(raw_bytes), data_only=True)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to read this Excel file. Please save it as .xlsx (Excel Workbook) and upload again.",
+        )
+    upload_no = await generate_upload_no("product", context["brand_code"])
 
     # HARD REQUIRE: original Excel must land in private REAL S3 before upload succeeds.
     storage = s3_storage.get_storage()
@@ -3648,7 +3634,6 @@ async def upload_product_center_v2(
             detail="Upload failed: Excel was not stored on private REAL S3 (missing storage_key).",
         )
 
-    wb = openpyxl.load_workbook(BytesIO(raw_bytes), data_only=True)
     # Prefer a worksheet explicitly named "Inventory" (case-insensitive) since that is
     # the required worksheet name for the Product Hub inventory upload. Fall back to
     # the active sheet for any older workbook that doesn't use that sheet name, so
