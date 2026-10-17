@@ -315,7 +315,7 @@ def _compute_day_movement(
         curr = curr_map.get(pk, {"qty": 0.0, "unit": 0.0, "value": 0.0})
         p_qty = _num(prev.get("qty"))
         c_qty = _num(curr.get("qty"))
-        unit = _num(curr.get("unit"), _num(prev.get("unit")))
+        unit = _num(curr.get("unit")) if pk in curr_map else _num(prev.get("unit"))
         add_q = max(c_qty - p_qty, 0.0)
         red_q = max(p_qty - c_qty, 0.0)
         added_q += add_q
@@ -851,7 +851,8 @@ def _requested_qty(row: dict) -> float:
 
 
 def _is_completed_request(row: dict) -> bool:
-    return _text(row.get("status")).lower() == "completed"
+    # The UI closes a transfer at "Received"; "Completed" is only reachable via the API.
+    return _text(row.get("status")).lower() in {"received", "completed"}
 
 
 def _nmts_sourced_qty_value(row: dict) -> Tuple[float, float]:
