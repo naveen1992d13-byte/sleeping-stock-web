@@ -251,9 +251,21 @@ async def _load_rows_from_archives(db, date_iso: str) -> Tuple[List[dict], List[
     used_keys: List[str] = []
     for m in chosen:
         key = m["storage_key"]
-        data, _ctype = storage.download_bytes(key)
+        try:
+            data, _ctype = storage.download_bytes(key)
+        except FileNotFoundError:
+            logger.warning("analytics archive missing in storage date=%s key=%s", date_iso, key)
+            continue
+        except Exception as exc:
+            logger.warning("analytics archive download failed date=%s key=%s err=%s", date_iso, key, exc)
+            continue
         used_keys.append(key)
-        for line in gzip.decompress(data).decode().splitlines():
+        try:
+            text = gzip.decompress(data).decode()
+        except Exception as exc:
+            logger.warning("analytics archive decompress failed date=%s key=%s err=%s", date_iso, key, exc)
+            continue
+        for line in text.splitlines():
             if not line.strip():
                 continue
             r = json.loads(line)
