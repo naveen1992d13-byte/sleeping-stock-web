@@ -733,13 +733,13 @@ async def get_user_permissions(user_id: str, current_user: UserResponse = Depend
 
 @api_router.get("/products")
 async def get_products(current_user: UserResponse = Depends(get_current_user)):
-    products = await db.products.find({}, {"_id": 0}).to_list(1000)
+    products = await db.products.find(_apply_role_scope_v2({}, current_user), {"_id": 0}).to_list(1000)
     # Return raw data to preserve all fields including location, branch, mav_value, etc.
     return products
 
 @api_router.get("/products/low-stock")
 async def get_low_stock(threshold: int = 10, current_user: UserResponse = Depends(get_current_user)):
-    products = await db.products.find({"quantity": {"$lte": threshold}}, {"_id": 0}).to_list(1000)
+    products = await db.products.find(_apply_role_scope_v2({"quantity": {"$lte": threshold}}, current_user), {"_id": 0}).to_list(1000)
     return products
 
 @api_router.get("/products/sleeping-stock")
@@ -748,7 +748,7 @@ async def get_sleeping_stock(days: int = 90, current_user: UserResponse = Depend
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
     
     # Get all products
-    all_products = await db.products.find({}, {"_id": 0}).to_list(1000)
+    all_products = await db.products.find(_apply_role_scope_v2({}, current_user), {"_id": 0}).to_list(1000)
     
     sleeping = []
     for product in all_products:
@@ -764,8 +764,7 @@ async def get_sleeping_stock(days: int = 90, current_user: UserResponse = Depend
 
 @api_router.post("/products", response_model=Product)
 async def create_product(product_data: ProductCreate, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master(current_user)
     
     # Check if part number exists
     existing = await db.products.find_one({"part_number": product_data.part_number})
@@ -782,8 +781,7 @@ async def create_product(product_data: ProductCreate, current_user: UserResponse
 
 @api_router.put("/products/{product_id}", response_model=Product)
 async def update_product(product_id: str, product_data: ProductUpdate, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master(current_user)
     
     update_data = {k: v for k, v in product_data.model_dump().items() if v is not None}
     if not update_data:
@@ -800,8 +798,7 @@ async def update_product(product_id: str, product_data: ProductUpdate, current_u
 
 @api_router.delete("/products/{product_id}")
 async def delete_product(product_id: str, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master(current_user)
     
     result = await db.products.delete_one({"id": product_id})
     if result.deleted_count == 0:
@@ -4294,19 +4291,7 @@ async def product_hub_summary(
     ) or testing_runtime.is_testing_env()
 
     if not needs_product_scan:
-        batch_query = {"active_date_key": date_key}
-        if not _is_all_scope(brand):
-            batch_query["brand_name"] = brand
-        elif current_user.role != "master":
-            batch_query["brand_name"] = current_user.brand
-        if not _is_all_scope(dealer):
-            batch_query["dealer_name"] = dealer
-        elif current_user.role != "master":
-            batch_query["dealer_name"] = current_user.group
-        if not _is_all_scope(branch):
-            batch_query["branch"] = branch
-        elif current_user.role != "master":
-            batch_query["branch"] = current_user.location
+        batch_query = _apply_role_scope_v2({"active_date_key": date_key}, current_user, brand, dealer, branch)
 
         rows = await db.batch_summaries.find(batch_query, {"_id": 0}).to_list(10000)
         summary = {
@@ -4370,18 +4355,18 @@ async def product_hub_branch_summary(
     fast no matter how many lakhs of rows exist in the raw products collection."""
     date_key = _nmts_date_key()
     query = {"active_date_key": date_key}
-    if not _is_all_scope(brand):
-        query["brand_name"] = brand
-    elif current_user.role != "master":
+    if current_user.role == "master":
+        if not _is_all_scope(brand):
+            query["brand_name"] = brand
+        if not _is_all_scope(dealer):
+            query["dealer_name"] = dealer
+    else:
         query["brand_name"] = current_user.brand
-    if not _is_all_scope(dealer):
-        query["dealer_name"] = dealer
-    elif current_user.role != "master":
         query["dealer_name"] = current_user.group
-    if not _is_all_scope(branch):
-        query["branch"] = branch
-    elif current_user.role == "user":
+    if current_user.role == "user":
         query["branch"] = current_user.location
+    elif not _is_all_scope(branch):
+        query["branch"] = branch
     testing_runtime.merge_query(query, testing_runtime.origin_query(data_origin))
 
     if testing_runtime.is_testing_env():
