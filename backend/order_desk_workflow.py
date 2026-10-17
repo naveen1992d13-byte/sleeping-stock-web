@@ -510,6 +510,28 @@ def partition_own_branch_first(pool: List[dict], order: dict) -> List[dict]:
     return own + others
 
 
+_ACCEPTED_ALLOC_PREFIXES = ('accepted', 'partially accepted', 'approved', 'partially approved',
+                            'completed', 'dispatched', 'received')
+
+
+def accepted_source_keys(item: dict) -> Set[Tuple[str, str]]:
+    """Sources whose sent request for this item was already accepted.
+
+    The availability snapshot is not reduced after acceptance, so these sources
+    must not keep a stage open; send-requests refuses to re-request them.
+    """
+    keys = set()
+    for alloc in item.get('allocations') or []:
+        if not (alloc.get('request_no') or alloc.get('request_number')):
+            continue
+        status = _clean(alloc.get('status') or alloc.get('request_status')).lower()
+        if not status.startswith(_ACCEPTED_ALLOC_PREFIXES):
+            continue
+        keys.add(source_key(alloc.get('dealer_name') or alloc.get('source_dealer'),
+                            alloc.get('branch') or alloc.get('source_branch')))
+    return keys
+
+
 def eligible_pool(item: dict, order: dict, level: str, freezes: Set[str], aging_type: str, min_aging_days: float) -> List[dict]:
     """Eligible sources for a stage after aging + freeze + net qty filters."""
     level = 'own' if level in ('own', 'own_branch') else level
@@ -517,7 +539,7 @@ def eligible_pool(item: dict, order: dict, level: str, freezes: Set[str], aging_
     part = _clean(item.get('part_number'))
     brand = _clean(order.get('brand_name'))
     excluded = {source_key(x.get('dealer_name'), x.get('branch')) for x in (item.get('excluded_sources') or [])}
-    # Also exclude sources with active pending request or accepted full
+    excluded |= accepted_source_keys(item)
     result = []
     for s in item.get(pool_field) or []:
         dealer = _clean(s.get('dealer_name'))
