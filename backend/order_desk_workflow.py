@@ -304,7 +304,7 @@ def compact_requested_from(history_rows: List[dict], allocations: List[dict], or
         add(dealer, branch, qty, 'dealer' if 'dealer' in level else 'branch')
 
     for alloc in allocations or []:
-        if alloc.get('request_no') or alloc.get('request_number'):
+        if allocation_is_sent(alloc):
             continue
         dealer = _clean(alloc.get('dealer_name') or alloc.get('source_dealer'))
         branch = _clean(alloc.get('branch') or alloc.get('source_branch'))
@@ -866,8 +866,14 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
             ui_status = REQUEST_STATUS_CANCEL_REQ
             has_cancel_req = True
 
-        email_meta = header_emails.get(req.get('request_number') or '', {})
-        timer_meta = header_timers.get(req.get('request_number') or '', {})
+        header_key = (
+            req.get('request_number')
+            or req.get('request_attempt_id')
+            or req.get('request_group_id')
+            or ''
+        )
+        email_meta = header_emails.get(header_key, {}) or header_emails.get(req.get('request_number') or '', {})
+        timer_meta = header_timers.get(header_key, {}) or header_timers.get(req.get('request_number') or '', {})
         email_status = email_status_label(
             req.get('email_status') or email_meta.get('email_status') or ('sent' if email_meta.get('email_sent') else 'pending')
         )
@@ -900,7 +906,10 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
             'requested_qty': requested,
             'accepted_qty': accepted,
             'remaining_qty': max(0.0, requested - accepted),
-            'request_no': req.get('request_number'),
+            'request_no': req.get('request_number') or req.get('request_attempt_id'),
+            'request_number': req.get('request_number'),
+            'request_attempt_id': req.get('request_attempt_id'),
+            'request_group_id': req.get('request_group_id'),
             'request_id': req.get('id'),
             'request_status': ui_status,
             'email_status': email_status,
@@ -947,10 +956,7 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
 
     unsent_alloc_qty = 0.0
     for alloc in item.get('allocations') or []:
-        if alloc.get('request_no') or alloc.get('request_number') or _clean(alloc.get('status')).lower() in (
-            'requested', 'request sent', 'awaiting response', 'accepted', 'partially accepted',
-            'rejected', 'cancelled', 'completed', 'response time expired',
-        ):
+        if allocation_is_sent(alloc):
             continue
         unsent_alloc_qty += _f(alloc.get('request_qty'))
 
@@ -1112,20 +1118,33 @@ async def enrich_order_items(db, order: dict, items: List[dict],
     requests = await db.order_requests.find({'order_id': order_id}, {'_id': 0}).to_list(20000)
     by_item: Dict[str, List[dict]] = {}
     request_numbers = set()
+    attempt_ids = set()
+    group_ids = set()
     for req in requests:
         by_item.setdefault(req.get('order_item_id'), []).append(req)
         if req.get('request_number'):
             request_numbers.add(req.get('request_number'))
+        if req.get('request_attempt_id'):
+            attempt_ids.add(req.get('request_attempt_id'))
+        if req.get('request_group_id'):
+            group_ids.add(req.get('request_group_id'))
 
     headers = {}
     header_timers = {}
+    header_query_or = []
     if request_numbers:
-        async for h in db.request_headers.find(
-            {'request_number': {'$in': list(request_numbers)}},
-            {'_id': 0},
-        ):
-            headers[h.get('request_number')] = h
-            header_timers[h.get('request_number')] = evaluate_group_timer(h)
+        header_query_or.append({'request_number': {'$in': list(request_numbers)}})
+    if attempt_ids:
+        header_query_or.append({'attempt_id': {'$in': list(attempt_ids)}})
+    if group_ids:
+        header_query_or.append({'id': {'$in': list(group_ids)}})
+    if header_query_or:
+        async for h in db.request_headers.find({'$or': header_query_or}, {'_id': 0}):
+            timer = evaluate_group_timer(h)
+            for key in (h.get('request_number'), h.get('attempt_id'), h.get('id')):
+                if key:
+                    headers[key] = h
+                    header_timers[key] = timer
 
     freezes = await load_today_freezes(
         db, [i.get('part_number') for i in items], order.get('brand_name') or '',
@@ -1172,7 +1191,7 @@ async def enrich_order_items(db, order: dict, items: List[dict],
                 'source_branch': alloc.get('branch') or alloc.get('source_branch'),
                 'source_dealer': alloc.get('dealer_name') or alloc.get('source_dealer'),
                 'requested_qty': alloc.get('request_qty') or alloc.get('requested_qty'),
-                'locked': bool(alloc.get('request_no') or alloc.get('request_number')),
+                'locked': allocation_is_sent(alloc),
             })
 
         # Mark own/branch/dealer exhausted when pools empty and remaining > 0
@@ -1263,12 +1282,17 @@ async def sync_order_item_after_request_decision(db, req: dict, now: str = None)
 
     kept_allocs = []
     req_number = _clean(req.get('request_number'))
+    req_attempt = _clean(req.get('request_attempt_id'))
     for alloc in item.get('allocations') or []:
         same = source_key(alloc.get('dealer_name'), alloc.get('branch')) == source_key(
             failed_source['dealer_name'], failed_source['branch']
         )
-        already_sent = bool(alloc.get('request_no') or alloc.get('request_number'))
-        same_request = req_number and _clean(alloc.get('request_no') or alloc.get('request_number')) == req_number
+        already_sent = allocation_is_sent(alloc)
+        alloc_ref = _clean(alloc.get('request_no') or alloc.get('request_number') or alloc.get('request_attempt_id'))
+        same_request = bool(
+            (req_number and alloc_ref == req_number)
+            or (req_attempt and _clean(alloc.get('request_attempt_id')) == req_attempt)
+        )
         if same and not already_sent:
             continue
         if (same or same_request) and already_sent:
@@ -1341,25 +1365,82 @@ def filter_unsent_allocations(item: dict, order: dict, level: str, existing_requ
         key = source_key(source.get('dealer_name'), source.get('branch'))
         if key in blocked:
             continue
-        if source.get('request_no') or source.get('request_number'):
+        if allocation_is_sent(source):
             continue
         result.append(source)
     return result
 
 
-def mark_allocations_sent(item: dict, pairs_sources: List[dict], request_number: str, now: str) -> List[dict]:
+def allocation_is_sent(alloc: Optional[dict]) -> bool:
+    """True once an allocation has been routed (attempt or official RQ)."""
+    if not alloc:
+        return False
+    if alloc.get('request_attempt_id') or alloc.get('request_no') or alloc.get('request_number'):
+        return True
+    if alloc.get('locked'):
+        return True
+    return _clean(alloc.get('status')).lower() in (
+        'request sent', 'awaiting response', 'requested', 'accepted', 'partially accepted',
+        'rejected', 'cancelled', 'completed', 'dispatched', 'received', 'response time expired',
+    )
+
+
+def mark_allocations_sent(
+    item: dict,
+    pairs_sources: List[dict],
+    request_number: str,
+    now: str,
+    *,
+    attempt_id: str = None,
+) -> List[dict]:
+    """Stamp routed allocations.
+
+    Before supplier acceptance only `request_attempt_id` is set. Official
+    `request_number` / `request_no` are filled later on acceptance promote.
+    """
     sent_keys = {source_key(s.get('dealer_name'), s.get('branch')) for s in pairs_sources}
+    official = _clean(request_number)
+    attempt = _clean(attempt_id) or official
     updated = []
     for alloc in item.get('allocations') or []:
         if source_key(alloc.get('dealer_name'), alloc.get('branch')) in sent_keys:
-            updated.append({
+            row = {
                 **alloc,
-                'request_no': request_number,
-                'request_number': request_number,
+                'request_attempt_id': attempt or alloc.get('request_attempt_id'),
                 'request_status': REQUEST_STATUS_AWAITING,
                 'status': REQUEST_STATUS_AWAITING,
                 'sent_at': now,
                 'locked': True,
+            }
+            if official:
+                row['request_no'] = official
+                row['request_number'] = official
+            updated.append(row)
+        else:
+            updated.append(alloc)
+    return updated
+
+
+def stamp_allocations_official_request(
+    item: dict,
+    attempt_id: str,
+    request_number: str,
+) -> List[dict]:
+    """Fill official RQ onto allocations previously stamped with attempt_id."""
+    attempt = _clean(attempt_id)
+    official = _clean(request_number)
+    if not attempt or not official:
+        return list(item.get('allocations') or [])
+    updated = []
+    for alloc in item.get('allocations') or []:
+        if _clean(alloc.get('request_attempt_id')) == attempt or (
+            not alloc.get('request_number') and _clean(alloc.get('request_attempt_id')) == attempt
+        ):
+            updated.append({
+                **alloc,
+                'request_no': official,
+                'request_number': official,
+                'request_attempt_id': attempt,
             })
         else:
             updated.append(alloc)

@@ -2343,7 +2343,11 @@ def _rejection_reason(lines, lock) -> Optional[str]:
 
 
 def _group_line_filter(request_group_key: str) -> dict:
-    return {"$or": [{"request_group_id": request_group_key}, {"request_number": request_group_key}]}
+    return {"$or": [
+        {"request_group_id": request_group_key},
+        {"request_attempt_id": request_group_key},
+        {"request_number": request_group_key},
+    ]}
 
 
 def _request_line_loc(line: dict) -> str:
@@ -2404,12 +2408,22 @@ async def _scope_group_lines(request_group_key: str, session, statuses=None):
 
 
 async def _header_for_request_number(request_number: str) -> dict:
+    """Resolve header by official RQ, attempt_id, or group id."""
     if not request_number:
         return {}
+    projection = {
+        "_id": 0, "id": 1, "request_number": 1, "attempt_id": 1,
+        "response_deadline": 1, "response_status": 1,
+        "request_sent_at": 1, "timeout_cancelled": 1, "mobile_expiry_status": 1,
+        "official_confirmed": 1, "sourcing_attempt": 1,
+    }
     return await db.request_headers.find_one(
-        {"request_number": request_number},
-        {"_id": 0, "request_number": 1, "response_deadline": 1, "response_status": 1,
-         "request_sent_at": 1, "timeout_cancelled": 1, "mobile_expiry_status": 1},
+        {"$or": [
+            {"request_number": request_number},
+            {"attempt_id": request_number},
+            {"id": request_number},
+        ]},
+        projection,
     ) or {}
 
 
@@ -2505,6 +2519,8 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             "request_group_key": key,
             "request_group_id": line.get("request_group_id") or key,
             "request_number": line.get("request_number"),
+            "attempt_id": line.get("request_attempt_id"),
+            "display_number": line.get("request_number") or line.get("request_attempt_id") or key,
             "requesting_dealer": line.get("requesting_dealer"),
             "requesting_branch": line.get("requesting_branch"),
             "supplying_dealer": line.get("supplying_dealer"),
@@ -2571,15 +2587,27 @@ async def list_branch_notifications(session=Depends(get_device_session)):
     ).to_list(2000)
     action_by_key = {a["request_id"]: a for a in actions}
 
-    request_numbers = [g.get("request_number") for g in groups.values() if g.get("request_number")]
+    header_keys = []
+    for g in groups.values():
+        for key_name in ("request_number", "attempt_id", "request_group_id", "request_group_key"):
+            if g.get(key_name):
+                header_keys.append(g.get(key_name))
+    header_keys = list(dict.fromkeys(header_keys))
     header_by_number = {}
-    if request_numbers:
+    if header_keys:
         async for header in db.request_headers.find(
-            {"request_number": {"$in": request_numbers}},
-            {"_id": 0, "request_number": 1, "response_deadline": 1, "response_status": 1,
+            {"$or": [
+                {"request_number": {"$in": header_keys}},
+                {"attempt_id": {"$in": header_keys}},
+                {"id": {"$in": header_keys}},
+            ]},
+            {"_id": 0, "id": 1, "request_number": 1, "attempt_id": 1,
+             "response_deadline": 1, "response_status": 1,
              "request_sent_at": 1, "timeout_cancelled": 1, "mobile_expiry_status": 1},
         ):
-            header_by_number[header.get("request_number")] = header
+            for key_name in ("request_number", "attempt_id", "id"):
+                if header.get(key_name):
+                    header_by_number[header.get(key_name)] = header
 
     results = []
     for key, group in groups.items():
@@ -2591,7 +2619,18 @@ async def list_branch_notifications(session=Depends(get_device_session)):
                 action = action_by_key.get(alias) or {}
                 if action:
                     break
-        header = header_by_number.get(group.get("request_number")) or {}
+        header = (
+            header_by_number.get(group.get("request_number"))
+            or header_by_number.get(group.get("attempt_id"))
+            or header_by_number.get(group.get("request_group_id"))
+            or header_by_number.get(key)
+            or {}
+        )
+        if header.get("attempt_id") and not group.get("attempt_id"):
+            group["attempt_id"] = header.get("attempt_id")
+        if header.get("request_number"):
+            group["request_number"] = header.get("request_number")
+        group["display_number"] = group.get("request_number") or group.get("attempt_id") or key
         status = _ownership_status(lines_for_group, lock, header, now)
         owner_name = _lock_owner_name(lock)
         owned_by_me = bool(lock) and lock.get("device_id") == device_id

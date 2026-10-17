@@ -203,7 +203,7 @@ function compactRequestedFrom(item, selectedAllocations = []) {
     } else parts.push(`${row.branch_name || row.source_name || '-'} - ${qty}`);
   });
   (selectedAllocations || []).forEach((alloc) => {
-    if (alloc.request_no || alloc.request_number) return;
+    if (alloc.request_no || alloc.request_number || alloc.request_attempt_id || alloc.locked) return;
     if (/rejected|cancelled/i.test(String(alloc.status || alloc.request_status || ''))) return;
     const qty = Number(alloc.request_qty || 0); if (!qty) return;
     const level = String(alloc.level || alloc.source_type || '').toLowerCase();
@@ -476,7 +476,7 @@ export function Orders({ scopeOverride } = {}) {
       const banner = res.data?.message_banner || res.data?.order?.auto_sourcing_message;
       if (banner) toast(banner);
       else if (state === 'waiting_response' || state === 'last_chance') {
-        toast.success(`Auto Sourcing routed${res.data?.result?.request_number ? `: ${res.data.result.request_number}` : ''}`);
+        toast.success(`Auto Sourcing routed${res.data?.result?.request_number ? `: ${res.data.result.request_number}` : (res.data?.result?.attempt_id ? `: ${res.data.result.attempt_id}` : '')}`);
       } else toast.success(res.data?.message || 'Auto Sourcing started');
       await loadOrder(currentOrder.id, { silent: true });
     } catch (error) {
@@ -616,8 +616,8 @@ export function Orders({ scopeOverride } = {}) {
     const current = allocations[item.id] || [];
     const key = `${source.dealer_name}__${source.branch}`;
     // Preserve locked/sent allocations
-    const preserved = current.filter(x => x.request_no || x.request_number || x.locked);
-    const drafts = current.filter(x => !(x.request_no || x.request_number || x.locked) && `${x.dealer_name}__${x.branch}` !== key);
+    const preserved = current.filter(x => x.request_no || x.request_number || x.request_attempt_id || x.locked);
+    const drafts = current.filter(x => !(x.request_no || x.request_number || x.request_attempt_id || x.locked) && `${x.dealer_name}__${x.branch}` !== key);
     const nextDraft = requestQty > 0
       ? [...drafts, { ...source, request_qty: Math.min(requestQty, available || Number(source.available_qty || 0)), level, source_type: level }]
       : drafts;
@@ -1206,7 +1206,7 @@ export function Orders({ scopeOverride } = {}) {
                               <div className="grid gap-2">
                                 {sources.map(source => {
                                   const key = `${source.dealer_name}__${source.branch}`;
-                                  const value = (selected.find(x => `${x.dealer_name}__${x.branch}` === key && !(x.request_no || x.request_number))?.request_qty) || '';
+                                  const value = (selected.find(x => `${x.dealer_name}__${x.branch}` === key && !(x.request_no || x.request_number || x.request_attempt_id || x.locked))?.request_qty) || '';
                                   const frozen = source.source_frozen_today || source.rejected_today;
                                   return (
                                     <div key={key} className={`grid grid-cols-2 md:grid-cols-7 gap-2 items-center rounded-lg border p-3 ${frozen ? 'bg-rose-50 opacity-80' : 'bg-white'}`}>

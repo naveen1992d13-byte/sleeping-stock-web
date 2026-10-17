@@ -228,8 +228,13 @@ def build_branch_request_push_message(token: str, group_doc: dict, kind: str = "
     Title/body/sound/channel are omitted so Android delivers a data message to
     the native FirebaseMessagingService while the app is killed. SLA scheduling
     and reminder-count logic are unchanged; only the payload shape is aligned.
+
+    Pre-acceptance attempts may have only attempt_id (no official RQ). The
+    display field uses official request_number when present, else attempt_id.
     """
     request_number = (group_doc or {}).get("request_number") or ""
+    attempt_id = (group_doc or {}).get("attempt_id") or ""
+    display_number = request_number or attempt_id
     requesting_branch = (group_doc or {}).get("requesting_branch") or ""
     total_items = (group_doc or {}).get("total_items")
     total_qty = (group_doc or {}).get("total_qty")
@@ -237,7 +242,7 @@ def build_branch_request_push_message(token: str, group_doc: dict, kind: str = "
         total_items = len((group_doc or {}).get("items") or [])
     if total_qty in (None, ""):
         total_qty = (group_doc or {}).get("total_quantity") or 0
-    request_group_key = (group_doc or {}).get("id") or request_number
+    request_group_key = (group_doc or {}).get("id") or request_number or attempt_id
     round_n = _KIND_TO_ROUND.get(kind, 0)
     return {
         "to": token,
@@ -249,12 +254,14 @@ def build_branch_request_push_message(token: str, group_doc: dict, kind: str = "
             "kind": kind,
             "round": round_n,
             "requestId": request_group_key,
-            "requestNumber": request_number,
+            "requestNumber": display_number,
+            "attemptId": attempt_id,
             "branchName": requesting_branch,
             "totalItems": total_items,
             "totalQuantity": total_qty,
             "request_group_key": request_group_key,
             "request_number": request_number,
+            "attempt_id": attempt_id,
             "requesting_branch": requesting_branch,
             "requested_branch": requesting_branch,
             "total_items": total_items,
@@ -262,6 +269,7 @@ def build_branch_request_push_message(token: str, group_doc: dict, kind: str = "
             "categoryId": REQUEST_CATEGORY_ID,
             "sticky": True,
             "autoDismiss": False,
+            "official": bool(request_number),
         },
     }
 
@@ -271,12 +279,14 @@ async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
     try:
         brand, dealer, branch = request_push_scope(group_doc)
         request_number = (group_doc or {}).get("request_number") or ""
-        request_group_key = (group_doc or {}).get("id") or request_number
-        if not brand or not dealer or not branch or not request_number:
+        attempt_id = (group_doc or {}).get("attempt_id") or ""
+        display_number = request_number or attempt_id
+        request_group_key = (group_doc or {}).get("id") or request_number or attempt_id
+        if not brand or not dealer or not branch or not (request_number or attempt_id or request_group_key):
             return {"ok": False, "error": "missing_scope"}
         preview = build_branch_request_push_message("ExponentPushToken[preview]", group_doc, kind)
         data = preview["data"]
-        title = data.get("requestNumber") or request_number
+        title = data.get("requestNumber") or display_number
         body = f"round={data.get('round')} {data.get('branchName') or ''} items={data.get('totalItems')} qty={data.get('totalQuantity')}"
         devices = await db.mobile_devices.find(
             eligible_request_device_query(brand, dealer, branch),

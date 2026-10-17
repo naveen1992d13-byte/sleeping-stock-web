@@ -4827,7 +4827,10 @@ async def _generate_request_number(brand_code: str) -> dict:
     The counter is a per-brand, per-day atomic $inc (same pattern as
     _generate_order_number / generate_upload_no), so two simultaneous
     requests for the same brand/day can never receive the same number, and
-    the daily serial naturally restarts at 0001 for a new date or brand."""
+    the daily serial naturally restarts at 0001 for a new date or brand.
+
+    Official RQ numbers are minted only after supplier acceptance.
+    """
     date_key = datetime.now(timezone.utc).strftime('%y%m%d')
     clean_brand = re.sub(r'[^A-Za-z0-9]', '', str(brand_code or 'XX')).upper() or 'XX'
     counter_id = f'request_RQ_{clean_brand}_{date_key}'
@@ -4844,6 +4847,44 @@ async def _generate_request_number(brand_code: str) -> dict:
     return {
         'request_number': testing_runtime.prefix_business_id(f'RQ{clean_brand}{date_key}{seq:04d}'),
 
+        'brand_code': clean_brand, 'date_key': date_key, 'sequence': seq,
+    }
+
+
+async def _resolve_request_header(ref: str) -> dict:
+    """Lookup request header by official RQ, attempt_id, or group id."""
+    if not ref:
+        return {}
+    return await db.request_headers.find_one(
+        {'$or': [
+            {'request_number': ref},
+            {'attempt_id': ref},
+            {'id': ref},
+        ]},
+        {'_id': 0},
+    ) or {}
+
+
+async def _generate_attempt_id(brand_code: str) -> dict:
+    """Internal sourcing attempt / event ID used before official RQ minting.
+
+    Format: AT + BRAND + YYMMDD + 4-digit daily serial (Testing-prefixed when
+    APP_ENV=testing). Never used as the official Parts Transfer Request number.
+    """
+    date_key = datetime.now(timezone.utc).strftime('%y%m%d')
+    clean_brand = re.sub(r'[^A-Za-z0-9]', '', str(brand_code or 'XX')).upper() or 'XX'
+    counter_id = f'request_AT_{clean_brand}_{date_key}'
+    counter = await db.counters.find_one_and_update(
+        {'_id': counter_id},
+        {'$inc': {'seq': 1}, '$setOnInsert': {'date_key': date_key, 'brand_code': clean_brand, 'type': 'AT'}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    seq = int(counter.get('seq', 1))
+    if seq > 9999:
+        raise HTTPException(status_code=500, detail=f'Daily attempt sequence exhausted for brand {clean_brand}. Contact support.')
+    return {
+        'attempt_id': testing_runtime.prefix_business_id(f'AT{clean_brand}{date_key}{seq:04d}'),
         'brand_code': clean_brand, 'date_key': date_key, 'sequence': seq,
     }
 
@@ -5044,25 +5085,47 @@ async def _send_request_group_email(group_doc: dict, *, result: bool = False, fo
 
 def _send_requests_response(group_docs: list, duplicate: bool):
     groups = [g for g in group_docs if g]
-    request_numbers = [g.get('request_number') for g in groups]
+    request_numbers = [g.get('request_number') for g in groups if g.get('request_number')]
+    attempt_ids = [g.get('attempt_id') or g.get('id') for g in groups]
     any_email_sent = any(g.get('email_sent') for g in groups)
-    any_email_failed = any(not g.get('email_sent') for g in groups)
+    any_email_failed = any(
+        (not g.get('email_sent')) and g.get('email_status') not in ('pending', 'deferred_until_acceptance', None)
+        for g in groups
+    )
     errors = [g.get('email_error') for g in groups if g.get('email_error')]
+    deferred = any(
+        (not g.get('email_sent')) and (
+            not g.get('request_number') or g.get('email_status') == 'deferred_until_acceptance'
+        )
+        for g in groups
+    )
 
     if duplicate:
-        message = f'Request already created for this order ({len(request_numbers)} request number(s)). No duplicate was created.'
+        refs = request_numbers or attempt_ids
+        message = (
+            f'Request already created for this order ({len(refs)} attempt/request(s)). '
+            'No duplicate was created.'
+        )
     elif not groups:
         message = 'No requests were created.'
+    elif deferred and not any_email_sent:
+        message = (
+            f'{len(attempt_ids)} sourcing attempt(s) routed. '
+            'Official request number, email and PDF are created after supplier acceptance.'
+        )
     elif any_email_sent and not any_email_failed:
         message = f'{len(request_numbers)} request(s) created and emailed successfully.'
     elif any_email_sent and any_email_failed:
         message = f'{len(request_numbers)} request(s) created. Some emails failed to send.'
     else:
-        message = f'{len(request_numbers)} request(s) created successfully, but email could not be sent.'
+        message = f'{len(attempt_ids)} sourcing attempt(s) created successfully.'
 
     return {
-        'request_created': bool(groups), 'message': message, 'request_numbers': request_numbers,
+        'request_created': bool(groups), 'message': message,
+        'request_numbers': request_numbers,
+        'attempt_ids': attempt_ids,
         'email_sent': any_email_sent, 'email_error': errors[0] if errors else None,
+        'email_deferred_until_acceptance': deferred and not any_email_sent,
         'groups': groups, 'duplicate': duplicate,
     }
 
@@ -5574,11 +5637,7 @@ async def order_desk_allocate(order_id: str, payload: dict, current_user: UserRe
         # Preserve already-sent allocations; only replace draft/unsent selections.
         preserved = [
             a for a in (item.get('allocations') or [])
-            if a.get('request_no') or a.get('request_number')
-            or str(a.get('status') or '').lower() in (
-                'request sent', 'requested', 'accepted', 'partially accepted',
-                'rejected', 'cancelled', 'completed', 'dispatched', 'received',
-            )
+            if odw.allocation_is_sent(a)
         ]
         preserved_keys = {
             (str(a.get('dealer_name') or '').lower(), str(a.get('branch') or '').lower())
@@ -5627,13 +5686,11 @@ async def order_desk_allocate(order_id: str, payload: dict, current_user: UserRe
             'allocations': cleaned, 'allocated_qty': total, 'balance_qty': max(0, required - total),
             'remaining_qty': max(0, required - float(wf.get('accepted_qty') or 0) - sum(
                 float(a.get('request_qty') or 0) for a in cleaned
-                if a.get('request_no') or a.get('request_number') or str(a.get('status') or '').lower() in (
-                    'request sent', 'requested', 'accepted', 'partially accepted', 'completed', 'dispatched', 'received',
-                )
+                if odw.allocation_is_sent(a)
             )),
             'status': 'Source Selected' if cleaned else 'Availability Checked', 'updated_at': now,
-            'allocation_source': 'manual' if any(not (a.get('request_no') or a.get('request_number')) for a in cleaned) else item.get('allocation_source'),
-            'request_status': odw.REQUEST_STATUS_READY if any(not (a.get('request_no') or a.get('request_number')) for a in cleaned) else wf.get('request_status'),
+            'allocation_source': 'manual' if any(not odw.allocation_is_sent(a) for a in cleaned) else item.get('allocation_source'),
+            'request_status': odw.REQUEST_STATUS_READY if any(not odw.allocation_is_sent(a) for a in cleaned) else wf.get('request_status'),
         }})
     await db.order_headers.update_one({'id': order_id}, {'$set': {'status': 'Source Selected', 'updated_at': now}})
     await odw.append_order_audit(db, order, 'Manual source selected / Qty changed', current_user)
@@ -5800,11 +5857,7 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
 
         kept = []
         for alloc in (item.get('allocations') or []):
-            sent = bool(alloc.get('request_no') or alloc.get('request_number')) or str(alloc.get('status') or '').lower() in (
-                'request sent', 'awaiting response', 'requested', 'accepted', 'partially accepted',
-                'rejected', 'cancelled', 'completed', 'dispatched', 'received', 'response time expired',
-            )
-            if sent or odw.allocation_level(alloc, order) != level:
+            if odw.allocation_is_sent(alloc) or odw.allocation_level(alloc, order) != level:
                 kept.append(alloc)
         new_allocations = kept + picked
 
@@ -5927,11 +5980,7 @@ async def _auto_source_send_destination(order: dict, destination: dict, current_
         fresh = await db.order_items.find_one({'id': item['id']}, {'_id': 0}) or item
         kept = []
         for a in (fresh.get('allocations') or []):
-            sent = bool(a.get('request_no') or a.get('request_number')) or str(a.get('status') or '').lower() in (
-                'request sent', 'awaiting response', 'requested', 'accepted', 'partially accepted',
-                'rejected', 'cancelled', 'completed', 'dispatched', 'received', 'response time expired',
-            )
-            if sent:
+            if odw.allocation_is_sent(a):
                 kept.append(a)
         new_allocs = kept + [alloc]
         await db.order_items.update_one({'id': item['id']}, {'$set': {
@@ -5949,9 +5998,11 @@ async def _auto_source_send_destination(order: dict, destination: dict, current_
         return {'sent': False, 'reason': 'no_live_qty'}
 
     group_doc = await _create_request_group(order, pairs, current_user, now)
-    request_number = (group_doc or {}).get('request_number')
+    attempt_id = (group_doc or {}).get('attempt_id') or (group_doc or {}).get('id')
+    request_number = (group_doc or {}).get('request_number')  # None until acceptance
+    routing_ref = request_number or attempt_id
     for item, source in pairs:
-        stamped = odw.mark_allocations_sent(item, [source], request_number, now)
+        stamped = odw.mark_allocations_sent(item, [source], request_number, now, attempt_id=attempt_id)
         await db.order_items.update_one({'id': item['id']}, {'$set': {
             'allocations': stamped,
             'status': 'Requested',
@@ -5962,15 +6013,17 @@ async def _auto_source_send_destination(order: dict, destination: dict, current_
     await db.order_headers.update_one({'id': order['id']}, {'$set': {
         'auto_sourcing_state': oas.AUTO_SOURCE_LAST_CHANCE if last_chance else oas.AUTO_SOURCE_WAITING,
         'auto_sourcing_active': True,
-        'auto_sourcing_current_request': request_number,
+        'auto_sourcing_current_request': routing_ref,
+        'auto_sourcing_current_attempt': attempt_id,
         'auto_sourcing_last_chance': bool(last_chance),
         'updated_at': now,
     }})
-    await db.request_headers.update_one({'request_number': request_number}, {'$set': {
+    await db.request_headers.update_one({'id': (group_doc or {}).get('id')}, {'$set': {
         'auto_sourced': True,
         'last_chance': bool(last_chance),
     }})
     await oas.append_sourcing_event(db, order, 'Last Chance alert routed' if last_chance else 'Auto Sourcing routed', {
+        'attempt_id': attempt_id,
         'request_number': request_number,
         'supplying_dealer': destination.get('dealer_name'),
         'supplying_branch': destination.get('branch'),
@@ -5984,7 +6037,13 @@ async def _auto_source_send_destination(order: dict, destination: dict, current_
             'total_available': destination.get('total_available'),
         },
     }, current_user)
-    return {'sent': True, 'request_number': request_number, 'group': group_doc, 'lines': len(pairs)}
+    return {
+        'sent': True,
+        'attempt_id': attempt_id,
+        'request_number': request_number,
+        'group': group_doc,
+        'lines': len(pairs),
+    }
 
 
 async def _auto_source_advance(order_id: str, actor: UserResponse = None, reason: str = '') -> dict:
@@ -6007,10 +6066,11 @@ async def _auto_source_advance(order_id: str, actor: UserResponse = None, reason
         # Wait if an active Requested header still exists
         pending = await db.request_headers.find_one(
             {'order_id': order_id, 'status': 'Requested', 'auto_sourced': True},
-            {'_id': 0, 'request_number': 1, 'status': 1},
+            {'_id': 0, 'request_number': 1, 'attempt_id': 1, 'id': 1, 'status': 1},
         )
         if pending:
-            return {'ok': True, 'state': oas.AUTO_SOURCE_WAITING, 'waiting_on': pending.get('request_number')}
+            waiting_on = pending.get('request_number') or pending.get('attempt_id') or pending.get('id')
+            return {'ok': True, 'state': oas.AUTO_SOURCE_WAITING, 'waiting_on': waiting_on}
 
         items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
         items = await odw.enrich_order_items(db, order, items)
@@ -6109,13 +6169,12 @@ async def order_desk_auto_source_start(order_id: str, payload: dict = None, curr
         raise HTTPException(status_code=400, detail='Run Check Availability before Auto Sourcing')
     # Idempotent: if already waiting on a request, return current state
     if order.get('auto_sourcing_active') and order.get('auto_sourcing_current_request'):
-        pending = await db.request_headers.find_one(
-            {'request_number': order.get('auto_sourcing_current_request'), 'status': 'Requested'}, {'_id': 0},
-        )
-        if pending:
+        pending = await _resolve_request_header(order.get('auto_sourcing_current_request'))
+        if pending and pending.get('status') == 'Requested':
             return {
                 'message': 'Auto Sourcing already awaiting response',
                 'state': order.get('auto_sourcing_state'),
+                'attempt_id': pending.get('attempt_id'),
                 'request_number': pending.get('request_number'),
                 'duplicate': True,
             }
@@ -6199,8 +6258,13 @@ async def order_desk_factory_decision(order_id: str, payload: dict, current_user
             'updated_at': now,
             'factory_decision_stopped': True,
         }})
+        line_or = [{'request_group_id': header.get('id')}]
+        if header.get('attempt_id'):
+            line_or.append({'request_attempt_id': header.get('attempt_id')})
+        if header.get('request_number'):
+            line_or.append({'request_number': header.get('request_number')})
         await db.order_requests.update_many(
-            {'request_number': header.get('request_number'), 'status': 'Requested'},
+            {'$and': [{'$or': line_or}, {'status': 'Requested'}]},
             {'$set': {
                 'status': 'Cancelled',
                 'official_confirmed': False,
@@ -6290,22 +6354,143 @@ async def _active_recipients_for_scope(brand: str = None, dealer: str = None, br
     return recipients
 
 
+async def _insert_reservations_atomic(reservation_docs: list) -> tuple:
+    """Insert reservations and roll back any stock_id that exceeds live qty.
+
+    Prevents two concurrent orders from over-allocating the same stock while a
+    supplier response is pending. Does not modify product available quantities.
+    Returns (ok, kept_docs_or_reason).
+    """
+    if not reservation_docs:
+        return True, []
+    ids = [d['id'] for d in reservation_docs]
+    await db.stock_reservations.insert_many([dict(d) for d in reservation_docs])
+    stock_ids = sorted({d.get('stock_id') for d in reservation_docs if d.get('stock_id')})
+    reserved_map = await _reservation_qty_map(stock_ids)
+    over = []
+    for stock_id in stock_ids:
+        product = await db.products.find_one(
+            {'id': stock_id},
+            {'_id': 0, 'available_qty_number': 1, 'quantity': 1},
+        )
+        avail = float((product or {}).get('available_qty_number', (product or {}).get('quantity') or 0) or 0)
+        if float(reserved_map.get(stock_id) or 0) > avail + 1e-9:
+            over.append(stock_id)
+    if over:
+        await db.stock_reservations.delete_many({'id': {'$in': ids}})
+        return False, f'over_allocated:{",".join(over)}'
+    return True, reservation_docs
+
+
+async def _promote_attempt_to_official_request(group_doc: dict, *, now: str = None) -> dict:
+    """Mint official RQ + send email/PDF once after supplier acceptance.
+
+    Idempotent: if request_number already exists or official side-effects were
+    claimed, returns the current header without duplicating email/PDF/push.
+    """
+    if not group_doc:
+        return group_doc or {}
+    now = now or datetime.now(timezone.utc).isoformat()
+    group_id = group_doc.get('id')
+    attempt_id = group_doc.get('attempt_id') or group_doc.get('id')
+    if group_doc.get('request_number') and group_doc.get('official_confirmed'):
+        return group_doc
+
+    # Claim promotion so concurrent approve lines cannot double-mint / double-email.
+    claim = await db.request_headers.find_one_and_update(
+        {'id': group_id, 'official_side_effects_claimed': {'$ne': True}},
+        {'$set': {'official_side_effects_claimed': True, 'official_side_effects_claimed_at': now}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claim:
+        return await db.request_headers.find_one({'id': group_id}, {'_id': 0}) or group_doc
+
+    request_number = claim.get('request_number')
+    minted_now = False
+    if not request_number:
+        brand_code = claim.get('brand_code') or await resolve_brand_code_for_upload(
+            claim.get('requesting_brand') or claim.get('supplying_brand')
+        )
+        numbering = await _generate_request_number(brand_code)
+        request_number = numbering['request_number']
+        minted_now = True
+        await db.request_headers.update_one({'id': group_id}, {'$set': {
+            'request_number': request_number,
+            'request_number_date': numbering['date_key'],
+            'request_sequence': numbering['sequence'],
+            'brand_code': numbering['brand_code'],
+            'pdf_filename': f'{request_number}.pdf',
+            'official_confirmed': True,
+            'official_confirmed_at': now,
+            'sourcing_attempt': False,
+            'updated_at': now,
+        }})
+        await db.order_requests.update_many(
+            {'request_group_id': group_id},
+            {'$set': {
+                'request_number': request_number,
+                'official_confirmed': True,
+                'official_confirmed_at': now,
+                'sourcing_attempt': False,
+            }},
+        )
+        # Stamp official RQ onto order allocations previously keyed by attempt.
+        item_ids = list({
+            r.get('order_item_id')
+            for r in await db.order_requests.find({'request_group_id': group_id}, {'_id': 0, 'order_item_id': 1}).to_list(10000)
+            if r.get('order_item_id')
+        })
+        for item_id in item_ids:
+            item = await db.order_items.find_one({'id': item_id}, {'_id': 0})
+            if not item:
+                continue
+            stamped = odw.stamp_allocations_official_request(item, attempt_id, request_number)
+            await db.order_items.update_one({'id': item_id}, {'$set': {'allocations': stamped, 'updated_at': now}})
+        if claim.get('order_id'):
+            await db.order_headers.update_one(
+                {'id': claim.get('order_id'), 'auto_sourcing_current_request': attempt_id},
+                {'$set': {'auto_sourcing_current_request': request_number, 'updated_at': now}},
+            )
+
+    refreshed = await db.request_headers.find_one({'id': group_id}, {'_id': 0}) or claim
+    # Official email + PDF exactly once (create-time email is deferred).
+    if not refreshed.get('email_sent'):
+        await _send_request_group_email(refreshed)
+        refreshed = await db.request_headers.find_one({'id': group_id}, {'_id': 0}) or refreshed
+    # Official acceptance push once (attempt alert may already have been sent).
+    if not refreshed.get('mobile_push_sent', {}).get('official'):
+        try:
+            if await request_sla_scheduler.claim_push(db, refreshed, 'official'):
+                await mobile_push.notify_branch_request_push(db, refreshed, kind='new')
+                await db.request_headers.update_one(
+                    {'id': group_id},
+                    {'$set': {'mobile_push_sent.official': now}},
+                )
+        except Exception as exc:
+            logging.getLogger('nmts.mobile_push').warning('official request push failed: %s', exc)
+    if minted_now:
+        logging.getLogger('nmts.order_desk').info(
+            'Promoted attempt %s to official request %s', attempt_id, request_number,
+        )
+    return await db.request_headers.find_one({'id': group_id}, {'_id': 0}) or refreshed
+
+
 async def _create_request_group(order: dict, pairs: list, current_user: UserResponse, now: str):
-    """Create one Parts Transfer Request (one request_number, one PDF, one
-    email) for a single Requested-To destination (supplying dealer+branch).
-    `pairs` is the list of (order_item, allocation_source) tuples going to
-    that destination. Existing per-item order_requests rows are still
-    created — one per (item, source) — so Approve/Reject/Cancel and the
-    Request Center list continue to work exactly as before; they simply now
-    share a common request_number and request_group_id."""
+    """Create one sourcing attempt for a single Requested-To destination.
+
+    Before supplier acceptance this stores only an internal attempt_id (no
+    official RQ). Official request_number, email, and PDF are created on
+    acceptance via `_promote_attempt_to_official_request`. Stock is reserved
+    atomically at attempt time so concurrent orders cannot over-allocate.
+    """
     first_item, first_source = pairs[0]
     supplying_brand = order.get('brand_name')
     supplying_dealer = _order_clean_text(first_source.get('dealer_name'))
     supplying_branch = _order_clean_text(first_source.get('branch'))
 
     brand_code = await resolve_brand_code_for_upload(order.get('brand_name'))
-    numbering = await _generate_request_number(brand_code)
-    request_number = numbering['request_number']
+    attempt_meta = await _generate_attempt_id(brand_code)
+    attempt_id = attempt_meta['attempt_id']
     group_id = str(uuid.uuid4())
 
     line_items, order_request_ids = [], []
@@ -6340,7 +6525,10 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
             'status': 'Requested', 'remarks': '', 'approval_remarks': '',
             'requested_by': current_user.id, 'requested_user_name': current_user.username, 'requested_at': now,
             'requester_email': current_user.email, 'requester_mobile': getattr(current_user, 'phone', ''),
-            'request_number': request_number, 'request_group_id': group_id,
+            # Official RQ is deferred until acceptance.
+            'request_number': None,
+            'request_attempt_id': attempt_id,
+            'request_group_id': group_id,
             'sourcing_attempt': True,
             'official_confirmed': False,
         }
@@ -6357,8 +6545,14 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         })
 
     group_doc = {
-        'id': group_id, 'request_number': request_number, 'request_number_date': numbering['date_key'],
-        'request_sequence': numbering['sequence'], 'brand_code': numbering['brand_code'],
+        'id': group_id,
+        'attempt_id': attempt_id,
+        'request_number': None,
+        'request_number_date': None,
+        'request_sequence': None,
+        'attempt_date': attempt_meta['date_key'],
+        'attempt_sequence': attempt_meta['sequence'],
+        'brand_code': attempt_meta['brand_code'],
         'order_id': order.get('id'), 'order_number': order.get('order_number'),
         'requesting_brand': order.get('brand_name'), 'requesting_dealer': order.get('dealer_name'),
         'requesting_branch': order.get('branch'),
@@ -6370,13 +6564,13 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         'order_request_ids': order_request_ids, 'items': line_items,
         'total_items': len(line_items), 'total_qty': total_qty, 'total_value': total_value,
         'status': 'Requested', 'created_at': now, 'updated_at': now, 'retry_count': 0,
-        'email_sent': False, 'email_status': 'pending', 'email_sent_at': None, 'email_error': None,
-        'receiver_email': '', 'pdf_filename': f'{request_number}.pdf', 'notification_log_id': None,
-        # Official confirmation flips true only after supplier acceptance.
-        # Rejects / timeouts remain sourcing audit attempts.
+        'email_sent': False, 'email_status': 'deferred_until_acceptance',
+        'email_sent_at': None, 'email_error': None,
+        'receiver_email': '', 'pdf_filename': None, 'notification_log_id': None,
         'sourcing_attempt': True,
         'official_confirmed': False,
         'official_confirmed_at': None,
+        'official_side_effects_claimed': False,
     }
     # Response SLA timer — always a fresh full window for THIS destination
     # request. Never copy remaining time from a previous Branch request.
@@ -6388,8 +6582,6 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
     except DuplicateKeyError:
         # Concurrent duplicate ACTIVE request to the same destination
         # (partial unique index on status=Requested). Reuse the winner.
-        # Terminal history for the same destination is allowed and does not
-        # hit this path.
         existing = await db.request_headers.find_one(
             {
                 'order_id': order.get('id'),
@@ -6402,17 +6594,11 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         await db.order_requests.delete_many({'id': {'$in': order_request_ids}})
         if existing:
             return existing
-        # Fallback: any matching destination header (should be rare).
         return await db.request_headers.find_one(
             {'order_id': order.get('id'), 'supplying_dealer': supplying_dealer, 'supplying_branch': supplying_branch},
             {'_id': 0},
         )
 
-    # Reservation-aware allocation: only once the request group is durably
-    # saved (never on the DuplicateKeyError/retry path above) do we reserve
-    # the underlying stock rows, so the same physical stock can never be
-    # suggested or double-allocated again — by this order or any other —
-    # until it is released by a Reject/Cancel on this request.
     reservation_docs = []
     for (item, source), order_request_id in zip(pairs, order_request_ids):
         stock_id = source.get('stock_id')
@@ -6421,21 +6607,27 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         reservation_docs.append({
             'id': str(uuid.uuid4()), 'order_id': order.get('id'), 'order_item_id': item.get('id'),
             'order_request_id': order_request_id, 'request_group_id': group_id,
+            'request_attempt_id': attempt_id,
             'part_number': item.get('part_number'), 'brand_name': order.get('brand_name'),
             'supplying_dealer': supplying_dealer, 'supplying_branch': supplying_branch,
             'stock_id': stock_id, 'qty': float(source.get('request_qty') or 0),
             'status': 'active', 'created_at': now, 'released_at': None,
         })
-    if reservation_docs:
-        await db.stock_reservations.insert_many(reservation_docs)
+    ok, reserve_result = await _insert_reservations_atomic(reservation_docs)
+    if not ok:
+        # Roll back the attempt — competing order won the stock.
+        await db.order_requests.delete_many({'id': {'$in': order_request_ids}})
+        await db.request_headers.delete_one({'id': group_id})
+        raise HTTPException(
+            status_code=409,
+            detail=f'Stock no longer available for reservation ({reserve_result}). Retry Auto Sourcing.',
+        )
 
-    # Email is best-effort only: the request/request number/items above are
-    # already saved and must never be rolled back by a PDF or SMTP failure.
-    await _send_request_group_email(group_doc)
+    # Attempt alert only (no official email/PDF until acceptance).
     try:
         asyncio.create_task(_notify_new_request_push(group_doc))
     except Exception as exc:
-        logging.getLogger('nmts.mobile_push').warning('new request push schedule failed: %s', exc)
+        logging.getLogger('nmts.mobile_push').warning('attempt request push schedule failed: %s', exc)
     return await db.request_headers.find_one({'id': group_id}, {'_id': 0})
 
 
@@ -6534,14 +6726,16 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
         group_doc = await _create_request_group(order, pairs, current_user, now)
         created_group_docs.append(group_doc)
         request_number = (group_doc or {}).get('request_number')
+        attempt_id = (group_doc or {}).get('attempt_id') or (group_doc or {}).get('id')
+        group_id = (group_doc or {}).get('id')
         touched_item_ids = set()
         for item, source in pairs:
             touched_item_ids.add(item.get('id'))
-            # Stamp allocation rows with request number / Request Sent status
+            # Stamp allocation rows with attempt id / Request Sent status
             fresh = await db.order_items.find_one({'id': item.get('id')}, {'_id': 0})
             if not fresh:
                 continue
-            stamped = odw.mark_allocations_sent(fresh, [source], request_number, now)
+            stamped = odw.mark_allocations_sent(fresh, [source], request_number, now, attempt_id=attempt_id)
             await db.order_items.update_one({'id': item.get('id')}, {'$set': {
                 'allocations': stamped,
                 'status': 'Requested',
@@ -6555,7 +6749,7 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
         for item_id in touched_item_ids:
             # Store source_type on the underlying order_requests for this batch
             await db.order_requests.update_many(
-                {'order_item_id': item_id, 'request_number': request_number},
+                {'order_item_id': item_id, 'request_group_id': group_id},
                 {'$set': {'source_type': level or odw.allocation_level(
                     {'dealer_name': _key[0], 'branch': _key[1]}, order
                 ), 'level': level or odw.allocation_level(
@@ -6574,7 +6768,11 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
     await db.order_activity.insert_one({
         'id': str(uuid.uuid4()), 'order_id': order_id, 'order_number': order.get('order_number'),
         'action': action or 'Requests Sent', 'performed_by': current_user.id, 'performed_user_name': current_user.username,
-        'created_at': now, 'details': {'level': level or 'all', 'request_numbers': [g.get('request_number') for g in created_group_docs if g]},
+        'created_at': now, 'details': {
+            'level': level or 'all',
+            'attempt_ids': [g.get('attempt_id') for g in created_group_docs if g],
+            'request_numbers': [g.get('request_number') for g in created_group_docs if g and g.get('request_number')],
+        },
     })
 
     return _send_requests_response(created_group_docs, duplicate=False)
@@ -6711,11 +6909,7 @@ async def order_desk_re_enquire(order_id: str, payload: dict = None, current_use
             # Clear only unsent draft allocations so Auto Suggest can refill remaining.
             'allocations': [
                 a for a in (item.get('allocations') or [])
-                if a.get('request_no') or a.get('request_number')
-                or str(a.get('status') or '').lower() in (
-                    'request sent', 'requested', 'accepted', 'partially accepted',
-                    'rejected', 'cancelled', 'completed', 'dispatched', 'received',
-                )
+                if odw.allocation_is_sent(a)
             ],
             'updated_at': now,
         }})
@@ -6827,7 +7021,7 @@ async def order_desk_request_cancellation(order_id: str, item_id: str, payload: 
         # Clear unsent draft allocations only; keep any historical allocations if somehow present
         item_update['allocations'] = [
             a for a in (item.get('allocations') or [])
-            if a.get('request_no') or a.get('request_number')
+            if odw.allocation_is_sent(a)
         ]
 
     await db.order_items.update_one({'id': item_id}, {'$set': item_update})
@@ -6924,9 +7118,14 @@ async def order_desk_decide_cancellation(cancellation_id: str, payload: dict, cu
 async def resend_request_group_email(request_number: str, current_user: UserResponse = Depends(get_current_user)):
     """Safe, explicit retry for a request whose email previously failed.
     Never creates a new request or a new request number."""
-    group_doc = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
+    group_doc = await _resolve_request_header(request_number)
     if not group_doc:
         raise HTTPException(status_code=404, detail='Request not found')
+    if not group_doc.get('request_number'):
+        raise HTTPException(
+            status_code=400,
+            detail='Official request email/PDF is available only after supplier acceptance.',
+        )
     role = (current_user.role or '').lower()
     is_supplier = _is_request_supplier(group_doc, current_user)
     is_requester = group_doc.get('requested_by') == current_user.id or (role != 'user' and group_doc.get('requesting_dealer') == current_user.group)
@@ -6972,12 +7171,28 @@ async def _apply_request_group_timeout(group_doc: dict, actor: UserResponse):
     qty is marked retry_required so the existing next-source flow continues.
     """
     request_number = group_doc.get('request_number')
+    attempt_id = group_doc.get('attempt_id')
+    group_id = group_doc.get('id')
     now = datetime.now(timezone.utc).isoformat()
+    line_or = []
+    if group_id:
+        line_or.append({'request_group_id': group_id})
+    if attempt_id:
+        line_or.append({'request_attempt_id': attempt_id})
+    if request_number:
+        line_or.append({'request_number': request_number})
     pending = await db.order_requests.find(
-        {'request_number': request_number, 'status': 'Requested'}, {'_id': 0},
+        {'$and': [{'$or': line_or or [{'_id': None}]}, {'status': 'Requested'}]},
+        {'_id': 0},
     ).to_list(10000)
     if not pending:
-        return {'message': 'No unanswered items to cancel', 'cancelled': 0, 'cancel_allowed': False, 'request_number': request_number}
+        return {
+            'message': 'No unanswered items to cancel',
+            'cancelled': 0,
+            'cancel_allowed': False,
+            'request_number': request_number,
+            'attempt_id': attempt_id,
+        }
 
     cancelled = 0
     for req in pending:
@@ -7039,8 +7254,9 @@ async def _apply_request_group_timeout(group_doc: dict, actor: UserResponse):
 async def cancel_request_group_timeout(request_number: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     """Cancel unanswered items after response deadline. Does not unlock Accepted qty.
     Cancellation reason: Cancelled – No Response. Does NOT create a Rejected-Today freeze.
+    Path param accepts official RQ, attempt_id, or group id.
     """
-    group_doc = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
+    group_doc = await _resolve_request_header(request_number)
     if not group_doc:
         raise HTTPException(status_code=404, detail='Request not found')
     role = (current_user.role or '').lower()
@@ -7057,7 +7273,7 @@ async def cancel_request_group_timeout(request_number: str, payload: dict = None
 
 @api_router.get('/requests/group/{request_number}')
 async def request_group_detail(request_number: str, current_user: UserResponse = Depends(get_current_user)):
-    group_doc = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
+    group_doc = await _resolve_request_header(request_number)
     if not group_doc:
         raise HTTPException(status_code=404, detail='Request not found')
     role = (current_user.role or '').lower()
@@ -7692,12 +7908,28 @@ def _first_item_actor(items, name_keys, mobile_keys):
 
 async def _sync_request_header_after_item_decision(req: dict, now: str):
     """Keep the request header/PDF summary aligned with item-wise decisions."""
+    group_id = req.get('request_group_id')
+    attempt_id = req.get('request_attempt_id')
     request_number = req.get('request_number')
-    if not request_number:
+    if not group_id and not attempt_id and not request_number:
         return
-    items = await db.order_requests.find({'request_number': request_number}, {'_id': 0}).to_list(10000)
+    line_filter = {'request_group_id': group_id} if group_id else (
+        {'request_attempt_id': attempt_id} if attempt_id else {'request_number': request_number}
+    )
+    items = await db.order_requests.find(line_filter, {'_id': 0}).to_list(10000)
     if not items:
         return
+    header = await db.request_headers.find_one(
+        {'$or': [x for x in [
+            {'id': group_id} if group_id else None,
+            {'attempt_id': attempt_id} if attempt_id else None,
+            {'request_number': request_number} if request_number else None,
+        ] if x]},
+        {'_id': 0},
+    ) or {}
+    group_id = group_id or header.get('id')
+    attempt_id = attempt_id or header.get('attempt_id')
+    request_number = request_number or header.get('request_number')
     statuses = [i.get('status', 'Requested') for i in items]
     accepted_items = [i for i in items if float(i.get('accepted_qty', i.get('approved_qty', 0)) or 0) > 0]
     accepted_statuses = [i.get('status', 'Approved') for i in accepted_items]
@@ -7783,8 +8015,8 @@ async def _sync_request_header_after_item_decision(req: dict, now: str):
     if received_mobile:
         header_update['received_user_mobile'] = received_mobile
         header_update['completed_user_mobile'] = received_mobile
+    existing = header or {}
     if header_status != 'Requested':
-        existing = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0}) or {}
         if not existing.get('timer_frozen'):
             if existing.get('timeout_cancelled') or header_status == 'Cancelled':
                 freeze_status = 'timeout' if existing.get('timeout_cancelled') else 'cancelled'
@@ -7804,10 +8036,17 @@ async def _sync_request_header_after_item_decision(req: dict, now: str):
         header_update['official_confirmed'] = False
         header_update['sourcing_attempt'] = True
         header_update['audit_only_attempt'] = True
-    await db.request_headers.update_one(
-        {'request_number': request_number},
-        {'$set': header_update},
+    header_filter = {'id': group_id} if group_id else (
+        {'attempt_id': attempt_id} if attempt_id else {'request_number': request_number}
     )
+    await db.request_headers.update_one(header_filter, {'$set': header_update})
+    # Mint official RQ + email/PDF once on first acceptance.
+    if accepted_items and group_id:
+        promoted = await _promote_attempt_to_official_request(
+            {**existing, **header_update, 'id': group_id, 'attempt_id': attempt_id},
+            now=now,
+        )
+        request_number = (promoted or {}).get('request_number') or request_number
     # Sequential Auto Sourcing: advance after a terminal response on the active attempt.
     if header_status in ('Approved', 'Partially Approved', 'Rejected', 'Cancelled'):
         try:
@@ -7914,6 +8153,7 @@ async def _request_center_transition(request_id: str, new_status: str, remarks: 
     })
     updated = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
     await _sync_request_header_after_item_decision(updated, now)
+    updated = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
     try:
         await event_archive.maybe_enqueue_request_terminal(db, updated or {}, actor_id=current_user.id)
     except Exception as exc:
@@ -9896,9 +10136,21 @@ async def ensure_product_hub_indexes():
         [("order_id", 1), ("supplying_dealer", 1), ("supplying_branch", 1), ("created_at", -1)],
         name="idx_request_headers_destination_history",
     )
-    await db.request_headers.create_index([("request_number", 1)], unique=True)
+    # Official RQ is unique when present; pre-acceptance attempts have null RQ.
+    try:
+        await db.request_headers.drop_index('request_number_1')
+    except Exception:
+        pass
+    await db.request_headers.create_index(
+        [("request_number", 1)],
+        unique=True,
+        name="uniq_request_number_official",
+        partialFilterExpression={"request_number": {"$type": "string"}},
+    )
+    await db.request_headers.create_index([("attempt_id", 1)], unique=True, sparse=True)
     await db.request_headers.create_index([("created_at", -1)])
     await db.order_requests.create_index([("request_number", 1)])
+    await db.order_requests.create_index([("request_attempt_id", 1)])
     await db.order_requests.create_index([("request_group_id", 1)])
     await db.products.create_index([("is_active_today", 1), ("active_date_key", 1)])
     await db.products.create_index([("publish_status", 1), ("active_date_key", 1)])
