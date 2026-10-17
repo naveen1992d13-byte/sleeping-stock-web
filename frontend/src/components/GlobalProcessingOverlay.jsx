@@ -35,13 +35,24 @@ export function ProcessingProvider({ children }) {
   const showTimer = useRef(null);
   const originalFetch = useRef(null);
 
-  const begin = useCallback((copy = {}, immediate = false) => {
+  const overlayWatchdog = useRef(null);
+
+  const begin = useCallback((copy = {}, immediate = false, timeoutMs = 0) => {
     activeCount.current += 1;
     const show = () => setState({ visible: true, progress: null, ...copy });
     if (immediate) show();
     else {
       clearTimeout(showTimer.current);
       showTimer.current = setTimeout(show, 220);
+    }
+    const wait = Number(timeoutMs || 0);
+    if (wait > 0) {
+      clearTimeout(overlayWatchdog.current);
+      overlayWatchdog.current = setTimeout(() => {
+        activeCount.current = 0;
+        clearTimeout(showTimer.current);
+        setState(DEFAULT_STATE);
+      }, wait);
     }
   }, []);
 
@@ -53,6 +64,7 @@ export function ProcessingProvider({ children }) {
     activeCount.current = Math.max(0, activeCount.current - 1);
     if (activeCount.current === 0) {
       clearTimeout(showTimer.current);
+      clearTimeout(overlayWatchdog.current);
       setState(DEFAULT_STATE);
     }
   }, []);
@@ -64,10 +76,28 @@ export function ProcessingProvider({ children }) {
   }, [begin, end]);
 
   useEffect(() => {
+    // Full-screen overlay only for mutating / file operations. Plain GETs must not
+    // block the workspace (hanging monitor APIs previously trapped navigation).
+    const shouldOverlay = (method, url, config = {}) => {
+      if (config?.skipGlobalProcessing || config?.forceGlobalProcessing === false) return false;
+      if (config?.forceGlobalProcessing) return true;
+      const m = String(method || 'get').toLowerCase();
+      const u = String(url || '').toLowerCase();
+      if (config.responseType === 'blob') return true;
+      if (u.includes('/export') || u.includes('/download') || u.includes('/raw-file')) return true;
+      if (u.includes('/auth/login')) return true;
+      return m === 'post' || m === 'put' || m === 'patch' || m === 'delete';
+    };
+
     const requestId = axios.interceptors.request.use((config) => {
-      if (config?.skipGlobalProcessing) return config;
+      const url = String(config.url || '').toLowerCase();
+      if (url.includes('/auto-perpetual/generate') && !config.timeout) {
+        config.timeout = 90000;
+      }
+      if (!shouldOverlay(config.method, config.url, config)) return config;
       const copy = operationCopy(config);
-      begin(copy);
+      const overlayTimeout = Number(config.timeout || 0) || (url.includes('/auto-perpetual/generate') ? 90000 : 60000);
+      begin(copy, false, Math.min(overlayTimeout + 4000, 64000));
       config.__nmtsGlobalProcessing = true;
 
       const existingDownload = config.onDownloadProgress;
@@ -83,14 +113,21 @@ export function ProcessingProvider({ children }) {
 
     const responseId = axios.interceptors.response.use(
       (response) => { if (response?.config?.__nmtsGlobalProcessing) end(); return response; },
-      (error) => { if (error?.config?.__nmtsGlobalProcessing) end(); return Promise.reject(error); }
+      (error) => {
+        if (error?.config?.__nmtsGlobalProcessing) end();
+        else if (error?.code === 'ECONNABORTED' || /timeout/i.test(String(error?.message || ''))) end();
+        return Promise.reject(error);
+      }
     );
 
     originalFetch.current = window.fetch.bind(window);
     window.fetch = async (input, init = {}) => {
       if (init?.skipGlobalProcessing) return originalFetch.current(input, init);
-      const config = { url: typeof input === 'string' ? input : input?.url, method: init?.method || 'get' };
-      begin(operationCopy(config));
+      const url = typeof input === 'string' ? input : input?.url;
+      const method = init?.method || 'get';
+      if (!shouldOverlay(method, url, init)) return originalFetch.current(input, init);
+      const config = { url, method };
+      begin(operationCopy(config), false, 64000);
       try { return await originalFetch.current(input, init); }
       finally { end(); }
     };
@@ -100,6 +137,7 @@ export function ProcessingProvider({ children }) {
       axios.interceptors.response.eject(responseId);
       if (originalFetch.current) window.fetch = originalFetch.current;
       clearTimeout(showTimer.current);
+      clearTimeout(overlayWatchdog.current);
     };
   }, [begin, end, update]);
 

@@ -3,6 +3,7 @@ import {
   Users,
   UserPlus,
   Settings,
+  Smartphone,
   Plus,
   Edit,
   Trash2,
@@ -18,10 +19,12 @@ import {
   Upload,
   Download,
 } from "lucide-react";
-import { useOutletContext } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { useWorkspaceScope } from "../workspaceScope";
 import { Button } from "../components/ui/button";
 import { useAuth, API } from "../App";
 import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
+import NMTSMobile from "./NMTSMobile";
 import { toast } from "sonner";
 import { NmtsConfirmDialog } from "../components/NmtsConfirmDialog";
 import { NmtsModal } from "../components/NmtsModal";
@@ -40,6 +43,16 @@ const COLORS = {
 };
 
 const MENU_LIST = APPLICATION_PERMISSION_LABELS;
+const HUB_SECTIONS = ["website", "mobile", "add", "settings"];
+
+function normalizeHubSection(raw, { isMaster, isAdmin }) {
+  const value = String(raw || "website").toLowerCase();
+  const mapped = value === "list" ? "website" : value === "app" ? "mobile" : value;
+  if (!HUB_SECTIONS.includes(mapped)) return "website";
+  if (mapped === "settings" && !isMaster) return "website";
+  if (mapped === "add" && !(isMaster || isAdmin)) return "website";
+  return mapped;
+}
 
 async function apiErrorMessage(res, fallback) {
   try {
@@ -65,9 +78,10 @@ function networkErrorMessage(error) {
 
 export default function UsersPage() {
   const { user } = useAuth();
-  const outletScope = useOutletContext() || {};
+  const outletScope = useWorkspaceScope();
   const isMaster = user?.role === "master";
   const isAdmin = user?.role === "admin";
+  const navigate = useNavigate();
   const isNormalUser = user?.role === "user";
 
   const scopeBrand = outletScope.scopeBrand || "All Brands";
@@ -90,12 +104,19 @@ export default function UsersPage() {
     return `${API}/masters/branches/${encodeURIComponent(name)}${qs ? `?${qs}` : ""}`;
   };
 
-  const [activeTab, setActiveTab] = useState("list");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [mobileReady, setMobileReady] = useState(false);
   const [settingsTab, setSettingsTab] = useState("brand");
+  const activeTab = normalizeHubSection(searchParams.get("section"), { isMaster, isAdmin });
+  const selectSection = (next) => {
+    const section = normalizeHubSection(next, { isMaster, isAdmin });
+    setSearchParams({ section }, { replace: true });
+  };
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
 
   const [users, setUsers] = useState([]);
+  const [mobileUsers, setMobileUsers] = useState([]);
   const [states, setStates] = useState([]);
   const [brands, setBrands] = useState([]);
   const [dealers, setDealers] = useState([]);
@@ -219,11 +240,38 @@ export default function UsersPage() {
     }
   };
 
+  const loadMobileStats = async () => {
+    try {
+      const params = new URLSearchParams();
+      if (!isAllValue(scopeBrand)) params.set("brand_name", scopeBrand);
+      if (!isAllValue(scopeDealer)) params.set("dealer_name", scopeDealer);
+      if (!isAllValue(scopeBranch)) params.set("branch", scopeBranch);
+      const qs = params.toString();
+      const res = await fetch(`${API}/mobile/users${qs ? `?${qs}` : ""}`, { headers: authHeaders });
+      const data = await res.json().catch(() => []);
+      setMobileUsers(Array.isArray(data) ? data : []);
+    } catch {
+      setMobileUsers([]);
+    }
+  };
+
   useEffect(() => {
     loadData();
     loadTemplates();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    loadMobileStats();
+    const refresh = () => { loadMobileStats(); };
+    window.addEventListener("nmts-mobile-users-changed", refresh);
+    return () => window.removeEventListener("nmts-mobile-users-changed", refresh);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopeBrand, scopeDealer, scopeBranch, user?.id]);
+
+  useEffect(() => {
+    if (activeTab === "mobile") setMobileReady(true);
+  }, [activeTab]);
 
   useEffect(() => {
     if (isAdmin) {
@@ -284,13 +332,32 @@ export default function UsersPage() {
     ));
     const scopedBrands = brands.filter(b => isAllValue(scopeBrand) || b.name === scopeBrand);
     const scopedStates = states.filter(st => isAllValue(scopeBrand) || scopedUsers.some(u => u.state === st.name || u.state === st.code));
+    const scopedMobile = mobileUsers.filter((mu) => {
+      const uBrand = mu.brand_name || "";
+      const uDealer = mu.dealer_name || "";
+      const uBranch = mu.branch || "";
+      return (isAllValue(scopeBrand) || uBrand === scopeBrand) &&
+        (isAllValue(scopeDealer) || uDealer === scopeDealer) &&
+        (isAllValue(scopeBranch) || uBranch === scopeBranch);
+    });
+    const websiteActive = scopedUsers.filter((x) => String(x.status || "active").toLowerCase() === "active").length;
+    const websiteInactive = scopedUsers.filter((x) => String(x.status || "active").toLowerCase() !== "active").length;
+    const mobileAdmin = (mu) => String(mu.admin_status || mu.status || "active").toLowerCase();
+    const mobileActive = scopedMobile.filter((mu) => mobileAdmin(mu) === "active").length;
+    const mobileInactive = scopedMobile.filter((mu) => mobileAdmin(mu) !== "active").length;
     return {
-      totalUsers: scopedUsers.length,
-      activeUsers: scopedUsers.filter((x) => String(x.status || "active").toLowerCase() === "active").length,
-      inactiveUsers: scopedUsers.filter((x) => String(x.status || "active").toLowerCase() !== "active").length,
+      totalUsers: scopedUsers.length + scopedMobile.length,
+      activeUsers: websiteActive + mobileActive,
+      inactiveUsers: websiteInactive + mobileInactive,
+      websiteTotal: scopedUsers.length,
+      websiteActive,
+      websiteInactive,
+      mobileTotal: scopedMobile.length,
+      mobileActive,
+      mobileInactive,
       states: scopedStates.length, brands: scopedBrands.length, dealers: scopedDealers.length, branches: scopedBranches.length,
     };
-  }, [scopedUsers, states, brands, dealers, branches, scopeBrand, scopeDealer, scopeBranch]);
+  }, [scopedUsers, mobileUsers, states, brands, dealers, branches, scopeBrand, scopeDealer, scopeBranch]);
 
   const filteredUsers = scopedUsers.filter((u) => {
     const s = search.toLowerCase();
@@ -608,7 +675,7 @@ export default function UsersPage() {
       status: item.status || "active",
       permissions: Array.isArray(item.permissions) ? item.permissions : [],
     });
-    setActiveTab("add");
+    selectSection("add");
   };
 
   const saveUser = async () => {
@@ -653,7 +720,7 @@ export default function UsersPage() {
       if (!res.ok) return toast.error((await res.json()).detail || "User update failed");
       toast.success("User updated successfully");
       resetUserForm();
-      setActiveTab("list");
+      selectSection("website");
       loadData();
       return;
     }
@@ -668,13 +735,14 @@ export default function UsersPage() {
 
     toast.success("User created successfully");
     resetUserForm();
-    setActiveTab("list");
+    selectSection("website");
     loadData();
   };
 
   const toggleUserStatus = async (item) => {
     const id = item.id;
     if (!id) return toast.error("User ID not found");
+    if (isAdmin && item.role !== "user") return toast.warning("Admin can manage only User role");
 
     const res = await fetch(`${API}/profile/${id}/status`, {
       method: "PUT",
@@ -710,6 +778,7 @@ export default function UsersPage() {
     if (!isMaster && !isAdmin) {
       return toast.warning("Not allowed");
     }
+    if (isAdmin && item.role !== "user") return toast.warning("Admin can reset only User role");
     setResetTarget(item);
     setResetPasswordValue("");
     setResetPasswordConfirm("");
@@ -830,29 +899,30 @@ export default function UsersPage() {
   };
 
   return (
-    <div className="space-y-6 p-0 md:p-0" style={{ color: COLORS.text }}>
+    <div className="space-y-6 p-0 md:p-0" data-testid="user-hub-page" style={{ color: COLORS.text }}>
 
       <div className="grid grid-cols-2 xl:grid-cols-7 gap-4 mb-5">
-        <Stat title="Total Users" value={stats.totalUsers} icon={Users} />
-        <Stat title="Active Users" value={stats.activeUsers} icon={Power} />
-        <Stat title="Inactive" value={stats.inactiveUsers} icon={Power} />
+        <Stat title="Total Users" value={stats.totalUsers} icon={Users} breakdown={{ website: stats.websiteTotal, mobile: stats.mobileTotal }} />
+        <Stat title="Active Users" value={stats.activeUsers} icon={Power} breakdown={{ website: stats.websiteActive, mobile: stats.mobileActive }} />
+        <Stat title="Inactive" value={stats.inactiveUsers} icon={Power} breakdown={{ website: stats.websiteInactive, mobile: stats.mobileInactive }} />
         <Stat title="States" value={stats.states} icon={MapPin} />
         <Stat title="Brands" value={stats.brands} icon={Building2} />
         <Stat title="Dealers" value={stats.dealers} icon={Users} />
         <Stat title="Branches" value={stats.branches} icon={MapPin} />
       </div>
 
-      <div className="flex flex-wrap gap-3 mb-5">
-        <Tab active={activeTab === "list"} onClick={() => setActiveTab("list")} icon={Users} label="User List" />
+      <div className="flex flex-wrap gap-3 mb-5" data-testid="user-hub-nav">
+        <Tab active={activeTab === "website"} onClick={() => selectSection("website")} icon={Users} label="Website Users" testId="user-hub-tab-website" />
+        <Tab active={activeTab === "mobile"} onClick={() => selectSection("mobile")} icon={Smartphone} label="Mobile Users & Pairing Code" testId="user-hub-tab-mobile" />
         {(isMaster || isAdmin) && (
-          <Tab active={activeTab === "add"} onClick={() => setActiveTab("add")} icon={UserPlus} label={editingUser ? "Edit User" : "Add New User"} />
+          <Tab active={activeTab === "add"} onClick={() => selectSection("add")} icon={UserPlus} label={editingUser ? "Edit User" : "Add User"} testId="user-hub-tab-add" />
         )}
         {isMaster && (
-          <Tab active={activeTab === "settings"} onClick={() => setActiveTab("settings")} icon={Settings} label="Settings" />
+          <Tab active={activeTab === "settings"} onClick={() => selectSection("settings")} icon={Settings} label="Settings" testId="user-hub-tab-settings" />
         )}
       </div>
 
-      {activeTab === "list" && (
+      {activeTab === "website" && (
         <Panel>
           <div className="flex justify-between mb-4 gap-3">
             <h2 className="text-xl font-bold">Created User List <span className="text-xs font-medium" style={{ color: COLORS.muted }}>(Top filter applied)</span></h2>
@@ -937,7 +1007,12 @@ export default function UsersPage() {
                   </td>
                   <td className="p-3 whitespace-nowrap">
                     <div className="flex gap-3 items-center">
-                    <Eye size={16} title="View" />
+                    <Eye
+                      size={16}
+                      title="View Profile"
+                      style={{ cursor: "pointer", color: "#475569" }}
+                      onClick={() => navigate(`/profile/${u.id}`)}
+                    />
 
                     {(isMaster || isAdmin) && (
                       <>
@@ -1180,6 +1255,18 @@ export default function UsersPage() {
         </Panel>
       )}
 
+      {mobileReady && (
+        <div
+          data-testid="user-hub-mobile-embed"
+          style={{ display: activeTab === "mobile" ? undefined : "none" }}
+        >
+          <NMTSMobile
+            hideInternalNav
+            sectionOverride="mobile"
+          />
+        </div>
+      )}
+
       <NmtsConfirmDialog
         open={!!confirmDlg}
         title={confirmDlg?.title || ""}
@@ -1274,12 +1361,18 @@ function Header() {
   );
 }
 
-function Stat({ title, value, icon: Icon }) {
+function Stat({ title, value, icon: Icon, breakdown }) {
   return (
     <div className="rounded-2xl p-4 shadow-sm" style={{ backgroundColor: COLORS.card, border: `1px solid ${COLORS.border}` }}>
       <Icon className="h-5 w-5 mb-3" />
       <p className="text-sm">{title}</p>
       <h2 className="text-3xl font-bold">{value}</h2>
+      {breakdown && (
+        <div className="mt-2 text-xs leading-5" style={{ color: COLORS.muted }} data-testid="user-hub-stat-breakdown">
+          <div>Website: {breakdown.website}</div>
+          <div>Mobile: {breakdown.mobile}</div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1288,8 +1381,8 @@ function Panel({ children }) {
   return <div className="rounded-2xl p-5 shadow-sm" style={{ backgroundColor: COLORS.card, border: `1px solid ${COLORS.border}` }}>{children}</div>;
 }
 
-function Tab({ active, onClick, icon: Icon, label }) {
-  return <Button onClick={onClick} style={{ backgroundColor: active ? COLORS.active : COLORS.primary }}><Icon className="h-4 w-4 mr-2" /> {label}</Button>;
+function Tab({ active, onClick, icon: Icon, label, testId }) {
+  return <Button data-testid={testId} onClick={onClick} style={{ backgroundColor: active ? COLORS.active : COLORS.primary }}><Icon className="h-4 w-4 mr-2" /> {label}</Button>;
 }
 
 function MiniTab({ active, onClick, label }) {

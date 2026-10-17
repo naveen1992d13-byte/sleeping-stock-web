@@ -47,6 +47,12 @@ def inventory_date_key(dt: Optional[datetime] = None) -> str:
     return (dt or _ist_now()).strftime("%Y%m%d")
 
 
+TODAY_STOCK_MISSING_MESSAGE = (
+    "Today's stock data is not uploaded. "
+    "Please ask the branch in-charge to upload today's stock data."
+)
+
+
 async def resolve_branch_inventory_date_key(
     db, *, brand_name: str, dealer_name: str, branch: str
 ) -> str:
@@ -66,8 +72,96 @@ async def resolve_branch_inventory_date_key(
     return (row or {}).get("active_date_key") or inventory_date_key()
 
 
+def today_inventory_date_keys(dt: Optional[datetime] = None) -> List[str]:
+    return [inventory_date_key(dt), ist_date_key(dt)]
+
+
+async def todays_branch_stock_date_key(
+    db, *, brand_name: str, dealer_name: str, branch: str
+) -> Optional[str]:
+    """Return the stored IST-today inventory key, or None if today's stock is missing."""
+    row = await db.products.find_one(
+        {
+            "brand_name": brand_name,
+            "dealer_name": dealer_name,
+            "branch": branch,
+            "publish_status": "Published",
+            "active_date_key": {"$in": today_inventory_date_keys()},
+        },
+        {"_id": 0, "active_date_key": 1},
+    )
+    return (row or {}).get("active_date_key")
+
+
+async def require_todays_branch_stock(
+    db, *, brand_name: str, dealer_name: str, branch: str
+) -> str:
+    date_key = await todays_branch_stock_date_key(
+        db, brand_name=brand_name, dealer_name=dealer_name, branch=branch
+    )
+    if not date_key:
+        raise HTTPException(status_code=400, detail=TODAY_STOCK_MISSING_MESSAGE)
+    return date_key
+
+
+def _ci_exact(value: str) -> dict:
+    return {"$regex": f"^{re.escape(str(value or ''))}$", "$options": "i"}
+
+
+async def resolve_pending_auto_assignment_date(
+    db,
+    *,
+    mobile_user_id: str,
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+) -> Optional[str]:
+    """Today's pending work, else the latest still-open allocation for this user/scope."""
+    today = ist_date_key()
+    exact_scope = {
+        "mobile_user_id": mobile_user_id,
+        "status": "pending",
+        "brand_name": brand_name,
+        "dealer_name": dealer_name,
+        "branch": branch,
+    }
+    if await db.auto_perpetual_assignments.find_one(
+        {**exact_scope, "allocation_date": today},
+        {"_id": 0, "allocation_date": 1},
+    ):
+        return today
+    latest_rows = await db.auto_perpetual_assignments.find(
+        exact_scope, {"_id": 0, "allocation_date": 1}
+    ).sort("allocation_date", -1).to_list(1)
+    if latest_rows and latest_rows[0].get("allocation_date"):
+        return latest_rows[0]["allocation_date"]
+    loose = {
+        "mobile_user_id": mobile_user_id,
+        "status": "pending",
+        "brand_name": _ci_exact(brand_name),
+        "dealer_name": _ci_exact(dealer_name),
+        "branch": _ci_exact(branch),
+    }
+    if await db.auto_perpetual_assignments.find_one(
+        {**loose, "allocation_date": today},
+        {"_id": 0, "allocation_date": 1},
+    ):
+        return today
+    latest_loose = await db.auto_perpetual_assignments.find(
+        loose, {"_id": 0, "allocation_date": 1}
+    ).sort("allocation_date", -1).to_list(1)
+    return (latest_loose[0] or {}).get("allocation_date") if latest_loose else None
+
+
 def yymmdd_key(dt: Optional[datetime] = None) -> str:
     return (dt or _ist_now()).strftime("%y%m%d")
+
+
+def yyyymmdd_key(dt: Optional[datetime] = None) -> str:
+    return (dt or _ist_now()).strftime("%Y%m%d")
+
+
+PARENT_AUDIT_USER_ID = "__AUDIT_PARENT__"
 
 
 def branch_code(branch_name: str) -> str:
@@ -199,6 +293,135 @@ async def get_or_create_auto_daily_session(
             return raced["session_id"]
         raise
     return session_id
+
+
+async def get_or_create_auto_parent_session(
+    db,
+    *,
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    audit_id: str,
+    suggestion_id: str,
+) -> str:
+    """One parent Auto Perpetual session per Branch + IST date. session_id is the Audit ID."""
+    verification_date = ist_date_key()
+    day_scope = {
+        "session_kind": "auto_perpetual",
+        "verification_date": verification_date,
+        "mobile_user_id": PARENT_AUDIT_USER_ID,
+        "brand_id": brand_name,
+        "dealer_id": dealer_name,
+        "branch_id": branch,
+    }
+    existing = await db.stock_verification_sessions.find_one(
+        day_scope,
+        {"_id": 0, "session_id": 1, "status": 1},
+        sort=[("created_at", 1)],
+    )
+    now = _now()
+    if existing and existing.get("session_id"):
+        await db.stock_verification_sessions.update_one(
+            {"session_id": existing["session_id"]},
+            {
+                "$set": {
+                    "updated_at": now,
+                    "suggestion_id": suggestion_id,
+                    "suggestion_number": audit_id,
+                    "audit_id": audit_id,
+                    "is_parent_audit": True,
+                    "status": existing.get("status") if existing.get("status") not in (None, "", "CLOSED") else "SENT",
+                }
+            },
+        )
+        return existing["session_id"]
+
+    session_doc = {
+        "id": str(uuid.uuid4()),
+        "session_id": audit_id,
+        "session_kind": "auto_perpetual",
+        "verification_type": "auto",
+        "verification_date": verification_date,
+        "mobile_user_id": PARENT_AUDIT_USER_ID,
+        "brand_id": brand_name,
+        "dealer_id": dealer_name,
+        "branch_id": branch,
+        "brand_name": brand_name,
+        "dealer_name": dealer_name,
+        "branch": branch,
+        "status": "SENT",
+        "total_items": 0,
+        "source": "AUTO_PERPETUAL",
+        "information_only": True,
+        "affects_stock": False,
+        "is_parent_audit": True,
+        "suggestion_id": suggestion_id,
+        "suggestion_number": audit_id,
+        "audit_id": audit_id,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        await db.stock_verification_sessions.insert_one(session_doc)
+        return audit_id
+    except DuplicateKeyError:
+        raced = await db.stock_verification_sessions.find_one(
+            day_scope,
+            {"_id": 0, "session_id": 1},
+            sort=[("created_at", 1)],
+        )
+        if raced and raced.get("session_id"):
+            return raced["session_id"]
+        by_id = await db.stock_verification_sessions.find_one(
+            {"session_id": audit_id}, {"_id": 0, "session_id": 1}
+        )
+        if by_id and by_id.get("session_id"):
+            return by_id["session_id"]
+        raise
+
+
+async def close_stale_auto_parent_sessions(
+    db,
+    *,
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    keep_session_id: str,
+) -> None:
+    """Close leftover parent Auto sessions that have no pending assignments."""
+    today = ist_date_key()
+    stale = await db.stock_verification_sessions.find(
+        {
+            "session_kind": "auto_perpetual",
+            "is_parent_audit": True,
+            "brand_id": brand_name,
+            "dealer_id": dealer_name,
+            "branch_id": branch,
+            "session_id": {"$ne": keep_session_id},
+            "status": {"$nin": ["CLOSED"]},
+        },
+        {"_id": 0, "session_id": 1, "verification_date": 1},
+    ).to_list(200)
+    now = _now()
+    for row in stale:
+        sid = row.get("session_id")
+        if not sid:
+            continue
+        pending = await db.auto_perpetual_assignments.count_documents(
+            {"session_id": sid, "status": "pending"}
+        )
+        if pending:
+            continue
+        if (row.get("verification_date") or "") >= today and sid == keep_session_id:
+            continue
+        await db.stock_verification_sessions.update_one(
+            {"session_id": sid},
+            {"$set": {"status": "CLOSED", "closed_at": now, "updated_at": now}},
+        )
+        await db.auto_perpetual_suggestions.update_one(
+            {"suggestion_number": sid, "status": {"$in": ["COMPLETED", "SENT"]}},
+            {"$set": {"status": "CLOSED", "closed_at": now}},
+        )
 
 
 def _working_days_left_in_month(dt: datetime) -> int:

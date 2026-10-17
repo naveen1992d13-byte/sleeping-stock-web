@@ -43,9 +43,12 @@ class TestReminderSchedule:
         assert sched['response_time_minutes'] == 30
         assert sched['reminder_at'] < sched['urgent_reminder_at'] < sched['reminder_3_at'] < sched['response_deadline']
 
-    def test_45_and_60_minute_buckets_unchanged(self):
-        assert odw.response_time_minutes_for_lines(21) == 45
-        assert odw.response_time_minutes_for_lines(51) == 60
+    def test_fifteen_minutes_per_five_lines(self):
+        assert odw.response_time_minutes_for_lines(1) == 15
+        assert odw.response_time_minutes_for_lines(5) == 15
+        assert odw.response_time_minutes_for_lines(6) == 30
+        assert odw.response_time_minutes_for_lines(11) == 45
+        assert odw.response_time_minutes_for_lines(16) == 60
         _, _, third45 = odw.reminder_offsets_minutes(45)
         _, _, third60 = odw.reminder_offsets_minutes(60)
         assert third45 == 44
@@ -191,7 +194,8 @@ class TestSlaHelpers:
         assert sla.is_timeout_due(expired) is True
 
     def test_reminders_due_at_thirds(self):
-        sent = datetime.now(timezone.utc) - timedelta(minutes=21)
+        # 5 lines → 15-minute SLA; at +11 min, reminders 1 & 2 are due, 3 is not.
+        sent = datetime.now(timezone.utc) - timedelta(minutes=11)
         header = {**odw.compute_response_schedule(5, sent), 'status': 'Requested', 'mobile_push_sent': {}}
         kinds = sla.reminder_due_kinds(header)
         assert 'reminder_1' in kinds
@@ -199,6 +203,6 @@ class TestSlaHelpers:
         assert 'reminder_3' not in kinds
 
     def test_reminders_stop_when_not_awaiting(self):
-        sent = datetime.now(timezone.utc) - timedelta(minutes=21)
+        sent = datetime.now(timezone.utc) - timedelta(minutes=11)
         header = {**odw.compute_response_schedule(5, sent), 'status': 'Approved'}
         assert sla.reminder_due_kinds(header) == []

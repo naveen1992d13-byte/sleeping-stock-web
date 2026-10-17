@@ -12,6 +12,7 @@ Viewing production data does not insert testing records.
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 import os
 import re
@@ -49,6 +50,19 @@ LOCAL_ONLY_COLLECTIONS = frozenset({
     "archive_job_locks",
     "login_repair_canaries",
     "login_screen_images",
+    "mobile_user_attendance",
+    "auto_perpetual_pool",
+    "auto_perpetual_assignments",
+    "auto_perpetual_suggestions",
+    "auto_perpetual_daily_runs",
+    "auto_perpetual_branch_planner",
+    # Finalized Analytics rollups are written/read only from Testing so upserts
+    # and status tracking never touch Production through the overlay.
+    "analytics_stock_daily_snapshots",
+    "analytics_rollup_status",
+    "analytics_daily_aggs",
+    # Order Desk sequential Auto Sourcing audit trail (Testing-local).
+    "order_sourcing_events",
 })
 
 # Business collections merged from production + testing deltas.
@@ -63,7 +77,10 @@ OVERLAY_COLLECTIONS = frozenset({
     "stock_verifications", "stock_verification_sessions", "stock_verification_history",
 })
 
-_ID_FIELDS = ("id", "user_id", "upload_id", "order_id", "request_id")
+_ID_FIELDS = ("id", "user_id", "upload_id", "order_id", "request_id", "device_id", "mobile_user_id", "file_id")
+_IDENT_PROJECTION = {"_id": 0, **{key: 1 for key in _ID_FIELDS}}
+_OVERLAP_SCAN_LIMIT = 200_000
+_READ_ONLY_COMMANDS = frozenset({"dbstats", "collstats", "ping", "buildinfo"})
 
 
 class ProductionWriteBlocked(RuntimeError):
@@ -78,6 +95,21 @@ def _strip_overlay_flags(query: Optional[Mapping[str, Any]]) -> tuple[dict, bool
     payload = dict(query or {})
     base_only = bool(payload.pop(QUERY_BASE_ONLY, False))
     testing_only = bool(payload.pop(QUERY_TESTING_ONLY, False))
+    # merge_query nests the origin flag inside $and when the query already has keys.
+    if isinstance(payload.get("$and"), list):
+        parts = []
+        for part in payload["$and"]:
+            if isinstance(part, Mapping) and (QUERY_BASE_ONLY in part or QUERY_TESTING_ONLY in part):
+                part = dict(part)
+                base_only = bool(part.pop(QUERY_BASE_ONLY, False)) or base_only
+                testing_only = bool(part.pop(QUERY_TESTING_ONLY, False)) or testing_only
+                if not part:
+                    continue
+            parts.append(part)
+        if parts:
+            payload["$and"] = parts
+        else:
+            payload.pop("$and")
     return payload, base_only, testing_only
 
 
@@ -118,6 +150,27 @@ def doc_id(doc: Mapping[str, Any] | None) -> str:
     if doc.get("_id") is not None:
         return str(doc["_id"])
     return ""
+
+
+def identity_query(ident: str) -> dict:
+    value = str(ident or "")
+    if not value:
+        return {"id": "__missing_overlay_id__"}
+    return {"$or": [{key: value} for key in _ID_FIELDS]}
+
+
+def identity_nin(idents) -> dict:
+    values = [str(x) for x in idents if x]
+    if not values:
+        return {}
+    return {"$and": [{key: {"$nin": values}} for key in _ID_FIELDS]}
+
+
+def identity_in(idents) -> dict:
+    values = [str(x) for x in idents if x]
+    if not values:
+        return {"id": "__missing_overlay_id__"}
+    return {"$or": [{key: {"$in": values}} for key in _ID_FIELDS]}
 
 
 def apply_mongo_update(base: dict, update: Mapping[str, Any]) -> dict:
@@ -355,6 +408,11 @@ class OverlayCursor:
             self._inner.allow_disk_use(_value)
         return self
 
+    def batch_size(self, size):
+        if self._inner is not None and hasattr(self._inner, "batch_size"):
+            self._inner.batch_size(size)
+        return self
+
     def _project(self, doc: dict) -> dict:
         if not self._projection:
             return doc
@@ -504,12 +562,29 @@ def _sort_key_tuple(doc: Mapping[str, Any], pairs: Sequence[tuple[str, int]]):
 
 
 def _doc_sort_before(left: Mapping[str, Any], right: Mapping[str, Any], pairs) -> bool:
-    lkey = _sort_key_tuple(left, pairs)
-    rkey = _sort_key_tuple(right, pairs)
-    try:
-        return lkey < rkey
-    except TypeError:
-        return str(lkey) < str(rkey)
+    lkeys = _sort_key_tuple(left, pairs)
+    rkeys = _sort_key_tuple(right, pairs)
+    for (_field, direction), lkey, rkey in zip(pairs, lkeys, rkeys):
+        try:
+            if lkey == rkey:
+                continue
+            less = lkey < rkey
+        except TypeError:
+            if str(lkey) == str(rkey):
+                continue
+            less = str(lkey) < str(rkey)
+        return less if int(direction) >= 0 else not less
+    return False
+
+
+def _doc_sort_cmp(pairs):
+    def _cmp(left, right):
+        if _doc_sort_before(left, right, pairs):
+            return -1
+        if _doc_sort_before(right, left, pairs):
+            return 1
+        return 0
+    return functools.cmp_to_key(_cmp)
 
 
 def _extract_sort_limit(stages: Sequence[Mapping[str, Any]]):
@@ -517,7 +592,15 @@ def _extract_sort_limit(stages: Sequence[Mapping[str, Any]]):
     sort_spec = None
     skip_n = 0
     limit_n = None
-    for stage in stages or []:
+    stages = list(stages or [])
+    # Only trailing page stages can be applied after merging; an earlier $sort
+    # feeds a later stage such as $group/$first and must stay in place.
+    cut = len(stages)
+    while cut and isinstance(stages[cut - 1], Mapping) and len(stages[cut - 1]) == 1 \
+            and next(iter(stages[cut - 1])) in ("$sort", "$skip", "$limit"):
+        cut -= 1
+    core.extend(stages[:cut])
+    for stage in stages[cut:]:
         if not isinstance(stage, Mapping) or len(stage) != 1:
             core.append(stage)
             continue
@@ -672,6 +755,9 @@ class ReadOnlyDatabase:
         return self[name]
 
 
+_COLLECTIONS_WITH_DELTAS: set = set()
+
+
 class OverlayCollection:
     def __init__(self, name: str, prod, test, overlays, tombstones):
         self.name = name
@@ -740,6 +826,7 @@ class OverlayCollection:
                 yield row
             return
         created_by_id: Dict[str, dict] = {}
+        created_without_id: List[dict] = []
         if not base_only:
             try:
                 created_cursor = self._test.find(self._testing_created_query(raw), {"_id": 0})
@@ -749,7 +836,10 @@ class OverlayCollection:
                     if not is_testing_created_doc(payload):
                         continue
                     ident = doc_id(payload)
-                    if ident and ident not in hidden:
+                    if not ident:
+                        payload.setdefault("data_origin", DATA_ORIGIN_TESTING)
+                        created_without_id.append(payload)
+                    elif ident not in hidden:
                         payload.setdefault("data_origin", DATA_ORIGIN_TESTING)
                         created_by_id[ident] = payload
             except Exception as exc:
@@ -761,7 +851,7 @@ class OverlayCollection:
                 async for row in _aiter(prod_cursor):
                     payload = dict(row)
                     ident = doc_id(payload)
-                    if not ident or ident in hidden:
+                    if ident and ident in hidden:
                         continue
                     if ident in created_by_id:
                         merged = created_by_id[ident]
@@ -779,6 +869,9 @@ class OverlayCollection:
                     continue
                 if _doc_matches(payload, raw):
                     yield payload
+            for payload in created_without_id:
+                if _doc_matches(payload, raw):
+                    yield payload
 
     async def _sorted_merge(self, raw, hidden, overlays, base_only, pairs):
         """Merge production + overlay-applied + testing-created without loading all rows."""
@@ -786,14 +879,14 @@ class OverlayCollection:
         exclude = set(hidden) | overlay_ids
         prod_query = raw
         if exclude:
-            nin = {"id": {"$nin": list(exclude)}}
+            nin = identity_nin(exclude)
             prod_query = {"$and": [raw, nin]} if raw else nin
         overlay_docs = []
         for ident, overlay in overlays.items():
             if ident in hidden:
                 continue
             try:
-                orig = await self._prod.find_one({"id": ident}, {"_id": 0})
+                orig = await self._prod.find_one(identity_query(ident), {"_id": 0})
             except Exception:
                 orig = None
             if not orig:
@@ -801,7 +894,7 @@ class OverlayCollection:
             merged = self._apply_overlay_row(orig, overlay)
             if _doc_matches(merged, raw):
                 overlay_docs.append(merged)
-        overlay_docs.sort(key=lambda d: _sort_key_tuple(d, pairs))
+        overlay_docs.sort(key=_doc_sort_cmp(pairs))
         streams = []
         try:
             prod_cursor = _apply_sort(self._prod.find(prod_query, {"_id": 0}), pairs)
@@ -900,18 +993,27 @@ class OverlayCollection:
             return created_n
         prod_query: dict = raw
         if hidden:
-            prod_query = {"$and": [raw, {"id": {"$nin": list(hidden)}}]} if raw else {"id": {"$nin": list(hidden)}}
+            nin = identity_nin(hidden)
+            prod_query = {"$and": [raw, nin]} if raw else nin
         try:
             prod_n = int(await self._prod.count_documents(prod_query))
         except Exception as exc:
             logger.warning("Production count failed for %s: %s", self.name, exc)
             prod_n = 0
         overlap = 0
-        if created_ids:
+        if created_ids and prod_n:
             try:
-                overlap = int(await self._prod.count_documents(
-                    {"$and": [prod_query, {"id": {"$in": created_ids}}]} if prod_query else {"id": {"$in": created_ids}}
-                ))
+                if prod_n <= max(len(created_ids), _OVERLAP_SCAN_LIMIT):
+                    # Combining a filter with a $in over thousands of ids runs for
+                    # minutes on DocumentDB; streaming the matching ids is seconds.
+                    created_set = set(created_ids)
+                    async for row in _aiter(self._prod.find(prod_query, _IDENT_PROJECTION)):
+                        if doc_id(row) in created_set:
+                            overlap += 1
+                else:
+                    overlap = int(await self._prod.count_documents(
+                        {"$and": [prod_query, identity_in(created_ids)]} if prod_query else identity_in(created_ids)
+                    ))
             except Exception:
                 overlap = 0
         overlay_delta = 0
@@ -919,7 +1021,7 @@ class OverlayCollection:
             if ident in hidden:
                 continue
             try:
-                orig = await self._prod.find_one({"id": ident}, {"_id": 0})
+                orig = await self._prod.find_one(identity_query(ident), {"_id": 0})
             except Exception:
                 orig = None
             if not orig:
@@ -942,14 +1044,22 @@ class OverlayCollection:
         return rows
 
     async def _has_any_deltas(self) -> bool:
+        # Deltas are only ever added at runtime, and the split read path stays
+        # correct without them, so a positive answer is safe to keep. The
+        # unindexed testing-created scan costs ~2s per call on large collections.
+        if self.name in _COLLECTIONS_WITH_DELTAS:
+            return True
         try:
-            if int(await self._tombstones.count_documents({"collection": self.name})) > 0:
-                return True
-            if int(await self._overlays.count_documents({"collection": self.name})) > 0:
-                return True
-            return int(await self._test.count_documents(self._testing_created_query({}))) > 0
+            found = (
+                await self._tombstones.find_one({"collection": self.name}, {"_id": 1})
+                or await self._overlays.find_one({"collection": self.name}, {"_id": 1})
+                or await self._test.find_one(self._testing_created_query({}), {"_id": 1})
+            )
         except Exception:
             return False
+        if found:
+            _COLLECTIONS_WITH_DELTAS.add(self.name)
+        return bool(found)
 
     async def insert_one(self, doc, *args, **kwargs):
         if self._local_only():
@@ -971,8 +1081,8 @@ class OverlayCollection:
             return True
         if ident:
             found = await self._test.find_one(
-                self._testing_created_query({"id": ident}),
-                {"_id": 0, "id": 1, "data_origin": 1},
+                self._testing_created_query(identity_query(ident)),
+                {"_id": 0, "id": 1, "mobile_user_id": 1, "device_id": 1, "data_origin": 1},
             )
             return bool(found)
         return False
@@ -985,7 +1095,7 @@ class OverlayCollection:
             return _WriteResult(matched_count=0, modified_count=0)
         ident = doc_id(existing)
         if await self._is_testing_owned(ident, existing):
-            return await self._test.update_one({"id": ident} if ident else query, update)
+            return await self._test.update_one(identity_query(ident) if ident else query, update)
         overlay_payload = apply_mongo_update(
             (await self._overlays.find_one({"collection": self.name, "production_id": ident}) or {}).get("payload") or existing,
             update,
@@ -1045,7 +1155,7 @@ class OverlayCollection:
         ident = doc_id(existing)
         if await self._is_testing_owned(ident, existing):
             return await self._test.find_one_and_update(query, update, *args, **kwargs)
-        await self.update_one({"id": ident} if ident else query, update)
+        await self.update_one(identity_query(ident) if ident else query, update)
         return_document = kwargs.get("return_document")
         after = False
         if return_document is not None:
@@ -1053,7 +1163,7 @@ class OverlayCollection:
         if not after:
             return existing
         if ident:
-            return await self.find_one({"id": ident})
+            return await self.find_one(identity_query(ident))
         return apply_mongo_update(copy.deepcopy(existing), update)
 
     async def delete_one(self, query, *args, **kwargs):
@@ -1064,7 +1174,7 @@ class OverlayCollection:
             return _WriteResult(deleted_count=0)
         ident = doc_id(existing)
         if await self._is_testing_owned(ident, existing):
-            result = await self._test.delete_one({"id": ident} if ident else query)
+            result = await self._test.delete_one(identity_query(ident) if ident else query)
             await self._overlays.delete_many({"collection": self.name, "production_id": ident})
             return result
         await self._tombstones.update_one(
@@ -1101,8 +1211,17 @@ class OverlayCollection:
         )
 
     def aggregate(self, pipeline, *args, **kwargs):
+        base_only = testing_only = False
+        if pipeline and isinstance(pipeline[0], Mapping) and isinstance(pipeline[0].get("$match"), Mapping):
+            raw, base_only, testing_only = _strip_overlay_flags(pipeline[0]["$match"])
+            pipeline = [{"$match": raw}] + list(pipeline[1:])
         if self._local_only():
             return OverlayCursor(inner=self._test.aggregate(pipeline, *args, **kwargs))
+        if testing_only:
+            created = [{"$match": self._testing_created_query(pipeline[0]["$match"])}] + list(pipeline[1:])
+            return OverlayCursor(inner=self._test.aggregate(created, *args, **kwargs))
+        if base_only:
+            return OverlayCursor(inner=self._prod.aggregate(pipeline, *args, **kwargs))
         cursor = OverlayCursor(prepare=None)
 
         async def prepare():
@@ -1140,7 +1259,7 @@ class OverlayCollection:
 
         prod_match = dict(match)
         if exclude:
-            nin = {"id": {"$nin": list(exclude)}}
+            nin = identity_nin(exclude)
             prod_match = {"$and": [match, nin]} if match else nin
         created_match = self._testing_created_query(match)
 
@@ -1167,7 +1286,7 @@ class OverlayCollection:
             if ident in hidden:
                 continue
             try:
-                orig = await self._prod.find_one({"id": ident}, {"_id": 0})
+                orig = await self._prod.find_one(identity_query(ident), {"_id": 0})
             except Exception:
                 orig = None
             if not orig:
@@ -1332,6 +1451,13 @@ class OverlayDatabase:
                 self._test[TOMBSTONE_COLLECTION],
             )
         return self._cache[name]
+
+    async def command(self, command, *args, **kwargs):
+        # Stats describe the Testing database itself; never run commands on Production.
+        name = command if isinstance(command, str) else next(iter(command or {}), "")
+        if str(name).lower() not in _READ_ONLY_COMMANDS:
+            raise ProductionWriteBlocked(f"Refusing database command {name!r} from the testing overlay")
+        return await self._test.command(command, *args, **kwargs)
 
     def __getattr__(self, name: str):
         if name.startswith("_"):

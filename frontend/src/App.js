@@ -5,25 +5,9 @@ import { Toaster } from 'sonner';
 import './App.css';
 import { ProcessingProvider } from './components/GlobalProcessingOverlay';
 
-// Import pages
+// Import pages — module screens mount via DashboardLayout keep-alive.
 import { LoginPage } from './pages/LoginPage';
 import { DashboardLayout } from './pages/DashboardLayout';
-import NoticeBoard from './pages/NoticeBoard';
-import { Products } from './pages/Products';
-import { ProductHubHistory } from './pages/ProductHubHistory';
-import { Orders } from './pages/Orders';
-import UploadCenter from "./pages/Upload";
-import { Notifications } from './pages/Notifications';
-import Users from './pages/Users';
-import { Profile } from './pages/Profile';
-import { Reports } from './pages/Reports';
-import { Analytics } from './pages/Analytics';
-import { Requests } from './pages/Requests';
-import { QueryDesk } from './pages/QueryDesk';
-import NMTSMobile from './pages/NMTSMobile';
-import { OrderHistory } from './pages/OrderHistory';
-import StockAudit from './pages/StockAudit';
-import { StorageCostMonitor } from './pages/StorageCostMonitor';
 import { SessionInactivityGuard } from './components/SessionInactivityGuard';
 import {
   touchSessionActivity,
@@ -34,7 +18,6 @@ import {
 import { resolveApiUrl, resolveBackendUrl } from '@/backendUrl';
 import { getFirstAllowedMenuItem } from './config/menuConfig';
 import { isTestingUiEnabled } from './testingUi';
-import { LoginScreenManager } from './pages/LoginScreenManager';
 import { TestingBanner } from './components/TestingBanner';
 
 const AuthContext = createContext(null);
@@ -86,6 +69,7 @@ export const canAccessMenuItem = (user, item) => {
   if (item.testingOnly && !isTestingUiEnabled()) return false;
   if (item.masterOnly) return user.role === 'master';
   if (item.allRoles) return true;
+  if (item.allowUser && user.role === 'user') return true;
   if (item.adminOnly && user.role === 'user') {
     return normalizePermissions(user.permissions).includes(item.permissionLabel || item.label);
   }
@@ -179,14 +163,21 @@ function AuthProvider({ children }) {
     setUser(null);
   };
 
+  const refreshUser = async () => {
+    const token = localStorage.getItem('token');
+    if (!token) return null;
+    const res = await axios.get(`${API}/auth/me`);
+    return saveUserSession(token, res.data);
+  };
+
   return (
-    <AuthContext.Provider value={{ user, login, logout, loading }}>
+    <AuthContext.Provider value={{ user, login, logout, loading, refreshUser }}>
       {children}
     </AuthContext.Provider>
   );
 }
 
-function ProtectedRoute({ children, permission, masterOnly = false }) {
+function ProtectedRoute({ children, permission, masterOnly = false, allowUser = false }) {
   const { user, loading } = useAuth();
   const location = useLocation();
 
@@ -198,6 +189,10 @@ function ProtectedRoute({ children, permission, masterOnly = false }) {
 
   if (masterOnly && user.role !== 'master') {
     return <Navigate to="/" replace />;
+  }
+
+  if (allowUser && user.role === 'user') {
+    return children;
   }
 
   if (!canAccessPermission(user, permission)) {
@@ -261,88 +256,56 @@ function App() {
               <DashboardLayout />
             </ProtectedRoute>
           }>
+            {/* Keep-alive modules mount in DashboardLayout (display:none when inactive).
+                Routes stay for permission gates + deep links; element is null to avoid double mount. */}
             <Route path="dashboard" element={
-              <ProtectedRoute permission="Analytics">
-                <Analytics />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Analytics">{null}</ProtectedRoute>
             } />
             <Route path="notice-board" element={
-              <ProtectedRoute permission="Notice Board">
-                <NoticeBoard />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Notice Board">{null}</ProtectedRoute>
             } />
             <Route path="products" element={
-              <ProtectedRoute permission="Product Hub">
-                <Products />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Product Hub">{null}</ProtectedRoute>
             } />
             <Route path="product-history" element={
-              <ProtectedRoute permission="Product Hub History">
-                <ProductHubHistory />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Product Hub History">{null}</ProtectedRoute>
             } />
             <Route path="orders" element={
-              <ProtectedRoute permission="Order Desk">
-                <Orders />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Order Desk">{null}</ProtectedRoute>
             } />
             <Route path="order-history" element={
-              <ProtectedRoute permission="Order Desk">
-                <OrderHistory />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Order Desk">{null}</ProtectedRoute>
             } />
             <Route path="upload" element={
-              <ProtectedRoute permission="Upload Center">
-                <UploadCenter />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Upload Center">{null}</ProtectedRoute>
             } />
-            <Route path="notifications" element={<Notifications />} />
+            <Route path="notifications" element={null} />
             <Route path="users" element={
-              <ProtectedRoute permission="User Hub">
-                <Users />
-              </ProtectedRoute>
+              <ProtectedRoute permission="User Hub" allowUser>{null}</ProtectedRoute>
             } />
-            <Route path="profile/:userId?" element={<Profile />} />
+            <Route path="profile/:userId?" element={null} />
             <Route path="reports" element={
-              <ProtectedRoute permission="Reports">
-                <Reports />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Reports">{null}</ProtectedRoute>
             } />
             <Route path="analytics" element={
-              <ProtectedRoute permission="Analytics">
-                <Analytics />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Analytics">{null}</ProtectedRoute>
             } />
             <Route path="storage-cost-monitor" element={
-              <ProtectedRoute permission="Storage & Cost Monitor" masterOnly>
-                <StorageCostMonitor />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Storage & Cost Monitor" masterOnly>{null}</ProtectedRoute>
             } />
             <Route path="login-screen-manager" element={
-              <ProtectedRoute masterOnly>
-                <LoginScreenManager />
-              </ProtectedRoute>
+              <ProtectedRoute masterOnly>{null}</ProtectedRoute>
             } />
             <Route path="requests" element={
-              <ProtectedRoute permission="Request Center">
-                <Requests />
-              </ProtectedRoute>
+              <ProtectedRoute permission="Request Center">{null}</ProtectedRoute>
             } />
-            <Route path="sleeping-stock-mobile" element={
-              <ProtectedRoute>
-                <NMTSMobile />
-              </ProtectedRoute>
-            } />
+            <Route path="sleeping-stock-mobile" element={<Navigate to="/users?section=mobile" replace />} />
             <Route path="stock-audit" element={
-              <ProtectedRoute>
-                <StockAudit />
-              </ProtectedRoute>
+              <ProtectedRoute>{null}</ProtectedRoute>
             } />
-            <Route path="nmts-mobile" element={<Navigate to="/sleeping-stock-mobile" replace />} />
+            <Route path="nmts-mobile" element={<Navigate to="/users?section=mobile" replace />} />
             <Route path="query" element={
-              <ProtectedRoute>
-                <QueryDesk />
-              </ProtectedRoute>
+              <ProtectedRoute>{null}</ProtectedRoute>
             } />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

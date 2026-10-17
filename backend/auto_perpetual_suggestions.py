@@ -15,6 +15,7 @@ try:
 except ImportError:
     import testing_runtime
 
+from auto_perpetual_blind import compact_edit_status
 from auto_perpetual import (
     IST,
     _attendance_active_users,
@@ -24,22 +25,24 @@ from auto_perpetual import (
     _verified_parts_this_month,
     _working_days_left_in_month,
     branch_code,
-    get_or_create_auto_daily_session,
+    close_stale_auto_parent_sessions,
+    get_or_create_auto_parent_session,
     ist_date_key,
     month_key,
     sync_monthly_pool,
-    yymmdd_key,
+    yyyymmdd_key,
 )
 
 
 def _natural_sort_key(text: str) -> Tuple:
-    s = (text or "").strip().upper()
+    s = str(text or "").strip().upper()
     parts = re.split(r"(\d+)", s)
     out: List[Any] = []
     for p in parts:
         if not p:
             continue
-        out.append(int(p) if p.isdigit() else p)
+        # Tag type so mixed locations like "12-A" and "A-12" can sort together.
+        out.append((0, int(p)) if p.isdigit() else (1, p))
     return tuple(out)
 
 
@@ -62,6 +65,118 @@ def _product_mav(product: Optional[dict]) -> float:
     return 0.0
 
 
+def _item_location_sort_key(row: dict) -> str:
+    return str(row.get("system_location") or row.get("loc") or "").upper()
+
+
+def assignment_as_suggestion_item(row: dict) -> dict:
+    return {
+        "part_number": row.get("part_number"),
+        "part_name": row.get("part_name") or "",
+        "system_qty": row.get("system_qty"),
+        "system_location": row.get("loc") or row.get("system_location") or "",
+        "suggestion_type": row.get("suggestion_type"),
+        "mobile_user_id": row.get("mobile_user_id"),
+        "mobile_user_name": row.get("mobile_user_name") or "",
+        "task_id": row.get("task_id"),
+        "session_id": row.get("session_id"),
+        "batch_no": row.get("batch_no"),
+        "verification_status": row.get("status") or row.get("verification_status") or "pending",
+        "edit_count": int(row.get("edit_count") or 0),
+        "quantity_edit_history": list(row.get("quantity_edit_history") or []),
+        "quantity_edit_status": row.get("quantity_edit_status") or "",
+        "edit_status_label": compact_edit_status(row.get("quantity_edit_history")),
+        "original_physical_quantity": row.get("original_physical_quantity"),
+        "physical_quantity": row.get("physical_quantity"),
+    }
+
+
+def _prefix_audit_id(value: str) -> str:
+    """Testing Audit IDs use TS without a hyphen so APSVAN… stays one token."""
+    text = str(value or "")
+    if not testing_runtime.is_testing_env() or not text:
+        return text
+    if text.startswith("TS"):
+        return text
+    return f"TS{text}"
+
+
+async def _mobile_user_name_map(db, user_ids: List[str]) -> Dict[str, str]:
+    ids = [u for u in {str(x or "").strip() for x in user_ids} if u]
+    if not ids:
+        return {}
+    rows = await db.mobile_users.find(
+        {"mobile_user_id": {"$in": ids}},
+        {"_id": 0, "mobile_user_id": 1, "name": 1},
+    ).to_list(len(ids))
+    return {str(r.get("mobile_user_id")): str(r.get("name") or "") for r in rows}
+
+
+async def suggestion_with_line_items(db, suggestion_id: str) -> dict:
+    row = await db.auto_perpetual_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
+    if not row:
+        raise HTTPException(404, "Suggestion not found")
+    assigns = await db.auto_perpetual_assignments.find(
+        {
+            "$or": [
+                {"suggestion_id": suggestion_id},
+                {"suggestion_number": row.get("suggestion_number")},
+            ]
+        },
+        {"_id": 0},
+    ).to_list(5000)
+    items = list(row.get("items") or [])
+    if not items:
+        items = [assignment_as_suggestion_item(a) for a in assigns]
+    else:
+        by_part = {str(a.get("part_number") or "").upper(): a for a in assigns}
+        merged = []
+        for it in items:
+            part = str(it.get("part_number") or "").upper()
+            extra = by_part.get(part) or {}
+            merged.append({**assignment_as_suggestion_item(extra), **it, **{
+                "mobile_user_id": it.get("mobile_user_id") or extra.get("mobile_user_id"),
+                "task_id": it.get("task_id") or extra.get("task_id"),
+                "session_id": it.get("session_id") or extra.get("session_id"),
+            }})
+        items = merged
+    names = await _mobile_user_name_map(db, [it.get("mobile_user_id") for it in items])
+    histories = await db.stock_verification_history.find(
+        {
+            "suggestion_number": row.get("suggestion_number"),
+            "verification_type": "auto",
+        },
+        {
+            "_id": 0,
+            "part_number": 1,
+            "mobile_user_id": 1,
+            "quantity_edit_history": 1,
+            "edit_count": 1,
+            "quantity_edit_status": 1,
+            "original_physical_quantity": 1,
+            "physical_quantity": 1,
+        },
+    ).to_list(5000)
+    hist_by_part = {str(h.get("part_number") or "").upper(): h for h in histories}
+    for it in items:
+        mu = it.get("mobile_user_id")
+        it["mobile_user_name"] = names.get(mu) or it.get("mobile_user_name") or ""
+        hist = hist_by_part.get(str(it.get("part_number") or "").upper()) or {}
+        if hist:
+            it["edit_count"] = int(hist.get("edit_count") or 0)
+            it["quantity_edit_history"] = list(hist.get("quantity_edit_history") or [])
+            it["quantity_edit_status"] = hist.get("quantity_edit_status") or ""
+            it["original_physical_quantity"] = hist.get("original_physical_quantity")
+            it["physical_quantity"] = hist.get("physical_quantity")
+        it["edit_status_label"] = compact_edit_status(it.get("quantity_edit_history"))
+    items.sort(key=lambda r: _natural_sort_key(r.get("system_location") or r.get("loc") or ""))
+    row["items"] = items
+    row["audit_id"] = row.get("suggestion_number")
+    if items and not row.get("total_items"):
+        row["total_items"] = len(items)
+    return row
+
+
 async def ensure_suggestion_indexes(db) -> None:
     await db.auto_perpetual_suggestions.create_index(
         [("allocation_date", 1), ("branch", 1), ("brand_name", 1), ("dealer_name", 1)],
@@ -77,21 +192,22 @@ async def ensure_suggestion_indexes(db) -> None:
     )
 
 
-async def _next_aps_number(db) -> str:
-    date_key = yymmdd_key()
-    counter_id = f"aps_suggestion_{date_key}"
+async def _next_aps_number(db, branch: str) -> str:
+    date_key = yyyymmdd_key()
+    code = branch_code(branch)
+    counter_id = f"aps_audit_{code}_{date_key}"
     from pymongo import ReturnDocument
 
     counter = await db.counters.find_one_and_update(
         {"_id": counter_id},
-        {"$inc": {"seq": 1}, "$setOnInsert": {"date_key": date_key}},
+        {"$inc": {"seq": 1}, "$setOnInsert": {"date_key": date_key, "branch_code": code}},
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
     seq = int(counter.get("seq", 1))
-    if seq > 9999:
+    if seq > 999:
         raise HTTPException(status_code=500, detail="Daily APS serial exhausted")
-    return testing_runtime.prefix_business_id(f"APS{date_key}{seq:04d}")
+    return _prefix_audit_id(f"APS{code}{date_key}{seq:03d}")
 
 
 
@@ -312,6 +428,57 @@ def select_items_502525(
     return out[:total_needed]
 
 
+def allocate_contiguous_location_blocks(items: List[dict], user_ids: List[str]) -> Dict[str, List[dict]]:
+    """Split naturally sorted items into nearly equal contiguous location-row blocks."""
+    ids = [u for u in user_ids if u]
+    result: Dict[str, List[dict]] = {u: [] for u in ids}
+    if not ids:
+        return result
+    ordered = sorted(
+        list(items or []),
+        key=lambda r: _natural_sort_key(r.get("system_location") or r.get("loc") or ""),
+    )
+    groups: List[List[dict]] = []
+    for it in ordered:
+        row_key = _location_row(it.get("system_location") or it.get("loc") or "")
+        if groups and _location_row(groups[-1][0].get("system_location") or groups[-1][0].get("loc") or "") == row_key:
+            groups[-1].append(it)
+        else:
+            groups.append([it])
+    total = len(ordered)
+    n = len(ids)
+    base, rem = divmod(total, n)
+    quotas = [base + (1 if i < rem else 0) for i in range(n)]
+    gi = 0
+    remaining_items = total
+    for ui, uid in enumerate(ids):
+        need = quotas[ui]
+        while gi < len(groups):
+            group = groups[gi]
+            glen = len(group)
+            remaining_after = remaining_items - glen
+            remaining_need = sum(quotas[ui + 1 :])
+            if (
+                ui < n - 1
+                and len(result[uid]) > 0
+                and len(result[uid]) + glen > need
+                and remaining_after >= remaining_need
+            ):
+                break
+            result[uid].extend(group)
+            remaining_items -= glen
+            gi += 1
+            if ui == n - 1:
+                continue
+            if len(result[uid]) >= need:
+                break
+        if ui == n - 1:
+            while gi < len(groups):
+                result[uid].extend(groups[gi])
+                gi += 1
+    return result
+
+
 async def compute_user_targets(
     db,
     *,
@@ -507,10 +674,11 @@ async def create_draft_suggestion(
             }
         )
 
-    aps = await _next_aps_number(db)
+    aps = await _next_aps_number(db, branch)
     doc = {
         "id": str(uuid.uuid4()),
         "suggestion_number": aps,
+        "audit_id": aps,
         **scope,
         "month_key": month,
         "status": "DRAFT",
@@ -586,10 +754,10 @@ async def send_suggestion_to_mobile(
     if not active_users:
         raise HTTPException(400, "No active mobile users for today")
 
-    targets = sug.get("targets_by_user") or {}
-    mu_order = [u["mobile_user_id"] for u in active_users if targets.get(u["mobile_user_id"], 0) > 0]
+    mu_order = [u["mobile_user_id"] for u in active_users]
+    user_names = {u["mobile_user_id"]: u.get("name") or "" for u in active_users}
     if not mu_order:
-        mu_order = [u["mobile_user_id"] for u in active_users]
+        raise HTTPException(400, "No Present mobile users are eligible")
 
     items = sorted(
         list(sug.get("items") or []),
@@ -612,37 +780,43 @@ async def send_suggestion_to_mobile(
     if not valid_items:
         raise HTTPException(400, "No eligible items remain to send (zero qty or already verified)")
 
-    idx = 0
+    audit_id = sug.get("suggestion_number")
+    parent_session_id = await get_or_create_auto_parent_session(
+        db,
+        brand_name=brand_name,
+        dealer_name=dealer_name,
+        branch=branch,
+        audit_id=audit_id,
+        suggestion_id=sug["id"],
+    )
+    await close_stale_auto_parent_sessions(
+        db,
+        brand_name=brand_name,
+        dealer_name=dealer_name,
+        branch=branch,
+        keep_session_id=parent_session_id,
+    )
+
+    blocks = allocate_contiguous_location_blocks(valid_items, mu_order)
+    names = await _mobile_user_name_map(db, mu_order)
+    for mu, name in names.items():
+        user_names[mu] = name or user_names.get(mu) or ""
+
     assignments_by_user: Dict[str, int] = {}
     updated_items: List[dict] = []
-    for mu in mu_order:
-        need = int(targets.get(mu) or 0)
-        if need <= 0:
+    allocated_parts: Set[str] = set()
+    for user_index, mu in enumerate(mu_order, start=1):
+        chunk = blocks.get(mu) or []
+        if not chunk:
             continue
-        session_id = await get_or_create_auto_daily_session(
-            db,
-            mobile_user_id=mu,
-            brand_name=brand_name,
-            dealer_name=dealer_name,
-            branch=branch,
-        )
-        await db.stock_verification_sessions.update_one(
-            {"session_id": session_id},
-            {
-                "$set": {
-                    "suggestion_id": sug["id"],
-                    "suggestion_number": sug["suggestion_number"],
-                    "updated_at": _now(),
-                }
-            },
-        )
+        task_id = f"{audit_id}U{user_index:02d}"
         batch_no = 1
         batch_count = 0
         assignments_by_user[mu] = 0
-        while need > 0 and idx < len(valid_items):
-            it = valid_items[idx]
-            idx += 1
-            part = it["part_number"]
+        for it in chunk:
+            part = str(it.get("part_number") or "").upper()
+            if part in allocated_parts:
+                continue
             try:
                 await db.auto_perpetual_assignments.insert_one(
                     {
@@ -653,13 +827,18 @@ async def send_suggestion_to_mobile(
                         "dealer_name": dealer_name,
                         "branch": branch,
                         "mobile_user_id": mu,
+                        "mobile_user_name": user_names.get(mu) or "",
                         "part_number": part,
+                        "part_name": it.get("part_name") or "",
+                        "system_qty": it.get("system_qty"),
                         "loc": it.get("system_location"),
                         "coverage_kind": "monthly",
-                        "session_id": session_id,
+                        "session_id": parent_session_id,
+                        "task_id": task_id,
                         "status": "pending",
-                        "suggestion_number": sug["suggestion_number"],
+                        "suggestion_number": audit_id,
                         "suggestion_id": sug["id"],
+                        "audit_id": audit_id,
                         "batch_no": batch_no,
                         "suggestion_type": it.get("suggestion_type"),
                         "assigned_at": _now(),
@@ -668,6 +847,7 @@ async def send_suggestion_to_mobile(
                 )
             except DuplicateKeyError:
                 continue
+            allocated_parts.add(part)
             await db.auto_perpetual_pool.update_one(
                 {"month_key": month, "branch": branch, "part_number": part, "coverage_kind": "monthly"},
                 {
@@ -681,14 +861,25 @@ async def send_suggestion_to_mobile(
             )
             batch_count += 1
             assignments_by_user[mu] += 1
-            need -= 1
             if batch_count >= BATCH_SIZE:
                 batch_no += 1
                 batch_count = 0
-            updated_items.append({**it, "mobile_user_id": mu, "batch_no": batch_no, "verification_status": "pending"})
+            updated_items.append(
+                {
+                    **it,
+                    "mobile_user_id": mu,
+                    "mobile_user_name": user_names.get(mu) or "",
+                    "task_id": task_id,
+                    "session_id": parent_session_id,
+                    "batch_no": batch_no,
+                    "verification_status": "pending",
+                }
+            )
 
-    for it in valid_items[idx:]:
-        updated_items.append({**it, "verification_status": "skipped_unallocated"})
+    for it in valid_items:
+        part = str(it.get("part_number") or "").upper()
+        if part not in allocated_parts:
+            updated_items.append({**it, "verification_status": "skipped_unallocated"})
 
     sent_count = sum(assignments_by_user.values())
     await db.auto_perpetual_suggestions.update_one(
@@ -701,6 +892,8 @@ async def send_suggestion_to_mobile(
                 "sent_by": actor_user_id,
                 "assignments_created": sent_count,
                 "assignments_by_user": assignments_by_user,
+                "parent_session_id": parent_session_id,
+                "audit_id": audit_id,
             }
         },
     )
@@ -720,15 +913,27 @@ async def send_suggestion_to_mobile(
                 "brand_name": brand_name,
                 "dealer_name": dealer_name,
             },
-            {"$set": {"status": "sent", "assignments_created": sent_count, "sent_at": _now()}},
+            {"$set": {"status": "sent", "assignments_created": sent_count, "sent_at": _now(), "parent_session_id": parent_session_id}},
             upsert=True,
         )
 
     if notify_fn and assignments_by_user:
         await notify_fn(assignments_by_user=assignments_by_user, branch=branch, allocation_date=allocation_date)
 
+    await db.stock_verification_sessions.update_one(
+        {"session_id": parent_session_id},
+        {
+            "$set": {
+                "status": "SENT" if sent_count else "DRAFT",
+                "total_items": sent_count,
+                "updated_at": _now(),
+            }
+        },
+    )
     return {
         "suggestion_number": sug["suggestion_number"],
+        "audit_id": audit_id,
+        "session_id": parent_session_id,
         "assignments_created": sent_count,
         "assignments_by_user": assignments_by_user,
     }
@@ -742,12 +947,24 @@ async def refresh_suggestion_status(db, suggestion_id: str) -> None:
     done = await db.auto_perpetual_assignments.count_documents({"suggestion_id": suggestion_id, "status": "completed"})
     if assigns and done >= assigns:
         await db.auto_perpetual_suggestions.update_one({"id": suggestion_id}, {"$set": {"status": "COMPLETED", "completed_at": _now()}})
+        await db.stock_verification_sessions.update_one(
+            {"suggestion_id": suggestion_id, "is_parent_audit": True},
+            {"$set": {"status": "COMPLETED", "updated_at": _now()}},
+        )
     elif done > 0:
         await db.auto_perpetual_suggestions.update_one({"id": suggestion_id}, {"$set": {"status": "IN_PROGRESS"}})
+        await db.stock_verification_sessions.update_one(
+            {"suggestion_id": suggestion_id, "is_parent_audit": True, "status": {"$nin": ["CLOSED", "COMPLETED"]}},
+            {"$set": {"status": "IN_PROGRESS", "updated_at": _now()}},
+        )
 
 
 async def finish_auto_session_for_user(db, *, mobile_user_id: str, brand_name: str, dealer_name: str, branch: str) -> dict:
     allocation_date = ist_date_key()
+    asn = await db.auto_perpetual_assignments.find_one(
+        {"allocation_date": allocation_date, "mobile_user_id": mobile_user_id, "branch": branch},
+        {"_id": 0, "session_id": 1, "suggestion_id": 1},
+    )
     scope = {
         "session_kind": "auto_perpetual",
         "verification_date": allocation_date,
@@ -757,6 +974,8 @@ async def finish_auto_session_for_user(db, *, mobile_user_id: str, brand_name: s
         "branch_id": branch,
     }
     sess = await db.stock_verification_sessions.find_one(scope, {"_id": 0})
+    if not sess and asn and asn.get("session_id"):
+        sess = await db.stock_verification_sessions.find_one({"session_id": asn["session_id"]}, {"_id": 0})
     if not sess:
         raise HTTPException(404, "No Auto Perpetual session for today")
 
@@ -788,24 +1007,25 @@ async def finish_auto_session_for_user(db, *, mobile_user_id: str, brand_name: s
         {"session_id": sess["session_id"], "verification_type": "auto", "location_status": "mismatch"}
     )
 
-    await db.stock_verification_sessions.update_one(
-        {"session_id": sess["session_id"]},
-        {
-            "$set": {
-                "status": status,
-                "finished_at": _now(),
-                "assigned_count": assigned,
-                "completed_count": completed,
-                "pending_count": max(0, pending),
-                "match_count": match_c,
-                "shortage_count": shortage_c,
-                "excess_count": excess_c,
-                "location_mismatch_count": loc_m,
-                "updated_at": _now(),
-            }
-        },
-    )
-    sid = sess.get("suggestion_id")
+    if not sess.get("is_parent_audit"):
+        await db.stock_verification_sessions.update_one(
+            {"session_id": sess["session_id"]},
+            {
+                "$set": {
+                    "status": status,
+                    "finished_at": _now(),
+                    "assigned_count": assigned,
+                    "completed_count": completed,
+                    "pending_count": max(0, pending),
+                    "match_count": match_c,
+                    "shortage_count": shortage_c,
+                    "excess_count": excess_c,
+                    "location_mismatch_count": loc_m,
+                    "updated_at": _now(),
+                }
+            },
+        )
+    sid = sess.get("suggestion_id") or (asn or {}).get("suggestion_id")
     if not sid:
         asn = await db.auto_perpetual_assignments.find_one(
             {"allocation_date": allocation_date, "mobile_user_id": mobile_user_id, "branch": branch},

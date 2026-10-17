@@ -31,6 +31,8 @@ backend/.env.s3.local
 .env.s3.local
 
 # EC2-local secrets and TLS material (never commit)
+backend/.env
+.env
 backend/.env.backup
 backend/certs/
 

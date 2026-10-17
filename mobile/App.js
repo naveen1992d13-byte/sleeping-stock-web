@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  AppState,
   BackHandler,
   FlatList,
   Image,
@@ -25,12 +26,21 @@ import * as Device from 'expo-device';
 import Constants from 'expo-constants';
 import NetInfo from '@react-native-community/netinfo';
 
-import { getSession, saveSession, clearSession } from './src/services/session';
+import {
+  getSession,
+  saveSession,
+  clearSession,
+  getBranchTransferredFlag,
+  setBranchTransferredFlag,
+  BRANCH_TRANSFERRED_MESSAGE,
+} from './src/services/session';
 import {
   ApiError,
   setOnSessionInvalidated,
+  isBranchTransferredError,
   verifyPairing,
   validateSession,
+  sendHeartbeat,
   getNotifications,
   acceptNotification,
   skipNotification,
@@ -48,11 +58,13 @@ import {
   subscribeToQueueChanges,
   startAutoSync,
   syncQueue,
+  clearQueuedRecords,
 } from './src/services/offlineQueue';
 import {
   initPushNotifications,
   registerForPushNotificationsAsync,
 } from './src/services/pushNotifications';
+import { normalizeApiBaseUrl, PRODUCTION_API_BASE_URL } from './src/config/env';
 
 const BLUE = '#2458c6';
 const DARK = '#14213d';
@@ -172,6 +184,7 @@ export default function App() {
   const [booting, setBooting] = useState(true);
   const [screen, setScreen] = useState('pair');
   const [session, setSession] = useState(null);
+  const [branchTransferred, setBranchTransferred] = useState(false);
   const [isOffline, setIsOffline] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
 
@@ -213,10 +226,39 @@ export default function App() {
   const [scannerTarget, setScannerTarget] = useState('verification');
   const [permission, requestPermission] = useCameraPermissions();
   const cameraRef = useRef(null);
+  const transferAlertedRef = useRef(false);
   const [ocrBusy, setOcrBusy] = useState(false);
   const scanLine = useRef(new Animated.Value(0)).current;
   const scanFrameLayout = useRef({ x: 36, y: 190, width: 320, height: 120 });
   const cameraLayout = useRef({ width: 390, height: 700 });
+
+  const clearOldBranchCache = useCallback(async () => {
+    try { await clearQueuedRecords(); } catch (_e) {}
+    setNotifications([]);
+    setSelectedRequest(null);
+    setRequestRows([]);
+    setVerificationList([]);
+    setSelectedPart(null);
+    setSearchParts([]);
+    setSearchResults([]);
+    setAutoTasks([]);
+    setAutoSelected(null);
+    setLastAutoResult(null);
+    setPendingCount(0);
+  }, []);
+
+  const handleBranchTransferred = useCallback(async () => {
+    await clearSession();
+    await setBranchTransferredFlag(true);
+    await clearOldBranchCache();
+    setSession(null);
+    setBranchTransferred(true);
+    setScreen('pair');
+    if (!transferAlertedRef.current) {
+      transferAlertedRef.current = true;
+      Alert.alert('Branch Transferred', BRANCH_TRANSFERRED_MESSAGE);
+    }
+  }, [clearOldBranchCache]);
 
   useEffect(() => {
     let mounted = true;
@@ -231,7 +273,11 @@ export default function App() {
       if (mounted) setIsOffline(!(state.isConnected && state.isInternetReachable !== false));
     });
 
-    setOnSessionInvalidated(async () => {
+    setOnSessionInvalidated(async (error) => {
+      if (isBranchTransferredError(error)) {
+        await handleBranchTransferred();
+        return;
+      }
       await clearSession();
       if (!mounted) return;
       setSession(null);
@@ -254,7 +300,12 @@ export default function App() {
       } catch (_e) {}
 
       try {
+        const transferred = await getBranchTransferredFlag();
         const saved = await getSession();
+        if (transferred) {
+          await handleBranchTransferred();
+          return;
+        }
         if (saved) {
           setSession(saved);
           try {
@@ -275,17 +326,28 @@ export default function App() {
       unsubscribeQueue?.();
       unsubscribeNetwork?.();
     };
-  }, []);
+  }, [handleBranchTransferred]);
 
   useEffect(() => {
     if (!session) return undefined;
     let teardown = () => {};
+    const isTransferPush = (data) =>
+      data?.type === 'branch_transferred' || data?.code === 'BRANCH_TRANSFERRED';
+
     initPushNotifications({
       onNotificationReceived: (data) => {
+        if (isTransferPush(data)) {
+          handleBranchTransferred();
+          return;
+        }
         if (data?.type === 'auto_perpetual') loadAutoTasks();
         if (screen === 'notifications') loadNotifications();
       },
       onNotificationTapped: (data) => {
+        if (isTransferPush(data)) {
+          handleBranchTransferred();
+          return;
+        }
         if (data?.type === 'auto_perpetual') {
           loadAutoTasks().finally(() => setScreen('auto'));
           return;
@@ -310,7 +372,25 @@ export default function App() {
       })
       .catch(() => {});
     return () => teardown();
-  }, [session?.deviceId, screen]);
+  }, [session?.deviceId, screen, handleBranchTransferred]);
+
+  useEffect(() => {
+    if (!session || branchTransferred) return undefined;
+    const check = () => {
+      validateSession().catch(() => {});
+    };
+    check();
+    const interval = setInterval(() => {
+      sendHeartbeat().catch(() => {});
+    }, 45000);
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'active') check();
+    });
+    return () => {
+      clearInterval(interval);
+      sub.remove();
+    };
+  }, [session, branchTransferred]);
 
 
   useEffect(() => {
@@ -335,6 +415,11 @@ export default function App() {
         return true;
       }
 
+      if (branchTransferred) {
+        setScreen(screen === 'scanner' && scannerTarget === 'pairing' ? 'pair' : 'pair');
+        return true;
+      }
+
       if (screen === 'verification' || screen === 'search' || screen === 'notifications' || screen === 'auto') {
         setScreen('home');
         return true;
@@ -347,7 +432,7 @@ export default function App() {
 
     const subscription = BackHandler.addEventListener('hardwareBackPress', handleHardwareBack);
     return () => subscription.remove();
-  }, [booting, screen, scannerTarget]);
+  }, [booting, screen, scannerTarget, branchTransferred]);
 
   useEffect(() => {
     if (screen !== 'scanner') return undefined;
@@ -362,6 +447,43 @@ export default function App() {
     return () => animation.stop();
   }, [screen, scanLine]);
 
+  const completePairing = async ({ apiBaseUrl, pairingType, pairingCode, pairingToken, mobileUserId }) => {
+    const resolvedBaseUrl = normalizeApiBaseUrl(apiBaseUrl);
+    const pushToken = await registerForPushNotificationsAsync().catch(() => null);
+    const result = await verifyPairing({
+      mobileUserId: mobileUserId || null,
+      pairingType,
+      pairingCode,
+      pairingToken,
+      apiBaseUrl: resolvedBaseUrl,
+      deviceUserName: userName.trim(),
+      deviceUserMobile: mobileNumber.trim(),
+      deviceName: Device.deviceName || `${Platform.OS} device`,
+      deviceInfo: `${Device.modelName || 'Unknown'} • ${Device.osName || Platform.OS} ${Device.osVersion || ''}`,
+      appVersion: Constants.expoConfig?.version || '1.0.0',
+      pushToken,
+    });
+    const nextSession = {
+      apiBaseUrl: resolvedBaseUrl,
+      sessionToken: result.session_token,
+      deviceId: result.device_id,
+      mobileUserId: result.mobile_user_id,
+      name: result.device_user_name || result.name || userName.trim(),
+      deviceUserMobile: result.device_user_mobile || mobileNumber.trim(),
+      brandName: result.brand_name,
+      dealerName: result.dealer_name,
+      branch: result.branch,
+    };
+    await setBranchTransferredFlag(false);
+    await clearOldBranchCache();
+    transferAlertedRef.current = false;
+    await saveSession(nextSession);
+    setBranchTransferred(false);
+    setSession(nextSession);
+    setPairingScanned(false);
+    setScreen('home');
+  };
+
   const pairDevice = async ({ qrMobileUserId, pairingType, qrPairingCode, apiBaseUrl, pairingToken }) => {
     if (!userName.trim() || !mobileNumber.trim()) {
       Alert.alert('Required', 'Enter your name and mobile number before scanning the QR code.');
@@ -373,15 +495,38 @@ export default function App() {
     }
     setPairingBusy(true);
     try {
-      const pushToken = await registerForPushNotificationsAsync().catch(() => null);
-      const result = await verifyPairing({ mobileUserId: qrMobileUserId?.trim()?.toUpperCase() || null, pairingType, pairingCode: qrPairingCode.trim().toUpperCase(), pairingToken, apiBaseUrl, deviceUserName: userName.trim(), deviceUserMobile: mobileNumber.trim(), deviceName: Device.deviceName || `${Platform.OS} device`, deviceInfo: `${Device.modelName || 'Unknown'} • ${Device.osName || Platform.OS} ${Device.osVersion || ''}`, appVersion: Constants.expoConfig?.version || '1.0.0', pushToken });
-      const nextSession = { apiBaseUrl, sessionToken: result.session_token, deviceId: result.device_id, mobileUserId: result.mobile_user_id, name: result.device_user_name || result.name || userName.trim(), deviceUserMobile: result.device_user_mobile || mobileNumber.trim(), brandName: result.brand_name, dealerName: result.dealer_name, branch: result.branch };
-      await saveSession(nextSession);
-      setSession(nextSession);
-      setPairingScanned(false);
-      setScreen('home');
+      await completePairing({
+        apiBaseUrl,
+        pairingType,
+        pairingCode: qrPairingCode.trim().toUpperCase(),
+        pairingToken,
+        mobileUserId: qrMobileUserId?.trim()?.toUpperCase() || null,
+      });
     } catch (error) {
       setPairingScanned(false);
+      Alert.alert('Pairing Failed', friendlyError(error));
+    } finally { setPairingBusy(false); }
+  };
+
+  const pairWithManualCode = async () => {
+    if (!userName.trim() || !mobileNumber.trim()) {
+      Alert.alert('Required', 'Enter your name and mobile number before pairing.');
+      return;
+    }
+    if (!pairingCode.trim()) {
+      Alert.alert('Pairing Code', 'Enter the one-time pairing code from the NMTS website.');
+      return;
+    }
+    setPairingBusy(true);
+    try {
+      await completePairing({
+        apiBaseUrl: PRODUCTION_API_BASE_URL,
+        pairingType: null,
+        pairingCode: pairingCode.trim().toUpperCase(),
+        pairingToken: null,
+        mobileUserId: mobileUserId.trim().toUpperCase() || null,
+      });
+    } catch (error) {
       Alert.alert('Pairing Failed', friendlyError(error));
     } finally { setPairingBusy(false); }
   };
@@ -391,7 +536,7 @@ export default function App() {
     setPairingScanned(true);
     try {
       const parsed = JSON.parse(String(data || ''));
-      const apiBaseUrl = parsed?.api_base_url || parsed?.apiBaseUrl;
+      const apiBaseUrl = normalizeApiBaseUrl(parsed?.api_base_url || parsed?.apiBaseUrl);
       const pairingType = String(parsed?.pairing_type || (parsed?.mobile_user_id ? 'REPAIR' : 'NEW')).toUpperCase();
       const valid = parsed?.issuer === 'NMTS_SLEEPING_STOCK_PAIRING' && [2, 3].includes(Number(parsed?.version)) && ['NEW', 'REPAIR'].includes(pairingType) && parsed?.pairing_code && parsed?.pairing_token && apiBaseUrl && (pairingType !== 'REPAIR' || parsed?.mobile_user_id);
       if (!valid) throw new Error('invalid-nmts-qr');
@@ -403,10 +548,15 @@ Server: ${apiBaseUrl}` : `New Mobile User Pairing
 Your Mobile User ID will be created after verification.
 Server: ${apiBaseUrl}`, [
         { text: 'Scan Again', style: 'cancel', onPress: () => setPairingScanned(false) },
-        { text: pairingType === 'REPAIR' ? 'Re-pair Device' : 'Pair Device', onPress: () => pairDevice({ qrMobileUserId: detectedId, pairingType, qrPairingCode: String(parsed.pairing_code), apiBaseUrl: String(apiBaseUrl), pairingToken: String(parsed.pairing_token) }) },
+        { text: pairingType === 'REPAIR' ? 'Re-pair Device' : 'Pair Device', onPress: () => pairDevice({ qrMobileUserId: detectedId, pairingType, qrPairingCode: String(parsed.pairing_code), apiBaseUrl, pairingToken: String(parsed.pairing_token) }) },
       ]);
-    } catch (_error) {
-      Alert.alert('Invalid QR Code', 'Scan only the pairing QR code generated from the NMTS website.');
+    } catch (error) {
+      Alert.alert(
+        'Invalid QR Code',
+        error?.message && /not allowed|HTTPS|invalid/i.test(error.message)
+          ? error.message
+          : 'Scan only the pairing QR code generated from the NMTS website.'
+      );
       setPairingScanned(false);
     }
   };
@@ -417,7 +567,20 @@ Server: ${apiBaseUrl}`, [
     setScreen('pair');
   };
 
+  const navigateGuarded = (next) => {
+    if (branchTransferred || !session) {
+      setScreen('pair');
+      return;
+    }
+    setScreen(next);
+  };
+
   const openScanner = async (target) => {
+    if (branchTransferred && target !== 'pairing') {
+      setScreen('pair');
+      Alert.alert('Branch Transferred', BRANCH_TRANSFERRED_MESSAGE);
+      return;
+    }
     if (!permission?.granted) {
       const result = await requestPermission();
       if (!result.granted) {
@@ -809,14 +972,18 @@ Server: ${apiBaseUrl}`, [
   }
 
   const goBack = () => {
+    if (branchTransferred) {
+      setScreen('pair');
+      return;
+    }
     if (screen === 'scanner') setScreen(scannerTarget === 'pairing' ? 'pair' : scannerTarget === 'verification' ? 'verification' : 'search');
     else if (screen === 'request') setScreen('notifications');
     else setScreen('home');
   };
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar barStyle="dark-content" backgroundColor="#ffffff" />
+    <SafeAreaView style={[styles.safeArea, screen === 'pair' && styles.pairSafeArea]}>
+      <StatusBar barStyle={screen === 'pair' ? 'light-content' : 'dark-content'} backgroundColor={screen === 'pair' ? '#050706' : '#ffffff'} />
       {isOffline && <View style={styles.offline}><Text style={styles.offlineText}>Offline — uploads will sync automatically</Text></View>}
       {screen === 'pair' && (
         <PairScreen
@@ -829,11 +996,13 @@ Server: ${apiBaseUrl}`, [
           pairingCode={pairingCode}
           setPairingCode={setPairingCode}
           busy={pairingBusy}
+          branchTransferred={branchTransferred}
           onScanQr={() => openScanner('pairing')}
+          onManualPair={pairWithManualCode}
         />
       )}
-      {screen === 'home' && <HomeScreen session={session} pendingCount={pendingCount} navigate={setScreen} logout={logout} />}
-      {screen === 'auto' && (
+      {screen === 'home' && !branchTransferred && session && <HomeScreen session={session} pendingCount={pendingCount} navigate={navigateGuarded} logout={logout} />}
+      {screen === 'auto' && !branchTransferred && session && (
         <AutoPerpetualScreen
           onBack={goBack}
           sessionId={autoSessionId}
@@ -856,7 +1025,7 @@ Server: ${apiBaseUrl}`, [
           lastResult={lastAutoResult}
         />
       )}
-      {screen === 'verification' && (
+      {screen === 'verification' && !branchTransferred && session && (
         <VerificationScreen
           onBack={goBack}
           input={verificationInput}
@@ -880,7 +1049,7 @@ Server: ${apiBaseUrl}`, [
           busy={verificationBusy}
         />
       )}
-      {screen === 'search' && (
+      {screen === 'search' && !branchTransferred && session && (
         <SearchScreen
           onBack={goBack}
           input={searchInput}
@@ -894,7 +1063,7 @@ Server: ${apiBaseUrl}`, [
           busy={searchBusy}
         />
       )}
-      {screen === 'notifications' && (
+      {screen === 'notifications' && !branchTransferred && session && (
         <NotificationsScreen
           onBack={goBack}
           rows={notifications}
@@ -905,7 +1074,7 @@ Server: ${apiBaseUrl}`, [
           snoozeRequest={snoozeRequest}
         />
       )}
-      {screen === 'request' && (
+      {screen === 'request' && !branchTransferred && session && (
         <RequestScreen
           onBack={goBack}
           request={selectedRequest}
@@ -918,8 +1087,23 @@ Server: ${apiBaseUrl}`, [
       {screen === 'scanner' && (
         scannerTarget === 'pairing' ? (
           <PairingScannerScreen onBack={goBack} onBarcodeScanned={handlePairingQr} scanned={pairingScanned || pairingBusy} onScanAgain={() => setPairingScanned(false)} />
-        ) : (
+        ) : !branchTransferred && session ? (
           <ScannerScreen onBack={goBack} permission={permission} cameraRef={cameraRef} cameraLayout={cameraLayout} scanFrameLayout={scanFrameLayout} scanLine={scanLine} onScan={scanPartNumber} busy={ocrBusy} />
+        ) : (
+          <PairScreen
+            mobileUserId={mobileUserId}
+            setMobileUserId={setMobileUserId}
+            userName={userName}
+            setUserName={setUserName}
+            mobileNumber={mobileNumber}
+            setMobileNumber={setMobileNumber}
+            pairingCode={pairingCode}
+            setPairingCode={setPairingCode}
+            busy={pairingBusy}
+            branchTransferred={branchTransferred}
+            onScanQr={() => openScanner('pairing')}
+            onManualPair={pairWithManualCode}
+          />
         )
       )}
     </SafeAreaView>
@@ -928,20 +1112,33 @@ Server: ${apiBaseUrl}`, [
 
 function PairScreen(props) {
   return (
-    <KeyboardScreen>
-      <ScrollView contentContainerStyle={styles.pairPage} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
-        <Image source={require("./assets/sleeping-stock-logo-transparent.png")} style={styles.brandLogo} resizeMode="contain" />
-        <Text style={styles.appTitle}>Sleeping Stock Mobile</Text>
-        <Text style={styles.appSub}>PAIR THIS DEVICE</Text>
-        <View style={styles.card}>
-          <Field label="Your Name" value={props.userName} onChangeText={props.setUserName} />
-          <Field label="Mobile Number" value={props.mobileNumber} onChangeText={props.setMobileNumber} keyboardType="phone-pad" />
-          <Text style={styles.qrInfo}>The NMTS website QR contains a one-time pairing code and secure server URL. A new Mobile User ID is created after first pairing; Re-pair keeps the same ID.</Text>
-          <PrimaryButton title="Scan NMTS Pairing QR" onPress={props.onScanQr} busy={props.busy} />
-          {!!props.mobileUserId && <Text style={styles.detectedUser}>Detected User: {props.mobileUserId}</Text>}
-        </View>
-      </ScrollView>
-    </KeyboardScreen>
+    <View style={styles.flex}>
+      <Image source={require('./assets/login-background.jpg')} style={styles.loginBackground} resizeMode="cover" blurRadius={18} />
+      <View style={styles.loginDim} />
+      <KeyboardScreen>
+        <ScrollView contentContainerStyle={styles.pairPage} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
+          <Image source={require('./assets/sleeping-stock-logo-transparent.png')} style={styles.brandLogo} resizeMode="contain" />
+          <Text style={styles.appTitleLight}>Sleeping Stock Mobile</Text>
+          <Text style={styles.appSubLight}>PAIR THIS DEVICE</Text>
+          {props.branchTransferred ? (
+            <View style={styles.transferBanner}>
+              <Text style={styles.transferBannerTitle}>BRANCH TRANSFERRED</Text>
+              <Text style={styles.transferBannerText}>{BRANCH_TRANSFERRED_MESSAGE}</Text>
+            </View>
+          ) : null}
+          <View style={styles.card}>
+            <Field label="Your Name" value={props.userName} onChangeText={props.setUserName} />
+            <Field label="Mobile Number" value={props.mobileNumber} onChangeText={props.setMobileNumber} keyboardType="phone-pad" />
+            <Text style={styles.qrInfo}>The NMTS website QR contains a one-time pairing code and secure server URL. A new Mobile User ID is created after first pairing; Re-pair keeps the same ID.</Text>
+            <PrimaryButton title="Scan NMTS Pairing QR" onPress={props.onScanQr} busy={props.busy} />
+            <Text style={styles.manualLabel}>OR ENTER PAIRING CODE</Text>
+            <Field label="Manual Pairing Code" value={props.pairingCode} onChangeText={(value) => props.setPairingCode(String(value || '').toUpperCase())} autoCapitalize="characters" autoCorrect={false} />
+            <PrimaryButton title="Pair with Code" onPress={props.onManualPair} busy={props.busy} />
+            {!!props.mobileUserId && <Text style={styles.detectedUser}>Detected User: {props.mobileUserId}</Text>}
+          </View>
+        </ScrollView>
+      </KeyboardScreen>
+    </View>
   );
 }
 
@@ -1211,9 +1408,9 @@ function VerificationRow({ row, onDelete }) { return <View style={styles.verific
 function StockRow({ row }) { return <View style={styles.stockRow}><View style={{ flex: 1 }}><Text style={styles.rowPartNo}>{row.partNumber}</Text><Text style={styles.rowPartName}>{row.partName}</Text></View><View style={styles.stockRight}><Text style={styles.stockQty}>{row.availableQty}</Text><Text style={styles.stockLoc}>{row.systemLocation}</Text><Text style={styles.stockValue}>₹{row.unitValue.toLocaleString('en-IN')}</Text></View></View>; }
 
 const styles = StyleSheet.create({
-  flex: { flex: 1 }, safeArea: { flex: 1, backgroundColor: BG }, center: { alignItems: 'center', justifyContent: 'center' },
+  flex: { flex: 1 }, safeArea: { flex: 1, backgroundColor: BG }, pairSafeArea: { backgroundColor: '#050706' }, loginBackground: { ...StyleSheet.absoluteFillObject, width: '100%', height: '100%' }, loginDim: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(5,7,6,0.70)' }, center: { alignItems: 'center', justifyContent: 'center' },
   offline: { backgroundColor: '#fff2c7', paddingVertical: 7, alignItems: 'center' }, offlineText: { color: '#7b5b00', fontSize: 12, fontWeight: '700' },
-  pairPage: { flexGrow: 1, justifyContent: 'center', padding: 24, paddingBottom: 56 }, qrInfo: { color: MUTED, fontSize: 12, lineHeight: 18, marginBottom: 16 }, detectedUser: { marginTop: 12, color: SUCCESS, fontSize: 12, fontWeight: '800', textAlign: 'center' }, brandLogo: { alignSelf: 'center', width: 190, height: 190 }, appTitle: { marginTop: 16, textAlign: 'center', color: DARK, fontSize: 24, fontWeight: '900' }, appSub: { marginTop: 4, marginBottom: 22, textAlign: 'center', color: MUTED, fontSize: 11, fontWeight: '800', letterSpacing: 1.4 },
+  pairPage: { flexGrow: 1, justifyContent: 'center', padding: 24, paddingBottom: 56 }, qrInfo: { color: MUTED, fontSize: 12, lineHeight: 18, marginBottom: 16 }, manualLabel: { marginTop: 18, marginBottom: 10, color: MUTED, fontSize: 11, fontWeight: '800', letterSpacing: 1.1, textAlign: 'center' }, detectedUser: { marginTop: 12, color: SUCCESS, fontSize: 12, fontWeight: '800', textAlign: 'center' }, brandLogo: { alignSelf: 'center', width: 190, height: 190 }, appTitle: { marginTop: 16, textAlign: 'center', color: DARK, fontSize: 24, fontWeight: '900' }, appTitleLight: { marginTop: 16, textAlign: 'center', color: '#ffffff', fontSize: 24, fontWeight: '900' }, appSub: { marginTop: 4, marginBottom: 22, textAlign: 'center', color: MUTED, fontSize: 11, fontWeight: '800', letterSpacing: 1.4 }, appSubLight: { marginTop: 4, marginBottom: 22, textAlign: 'center', color: '#d6dbe5', fontSize: 11, fontWeight: '800', letterSpacing: 1.4 }, transferBanner: { marginBottom: 16, padding: 16, backgroundColor: '#fde8e8', borderWidth: 1, borderColor: '#f3b4b4', borderRadius: 16 }, transferBannerTitle: { color: DANGER, fontSize: 12, fontWeight: '900', letterSpacing: 0.8 }, transferBannerText: { marginTop: 8, color: DARK, fontSize: 15, fontWeight: '800', lineHeight: 22 },
   card: { backgroundColor: '#fff', padding: 18, borderRadius: 20, borderWidth: 1, borderColor: BORDER }, label: { marginBottom: 7, color: DARK, fontSize: 12, fontWeight: '800' }, input: { minHeight: 50, borderWidth: 1, borderColor: BORDER, borderRadius: 13, paddingHorizontal: 14, backgroundColor: '#fbfcff', color: DARK },
   primaryButton: { minHeight: 50, paddingHorizontal: 18, borderRadius: 13, backgroundColor: BLUE, alignItems: 'center', justifyContent: 'center' }, primaryText: { color: '#fff', fontWeight: '900' }, secondaryButton: { flex: 1, minHeight: 50, borderRadius: 13, borderWidth: 1, borderColor: BLUE, alignItems: 'center', justifyContent: 'center', marginRight: 10 }, secondaryText: { color: BLUE, fontWeight: '900' }, disabled: { opacity: 0.45 },
   homePage: { padding: 20, paddingBottom: 50 }, homeHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, hello: { color: MUTED, fontSize: 11, fontWeight: '800' }, homeName: { marginTop: 3, color: DARK, fontSize: 24, fontWeight: '900' }, logout: { color: DANGER, fontWeight: '800' }, branchCard: { marginTop: 20, marginBottom: 22, padding: 18, backgroundColor: BLUE, borderRadius: 20 }, branchTitle: { color: '#fff', fontSize: 18, fontWeight: '900' }, branchSub: { marginTop: 5, color: '#dbe7ff', fontSize: 12 }, menuButton: { minHeight: 82, marginBottom: 13, padding: 15, backgroundColor: '#fff', borderWidth: 1, borderColor: BORDER, borderRadius: 18, flexDirection: 'row', alignItems: 'center' }, menuIcon: { width: 48, height: 48, borderRadius: 15, backgroundColor: '#edf3ff', alignItems: 'center', justifyContent: 'center', marginRight: 13 }, menuTitle: { color: DARK, fontSize: 16, fontWeight: '900' }, menuSub: { marginTop: 4, color: MUTED, fontSize: 11 }, chevron: { color: BLUE, fontSize: 28 }, pendingCard: { marginTop: 10, padding: 14, backgroundColor: '#fff7e6', borderRadius: 14, flexDirection: 'row', justifyContent: 'space-between' }, pendingText: { color: '#865b00', flex: 1 }, pendingAction: { color: BLUE, fontWeight: '900' },

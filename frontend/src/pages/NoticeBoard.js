@@ -9,6 +9,7 @@ import { toast } from 'sonner';
 import { NmtsModal } from '@/components/NmtsModal';
 import { NmtsConfirmDialog } from '@/components/NmtsConfirmDialog';
 import { resolveBackendUrl } from '@/backendUrl';
+import { openInlineAttachment, parseBlobError } from '@/utils/blobResponse';
 
 const BACKEND_ROOT = resolveBackendUrl();
 
@@ -195,19 +196,13 @@ export function NoticeBoard() {
     if (!attachment?.file_url) return;
     const href = attachment.file_url.startsWith('http') ? attachment.file_url : `${BACKEND_ROOT}${attachment.file_url}`;
     try {
-      const res = await axios.get(href, { responseType: 'blob' });
-      const url = window.URL.createObjectURL(new Blob([res.data], { type: 'application/pdf' }));
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = attachment.file_name || 'notice.pdf';
-      a.click();
-      window.URL.revokeObjectURL(url);
+      await openInlineAttachment(href, attachment.file_name || 'notice.pdf');
       if (!isMaster && detail?.id) {
         await axios.post(`${API}/notice-board/notices/${detail.id}/read`);
         load();
       }
-    } catch {
-      toast.error('Unable to download PDF');
+    } catch (error) {
+      toast.error(await parseBlobError(error, error.message || 'Unable to open attachment'));
     }
   };
 

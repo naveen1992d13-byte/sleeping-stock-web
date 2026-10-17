@@ -173,6 +173,25 @@ async def run_daily_coordinated_archive(
                         increment_retry=True,
                     )
 
+        # Analytics daily rollup at window start (11:00 PM IST), BEFORE archive/prune.
+        # Idempotent: a successful finalized date is skipped on catch-up retries.
+        try:
+            import analytics_rollup as analytics_rollup
+
+            rollup_result = await analytics_rollup.finalize_analytics_rollup_for_date(
+                db, archive_date, force=False
+            )
+            results["datasets"]["analytics-rollup"] = rollup_result
+            if str(rollup_result.get("status") or "") != analytics_rollup.STATUS_SUCCESS:
+                logger.error(
+                    "Analytics rollup not successful for %s: %s",
+                    archive_date,
+                    rollup_result.get("error") or rollup_result.get("status"),
+                )
+        except Exception as exc:
+            logger.error("Analytics rollup failed for %s: %s", archive_date, exc)
+            results["datasets"]["analytics-rollup"] = {"status": "error", "error": str(exc)[:500]}
+
         await _run_module("uploads", ha.archive_uploads_for_date(db, archive_date))
 
         # Product history (+ optional side jobs; prune stays gated by ARCHIVE_PRUNE_ENABLED)

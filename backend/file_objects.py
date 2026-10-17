@@ -130,13 +130,42 @@ async def read_bytes_from_meta_tracked(
     return data, ctype
 
 
-def streaming_response_from_meta(meta: Dict[str, Any], filename: Optional[str] = None) -> Response:
-    data, ctype = read_bytes_from_meta(meta)
+INLINE_CONTENT_TYPES = {
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/gif",
+    "image/webp",
+}
+
+
+def streaming_response_from_meta(
+    meta: Dict[str, Any],
+    filename: Optional[str] = None,
+    *,
+    preview: bool = False,
+) -> Response:
+    from fastapi import HTTPException
+    try:
+        data, ctype = read_bytes_from_meta(meta)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Attachment file not found"})
+    except Exception:
+        logger.exception("attachment storage read failed")
+        raise HTTPException(status_code=502, detail={"code": "STORAGE_FAILURE", "message": "Attachment storage failed"})
     name = filename or meta.get("original_filename") or meta.get("file_name") or meta.get("fileName") or meta.get("apk_filename") or "download.bin"
+    ctype = (ctype or meta.get("content_type") or "application/octet-stream").split(";")[0].strip().lower()
+    if ctype in INLINE_CONTENT_TYPES:
+        disposition = f'inline; filename="{name}"'
+    elif preview:
+        raise HTTPException(status_code=415, detail={"code": "UNSUPPORTED_TYPE", "message": "This file type cannot be opened inline"})
+    else:
+        disposition = f'attachment; filename="{name}"'
     return StreamingResponse(
         BytesIO(data),
         media_type=ctype or "application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        headers={"Content-Disposition": disposition},
     )
 
 
