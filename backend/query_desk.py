@@ -205,7 +205,7 @@ async def _save_attachment(file: UploadFile, prefix: str) -> dict:
             relative_key=f"{prefix}/{safe_name}",
             data=content,
             original_filename=filename,
-            content_type=file.content_type or CONTENT_TYPES.get(ext, "application/octet-stream"),
+            content_type=CONTENT_TYPES[ext],
         )
     except Exception:
         logger.exception("query attachment durable storage failed")
@@ -215,7 +215,7 @@ async def _save_attachment(file: UploadFile, prefix: str) -> dict:
         "file_id": file_id,
         "file_name": filename,
         "file_url": f"/api/queries/attachments/{file_id}",
-        "content_type": file.content_type or CONTENT_TYPES.get(ext, "application/octet-stream"),
+        "content_type": CONTENT_TYPES[ext],
         "file_size": len(content),
         "attachment_storage_path": str(path),
         "storage_provider": stored.get("storage_provider"),
