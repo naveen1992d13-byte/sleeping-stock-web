@@ -92,7 +92,7 @@ def test_overlay_identifies_mobile_user_and_device_docs():
     assert doc_id({"device_id": "dev-1", "mobile_user_id": "MUVAN2609190001"}) == "dev-1"
     assert doc_id({"id": "web-1", "mobile_user_id": "MUVAN2609190001"}) == "web-1"
     from testing_overlay import identity_query
-    assert identity_query("MUVAN2610020001")["$or"][-1] == {"mobile_user_id": "MUVAN2610020001"}
+    assert {"mobile_user_id": "MUVAN2610020001"} in identity_query("MUVAN2610020001")["$or"]
 
 
 def test_pairing_generate_request_coerces_values():
