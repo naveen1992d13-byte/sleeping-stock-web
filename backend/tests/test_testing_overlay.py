@@ -731,3 +731,55 @@ def test_extract_sort_limit_keeps_sort_that_feeds_a_group():
     core, sort_spec, skip_n, limit_n = ov._extract_sort_limit(stages)
     assert core == stages[:4]
     assert sort_spec == {"a": 1} and limit_n == 5 and skip_n == 0
+
+
+def _overlap_collection():
+    prod = FakeCollection([
+        {"id": "p1", "day": "d1"},
+        {"id": "p2", "day": "d1"},
+        {"id": "p3", "day": "d2"},
+    ])
+    created = FakeCollection([
+        {"id": "p1", "day": "d1", "data_origin": "testing"},
+        {"id": "TS-1", "day": "d1", "data_origin": "testing"},
+    ])
+    return ov.OverlayCollection("x_counts", prod, created, FakeCollection(), FakeCollection())
+
+
+def test_count_overlap_by_production_scan_matches_in_query(monkeypatch):
+    col = _overlap_collection()
+    assert asyncio.run(col.count_documents({"day": "d1"})) == 3
+    assert asyncio.run(col.count_documents({})) == 4
+    monkeypatch.setattr(ov, "_OVERLAP_SCAN_LIMIT", 0)
+    col = _overlap_collection()
+    assert asyncio.run(col.count_documents({})) == 4
+
+
+class _CommandDb(dict):
+    def __init__(self):
+        super().__init__()
+        self.commands = []
+
+    def __missing__(self, name):
+        self[name] = FakeCollection()
+        return self[name]
+
+    async def command(self, command, *args, **kwargs):
+        self.commands.append((command, args))
+        return {"ok": 1, "storageSize": 10}
+
+
+def test_overlay_database_runs_stats_commands_on_testing_only():
+    prod, test = _CommandDb(), _CommandDb()
+    db = ov.OverlayDatabase(prod, test)
+    assert asyncio.run(db.command("dbStats"))["storageSize"] == 10
+    asyncio.run(db.command("collStats", "products"))
+    assert [c[0] for c in test.commands] == ["dbStats", "collStats"]
+    assert prod.commands == []
+    try:
+        asyncio.run(db.command({"dropDatabase": 1}))
+    except ov.ProductionWriteBlocked:
+        pass
+    else:
+        raise AssertionError("write command must be refused")
+    assert len(test.commands) == 2

@@ -71,6 +71,9 @@ OVERLAY_COLLECTIONS = frozenset({
 })
 
 _ID_FIELDS = ("id", "user_id", "upload_id", "order_id", "request_id", "device_id", "mobile_user_id", "file_id")
+_IDENT_PROJECTION = {"_id": 0, **{key: 1 for key in _ID_FIELDS}}
+_OVERLAP_SCAN_LIMIT = 200_000
+_READ_ONLY_COMMANDS = frozenset({"dbstats", "collstats", "ping", "buildinfo"})
 
 
 class ProductionWriteBlocked(RuntimeError):
@@ -984,11 +987,19 @@ class OverlayCollection:
             logger.warning("Production count failed for %s: %s", self.name, exc)
             prod_n = 0
         overlap = 0
-        if created_ids:
+        if created_ids and prod_n:
             try:
-                overlap = int(await self._prod.count_documents(
-                    {"$and": [prod_query, identity_in(created_ids)]} if prod_query else identity_in(created_ids)
-                ))
+                if prod_n <= max(len(created_ids), _OVERLAP_SCAN_LIMIT):
+                    # Combining a filter with a $in over thousands of ids runs for
+                    # minutes on DocumentDB; streaming the matching ids is seconds.
+                    created_set = set(created_ids)
+                    async for row in _aiter(self._prod.find(prod_query, _IDENT_PROJECTION)):
+                        if doc_id(row) in created_set:
+                            overlap += 1
+                else:
+                    overlap = int(await self._prod.count_documents(
+                        {"$and": [prod_query, identity_in(created_ids)]} if prod_query else identity_in(created_ids)
+                    ))
             except Exception:
                 overlap = 0
         overlay_delta = 0
@@ -1426,6 +1437,13 @@ class OverlayDatabase:
                 self._test[TOMBSTONE_COLLECTION],
             )
         return self._cache[name]
+
+    async def command(self, command, *args, **kwargs):
+        # Stats describe the Testing database itself; never run commands on Production.
+        name = command if isinstance(command, str) else next(iter(command or {}), "")
+        if str(name).lower() not in _READ_ONLY_COMMANDS:
+            raise ProductionWriteBlocked(f"Refusing database command {name!r} from the testing overlay")
+        return await self._test.command(command, *args, **kwargs)
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
