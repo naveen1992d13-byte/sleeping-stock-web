@@ -6823,6 +6823,8 @@ async def finish_order_desk_order(order_id: str, current_user: UserResponse = De
     role = (current_user.role or '').lower()
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized for this order')
+    if order.get('finished_at'):
+        return {'message': 'Order already finished', 'order': order, 'already_finished': True}
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
     items = await odw.enrich_order_items(db, order, items)
     reqs_by_item = {}
