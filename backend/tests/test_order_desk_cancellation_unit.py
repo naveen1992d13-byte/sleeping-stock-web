@@ -34,8 +34,18 @@ def test_pending_or_rejected_cancellation_still_blocks_finish():
         assert readiness['remaining_open_items'] == ['A']
 
 
-def test_cancelled_item_with_factory_qty_still_needs_factory_order_no():
-    items = [_item('A', 2, 'approved', factory_order_qty=1)]
+def test_cancelled_item_with_sticky_factory_qty_does_not_need_factory_order_no():
+    items = [_item('A', 2, 'approved', factory_order_qty=2, no_further_stock=True)]
+    readiness = odw.evaluate_finish_readiness(ORDER, items, {})
+    assert readiness['can_finish'] is True
+    line = odw.build_fulfillment_line(ORDER, items[0], [])
+    assert line['factory_qty'] == 0
+    assert line['fulfilled_qty'] == 0
+    assert all(s['source_type'] != 'Factory' for s in line.get('sources', []))
+
+
+def test_uncancelled_factory_item_still_needs_factory_order_no():
+    items = [_item('A', 2, factory_order_qty=2)]
     readiness = odw.evaluate_finish_readiness(ORDER, items, {})
     assert readiness['missing_factory_order_no'] == ['A']
 
@@ -59,3 +69,16 @@ def test_open_item_unchanged():
     line = odw.build_fulfillment_line(ORDER, _item('A', 4), [])
     assert line['final_status'] == 'Open'
     assert line['remaining_qty'] == 4
+
+
+def test_workflow_status_cancelled_overrides_no_further_stock():
+    item = _item('A', 2, 'approved', factory_order_qty=2, no_further_stock=True, request_status='Cancelled')
+    wf = odw.compute_item_workflow(item, ORDER, [])
+    assert wf['request_status'] == odw.REQUEST_STATUS_CANCELLED
+    assert wf['factory_order_qty'] == 0
+
+
+def test_workflow_status_no_further_stock_without_cancellation():
+    item = _item('A', 2, factory_order_qty=2, no_further_stock=True)
+    wf = odw.compute_item_workflow(item, ORDER, [])
+    assert wf['request_status'] == odw.REQUEST_STATUS_FACTORY

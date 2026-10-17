@@ -725,7 +725,7 @@ def evaluate_finish_readiness(order: Dict[str, Any], items: List[Dict[str, Any]]
                     'level': req.get('level') or req.get('source_type'),
                 })
         factory_qty = max(0, int(_f(item.get('factory_fulfilled_qty') or item.get('factory_order_qty') or item.get('factory_qty'))))
-        factory_required = remaining > 0 or factory_qty > 0
+        factory_required = (remaining > 0 or factory_qty > 0) and not is_item_cancelled(item)
         if factory_required and not _clean(item.get('system_order_number')):
             missing_factory_order_no.append(item_id)
     return {
@@ -783,6 +783,8 @@ def build_fulfillment_line(order: Dict[str, Any], item: Dict[str, Any], reqs: Li
 
     factory_qty = _f(item.get('factory_fulfilled_qty') or item.get('factory_order_qty') or item.get('factory_qty'))
     factory_order_no = _clean(item.get('system_order_number'))
+    if is_item_cancelled(item) and not factory_order_no:
+        factory_qty = 0.0
     remaining = _f(item.get('remaining_qty'))
     required = _f(item.get('required_qty') or item.get('requested_qty'))
     if is_item_cancelled(item):
@@ -987,7 +989,9 @@ def compute_item_workflow(item: dict, order: dict, item_requests: List[dict],
     else:
         request_status = item.get('request_status') or item.get('status') or REQUEST_STATUS_TO_PROCESS
 
-    if item.get('no_further_stock') and remaining > 0:
+    if request_status == REQUEST_STATUS_CANCELLED:
+        factory_order_qty = 0
+    elif item.get('no_further_stock') and remaining > 0:
         request_status = REQUEST_STATUS_FACTORY
         factory_order_qty = remaining
 
@@ -1170,7 +1174,7 @@ async def enrich_order_items(db, order: dict, items: List[dict],
             stages['own_stage_status'] = 'exhausted' if stages['own_stage_status'] != 'complete' else stages['own_stage_status']
         if wf['remaining_qty'] > 0 and stages['own_stage_status'] == 'exhausted' and stages['eligible_branch_count'] == 0 and (item.get('same_dealer_sources') or item.get('availability_checked_at')):
             stages['branch_stage_status'] = 'exhausted' if stages['branch_stage_status'] != 'complete' else stages['branch_stage_status']
-        if wf['remaining_qty'] > 0 and stages['branch_stage_status'] == 'exhausted' and stages['eligible_dealer_count'] == 0:
+        if wf['remaining_qty'] > 0 and stages['branch_stage_status'] == 'exhausted' and stages['eligible_dealer_count'] == 0 and not is_item_cancelled(item):
             stages['dealer_stage_status'] = 'exhausted'
             stages['factory_stage_status'] = 'open'
             stages['active_stage'] = 'factory'
@@ -1305,7 +1309,7 @@ async def sync_order_item_after_request_decision(db, req: dict, now: str = None)
         'enquiry_stage': stages['active_stage'],
         'updated_at': now,
     }
-    if stages['active_stage'] == 'factory' and _f(refreshed.get('remaining_qty')) > 0:
+    if stages['active_stage'] == 'factory' and _f(refreshed.get('remaining_qty')) > 0 and not is_item_cancelled(refreshed):
         stage_update.update({
             'no_further_stock': True,
             'factory_order_qty': _f(refreshed.get('remaining_qty')),
