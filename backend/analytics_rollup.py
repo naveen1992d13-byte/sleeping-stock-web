@@ -75,23 +75,39 @@ async def get_rollup_status(db, date_iso: str) -> Optional[dict]:
     return await db[STATUS_COLLECTION].find_one({"rollup_date_ist": iso}, {"_id": 0})
 
 
+def _is_plausible_iso(date_iso: Optional[str]) -> bool:
+    text = date_key_to_iso(iso_to_date_key(date_iso or ""))
+    if len(iso_to_date_key(text)) != 8:
+        return False
+    # Ignore sentinel / fixture dates used in older Testing seeds.
+    if text < "2020-01-01":
+        return False
+    return True
+
+
 async def last_successful_rollup_date(db, *, on_or_before: Optional[str] = None) -> Optional[str]:
-    q: Dict[str, Any] = {"status": STATUS_SUCCESS}
+    q: Dict[str, Any] = {"status": STATUS_SUCCESS, "rollup_date_ist": {"$gte": "2020-01-01"}}
     if on_or_before:
-        q["rollup_date_ist"] = {"$lte": date_key_to_iso(iso_to_date_key(on_or_before))}
+        q["rollup_date_ist"] = {
+            "$gte": "2020-01-01",
+            "$lte": date_key_to_iso(iso_to_date_key(on_or_before)),
+        }
     row = await db[STATUS_COLLECTION].find_one(q, {"_id": 0, "rollup_date_ist": 1}, sort=[("rollup_date_ist", -1)])
-    if row and row.get("rollup_date_ist"):
+    if row and _is_plausible_iso(row.get("rollup_date_ist")):
         return str(row["rollup_date_ist"])
     # Legacy snapshots written before status tracking still count as finalized data.
-    snap_q: Dict[str, Any] = {}
+    snap_q: Dict[str, Any] = {"snapshot_date_ist": {"$gte": "2020-01-01"}}
     if on_or_before:
-        snap_q["snapshot_date_ist"] = {"$lte": date_key_to_iso(iso_to_date_key(on_or_before))}
+        snap_q["snapshot_date_ist"] = {
+            "$gte": "2020-01-01",
+            "$lte": date_key_to_iso(iso_to_date_key(on_or_before)),
+        }
     legacy = await db[SNAPSHOT_COLLECTION].find_one(
         snap_q,
         {"_id": 0, "snapshot_date_ist": 1},
         sort=[("snapshot_date_ist", -1)],
     )
-    if legacy and legacy.get("snapshot_date_ist"):
+    if legacy and _is_plausible_iso(legacy.get("snapshot_date_ist")):
         return str(legacy["snapshot_date_ist"])
     return None
 
@@ -113,10 +129,11 @@ def resolve_analytics_end_date(
         effective = min(effective, date_key_to_iso(iso_to_date_key(last_success)))
         updated = date_key_to_iso(iso_to_date_key(last_success))
     else:
-        # No finalized data yet — empty window ending yesterday.
-        effective = min(effective, "1970-01-01")
+        # No finalized data yet — caller should treat the window as empty.
         updated = None
-    return effective, (updated or effective)
+        effective = (datetime.strptime(req, "%Y-%m-%d").date() - timedelta(days=1)).isoformat()
+        # Keep effective < from_date only when caller also clamps keys to [].
+    return effective, updated
 
 
 async def _load_latest_published_rows(db, date_iso: str) -> List[dict]:
@@ -201,36 +218,40 @@ def build_snapshot_docs(date_iso: str, rows: List[Dict[str, Any]]) -> List[Dict[
     date_key = iso_to_date_key(date_iso)
     date_iso = date_key_to_iso(date_key)
     now = datetime.utcnow().isoformat() + "Z"
-    docs: List[Dict[str, Any]] = []
+    # Dedupe by the durable unique index keys, not display names.
+    by_key: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
     for r in rows:
         qty = _num(r.get("available_qty_number"), _num(r.get("quantity")))
         unit = _num(r.get("unit_value_number"), _num(r.get("mav_value"), _num(r.get("mav"))))
         value = _num(r.get("total_value_number"), _num(r.get("total_value"), qty * unit))
-        docs.append(
-            {
-                "snapshot_date_ist": date_iso,
-                "brand_id": r.get("brand_id") or r.get("brand_code") or "",
-                "dealer_id": r.get("dealer_id") or r.get("dealer_code") or "",
-                "branch_id": r.get("branch_id") or r.get("branch") or "",
-                "brand_name": r.get("brand_name"),
-                "dealer_name": r.get("dealer_name"),
-                "branch_name": r.get("branch"),
-                "part_number": r.get("part_number"),
-                "part_name": r.get("item_name") or r.get("part_name"),
-                "category": r.get("part_category") or r.get("category") or "",
-                "available_qty": qty,
-                "unit_value": unit,
-                "total_value": value,
-                "purchase_aging_days": r.get("purchase_aging_days"),
-                "sales_aging_days": r.get("sales_aging_days"),
-                "last_receipt_date": r.get("last_receipt_date"),
-                "last_sales_date": r.get("last_sales_date"),
-                "upload_no": r.get("upload_no"),
-                "updated_at": now,
-                "finalized": True,
-            }
-        )
-    return docs
+        brand_id = _text(r.get("brand_id") or r.get("brand_code"))
+        dealer_id = _text(r.get("dealer_id") or r.get("dealer_code") or r.get("dealer_name"))
+        branch_id = _text(r.get("branch_id") or r.get("branch"))
+        part_number = _text(r.get("part_number"))
+        key = (brand_id, dealer_id, branch_id, part_number.casefold())
+        by_key[key] = {
+            "snapshot_date_ist": date_iso,
+            "brand_id": brand_id,
+            "dealer_id": dealer_id,
+            "branch_id": branch_id,
+            "brand_name": r.get("brand_name"),
+            "dealer_name": r.get("dealer_name"),
+            "branch_name": r.get("branch"),
+            "part_number": part_number,
+            "part_name": r.get("item_name") or r.get("part_name"),
+            "category": r.get("part_category") or r.get("category") or "",
+            "available_qty": qty,
+            "unit_value": unit,
+            "total_value": value,
+            "purchase_aging_days": r.get("purchase_aging_days"),
+            "sales_aging_days": r.get("sales_aging_days"),
+            "last_receipt_date": r.get("last_receipt_date"),
+            "last_sales_date": r.get("last_sales_date"),
+            "upload_no": r.get("upload_no"),
+            "updated_at": now,
+            "finalized": True,
+        }
+    return list(by_key.values())
 
 
 def _totals(rows: List[Dict[str, Any]], *, qty_key: str, value_key: str) -> Tuple[float, float, int]:
@@ -269,7 +290,7 @@ async def finalize_analytics_rollup_for_date(
     try:
         source_rows = await _load_latest_published_rows(db, iso)
         docs = build_snapshot_docs(iso, source_rows)
-        src_qty, src_value, src_n = _totals(
+        raw_qty, raw_value, raw_n = _totals(
             [
                 {
                     "qty": _num(r.get("available_qty_number"), _num(r.get("quantity"))),
@@ -288,24 +309,29 @@ async def finalize_analytics_rollup_for_date(
             value_key="value",
         )
         snap_qty, snap_value, snap_n = _totals(docs, qty_key="available_qty", value_key="total_value")
+        # After unique-key collapse, the durable snapshot totals are the source of truth.
+        src_qty, src_value, src_n = snap_qty, snap_value, snap_n
 
         # Replace the day's snapshots atomically enough for DocumentDB: delete date then insert.
         await db[SNAPSHOT_COLLECTION].delete_many({"snapshot_date_ist": iso})
         if docs:
-            # Motor insert_many batches; keep chunks modest for the low-memory host.
             chunk = 1000
             for i in range(0, len(docs), chunk):
                 await db[SNAPSHOT_COLLECTION].insert_many(docs[i : i + chunk], ordered=False)
 
-        qty_ok = abs(src_qty - snap_qty) <= max(0.01, abs(src_qty) * 1e-9)
-        value_ok = abs(src_value - snap_value) <= max(0.01, abs(src_value) * 1e-9)
-        count_ok = src_n == snap_n
+        # Re-read and validate persisted totals against the built rollup.
+        stored = await db[SNAPSHOT_COLLECTION].find({"snapshot_date_ist": iso}, {"_id": 0, "available_qty": 1, "total_value": 1}).to_list(500000)
+        store_qty, store_value, store_n = _totals(stored, qty_key="available_qty", value_key="total_value")
+        qty_ok = abs(src_qty - store_qty) <= max(0.01, abs(src_qty) * 1e-9)
+        value_ok = abs(src_value - store_value) <= max(0.01, abs(src_value) * 1e-9)
+        count_ok = src_n == store_n
         reconciled = bool(qty_ok and value_ok and count_ok)
-        if not reconciled and src_n:
+        if not reconciled:
             raise RuntimeError(
                 f"rollup reconciliation failed for {iso}: "
-                f"src(n={src_n}, qty={src_qty}, value={src_value}) "
-                f"snap(n={snap_n}, qty={snap_qty}, value={snap_value})"
+                f"built(n={src_n}, qty={src_qty}, value={src_value}) "
+                f"stored(n={store_n}, qty={store_qty}, value={store_value}) "
+                f"raw_source(n={raw_n}, qty={raw_qty}, value={raw_value})"
             )
 
         result = await _set_status(
@@ -315,11 +341,14 @@ async def finalize_analytics_rollup_for_date(
                 "status": STATUS_SUCCESS,
                 "error": None,
                 "source_record_count": src_n,
-                "snapshot_record_count": snap_n,
+                "snapshot_record_count": store_n,
                 "source_total_qty": src_qty,
                 "source_total_value": src_value,
-                "snapshot_total_qty": snap_qty,
-                "snapshot_total_value": snap_value,
+                "snapshot_total_qty": store_qty,
+                "snapshot_total_value": store_value,
+                "raw_source_record_count": raw_n,
+                "raw_source_total_qty": raw_qty,
+                "raw_source_total_value": raw_value,
                 "reconciled": True,
                 "finalized_at": datetime.utcnow().isoformat() + "Z",
             },

@@ -147,7 +147,7 @@ def test_finalize_rollup_idempotent_and_reconciled():
     first = asyncio.run(ar.finalize_analytics_rollup_for_date(db, "2026-10-16"))
     assert first["status"] == ar.STATUS_SUCCESS
     assert first["reconciled"] is True
-    assert first["snapshot_record_count"] == 1
+    assert first.get("snapshot_record_count") == 1
     assert abs(first["snapshot_total_value"] - 500) < 1e-6
     assert len(db.analytics_stock_daily_snapshots.rows) == 1
 

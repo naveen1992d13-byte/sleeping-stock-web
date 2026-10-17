@@ -992,6 +992,8 @@ async def _analytics_window(from_date: str, to_date: str) -> Tuple[str, str, Lis
     """Clamp Analytics to finalized historical dates only (never today)."""
     last = await rollup.last_successful_rollup_date(db)
     effective_to, updated_up_to = rollup.resolve_analytics_end_date(to_date, last_success=last)
+    if not updated_up_to:
+        return from_date, effective_to, [], None
     start = datetime.strptime(from_date, "%Y-%m-%d").date()
     end = datetime.strptime(effective_to, "%Y-%m-%d").date()
     if end < start:
@@ -1401,6 +1403,27 @@ async def analytics_order_saving(
         from_date, to_date, category=category, metric_type=metric_type
     )
     from_date, effective_to, date_keys, updated_up_to = await _analytics_window(from_date, to_date)
+    if not updated_up_to or not date_keys:
+        return {
+            "summary": {
+                "total_order_count": 0,
+                "original_order_value": 0.0,
+                "own_branch_saved_value": 0.0,
+                "same_dealer_saved_value": 0.0,
+                "other_dealer_saved_value": 0.0,
+                "total_saved_value": 0.0,
+                "balance_order_value": 0.0,
+                "saving_pct": 0.0,
+                "reduction_pct": 0.0,
+            },
+            "series": [],
+            "metric_type": metric_type,
+            "scope": scope,
+            "data_updated_up_to": updated_up_to,
+            "from_date": from_date,
+            "to_date": effective_to,
+            "data_coverage": _coverage_payload(updated_up_to),
+        }
     start, end, _, _, _, _ = _common_params(from_date, effective_to, category=category, metric_type=metric_type)
     orders = await _orders_query(scope, start, end)
     order_ids = {o.get("id") for o in orders if o.get("id")}
@@ -1644,11 +1667,31 @@ async def analytics_request_acceptance(
     _, _, _, _, metric_type, category = _common_params(
         from_date, to_date, category=category, metric_type=metric_type
     )
-    from_date, effective_to, _, updated_up_to = await _analytics_window(from_date, to_date)
-    start, end, _, _, _, _ = _common_params(from_date, effective_to, category=category, metric_type=metric_type)
+    from_date, effective_to, date_keys, updated_up_to = await _analytics_window(from_date, to_date)
     direction = (request_direction or "received").lower()
     if direction not in {"raised", "received"}:
         raise HTTPException(400, "request_direction must be raised or received")
+    if not updated_up_to or not date_keys:
+        return {
+            "summary": {
+                "total_request_count": 0,
+                "request_received_value": 0.0,
+                "total_fulfilled_value": 0.0,
+                "lost_opportunity_value": 0.0,
+                "given_to_branches_value": 0.0,
+                "given_to_dealers_value": 0.0,
+                "fulfillment_pct": 0.0,
+            },
+            "series": [],
+            "metric_type": metric_type,
+            "request_direction": direction,
+            "scope": scope,
+            "data_updated_up_to": updated_up_to,
+            "from_date": from_date,
+            "to_date": effective_to,
+            "data_coverage": _coverage_payload(updated_up_to),
+        }
+    start, end, _, _, _, _ = _common_params(from_date, effective_to, category=category, metric_type=metric_type)
     reqs = await _requests_query(scope, start, end, direction)
     reqs = await _filter_rows_by_part_type(reqs, category, scope)
 
