@@ -840,7 +840,7 @@ class OverlayCollection:
                 async for row in _aiter(prod_cursor):
                     payload = dict(row)
                     ident = doc_id(payload)
-                    if not ident or ident in hidden:
+                    if ident and ident in hidden:
                         continue
                     if ident in created_by_id:
                         merged = created_by_id[ident]
