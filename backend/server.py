@@ -6824,6 +6824,7 @@ async def finish_order_desk_order(order_id: str, current_user: UserResponse = De
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized for this order')
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    items = await odw.enrich_order_items(db, order, items)
     reqs_by_item = {}
     for req in await db.order_requests.find({'order_id': order_id}, {'_id': 0}).to_list(20000):
         reqs_by_item.setdefault(req.get('order_item_id'), []).append(req)
@@ -6864,6 +6865,7 @@ async def _load_order_fulfillment(order_id: str, current_user: UserResponse):
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized for this order')
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    items = await odw.enrich_order_items(db, order, items)
     reqs_by_item = {}
     for req in await db.order_requests.find({'order_id': order_id}, {'_id': 0}).to_list(20000):
         reqs_by_item.setdefault(req.get('order_item_id'), []).append(req)

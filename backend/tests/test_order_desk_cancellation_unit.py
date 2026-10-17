@@ -82,3 +82,10 @@ def test_workflow_status_no_further_stock_without_cancellation():
     item = _item('A', 2, factory_order_qty=2, no_further_stock=True)
     wf = odw.compute_item_workflow(item, ORDER, [])
     assert wf['request_status'] == odw.REQUEST_STATUS_FACTORY
+
+
+def test_unsourced_item_without_stored_remaining_blocks_finish():
+    item = {'id': 'A', 'part_number': 'A', 'required_qty': 1, 'status': 'Order Created'}
+    readiness = odw.evaluate_finish_readiness(ORDER, [item], {})
+    assert readiness['can_finish'] is False
+    assert readiness['remaining_open_items'] == ['A']

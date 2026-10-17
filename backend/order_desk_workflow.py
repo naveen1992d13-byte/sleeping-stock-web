@@ -705,6 +705,12 @@ def is_item_cancelled(item: Dict[str, Any]) -> bool:
     return _clean(item.get('cancellation_status')).lower() == 'approved'
 
 
+def _item_remaining_qty(item: Dict[str, Any]) -> float:
+    if item.get('remaining_qty') is not None:
+        return _f(item.get('remaining_qty'))
+    return _f(item.get('required_qty')) - _f(item.get('accepted_qty')) - _f(item.get('factory_fulfilled_qty'))
+
+
 def evaluate_finish_readiness(order: Dict[str, Any], items: List[Dict[str, Any]], requests_by_item: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     """Order-level Finish is allowed only when no request is still open,
     remaining qty is zero, and every factory-required row has a Factory Order No.
@@ -714,7 +720,7 @@ def evaluate_finish_readiness(order: Dict[str, Any], items: List[Dict[str, Any]]
     remaining_open = []
     for item in items or []:
         item_id = item.get('id')
-        remaining = 0 if is_item_cancelled(item) else max(0, int(_f(item.get('remaining_qty'))))
+        remaining = 0 if is_item_cancelled(item) else max(0, int(_item_remaining_qty(item)))
         if remaining > 0:
             remaining_open.append(item_id)
         for req in requests_by_item.get(item_id, []) if requests_by_item else []:
