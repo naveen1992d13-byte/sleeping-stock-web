@@ -19,7 +19,7 @@ import {
   Upload,
   Download,
 } from "lucide-react";
-import { useOutletContext, useSearchParams } from "react-router-dom";
+import { useNavigate, useOutletContext, useSearchParams } from "react-router-dom";
 import { Button } from "../components/ui/button";
 import { useAuth, API } from "../App";
 import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
@@ -80,6 +80,7 @@ export default function UsersPage() {
   const outletScope = useOutletContext() || {};
   const isMaster = user?.role === "master";
   const isAdmin = user?.role === "admin";
+  const navigate = useNavigate();
   const isNormalUser = user?.role === "user";
 
   const scopeBrand = outletScope.scopeBrand || "All Brands";
@@ -740,6 +741,7 @@ export default function UsersPage() {
   const toggleUserStatus = async (item) => {
     const id = item.id;
     if (!id) return toast.error("User ID not found");
+    if (isAdmin && item.role !== "user") return toast.warning("Admin can manage only User role");
 
     const res = await fetch(`${API}/profile/${id}/status`, {
       method: "PUT",
@@ -775,6 +777,7 @@ export default function UsersPage() {
     if (!isMaster && !isAdmin) {
       return toast.warning("Not allowed");
     }
+    if (isAdmin && item.role !== "user") return toast.warning("Admin can reset only User role");
     setResetTarget(item);
     setResetPasswordValue("");
     setResetPasswordConfirm("");
@@ -1003,7 +1006,12 @@ export default function UsersPage() {
                   </td>
                   <td className="p-3 whitespace-nowrap">
                     <div className="flex gap-3 items-center">
-                    <Eye size={16} title="View" />
+                    <Eye
+                      size={16}
+                      title="View Profile"
+                      style={{ cursor: "pointer", color: "#475569" }}
+                      onClick={() => navigate(`/profile/${u.id}`)}
+                    />
 
                     {(isMaster || isAdmin) && (
                       <>

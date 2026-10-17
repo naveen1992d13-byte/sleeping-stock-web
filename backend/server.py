@@ -620,8 +620,7 @@ async def get_me(current_user: UserResponse = Depends(get_current_user)):
 
 @api_router.get("/users", response_model=List[UserResponse])
 async def get_users(current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master(current_user)
     
     users = await db.users.find({}, {"_id": 0}).to_list(1000)
     return [UserResponse(**u) for u in users]
@@ -635,6 +634,9 @@ async def create_user(user_data: UserCreate, current_user: UserResponse = Depend
     elif current_user.role == "admin":
         if user_data.role != "user":
             raise HTTPException(status_code=403, detail="Admins can only create users")
+        user_data.brand = current_user.brand
+        user_data.group = current_user.group
+        user_data.permissions = {}
     else:
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -702,8 +704,7 @@ class PermissionUpdate(BaseModel):
 
 @api_router.put("/users/{user_id}/permissions")
 async def update_user_permissions(user_id: str, data: PermissionUpdate, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master(current_user)
     
     result = await db.users.update_one(
         {"id": user_id},
@@ -717,8 +718,8 @@ async def update_user_permissions(user_id: str, data: PermissionUpdate, current_
 
 @api_router.get("/users/{user_id}/permissions")
 async def get_user_permissions(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master_or_admin(current_user)
+    await _ensure_can_view_user(current_user, user_id)
     
     user = await db.users.find_one({"id": user_id}, {"_id": 0})
     if not user:
@@ -1864,9 +1865,7 @@ async def get_dashboard_metrics(current_user: UserResponse = Depends(get_current
 
 @api_router.get("/profile/{user_id}", response_model=UserResponse)
 async def get_user_profile(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    # Users can only view their own profile unless they're admin/master
-    if current_user.role not in ["master", "admin"] and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized to view this profile")
+    await _ensure_can_view_user(current_user, user_id)
     
     user = await db.users.find_one({"id": user_id}, {"_id": 0})
     if not user:
@@ -2006,6 +2005,7 @@ async def toggle_user_status(user_id: str, current_user: UserResponse = Depends(
     user = await db.users.find_one({"id": user_id}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    _ensure_can_manage_user(current_user, user)
     
     new_status = "inactive" if user.get("status") == "active" else "active"
     await db.users.update_one(
@@ -2026,9 +2026,7 @@ async def toggle_user_status(user_id: str, current_user: UserResponse = Depends(
 
 @api_router.get("/profile/{user_id}/analytics")
 async def get_user_analytics(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    # Users can only view their own analytics unless they're admin/master
-    if current_user.role not in ["master", "admin"] and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_can_view_user(current_user, user_id)
     
     # Count total orders
     total_orders = await db.orders.count_documents({"created_by": user_id})
@@ -2052,18 +2050,14 @@ async def get_user_analytics(user_id: str, current_user: UserResponse = Depends(
 
 @api_router.get("/profile/{user_id}/orders")
 async def get_user_orders(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    # Users can only view their own orders unless they're admin/master
-    if current_user.role not in ["master", "admin"] and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_can_view_user(current_user, user_id)
     
     orders = await db.orders.find({"created_by": user_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
     return orders
 
 @api_router.get("/profile/{user_id}/activity-logs")
 async def get_user_activity_logs(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    # Users can view their own logs, admins can view anyone's
-    if current_user.role not in ["master", "admin"] and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_can_view_user(current_user, user_id)
     
     logs = await db.activity_logs.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).limit(50).to_list(50)
     return logs
@@ -2256,6 +2250,32 @@ async def _ensure_master(current_user: UserResponse):
 async def _ensure_master_or_admin(current_user: UserResponse):
     if current_user.role not in ["master", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
+
+
+def _is_same_dealer(current_user: UserResponse, target: dict) -> bool:
+    return target.get("brand") == current_user.brand and target.get("group") == current_user.group
+
+
+async def _ensure_can_view_user(current_user: UserResponse, user_id: str):
+    if current_user.id == user_id or current_user.role == "master":
+        return
+    if current_user.role == "admin":
+        target = await db.users.find_one({"id": user_id}, {"_id": 0, "brand": 1, "group": 1})
+        if target and _is_same_dealer(current_user, target):
+            return
+    raise HTTPException(status_code=403, detail="Not authorized for this user")
+
+
+def _ensure_can_manage_user(current_user: UserResponse, target: dict):
+    """Admins manage only role=user accounts of their own brand and dealer."""
+    if current_user.role == "master":
+        return
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if target.get("role") != "user":
+        raise HTTPException(status_code=403, detail="Admin can manage only users")
+    if not _is_same_dealer(current_user, target):
+        raise HTTPException(status_code=403, detail="Not authorized for this user")
 
 
 def _clean_master_code(value: str) -> str:
@@ -3008,6 +3028,10 @@ async def update_hub_user(user_id: str, data: UserHubUpdate, current_user: UserR
             raise HTTPException(status_code=403, detail="Not authorized for this user")
         for locked in ("brand", "dealer", "group", "role", "state"):
             raw.pop(locked, None)
+        if raw.get("permissions") is not None:
+            allowed_permissions = set(_permission_list(current_user.permissions))
+            if not set(raw["permissions"]).issubset(allowed_permissions):
+                raise HTTPException(status_code=403, detail="Admin cannot assign permissions not given by Master")
 
     update_data = {}
     for key, value in raw.items():
