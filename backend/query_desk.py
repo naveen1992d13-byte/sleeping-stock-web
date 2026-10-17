@@ -493,7 +493,6 @@ async def download_attachment(file_id: str, current_user=Depends(_current_user))
     return file_objects.streaming_response_from_meta(
         meta,
         filename=meta.get("file_name") or "attachment.bin",
-        preview=True,
     )
 
 

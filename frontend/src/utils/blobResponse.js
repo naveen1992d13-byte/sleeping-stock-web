@@ -53,14 +53,18 @@ export async function openInlineAttachment(href, fileName = 'attachment') {
       ? res.data
       : new Blob([res.data], { type: ctype || 'application/octet-stream' });
   const url = URL.createObjectURL(blob);
-  const opened = window.open(url, '_blank', 'noopener,noreferrer');
-  if (!opened) {
+  const viewable = ctype === 'application/pdf' || ctype.startsWith('image/');
+  // window.open returns null whenever 'noopener' is passed, so it cannot be used to detect a blocked popup.
+  const opened = viewable ? window.open(url, '_blank') : null;
+  if (opened) {
+    opened.opener = null;
+  } else {
     const a = document.createElement('a');
     a.href = url;
-    a.target = '_blank';
-    a.rel = 'noopener';
-    a.download = '';
+    a.download = fileName;
+    document.body.appendChild(a);
     a.click();
+    a.remove();
   }
   window.setTimeout(() => URL.revokeObjectURL(url), 120000);
   return { url, fileName, contentType: ctype };
