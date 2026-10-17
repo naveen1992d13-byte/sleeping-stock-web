@@ -688,8 +688,7 @@ async def _build_daily_stock_series(
 ) -> dict:
     expected_branches = await _expected_branch_names(scope, current_user)
     consolidated = not bool(scope.get("branch"))
-    uploaded_by_date, upload_meta = await _uploaded_branches_by_date(scope, date_keys)
-    # Screen path: finalized rollups only. Prior-day comparison also comes from rollups.
+    # Screen path: finalized rollups only. Do not scan live uploads/products for presence.
     prior_key = None
     if date_keys:
         prior_iso = await rollup.last_successful_rollup_date(
@@ -708,12 +707,15 @@ async def _build_daily_stock_series(
             dk: _filter_parts_by_aging_bucket(part_map, aging_type, aging_bucket)
             for dk, part_map in by_date.items()
         }
-    if prior_key:
-        up_prior, meta_prior = await _uploaded_branches_by_date(scope, [prior_key])
-        for dk, branches in up_prior.items():
-            uploaded_by_date[dk] = uploaded_by_date.get(dk, set()) | branches
-        for dk, m in meta_prior.items():
-            upload_meta[dk] = {**upload_meta.get(dk, {}), **m}
+    uploaded_by_date = {}
+    upload_meta = {}
+    for dk, part_map in by_date.items():
+        branches = {_text(row.get("branch")).casefold() for row in part_map.values() if _text(row.get("branch"))}
+        uploaded_by_date[dk] = branches
+        upload_meta[dk] = {
+            b: {"published_at": None, "total_value": sum(r["value"] for r in part_map.values() if _text(r.get("branch")).casefold() == b)}
+            for b in branches
+        }
 
     last_avail_key: Optional[str] = prior_key
     if prior_key:
