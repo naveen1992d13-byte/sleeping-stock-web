@@ -443,6 +443,36 @@ async def _read_s3_product_day(db, date_key: str) -> List[Dict[str, Any]]:
     return _load_jsonl_gz(data)
 
 
+async def _restrict_to_latest_uploads(db, query: Dict[str, Any]) -> Dict[str, Any]:
+    """A branch can publish more than once a day; only its last publish is that day's stock."""
+    try:
+        grouped = await db.products.aggregate([
+            {"$match": query},
+            {"$group": {
+                "_id": {
+                    "brand": "$brand_name",
+                    "dealer": "$dealer_name",
+                    "branch": "$branch",
+                    "upload_id": "$upload_id",
+                },
+                "last_published_at": {"$max": "$published_at"},
+            }},
+        ]).to_list(100000)
+    except Exception:
+        return query
+    latest: Dict[Tuple[Any, Any, Any], Tuple[str, Any]] = {}
+    for row in grouped:
+        ident = row.get("_id") or {}
+        scope_key = (ident.get("brand"), ident.get("dealer"), ident.get("branch"))
+        stamp = str(row.get("last_published_at") or "")
+        if scope_key not in latest or stamp > latest[scope_key][0]:
+            latest[scope_key] = (stamp, ident.get("upload_id"))
+    upload_ids = {upload_id for _stamp, upload_id in latest.values()}
+    if len(upload_ids) >= len(grouped):
+        return query
+    return {**query, "upload_id": {"$in": sorted(upload_ids, key=lambda x: str(x))}}
+
+
 async def _read_mongo_product_day(db, date_key: str, brand=None, dealer=None, branch=None) -> List[Dict[str, Any]]:
     dk = _normalize_date_key(date_key)
     date_iso = date_key_to_iso(dk)
@@ -456,6 +486,7 @@ async def _read_mongo_product_day(db, date_key: str, brand=None, dealer=None, br
         query["dealer_name"] = dealer
     if branch:
         query["branch"] = branch
+    query = await _restrict_to_latest_uploads(db, query)
     return await db.products.find(query, {"_id": 0}).to_list(300000)
 
 
@@ -484,6 +515,7 @@ async def _read_mongo_product_day_page(
         query["dealer_name"] = dealer
     if branch:
         query["branch"] = branch
+    query = await _restrict_to_latest_uploads(db, query)
     if part_number:
         query["part_number"] = part_number
 
@@ -765,6 +797,7 @@ async def summarize_product_history(
         if branch:
             query["branch"] = branch
         used_mongo = False
+        query = await _restrict_to_latest_uploads(db, query)
         try:
             mongo_n = await db.products.count_documents(query)
         except Exception:
