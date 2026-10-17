@@ -686,3 +686,17 @@ def test_strip_overlay_flags_keeps_other_and_parts():
     raw, base_only, testing_only = ov._strip_overlay_flags(query)
     assert base_only is True and testing_only is False
     assert raw == {"$and": [{"a": 1}, {"b": 2}]}
+
+
+def test_attachment_metadata_keyed_by_file_id_is_readable():
+    prod = FakeCollection([{"file_id": "prod-file", "query_id": "q0"}])
+    test = FakeCollection([])
+    col = ov.OverlayCollection("query_attachments", prod, test, FakeCollection(), FakeCollection())
+
+    async def _go():
+        await col.insert_one({"file_id": "ts-file", "query_id": "q1"})
+        return await col.find_one({"file_id": "ts-file"}), await col.find_one({"file_id": "prod-file"})
+
+    created, base = asyncio.run(_go())
+    assert created and created["query_id"] == "q1"
+    assert base and base["query_id"] == "q0"
