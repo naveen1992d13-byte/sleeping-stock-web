@@ -262,6 +262,8 @@ export function Orders({ scopeOverride } = {}) {
   const [sendRequestResult, setSendRequestResult] = useState(null);
   const [resendingNumber, setResendingNumber] = useState('');
   const [autoSuggestLoading, setAutoSuggestLoading] = useState('');
+  const [autoSourceLoading, setAutoSourceLoading] = useState(false);
+  const [factoryDecisionLoading, setFactoryDecisionLoading] = useState('');
   const [nowMs, setNowMs] = useState(Date.now());
   const [factoryDrafts, setFactoryDrafts] = useState({});
   const [factorySaving, setFactorySaving] = useState('');
@@ -459,6 +461,44 @@ export function Orders({ scopeOverride } = {}) {
     await axios.post(`${API}/order-desk/orders/${currentOrder.id}/allocate`, {
       allocations: items.map(item => ({ item_id: item.id, sources: allocations[item.id] || [] })),
     });
+  };
+
+  const startAutoSourcing = async () => {
+    if (!currentOrder?.id || autoSourceLoading || orderFinished) return toast.error('Upload or open an order first');
+    if (!currentOrder?.availability_checked) return toast.error('Run Check Availability first');
+    setAutoSourceLoading(true);
+    try {
+      const res = await axios.post(`${API}/order-desk/orders/${currentOrder.id}/auto-source/start`, {
+        aging_type: branchAgingType,
+        min_aging_days: Number(branchAgingMin || 0),
+      });
+      const state = res.data?.state || res.data?.order?.auto_sourcing_state;
+      const banner = res.data?.message_banner || res.data?.order?.auto_sourcing_message;
+      if (banner) toast(banner);
+      else if (state === 'waiting_response' || state === 'last_chance') {
+        toast.success(`Auto Sourcing routed${res.data?.result?.request_number ? `: ${res.data.result.request_number}` : ''}`);
+      } else toast.success(res.data?.message || 'Auto Sourcing started');
+      await loadOrder(currentOrder.id, { silent: true });
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Auto Sourcing failed');
+    } finally {
+      setAutoSourceLoading(false);
+    }
+  };
+
+  const submitFactoryDecision = async (action) => {
+    if (!currentOrder?.id || factoryDecisionLoading || orderFinished) return;
+    setFactoryDecisionLoading(action);
+    try {
+      const res = await axios.post(`${API}/order-desk/orders/${currentOrder.id}/factory-decision`, { action });
+      toast.success(res.data?.message || 'Decision saved');
+      await loadOrder(currentOrder.id, { silent: true });
+      if (action === 'move_to_factory') setActiveStage('factory');
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Unable to save factory decision');
+    } finally {
+      setFactoryDecisionLoading('');
+    }
   };
 
   const runAutoSuggest = async (level) => {
@@ -805,6 +845,58 @@ export function Orders({ scopeOverride } = {}) {
               {resendingNumber === rn ? 'Retrying…' : `Retry Email (${rn})`}
             </Button>
           ))}
+        </div>
+      )}
+
+      {currentOrder && (
+        <div className="rounded-xl border bg-white p-4 flex flex-wrap items-center gap-3">
+          <div className="flex-1 min-w-[220px]">
+            <div className="text-sm font-semibold text-slate-800">Sequential Auto Sourcing</div>
+            <div className="text-xs text-slate-500 mt-1">
+              Own Branch first → best supplier (full coverage, fewer pickups, same dealer, higher aging) → Last Chance → Factory Decision.
+              Response window: 15 minutes per 5 part lines.
+            </div>
+            {currentOrder.auto_sourcing_state && (
+              <div className="text-xs mt-1 text-slate-600">
+                State: <span className="font-medium">{currentOrder.auto_sourcing_state}</span>
+                {currentOrder.auto_sourcing_current_request ? ` · Active: ${currentOrder.auto_sourcing_current_request}` : ''}
+              </div>
+            )}
+          </div>
+          <Button
+            onClick={startAutoSourcing}
+            disabled={!currentOrder?.availability_checked || loading || autoSourceLoading || orderFinished || currentOrder.auto_sourcing_active}
+          >
+            {autoSourceLoading ? 'Starting…' : currentOrder.auto_sourcing_active ? 'Auto Sourcing Active…' : 'Start Auto Sourcing'}
+          </Button>
+        </div>
+      )}
+
+      {(currentOrder?.factory_decision_required || currentOrder?.auto_sourcing_message) && (
+        <div className="rounded-xl border border-slate-300 bg-slate-50 p-4 space-y-3">
+          <div className="text-sm font-semibold text-slate-900">
+            {currentOrder.auto_sourcing_message || 'Auto Sourcing Completed – Factory Decision Required'}
+          </div>
+          <div className="text-xs text-slate-600">
+            Selecting either option stops the response timer and closes remaining Auto Sourcing.
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              disabled={!!factoryDecisionLoading || orderFinished}
+              onClick={() => submitFactoryDecision('move_to_factory')}
+            >
+              {factoryDecisionLoading === 'move_to_factory' ? 'Saving…' : 'Move Balance to Factory'}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!!factoryDecisionLoading || orderFinished}
+              onClick={() => submitFactoryDecision('cancel_remaining')}
+            >
+              {factoryDecisionLoading === 'cancel_remaining' ? 'Saving…' : 'Cancel Remaining Requirement'}
+            </Button>
+          </div>
         </div>
       )}
 

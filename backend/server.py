@@ -4783,15 +4783,22 @@ def _aging_value_for_suggest(entry: dict, aging_type: str) -> float:
     return float(entry.get('purchase_aging_days') or entry.get('aging_days') or 0)
 
 
-def _auto_suggest_sort_key(entry: dict, aging_type: str):
-    """Highest Aging First; if equal, Highest Available Quantity first; if
-    still equal, Oldest Uploaded Stock first; if still equal, Alphabetical
-    Branch. Built as an ascending sort key (negate the descending fields)."""
-    aging = _aging_value_for_suggest(entry, aging_type)
-    qty = float(entry.get('net_available_qty', entry.get('available_qty', 0)) or 0)
-    last_upload = entry.get('last_upload') or ''
-    branch = _order_clean_text(entry.get('branch')).lower()
-    return (-aging, -qty, last_upload, branch)
+def _auto_suggest_sort_key(entry: dict, aging_type: str, *, need_qty: float = 0.0, order: dict = None):
+    """Approved Auto Suggest ranking for a single remaining line.
+
+    Full coverage → same-dealer preference → higher aging → higher available qty.
+    (Minimum pickup locations is applied when selecting one multi-line destination
+    in the sequential Auto Sourcing engine.)
+    """
+    try:
+        import order_auto_sourcing as oas
+        return oas.single_source_rank_key(entry, need_qty or 0.0, order or {}, aging_type)
+    except Exception:
+        aging = _aging_value_for_suggest(entry, aging_type)
+        qty = float(entry.get('net_available_qty', entry.get('available_qty', 0)) or 0)
+        last_upload = entry.get('last_upload') or ''
+        branch = _order_clean_text(entry.get('branch')).lower()
+        return (-aging, -qty, last_upload, branch)
 
 
 def _order_number_prefix(brand_code: str):
@@ -5762,7 +5769,7 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
         pool = odw.eligible_pool(item, order, level, freezes, aging_type, min_aging_days)
         pool = [_with_reservation_adjustment(s, reserved_map) for s in pool]
         pool = [s for s in pool if s.get('net_available_qty', 0) > 0]
-        pool.sort(key=lambda s: _auto_suggest_sort_key(s, aging_type))
+        pool.sort(key=lambda s: _auto_suggest_sort_key(s, aging_type, need_qty=pending_qty, order=order))
         if level == 'own':
             pool = odw.partition_own_branch_first(pool, order)
 
@@ -5832,6 +5839,432 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
     enriched = await odw.enrich_order_items(db, order, result_items, aging_type, min_aging_days, aging_type, min_aging_days)
     return {'order_number': order.get('order_number'), 'level': level, 'aging_type': aging_type,
             'min_aging_days': min_aging_days, 'items': enriched}
+
+
+async def _auto_source_continue_safe(order_id: str, reason: str = ''):
+    try:
+        await _auto_source_advance(order_id, actor=_sla_system_actor(), reason=reason)
+    except Exception as exc:
+        logging.getLogger('nmts.order_auto_sourcing').exception(
+            'auto-source advance failed order=%s reason=%s err=%s', order_id, reason, exc
+        )
+
+
+async def _auto_source_claim_lock(order_id: str) -> bool:
+    """Concurrency protection: only one advance runs at a time per order."""
+    now = datetime.now(timezone.utc).isoformat()
+    res = await db.order_headers.find_one_and_update(
+        {
+            'id': order_id,
+            '$or': [
+                {'auto_sourcing_lock_until': {'$exists': False}},
+                {'auto_sourcing_lock_until': None},
+                {'auto_sourcing_lock_until': {'$lt': now}},
+            ],
+        },
+        {'$set': {
+            'auto_sourcing_lock_until': (datetime.now(timezone.utc) + timedelta(seconds=45)).isoformat(),
+            'auto_sourcing_lock_token': str(uuid.uuid4()),
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    return bool(res)
+
+
+async def _auto_source_release_lock(order_id: str):
+    await db.order_headers.update_one(
+        {'id': order_id},
+        {'$set': {'auto_sourcing_lock_until': None, 'auto_sourcing_lock_token': None}},
+    )
+
+
+async def _auto_source_send_destination(order: dict, destination: dict, current_user: UserResponse, *, last_chance: bool = False) -> dict:
+    """Allocate + send ONE destination request group (sequential, never broadcast)."""
+    import order_auto_sourcing as oas
+    now = datetime.now(timezone.utc).isoformat()
+    pairs = []
+    for line in destination.get('lines') or []:
+        item = line['item']
+        source = line['source']
+        take = float(line.get('take_qty') or 0)
+        if take <= 0:
+            continue
+        # Live stock check — refuse stale availability
+        stock_id = source.get('stock_id')
+        live_qty = float(source.get('net_available_qty', source.get('available_qty') or 0) or 0)
+        if stock_id:
+            reserved_map = await _reservation_qty_map([stock_id])
+            product = await db.products.find_one({'id': stock_id}, {'_id': 0, 'available_qty_number': 1, 'quantity': 1})
+            if product is not None:
+                live_qty = max(0.0, float(product.get('available_qty_number', product.get('quantity') or 0) or 0) - float(reserved_map.get(stock_id) or 0))
+        take = min(take, live_qty, float(item.get('remaining_qty') or 0))
+        if take <= 0:
+            continue
+        level = line.get('level') or destination.get('level') or 'branch'
+        alloc = {
+            'dealer_name': _order_clean_text(source.get('dealer_name')),
+            'branch': _order_clean_text(source.get('branch')),
+            'request_qty': take,
+            'available_qty_at_selection': float(source.get('available_qty') or live_qty or 0),
+            'purchase_aging_days': source.get('purchase_aging_days'),
+            'sales_aging_days': source.get('sales_aging_days'),
+            'aging_days': source.get('aging_days'),
+            'loc': source.get('loc', ''),
+            'stock_id': stock_id,
+            'status': odw.REQUEST_STATUS_READY,
+            'selected_at': now,
+            'level': level,
+            'origin': 'auto_source',
+            'source_type': level,
+            'source_dealer': _order_clean_text(source.get('dealer_name')),
+            'source_branch': _order_clean_text(source.get('branch')),
+            'requested_qty': take,
+            'accepted_qty': 0,
+            'remaining_qty': take,
+            'request_status': odw.REQUEST_STATUS_READY,
+            'last_chance': bool(last_chance),
+        }
+        fresh = await db.order_items.find_one({'id': item['id']}, {'_id': 0}) or item
+        kept = []
+        for a in (fresh.get('allocations') or []):
+            sent = bool(a.get('request_no') or a.get('request_number')) or str(a.get('status') or '').lower() in (
+                'request sent', 'awaiting response', 'requested', 'accepted', 'partially accepted',
+                'rejected', 'cancelled', 'completed', 'dispatched', 'received', 'response time expired',
+            )
+            if sent:
+                kept.append(a)
+        new_allocs = kept + [alloc]
+        await db.order_items.update_one({'id': item['id']}, {'$set': {
+            'allocations': new_allocs,
+            'allocated_qty': odw.sum_active_allocation_qty(new_allocs),
+            'allocation_source': 'auto_source',
+            'status': 'Source Selected',
+            'request_status': odw.REQUEST_STATUS_READY,
+            'updated_at': now,
+        }})
+        refreshed = await db.order_items.find_one({'id': item['id']}, {'_id': 0})
+        pairs.append((refreshed, alloc))
+
+    if not pairs:
+        return {'sent': False, 'reason': 'no_live_qty'}
+
+    group_doc = await _create_request_group(order, pairs, current_user, now)
+    request_number = (group_doc or {}).get('request_number')
+    for item, source in pairs:
+        stamped = odw.mark_allocations_sent(item, [source], request_number, now)
+        await db.order_items.update_one({'id': item['id']}, {'$set': {
+            'allocations': stamped,
+            'status': 'Requested',
+            'request_status': odw.REQUEST_STATUS_SENT,
+            'retry_required': False,
+            'updated_at': now,
+        }})
+    await db.order_headers.update_one({'id': order['id']}, {'$set': {
+        'auto_sourcing_state': oas.AUTO_SOURCE_LAST_CHANCE if last_chance else oas.AUTO_SOURCE_WAITING,
+        'auto_sourcing_active': True,
+        'auto_sourcing_current_request': request_number,
+        'auto_sourcing_last_chance': bool(last_chance),
+        'updated_at': now,
+    }})
+    await db.request_headers.update_one({'request_number': request_number}, {'$set': {
+        'auto_sourced': True,
+        'last_chance': bool(last_chance),
+    }})
+    await oas.append_sourcing_event(db, order, 'Last Chance alert routed' if last_chance else 'Auto Sourcing routed', {
+        'request_number': request_number,
+        'supplying_dealer': destination.get('dealer_name'),
+        'supplying_branch': destination.get('branch'),
+        'lines': len(pairs),
+        'last_chance': last_chance,
+        'rank': {
+            'full_coverage_count': destination.get('full_coverage_count'),
+            'lines_covered': len(destination.get('lines') or []),
+            'same_dealer': destination.get('same_dealer'),
+            'max_aging': destination.get('max_aging'),
+            'total_available': destination.get('total_available'),
+        },
+    }, current_user)
+    return {'sent': True, 'request_number': request_number, 'group': group_doc, 'lines': len(pairs)}
+
+
+async def _auto_source_advance(order_id: str, actor: UserResponse = None, reason: str = '') -> dict:
+    """Continue sequential Auto Sourcing for an order (idempotent / locked)."""
+    import order_auto_sourcing as oas
+    actor = actor or _sla_system_actor()
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        return {'ok': False, 'reason': 'order_missing'}
+    if order.get('auto_sourcing_state') in (oas.AUTO_SOURCE_COMPLETED, oas.AUTO_SOURCE_CANCELLED, oas.AUTO_SOURCE_FACTORY_DECISION):
+        if not order.get('auto_sourcing_active'):
+            return {'ok': True, 'state': order.get('auto_sourcing_state'), 'skipped': True}
+    if order.get('finished_at'):
+        return {'ok': False, 'reason': 'order_finished'}
+
+    if not await _auto_source_claim_lock(order_id):
+        return {'ok': False, 'reason': 'locked'}
+
+    try:
+        # Wait if an active Requested header still exists
+        pending = await db.request_headers.find_one(
+            {'order_id': order_id, 'status': 'Requested', 'auto_sourced': True},
+            {'_id': 0, 'request_number': 1, 'status': 1},
+        )
+        if pending:
+            return {'ok': True, 'state': oas.AUTO_SOURCE_WAITING, 'waiting_on': pending.get('request_number')}
+
+        items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+        items = await odw.enrich_order_items(db, order, items)
+        remaining = oas.remaining_items(items)
+        if not remaining:
+            now = datetime.now(timezone.utc).isoformat()
+            await db.order_headers.update_one({'id': order_id}, {'$set': {
+                'auto_sourcing_state': oas.AUTO_SOURCE_COMPLETED,
+                'auto_sourcing_active': False,
+                'auto_sourcing_message': 'Auto Sourcing Completed',
+                'factory_decision_required': False,
+                'updated_at': now,
+            }})
+            await oas.append_sourcing_event(db, order, 'Auto Sourcing Completed', {'reason': reason}, actor)
+            return {'ok': True, 'state': oas.AUTO_SOURCE_COMPLETED}
+
+        aging_type = order.get('auto_sourcing_aging_type') or order.get('branch_aging_type') or 'purchase'
+        min_aging = float(order.get('auto_sourcing_min_aging_days') or 0)
+        freezes = await odw.load_today_freezes(db, [i.get('part_number') for i in remaining], order.get('brand_name') or '')
+
+        # Adjust pools for live reservations
+        all_stock_ids = []
+        for item in remaining:
+            for field in ('same_dealer_sources', 'other_dealer_sources'):
+                for s in item.get(field) or []:
+                    if s.get('stock_id'):
+                        all_stock_ids.append(s['stock_id'])
+        reserved_map = await _reservation_qty_map(all_stock_ids)
+        for item in remaining:
+            for field in ('same_dealer_sources', 'other_dealer_sources'):
+                item[field] = [_with_reservation_adjustment(s, reserved_map) for s in (item.get(field) or [])]
+
+        # 1) Own Branch first
+        own_candidates = oas.build_destination_candidates(
+            remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging, levels=['own'],
+        )
+        best = oas.select_best_destination(own_candidates, prefer_own=True)
+        phase = 'own'
+        last_chance = False
+        if not best:
+            # 2) Same-dealer branches, then other dealers
+            normal = oas.build_destination_candidates(
+                remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging, levels=['branch', 'dealer'],
+            )
+            best = oas.select_best_destination(normal, prefer_own=False)
+            phase = 'normal'
+        if not best:
+            # 3) Last Chance — unique holders only
+            unique = oas.find_unique_holder_candidates(
+                remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging,
+            )
+            best = oas.select_best_destination(unique, prefer_own=False)
+            phase = 'last_chance'
+            last_chance = True
+        if not best:
+            result = await oas.mark_factory_decision_required(db, order, remaining, actor)
+            return {'ok': True, **result}
+
+        send = await _auto_source_send_destination(order, best, actor, last_chance=last_chance)
+        if not send.get('sent'):
+            # Exclude empty destination and retry once
+            for line in best.get('lines') or []:
+                await db.order_items.update_one({'id': line['item']['id']}, {
+                    '$addToSet': {'excluded_sources': {
+                        'dealer_name': best.get('dealer_name'),
+                        'branch': best.get('branch'),
+                        'reason': 'stock_changed_during_response',
+                    }},
+                    '$set': {'updated_at': datetime.now(timezone.utc).isoformat()},
+                })
+            await oas.append_sourcing_event(db, order, 'Auto Sourcing skipped destination (stock changed)', {
+                'dealer': best.get('dealer_name'), 'branch': best.get('branch'), 'phase': phase,
+            }, actor)
+            return await _auto_source_advance(order_id, actor=actor, reason='stock_changed_retry')
+
+        return {'ok': True, 'state': oas.AUTO_SOURCE_WAITING if not last_chance else oas.AUTO_SOURCE_LAST_CHANCE, **send, 'phase': phase}
+    finally:
+        await _auto_source_release_lock(order_id)
+
+
+@api_router.post('/order-desk/orders/{order_id}/auto-source/start')
+async def order_desk_auto_source_start(order_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    """Start sequential Auto Sourcing for an order (Own Branch → ranked suppliers → Last Chance → Factory Decision)."""
+    import order_auto_sourcing as oas
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
+    odg.assert_order_not_finished(order)
+    role = (current_user.role or '').lower()
+    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not authorized for this order')
+    items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    if not items:
+        raise HTTPException(status_code=400, detail='Order has no items')
+    if not any(item.get('availability_checked_at') for item in items) and not order.get('availability_checked'):
+        raise HTTPException(status_code=400, detail='Run Check Availability before Auto Sourcing')
+    # Idempotent: if already waiting on a request, return current state
+    if order.get('auto_sourcing_active') and order.get('auto_sourcing_current_request'):
+        pending = await db.request_headers.find_one(
+            {'request_number': order.get('auto_sourcing_current_request'), 'status': 'Requested'}, {'_id': 0},
+        )
+        if pending:
+            return {
+                'message': 'Auto Sourcing already awaiting response',
+                'state': order.get('auto_sourcing_state'),
+                'request_number': pending.get('request_number'),
+                'duplicate': True,
+            }
+    aging_type = str((payload or {}).get('aging_type') or 'purchase').strip().lower()
+    if aging_type not in ('purchase', 'sales'):
+        aging_type = 'purchase'
+    try:
+        min_aging = float((payload or {}).get('min_aging_days') or 0)
+    except (TypeError, ValueError):
+        min_aging = 0.0
+    now = datetime.now(timezone.utc).isoformat()
+    await db.order_headers.update_one({'id': order_id}, {'$set': {
+        'auto_sourcing_active': True,
+        'auto_sourcing_state': oas.AUTO_SOURCE_ACTIVE,
+        'auto_sourcing_aging_type': aging_type,
+        'auto_sourcing_min_aging_days': min_aging,
+        'auto_sourcing_started_at': now,
+        'auto_sourcing_started_by': current_user.id,
+        'factory_decision_required': False,
+        'auto_sourcing_message': None,
+        'updated_at': now,
+    }})
+    await oas.append_sourcing_event(db, order, 'Auto Sourcing started', {
+        'aging_type': aging_type, 'min_aging_days': min_aging,
+    }, current_user)
+    result = await _auto_source_advance(order_id, actor=current_user, reason='start')
+    refreshed = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    return {
+        'message': 'Auto Sourcing started',
+        'order': refreshed,
+        'result': result,
+        'state': (refreshed or {}).get('auto_sourcing_state'),
+        'message_banner': (refreshed or {}).get('auto_sourcing_message'),
+    }
+
+
+@api_router.post('/order-desk/orders/{order_id}/auto-source/continue')
+async def order_desk_auto_source_continue(order_id: str, current_user: UserResponse = Depends(get_current_user)):
+    """Manual / system continue after reject, timeout, or partial acceptance."""
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
+    role = (current_user.role or '').lower()
+    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not authorized')
+    result = await _auto_source_advance(order_id, actor=current_user, reason='continue')
+    refreshed = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    return {'result': result, 'order': refreshed, 'state': (refreshed or {}).get('auto_sourcing_state')}
+
+
+@api_router.post('/order-desk/orders/{order_id}/factory-decision')
+async def order_desk_factory_decision(order_id: str, payload: dict, current_user: UserResponse = Depends(get_current_user)):
+    """Order creator decision after Auto Sourcing is exhausted.
+
+    action: 'move_to_factory' | 'cancel_remaining'
+    Stops the response timer on any leftover open auto-sourced request and
+    closes the remaining sourcing flow.
+    """
+    import order_auto_sourcing as oas
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
+    odg.assert_order_not_finished(order)
+    role = (current_user.role or '').lower()
+    is_creator = order.get('created_by') == current_user.id
+    if role != 'master' and not is_creator and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Only the order creator (or Master/Admin scope) can decide')
+    action = str((payload or {}).get('action') or '').strip().lower()
+    if action not in ('move_to_factory', 'cancel_remaining'):
+        raise HTTPException(status_code=400, detail="action must be 'move_to_factory' or 'cancel_remaining'")
+
+    now = datetime.now(timezone.utc).isoformat()
+    # Stop timers on any still-open auto-sourced requests
+    open_headers = await db.request_headers.find(
+        {'order_id': order_id, 'status': 'Requested'}, {'_id': 0},
+    ).to_list(500)
+    for header in open_headers:
+        await db.request_headers.update_one({'id': header['id']}, {'$set': {
+            **odw.freeze_response_timer(header, now, 'cancelled'),
+            'status': 'Cancelled',
+            'updated_at': now,
+            'factory_decision_stopped': True,
+        }})
+        await db.order_requests.update_many(
+            {'request_number': header.get('request_number'), 'status': 'Requested'},
+            {'$set': {
+                'status': 'Cancelled',
+                'official_confirmed': False,
+                'audit_only_attempt': True,
+                'updated_at': now,
+                'approval_remarks': f'Closed by factory decision ({action})',
+            }},
+        )
+        await db.stock_reservations.update_many(
+            {'request_group_id': header.get('id'), 'status': 'active'},
+            {'$set': {'status': 'released', 'released_at': now}},
+        )
+
+    items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    for item in items:
+        rem = float(item.get('remaining_qty') or 0)
+        if rem <= 0 and not item.get('factory_decision_required'):
+            continue
+        if action == 'move_to_factory':
+            await db.order_items.update_one({'id': item['id']}, {'$set': {
+                'factory_order_qty': rem,
+                'no_further_stock': True,
+                'factory_decision_required': False,
+                'factory_decision_action': 'move_to_factory',
+                'request_status': odw.REQUEST_STATUS_FACTORY,
+                'status': odw.REQUEST_STATUS_FACTORY,
+                'auto_source_closed': True,
+                'retry_required': False,
+                'updated_at': now,
+            }})
+        else:
+            await db.order_items.update_one({'id': item['id']}, {'$set': {
+                'remaining_qty': 0,
+                'factory_order_qty': 0,
+                'no_further_stock': False,
+                'factory_decision_required': False,
+                'factory_decision_action': 'cancel_remaining',
+                'request_status': odw.REQUEST_STATUS_CANCELLED,
+                'status': 'Cancelled',
+                'auto_source_closed': True,
+                'retry_required': False,
+                'cancellation_reason': 'No Longer Required',
+                'updated_at': now,
+            }})
+
+    state = oas.AUTO_SOURCE_COMPLETED if action == 'move_to_factory' else oas.AUTO_SOURCE_CANCELLED
+    await db.order_headers.update_one({'id': order_id}, {'$set': {
+        'auto_sourcing_active': False,
+        'auto_sourcing_state': state,
+        'auto_sourcing_message': None,
+        'factory_decision_required': False,
+        'factory_decision_action': action,
+        'factory_decision_at': now,
+        'factory_decision_by': current_user.id,
+        'updated_at': now,
+    }})
+    await oas.append_sourcing_event(db, order, f'Factory decision: {action}', {'action': action}, current_user)
+    refreshed = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    return {
+        'message': 'Moved balance to Factory' if action == 'move_to_factory' else 'Remaining requirement cancelled',
+        'action': action,
+        'order': refreshed,
+        'state': state,
+    }
 
 
 async def _active_recipients_for_scope(brand: str = None, dealer: str = None, branch: str = None, roles=('admin', 'master')):
@@ -5908,6 +6341,8 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
             'requested_by': current_user.id, 'requested_user_name': current_user.username, 'requested_at': now,
             'requester_email': current_user.email, 'requester_mobile': getattr(current_user, 'phone', ''),
             'request_number': request_number, 'request_group_id': group_id,
+            'sourcing_attempt': True,
+            'official_confirmed': False,
         }
         await db.order_requests.insert_one(dict(request_doc))
         line_items.append({
@@ -5937,6 +6372,11 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         'status': 'Requested', 'created_at': now, 'updated_at': now, 'retry_count': 0,
         'email_sent': False, 'email_status': 'pending', 'email_sent_at': None, 'email_error': None,
         'receiver_email': '', 'pdf_filename': f'{request_number}.pdf', 'notification_log_id': None,
+        # Official confirmation flips true only after supplier acceptance.
+        # Rejects / timeouts remain sourcing audit attempts.
+        'sourcing_attempt': True,
+        'official_confirmed': False,
+        'official_confirmed_at': None,
     }
     # Response SLA timer — always a fresh full window for THIS destination
     # request. Never copy remaining time from a previous Branch request.
@@ -6568,12 +7008,25 @@ async def _apply_request_group_timeout(group_doc: dict, actor: UserResponse):
         'timeout_cancelled': True,
         'timeout_cancelled_at': now,
         'mobile_expiry_status': 'EXPIRED – NO RESPONSE',
+        'official_confirmed': False,
+        'audit_only_attempt': True,
         'updated_at': now,
     }})
     order = await db.order_headers.find_one({'id': group_doc.get('order_id')}, {'_id': 0}) or {}
     await odw.append_order_audit(db, order, 'Cancelled – No Response', actor, {
         'request_number': request_number, 'cancelled': cancelled,
     })
+    try:
+        import order_auto_sourcing as oas
+        if order.get('auto_sourcing_active') or order.get('auto_sourcing_state') in (
+            oas.AUTO_SOURCE_WAITING, oas.AUTO_SOURCE_LAST_CHANCE, oas.AUTO_SOURCE_ACTIVE,
+        ):
+            await oas.append_sourcing_event(db, order, 'Auto Sourcing timeout – next supplier', {
+                'request_number': request_number, 'cancelled': cancelled,
+            }, actor)
+            asyncio.create_task(_auto_source_continue_safe(order.get('id'), reason='timeout'))
+    except Exception as exc:
+        logging.getLogger('nmts.order_auto_sourcing').warning('timeout auto-continue failed: %s', exc)
     return {
         'message': f'{cancelled} unanswered item(s) cancelled – no response.',
         'cancelled': cancelled,
@@ -7343,10 +7796,28 @@ async def _sync_request_header_after_item_decision(req: dict, now: str):
                 header_update['completed_at'] = now
             if header_status == 'Received' and not existing.get('received_at'):
                 header_update['received_at'] = now
+    if accepted_items:
+        header_update['official_confirmed'] = True
+        header_update['official_confirmed_at'] = now
+        header_update['sourcing_attempt'] = False
+    elif header_status in ('Rejected', 'Cancelled'):
+        header_update['official_confirmed'] = False
+        header_update['sourcing_attempt'] = True
+        header_update['audit_only_attempt'] = True
     await db.request_headers.update_one(
         {'request_number': request_number},
         {'$set': header_update},
     )
+    # Sequential Auto Sourcing: advance after a terminal response on the active attempt.
+    if header_status in ('Approved', 'Partially Approved', 'Rejected', 'Cancelled'):
+        try:
+            order_id = (req or {}).get('order_id') or (accepted_items[0].get('order_id') if accepted_items else None)
+            if order_id:
+                order_doc = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+                if order_doc and order_doc.get('auto_sourcing_active'):
+                    asyncio.create_task(_auto_source_continue_safe(order_id, reason=f'header_{header_status}'))
+        except Exception as exc:
+            logging.getLogger('nmts.order_auto_sourcing').warning('auto-source continue schedule failed: %s', exc)
 
 
 def _is_request_supplier(doc: dict, current_user: UserResponse) -> bool:
@@ -7406,6 +7877,10 @@ async def _request_center_transition(request_id: str, new_status: str, remarks: 
         update['accepted_user_mobile'] = _actor_mobile(current_user)
         update['picked_user_name'] = _actor_name(current_user)
         update['picked_user_mobile'] = _actor_mobile(current_user)
+        # Official Request Number is confirmed only for finally accepted qty.
+        update['official_confirmed'] = True
+        update['official_confirmed_at'] = now
+        update['sourcing_attempt'] = False
     await db.order_requests.update_one({'id': request_id}, {'$set': update})
 
     if new_status in ('Rejected', 'Cancelled') or (new_status == 'Approved' and accepted < requested_qty):

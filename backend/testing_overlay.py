@@ -61,6 +61,8 @@ LOCAL_ONLY_COLLECTIONS = frozenset({
     "analytics_stock_daily_snapshots",
     "analytics_rollup_status",
     "analytics_daily_aggs",
+    # Order Desk sequential Auto Sourcing audit trail (Testing-local).
+    "order_sourcing_events",
 })
 
 # Business collections merged from production + testing deltas.

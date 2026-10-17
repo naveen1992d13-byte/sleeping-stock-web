@@ -149,12 +149,12 @@ def freeze_key(part_number: str, brand: str, dealer: str, branch: str, date_key:
 
 
 def response_time_minutes_for_lines(line_item_count: int) -> int:
-    n = int(line_item_count or 0)
-    if n <= 20:
-        return 30
-    if n <= 50:
-        return 45
-    return 60
+    """15 minutes for every 5 part lines (1–5 → 15, 6–10 → 30, …)."""
+    import math
+    n = max(0, int(line_item_count or 0))
+    if n <= 0:
+        return 15
+    return int(math.ceil(n / 5.0) * 15)
 
 
 def reminder_offsets_minutes(sla_minutes: int) -> Tuple[int, int, int]:
