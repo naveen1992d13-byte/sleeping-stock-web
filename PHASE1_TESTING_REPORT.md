@@ -96,4 +96,26 @@ Runtime results: see section “Runtime verification” below (filled after exec
 
 ## Runtime verification
 
-_(filled after deploy + reset ×2)_
+| Check | Result |
+|-------|--------|
+| Deployed SHA (www `/deployment.json`) | **4072a58** |
+| `X-NMTS-Build` | **4072a58** |
+| API `/testing/deployment` | **4072a58** |
+| Reset dry-run | OK — S3 `testing/` 69 objs / 110MB; all keys under `testing/` |
+| Reset execute #1 (`--force-password-from-env`) | Master preserved; S3 deleted 69; hub tombs brands5/dealers6/branches8/users5/states1; raw brands/dealers/branches **0/0/0** |
+| Reset execute #2 (idempotent) | Master parity only (password not overwritten); hub still 0/0/0 |
+| Clear Testing Data #1 + #2 | `status=cleaned`; `hub_isolation` re-tombs Production hub; Master login **200** both times |
+| `/auth/login` Testing Master | **200** |
+| `/auth/me` | **200** `master_admin` / `TSTMST001` / `testing.master@sleepingstock.in` |
+| User Hub after reset/clears | users **1** (Testing Master only), brands **0**, dealers **0**, branches **0** |
+| Self-delete / demote Master | **403** (harness PASS) |
+| `admin@sleepingstock.in` in Hub | **absent** |
+| pytest Phase-1 suite | **51 passed** |
+| Testing unit | `Restart=on-failure`, `TimeoutStopSec=45`, `MemoryMax=650M` active |
+| Production PID | **1236056** unchanged |
+| Production `.env` sha256 | `c0f3b4fb7074c877e983308182b5cbc5a7104a88e6d609488cd3003ac5d9279a` unchanged |
+| nginx.conf sha256 | `c0922b9a3024065f7ff1e6ba72914f24aa11eb0802a5602ad1d27c42cc8f78ab` unchanged |
+| nmts-fastapi.conf sha256 | `f56edaf53eafb1866127d179c09ca3bf760a40c3eca2fed335ddc0b4c5888fda` unchanged |
+| nmts-testing.conf sha256 | `e0ceeba5ac32bf67a000cfa61655a11d69a75d1aaa83df7e7746f516525c6ebb` unchanged |
+
+**STOP — awaiting approval before Phase 2.** No merge. No Production deploy.
