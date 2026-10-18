@@ -1,13 +1,14 @@
 .nmts-login-page {
   --nmts-banner-h: 22px;
   position: relative;
-  min-height: 100vh;
+  /* Banner is a sticky sibling above this page — do not add another full 100vh. */
+  min-height: calc(100vh - var(--nmts-banner-h));
+  height: calc(100vh - var(--nmts-banner-h));
   width: 100%;
   overflow: hidden;
   display: grid;
   place-items: center;
   padding: 12px 16px;
-  padding-top: calc(var(--nmts-banner-h) + 12px);
   box-sizing: border-box;
   background-image: url('../assets/nmts-login-background.jpg');
   background-size: cover;
@@ -233,6 +234,8 @@
   overflow: visible;
   display: flex;
   flex-direction: column;
+  justify-content: center;
+  align-self: stretch;
 }
 
 .nmts-login-panel--split .nmts-login-card {
@@ -256,13 +259,13 @@
 .nmts-login-content {
   position: relative;
   z-index: 1;
-  flex: 1 1 auto;
-  min-height: 400px;
-  height: 100%;
+  flex: 0 0 auto;
+  min-height: 0;
+  height: auto;
   padding: 14px 22px 12px;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  justify-content: flex-start;
   box-sizing: border-box;
 }
 

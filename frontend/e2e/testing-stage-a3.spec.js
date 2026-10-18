@@ -39,7 +39,11 @@ async function assertLayout(page, vp) {
   expect(trunc.v).toBe(EMAIL);
   expect(trunc.sw).toBeLessThanOrEqual(trunc.cw + 1);
 
-  const scrollY = await page.evaluate(() => document.documentElement.scrollHeight > document.documentElement.clientHeight + 1);
+  const scrollY = await page.evaluate(() => {
+    const de = document.documentElement;
+    const body = document.body;
+    return Math.max(de.scrollHeight, body.scrollHeight) > Math.min(de.clientHeight, window.innerHeight) + 2;
+  });
   expect(scrollY).toBeFalsy();
 
   const promoBox = await promo.boundingBox();
