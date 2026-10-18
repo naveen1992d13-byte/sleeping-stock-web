@@ -32,9 +32,9 @@ test.describe('Testing rollback browser', () => {
     await login(page);
     await page.goto(BASE + '/users');
     await expect(page.getByTestId('user-hub-page')).toBeVisible({ timeout: 45000 });
-    const body = (await page.locator('body').innerText()).toLowerCase();
-    expect(body).toContain('admin@sleepingstock.in');
-    expect(body).toContain('testing.master@sleepingstock.in');
+    // Wait for async /users/list + masters overlay merge to paint.
+    await expect(page.locator('body')).toContainText('admin@sleepingstock.in', { timeout: 60000 });
+    await expect(page.locator('body')).toContainText('testing.master@sleepingstock.in');
   });
 
   test('Analytics opens without 5xx / crash', async ({ page }) => {
