@@ -74,9 +74,10 @@ def resolve_actor_upload_branch(
     admin's allowed branches. The assigned/default branch is not a fallback
     for a different selection. Users stay on their assigned branch.
     """
-    role_key = str(role or "").strip().lower()
+    role_key = str(role or "").strip().lower().replace("-", "_").replace(" ", "_")
     assigned = str(assigned_branch or "").strip()
-    if role_key == "master":
+    # Master Admin and Master both upload against the selected Hub scope.
+    if role_key in {"master", "master_admin", "masteradmin"}:
         selected = str(selected_branch or "").strip()
         if is_placeholder_scope(selected):
             raise HTTPException(status_code=400, detail=upload_scope_error_message("Brand", "Dealer", selected_branch) or "Please select Branch.")
