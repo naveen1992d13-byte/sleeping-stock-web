@@ -302,9 +302,8 @@ if [[ -e "$FRONTEND_DEST" || -L "$FRONTEND_DEST" ]]; then
   sudo mv "$FRONTEND_DEST" "$PREV_DEST"
 fi
 sudo mv "$STAGE_DEST" "$FRONTEND_DEST"
-# Keep backend deployment.json identical to the live FE build identity.
+# Keep www deployment.json identical to the backend build identity written above.
 sudo cp -f "$DEPLOYMENT_JSON" "$FRONTEND_DEST/deployment.json"
-sudo cp -f "$DEPLOYMENT_JSON" "$ROOT/backend/deployment.json"
 sudo rm -rf "$PREV_DEST"
 
 # Reload Testing nginx vhost so X-NMTS-Build matches this release (never touch prod vhost content).
