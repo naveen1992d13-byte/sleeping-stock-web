@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import axios from 'axios';
-import { API, useAuth } from '@/App';
+import { API, useAuth, isMasterLevelRole } from '@/App';
 import { Button } from '@/components/ui/button';
 import { HardDrive, RefreshCw, AlertTriangle, ExternalLink, ShieldCheck, Trash2, Download } from 'lucide-react';
 import { toast } from 'sonner';
@@ -110,7 +110,7 @@ export function StorageCostMonitor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.role]);
 
-  if (user?.role !== 'master') {
+  if (!isMasterLevelRole(user?.role)) {
     return (
       <div className="rounded-xl border bg-white p-6 text-sm" style={{ borderColor: COLORS.border, color: COLORS.muted }}>
         Storage & Data Cleanup is available to Master Admin only.

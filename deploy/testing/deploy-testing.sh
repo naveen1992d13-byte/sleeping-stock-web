@@ -245,8 +245,8 @@ if [[ -f "$ROOT/deploy/testing/nmts-backend-testing.service" ]]; then
 fi
 
 # This instance has ~1Gi RAM; CRA OOMs if the testing backend is also resident.
-# Stopping :8001 here is the known 502 Connection-refused window. Nginx cannot
-# proxy to a stopped uvicorn. Restart + health wait below close that window.
+# Stopping :8001 here is the known 502 Connection-refused window. Keep that
+# window as short as possible: build → stage static → start API → atomic switch.
 if systemctl is-active --quiet "$SERVICE"; then
   echo "Stopping $SERVICE during frontend build to free RAM (expected brief Testing 502)..."
   sudo systemctl stop "$SERVICE"
@@ -261,20 +261,40 @@ REACT_APP_BACKEND_URL=https://testing.sleepingstock.in \
   REACT_APP_TESTING_COMMIT="${RESOLVED_SHORT}" \
   REACT_APP_TESTING_DEPLOYED_AT="${DEPLOYED_AT_IST}" \
   GENERATE_SOURCEMAP=false \
-  NODE_OPTIONS=--max-old-space-size=2048 \
+  NODE_OPTIONS=--max-old-space-size=1536 \
   npm run build
 
 cp -f "$DEPLOYMENT_JSON" "$ROOT/frontend/build/deployment.json"
+cp -f "$ROOT/deploy/testing/robots.txt" "$ROOT/frontend/build/robots.txt"
 
-sudo mkdir -p "$FRONTEND_DEST"
-sudo rsync -a --delete "$ROOT/frontend/build/" "$FRONTEND_DEST/"
-sudo cp -f "$DEPLOYMENT_JSON" "$FRONTEND_DEST/deployment.json"
-sudo cp -f "$ROOT/deploy/testing/robots.txt" "$FRONTEND_DEST/robots.txt"
-sudo chown -R nginx:nginx "$FRONTEND_DEST"
+# Stage complete build away from the live root, then flip once.
+STAGE_DEST="${FRONTEND_DEST}.incoming-${RESOLVED_SHORT}"
+PREV_DEST="${FRONTEND_DEST}.prev"
+sudo rm -rf "$STAGE_DEST"
+sudo mkdir -p "$STAGE_DEST"
+sudo rsync -a --delete "$ROOT/frontend/build/" "$STAGE_DEST/"
+sudo cp -f "$DEPLOYMENT_JSON" "$STAGE_DEST/deployment.json"
+sudo chown -R nginx:nginx "$STAGE_DEST"
 
-echo "Restarting $SERVICE only..."
+echo "Restarting $SERVICE before atomic frontend switch..."
 sudo systemctl restart "$SERVICE"
 sudo systemctl is-active --quiet "$SERVICE" || true
+
+# Wait briefly for API before flipping HTML so login is not stuck mid-switch.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if curl -fsS "http://127.0.0.1:${TEST_PORT}/api/maintenance/status" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+echo "Atomically switching Testing static root..."
+sudo rm -rf "$PREV_DEST"
+if [[ -e "$FRONTEND_DEST" || -L "$FRONTEND_DEST" ]]; then
+  sudo mv "$FRONTEND_DEST" "$PREV_DEST"
+fi
+sudo mv "$STAGE_DEST" "$FRONTEND_DEST"
+sudo rm -rf "$PREV_DEST"
 
 TEST_PID_AFTER=""
 HEALTH_OK=""

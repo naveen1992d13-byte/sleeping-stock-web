@@ -173,14 +173,19 @@ function AuthProvider({ children }) {
     }
 
     if (token) {
-      axios.get(`${API}/auth/me`)
+      // Only clear the session on definitive auth failures. Transient 502/timeouts
+      // during Testing deploys must not wipe the user and empty Hub/Analytics.
+      axios.get(`${API}/auth/me`, { timeout: 20000 })
         .then((res) => {
           touchSessionActivity();
           saveUserSession(token, res.data);
         })
-        .catch(() => {
-          clearAuthStorage();
-          setUser(null);
+        .catch((err) => {
+          const status = err?.response?.status;
+          if (status === 401 || status === 403) {
+            clearAuthStorage();
+            setUser(null);
+          }
         })
         .finally(() => setLoading(false));
     } else {
@@ -190,10 +195,14 @@ function AuthProvider({ children }) {
   }, []);
 
   const login = async (identifier, password) => {
-    const response = await axios.post(`${API}/auth/login`, {
-      email: String(identifier || '').trim(),
-      password,
-    });
+    const response = await axios.post(
+      `${API}/auth/login`,
+      {
+        email: String(identifier || '').trim(),
+        password,
+      },
+      { timeout: 30000, forceGlobalProcessing: true }
+    );
 
     return saveUserSession(response.data.access_token, response.data.user);
   };
@@ -227,7 +236,7 @@ function ProtectedRoute({ children, permission, masterOnly = false, allowUser = 
     return <Navigate to="/login" replace state={{ from: location }} />;
   }
 
-  if (masterOnly && user.role !== 'master') {
+  if (masterOnly && !isMasterLevelRole(user.role)) {
     return <Navigate to="/" replace />;
   }
 

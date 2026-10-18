@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import axios from 'axios';
-import { API, useAuth } from '@/App';
+import { API, useAuth, isMasterLevelRole } from '@/App';
 import { toast } from 'sonner';
 import { Image as ImageIcon } from 'lucide-react';
 import { LoginImageCropper } from './LoginImageCropper';
@@ -140,11 +140,11 @@ export function LoginScreenManager() {
   };
 
   useEffect(() => {
-    if (user?.role !== 'master') return;
+    if (!isMasterLevelRole(user?.role)) return;
     load().catch((error) => toast.error(apiDetailMessage(error, 'Could not load Login Screen media')));
   }, [user?.role]);
 
-  if (user?.role !== 'master') {
+  if (!isMasterLevelRole(user?.role)) {
     return <div className="p-6 text-sm text-gray-500">Master Admin only.</div>;
   }
 
