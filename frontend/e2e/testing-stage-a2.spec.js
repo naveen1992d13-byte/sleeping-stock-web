@@ -13,7 +13,7 @@ const VIEWPORTS = [
 ];
 
 async function assertLoginLayout(page, vp) {
-  await page.setViewportSize({ width: vp.width, height: vp.height, deviceScaleFactor: 1 });
+  await page.setViewportSize({ width: vp.width, height: vp.height });
   await page.goto(BASE + '/', { waitUntil: 'networkidle' });
   await expect(page.getByTestId('login-page')).toBeVisible({ timeout: 30000 });
   const panel = page.locator('.nmts-login-panel--split');
