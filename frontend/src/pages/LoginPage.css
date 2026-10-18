@@ -42,8 +42,9 @@
 
 /* Net ~52vw on screen (Stage A 80%-zoom look at 100% browser zoom). Viewport-only; promo never drives size. */
 .nmts-login-zoom {
-  width: min(52vw, 1100px);
-  max-width: min(52vw, 1100px);
+  /* Keep within 48–56vw; bias high enough that 40% form fits a 32-char email at 1366. */
+  width: min(55vw, 1100px);
+  max-width: min(55vw, 1100px);
   max-height: calc(100vh - var(--nmts-banner-h) - 24px);
   display: flex;
   justify-content: center;
@@ -234,7 +235,8 @@
   overflow: visible;
   display: flex;
   flex-direction: column;
-  justify-content: flex-start;
+  justify-content: center;
+  /* Form column drives card height; do not stretch past content (keeps empty-under ≤40px). */
   align-self: flex-start;
 }
 
@@ -262,10 +264,10 @@
   flex: 0 0 auto;
   min-height: 0;
   height: auto;
-  padding: 14px 22px 12px;
+  padding: 14px 16px 12px;
   display: flex;
   flex-direction: column;
-  justify-content: flex-start;
+  justify-content: center;
   box-sizing: border-box;
 }
 
@@ -368,9 +370,9 @@
   outline: 0;
   background: transparent !important;
   color: #f0f4f0;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 400;
-  padding-left: 8px;
+  padding-left: 6px;
   text-overflow: clip;
 }
 
