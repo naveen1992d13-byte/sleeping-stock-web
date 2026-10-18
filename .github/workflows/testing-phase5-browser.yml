@@ -11,6 +11,7 @@ on:
           - build-artifact
           - stage-a-browser
           - stage-a2-browser
+          - stage-a3-browser
 jobs:
   build-artifact:
     if: ${{ github.event.inputs.mode == 'build-artifact' }}
@@ -88,7 +89,7 @@ jobs:
           retention-days: 2
 
   stage-a-browser:
-    if: ${{ github.event.inputs.mode == 'stage-a-browser' || github.event.inputs.mode == 'stage-a2-browser' }}
+    if: ${{ github.event.inputs.mode == 'stage-a-browser' || github.event.inputs.mode == 'stage-a2-browser' || github.event.inputs.mode == 'stage-a3-browser' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -109,7 +110,9 @@ jobs:
           NMTS_E2E_EMAIL: ${{ secrets.TESTING_MASTER_EMAIL }}
           NMTS_E2E_PASSWORD: ${{ secrets.TESTING_MASTER_PASSWORD }}
         run: | 
-          if [ "${{ github.event.inputs.mode }}" = "stage-a2-browser" ]; then
+          if [ "${{ github.event.inputs.mode }}" = "stage-a3-browser" ]; then
+            npx playwright test e2e/testing-stage-a3.spec.js --project=chromium
+          elif [ "${{ github.event.inputs.mode }}" = "stage-a2-browser" ]; then
             npx playwright test e2e/testing-stage-a2.spec.js --project=chromium
           else
             npx playwright test e2e/testing-stage-a.spec.js --project=chromium

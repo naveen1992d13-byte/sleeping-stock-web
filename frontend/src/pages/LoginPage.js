@@ -6,7 +6,6 @@ import { getFirstAllowedMenuItem } from '@/config/menuConfig';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { User, Key, ArrowRight, Eye, EyeOff } from 'lucide-react';
-import { LOGIN_PROMO_ASPECT } from './loginPromoCrop';
 import './LoginPage.css';
 
 function seedHomeTab(user) {
@@ -46,13 +45,8 @@ export function LoginPage() {
   const [promoPosterUrl, setPromoPosterUrl] = useState(null);
   const [promoKind, setPromoKind] = useState('image');
   const [promoFailed, setPromoFailed] = useState(false);
-  const [promoAspect, setPromoAspect] = useState(LOGIN_PROMO_ASPECT);
   const { login } = useAuth();
   const navigate = useNavigate();
-
-  const onPromoDims = (w, h) => {
-    if (w > 0 && h > 0) setPromoAspect(w / h);
-  };
 
   useEffect(() => {
     let cancelled = false;
@@ -149,15 +143,12 @@ export function LoginPage() {
       <div className="nmts-login-overlay" />
 
       <main className="nmts-login-shell">
-        <div className={`nmts-login-panel${useSplitShell ? ' nmts-login-panel--split' : ''}`}>
+        <div className="nmts-login-zoom" data-testid="login-zoom-wrap">
+        <div className="nmts-login-zoom-inner">
+        <div className={`nmts-login-panel${useSplitShell ? ' nmts-login-panel--split' : ''}`} data-testid="login-card-panel">
         <div className="nmts-login-panel-run" aria-hidden="true" />
         <div className="nmts-login-panel-face">
-        <aside
-          className="nmts-login-promo"
-          aria-label="Login promotional media"
-          style={{ '--nmts-promo-aspect': String(promoAspect) }}
-          data-testid="login-promo-aside"
-        >
+        <aside className="nmts-login-promo" aria-label="Login promotional media" data-testid="login-promo-aside">
             {showPromo ? (
               <>
             <div className="nmts-login-promo-bg" aria-hidden="true" />
@@ -174,7 +165,6 @@ export function LoginPage() {
                   controls={false}
                   disablePictureInPicture
                   data-testid="login-promo-video"
-                  onLoadedMetadata={(e) => onPromoDims(e.currentTarget.videoWidth, e.currentTarget.videoHeight)}
                   onError={() => setPromoFailed(true)}
                 />
               ) : (
@@ -184,7 +174,6 @@ export function LoginPage() {
                   decoding="async"
                   fetchPriority="high"
                   data-testid="login-promo-image"
-                  onLoad={(e) => onPromoDims(e.currentTarget.naturalWidth, e.currentTarget.naturalHeight)}
                   onError={() => setPromoFailed(true)}
                 />
               )}
@@ -192,7 +181,7 @@ export function LoginPage() {
               </>
             ) : null}
         </aside>
-        <section className="nmts-login-card" aria-label="NMTS login">
+        <section className="nmts-login-card" aria-label="NMTS login" data-testid="login-form-column">
           <div className="nmts-login-card-glow" />
 
           <div className="nmts-login-content">
@@ -282,6 +271,8 @@ export function LoginPage() {
             </footer>
           </div>
         </section>
+        </div>
+        </div>
         </div>
         </div>
       </main>
