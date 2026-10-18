@@ -14,6 +14,9 @@ ExecStartPost=/bin/bash -c 'for i in $(seq 1 45); do /usr/bin/curl -fsS http://1
 TimeoutStartSec=90
 Restart=on-failure
 RestartSec=5
+# Prefer Testing as OOM victim on the shared host so Production :8000 is never selected first.
+MemoryMax=400M
+OOMScoreAdjust=500
 
 # Never bind 8000 — that is the production backend.
 
