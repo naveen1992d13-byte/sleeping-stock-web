@@ -693,15 +693,53 @@ async def create_user(user_data: UserCreate, current_user: UserResponse = Depend
     
     return UserResponse(**user.model_dump())
 
+# Original Production Master + Testing Master (and any extra IDs from env).
+_DEFAULT_PROTECTED_MASTER_EMAILS = (
+    "admin@sleepingstock.in",
+    "testing.master@sleepingstock.in",
+)
+
+
+def _protected_master_ids() -> set[str]:
+    raw = os.environ.get("PROTECTED_MASTER_IDS") or ""
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _protected_master_emails() -> set[str]:
+    raw = os.environ.get("PROTECTED_MASTER_EMAILS") or ""
+    extras = {part.strip().casefold() for part in raw.split(",") if part.strip()}
+    return {e.casefold() for e in _DEFAULT_PROTECTED_MASTER_EMAILS} | extras
+
+
+async def _assert_user_not_protected_master(user_id: str) -> dict:
+    """Block deletion of original Production/Testing Master accounts."""
+    user = await db.users.find_one(
+        {"$or": [{"id": user_id}, {"userId": user_id}, {"user_id": user_id}]},
+        {"_id": 0, "id": 1, "email": 1, "role": 1, "is_testing_master": 1},
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    email = str(user.get("email") or "").strip().casefold()
+    uid = str(user.get("id") or "").strip()
+    if uid in _protected_master_ids() or email in _protected_master_emails():
+        raise HTTPException(
+            status_code=403,
+            detail="Protected master account cannot be deleted",
+        )
+    return user
+
+
 @api_router.delete("/users/{user_id}")
 async def delete_user(user_id: str, current_user: UserResponse = Depends(get_current_user)):
     if current_user.role != "master":
         raise HTTPException(status_code=403, detail="Only master can delete users")
-    
+
+    await _assert_user_not_protected_master(user_id)
+
     result = await db.users.delete_one({"id": user_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
     return {"message": "User deleted successfully"}
 
 # Update user permissions
@@ -3039,6 +3077,8 @@ async def update_hub_user(user_id: str, data: UserHubUpdate, current_user: UserR
 @api_router.delete("/users/hub/{user_id}")
 async def delete_hub_user(user_id: str, current_user: UserResponse = Depends(get_current_user)):
     await _ensure_master(current_user)
+
+    await _assert_user_not_protected_master(user_id)
 
     result = await db.users.delete_one({"$or": [{"id": user_id}, {"userId": user_id}, {"user_id": user_id}]})
     if result.deleted_count == 0:
@@ -5866,15 +5906,31 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
         new_allocations = kept + picked
 
         total_allocated = odw.sum_active_allocation_qty(new_allocations)
-        await db.order_items.update_one({'id': item['id']}, {'$set': {
+        remaining_after = max(0.0, pending_qty - sum(p['request_qty'] for p in picked))
+        update_fields = {
             'allocations': new_allocations, 'allocated_qty': total_allocated,
             'balance_qty': max(0.0, required_qty - total_allocated),
-            'remaining_qty': pending_qty - sum(p['request_qty'] for p in picked),
+            'remaining_qty': remaining_after,
             'status': 'Source Selected' if new_allocations else item.get('status', 'Availability Checked'),
             'allocation_source': 'auto', 'retry_required': False if picked else item.get('retry_required', False),
             'request_status': odw.REQUEST_STATUS_READY if picked else item.get('request_status'),
             'updated_at': now,
-        }})
+        }
+        # Issue 6: Dealer Auto Suggest remainder → Factory Order (no further network stock).
+        if level == 'dealer' and remaining_after > 0:
+            update_fields.update({
+                'factory_order_qty': remaining_after,
+                'no_further_stock': True,
+                'dealer_stage_exhausted': True,
+                'enquiry_stage': 'factory',
+            })
+            if not picked:
+                update_fields.update({
+                    'request_status': odw.REQUEST_STATUS_FACTORY,
+                    'status': odw.REQUEST_STATUS_FACTORY,
+                    'retry_required': False,
+                })
+        await db.order_items.update_one({'id': item['id']}, {'$set': update_fields})
         updated_item = await db.order_items.find_one({'id': item['id']}, {'_id': 0})
         result_items.append({
             **updated_item,
@@ -6766,6 +6822,28 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
         if matched:
             return _send_requests_response(matched, duplicate=True)
 
+    # Atomic claim closes the double-click/retry race before any request_headers insert.
+    claimed = await db.order_headers.find_one_and_update(
+        {
+            'id': order_id,
+            'send_requests_fingerprint': {'$ne': fingerprint},
+            'send_requests_fingerprints': {'$nin': [fingerprint]},
+        },
+        {'$addToSet': {'send_requests_fingerprints': fingerprint},
+         '$set': {'send_requests_fingerprint': fingerprint, 'send_requests_claim_at': now}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed:
+        existing_groups = await db.request_headers.find({'order_id': order_id}, {'_id': 0}).sort('created_at', 1).to_list(1000)
+        matched = [
+            g for g in existing_groups
+            if (_order_clean_text(g.get('supplying_dealer')), _order_clean_text(g.get('supplying_branch'))) in groups
+        ]
+        if matched:
+            return _send_requests_response(matched, duplicate=True)
+        # Claim lost to a concurrent sender that has not finished inserts yet.
+        raise HTTPException(status_code=409, detail='Request send already in progress for this selection')
+
     created_group_docs = []
     for _key, pairs in groups.items():
         try:
@@ -6810,6 +6888,7 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
                 )}},
             )
 
+    prior_fps = set(claimed.get('send_requests_fingerprints') or [])
     prior_fps.add(fingerprint)
     await db.order_headers.update_one({'id': order_id}, {'$set': {
         'status': 'Requested', 'updated_at': now,
