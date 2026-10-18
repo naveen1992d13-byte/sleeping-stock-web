@@ -126,33 +126,48 @@ def creation_forbidden_detail(actor_role: Any, target_role: Any) -> str:
     return f"{ROLE_LABELS.get(actor, actor)} can only create: {labels}"
 
 
-async def migrate_legacy_master_roles(db) -> dict:
+async def migrate_legacy_master_roles(db, raw_db=None) -> dict:
     """Promote original Master accounts from role=master → master_admin.
 
     Safe / idempotent. Does not demote any already-correct master_admin.
     Leaves other role=master rows untouched so mid-tier Master accounts can exist.
+
+    In Testing, also updates the raw nmts_testing.users collection so snapshot
+    copies (data_origin=snapshot) that are invisible to the merged overlay view
+    still get promoted.
     """
+    targets = [db]
+    if raw_db is not None and raw_db is not db:
+        targets.append(raw_db)
+
     promoted = 0
-    for email in ORIGINAL_MASTER_ADMIN_EMAILS:
-        result = await db.users.update_many(
-            {
-                "email": {"$regex": f"^{email}$", "$options": "i"},
-                "role": {"$in": ["master", ROLE_MASTER]},
-            },
+    for target in targets:
+        for email in ORIGINAL_MASTER_ADMIN_EMAILS:
+            result = await target.users.update_many(
+                {
+                    "email": {"$regex": f"^{email}$", "$options": "i"},
+                    "role": {"$in": ["master", ROLE_MASTER]},
+                },
+                {"$set": {"role": ROLE_MASTER_ADMIN}},
+            )
+            promoted += int(getattr(result, "modified_count", 0) or 0)
+        flagged = await target.users.update_many(
+            {"is_testing_master": True, "role": {"$in": ["master", ROLE_MASTER]}},
             {"$set": {"role": ROLE_MASTER_ADMIN}},
         )
-        promoted += int(getattr(result, "modified_count", 0) or 0)
-    # Also promote any explicit testing-master flag still on role=master.
-    flagged = await db.users.update_many(
-        {"is_testing_master": True, "role": {"$in": ["master", ROLE_MASTER]}},
-        {"$set": {"role": ROLE_MASTER_ADMIN}},
-    )
-    promoted += int(getattr(flagged, "modified_count", 0) or 0)
+        promoted += int(getattr(flagged, "modified_count", 0) or 0)
     return {"promoted": promoted}
 
 
-async def restore_mirrored_master_admin_visibility(db) -> dict:
-    """Remove Testing tombstones that hide the mirrored Production Master Admin."""
+async def restore_mirrored_master_admin_visibility(db, raw_db=None) -> dict:
+    """Remove Testing tombstones that hide the mirrored Production Master Admin.
+
+    Important: the merged overlay view already hides tombstoned ids, so this
+    must resolve candidate ids from the raw Testing DB / production base — not
+    only from a normal merged find. Snapshot copies of the original Master are
+    revived as testing-visible Master Admin rows when Production no longer has
+    the account.
+    """
     try:
         from . import testing_overlay as overlay
         from . import testing_runtime
@@ -163,37 +178,67 @@ async def restore_mirrored_master_admin_visibility(db) -> dict:
     if not testing_runtime.is_testing_env():
         return {"removed": 0, "skipped": "not_testing"}
 
-    # Find production master admin id(s) visible in the merged users collection.
+    email_regex = r"^(?:admin@sleepingstock\.in|testing\.master@sleepingstock\.in)$"
     ids: list[str] = []
-    cursor = db.users.find(
-        {"email": {"$regex": r"^admin@sleepingstock\.in$", "$options": "i"}},
-        {"_id": 0, "id": 1, "email": 1, "role": 1, "data_origin": 1},
-    )
-    async for row in cursor:
-        if is_mirrored_production_master_admin(row) or is_protected_master_admin_doc(row):
-            if row.get("id"):
-                ids.append(str(row["id"]))
+    revived = 0
 
-    if not ids:
-        # Also clear any tombstone keyed by known email via production_id lookup of historical ids.
-        ids = []
+    # 1) Raw Testing users (includes snapshot orphans invisible to merge).
+    if raw_db is not None:
+        cursor = raw_db.users.find(
+            {"email": {"$regex": email_regex, "$options": "i"}},
+            {"_id": 0, "id": 1, "email": 1, "role": 1, "data_origin": 1, "is_testing_master": 1},
+        )
+        async for row in cursor:
+            ident = str(row.get("id") or "").strip()
+            if ident:
+                ids.append(ident)
+            origin = str(row.get("data_origin") or "").strip().lower()
+            # Snapshot leftovers are not testing-created, so merge skips them.
+            # Revive as a Testing-owned Master Admin so the account is visible.
+            if origin == "snapshot" and is_protected_master_admin_doc(row):
+                result = await raw_db.users.update_one(
+                    {"id": ident} if ident else {"email": row.get("email")},
+                    {
+                        "$set": {
+                            "role": ROLE_MASTER_ADMIN,
+                            "data_origin": testing_runtime.DATA_ORIGIN_TESTING,
+                            "is_testing_master": True,
+                            "status": "active",
+                        }
+                    },
+                )
+                revived += int(getattr(result, "modified_count", 0) or 0)
 
+    # 2) Merged + production-base lookups (best-effort).
+    for query in (
+        {"email": {"$regex": email_regex, "$options": "i"}},
+        {overlay.QUERY_BASE_ONLY: True, "email": {"$regex": email_regex, "$options": "i"}},
+    ):
+        try:
+            cursor = db.users.find(query, {"_id": 0, "id": 1, "email": 1, "role": 1, "data_origin": 1})
+            async for row in cursor:
+                if row.get("id"):
+                    ids.append(str(row["id"]))
+        except Exception:
+            continue
+
+    ids = sorted({i for i in ids if i})
     removed = 0
-    tombs = db[overlay.TOMBSTONE_COLLECTION]
+    tombs_db = raw_db if raw_db is not None else db
+    tombs = tombs_db[overlay.TOMBSTONE_COLLECTION]
     if ids:
         result = await tombs.delete_many(
             {"collection": "users", "production_id": {"$in": ids}}
         )
         removed = int(getattr(result, "deleted_count", 0) or 0)
-    # Belt-and-suspenders: drop tombstones whose payload email matches.
     result2 = await tombs.delete_many(
         {
             "collection": "users",
             "$or": [
-                {"email": {"$regex": r"^admin@sleepingstock\.in$", "$options": "i"}},
-                {"doc.email": {"$regex": r"^admin@sleepingstock\.in$", "$options": "i"}},
+                {"email": {"$regex": email_regex, "$options": "i"}},
+                {"doc.email": {"$regex": email_regex, "$options": "i"}},
             ],
         }
     )
     removed += int(getattr(result2, "deleted_count", 0) or 0)
-    return {"removed": removed, "ids": ids}
+    return {"removed": removed, "ids": ids, "revived": revived}

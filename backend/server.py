@@ -10337,7 +10337,10 @@ async def seed_master_user_on_startup():
     except Exception as e:
         logger.error(f"Startup init check failed: {e}")
     try:
-        migrate_result = await role_defs.migrate_legacy_master_roles(db)
+        migrate_result = await role_defs.migrate_legacy_master_roles(
+            db,
+            raw_db=testing_db_raw if testing_runtime.is_testing_env() else None,
+        )
         logger.info("Legacy master role migration: %s", migrate_result)
     except Exception as e:
         logger.error("Legacy master role migration failed: %s", e)
@@ -10371,7 +10374,10 @@ async def seed_master_user_on_startup():
             await _testing_overlay.ensure_overlay_indexes(testing_db_raw)
             logger.info("Testing overlay indexes verified")
             try:
-                restore = await role_defs.restore_mirrored_master_admin_visibility(db)
+                restore = await role_defs.restore_mirrored_master_admin_visibility(
+                    db,
+                    raw_db=testing_db_raw,
+                )
                 logger.info("Mirrored Master Admin tombstone restore: %s", restore)
             except Exception as exc:
                 logger.warning("Mirrored Master Admin tombstone restore failed: %s", exc)
