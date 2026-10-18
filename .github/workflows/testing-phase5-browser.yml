@@ -1,0 +1,25 @@
+name: Testing Phase 5 Browser QA
+on:
+  workflow_dispatch:
+jobs:
+  browser-qa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Playwright
+        working-directory: frontend
+        run: |
+          npm ci --ignore-scripts || npm install --ignore-scripts
+          npm install --no-save @playwright/test@1.48.2
+          npx playwright install --with-deps chromium
+      - name: Stage A remote UI checks
+        working-directory: frontend
+        env:
+          NMTS_E2E_BASE_URL: https://testing.sleepingstock.in
+          NMTS_E2E_EMAIL: ${{ secrets.TESTING_MASTER_EMAIL }}
+          NMTS_E2E_PASSWORD: ${{ secrets.TESTING_MASTER_PASSWORD }}
+        run: npx playwright test e2e/testing-stage-a.spec.js --project=chromium

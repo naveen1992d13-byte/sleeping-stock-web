@@ -602,6 +602,20 @@ export function DashboardLayout() {
                   aria-label="Main navigation"
                   onCloseAutoFocus={(e) => e.preventDefault()}
                 >
+                  <div className="nmts-app-menu-brand" data-testid="app-menu-brand-header">
+                    <img
+                      src="/sleeping-stock-logo-transparent.png"
+                      alt=""
+                      className="nmts-app-menu-brand-logo"
+                    />
+                    <div className="nmts-app-menu-brand-text">
+                      <div className="nmts-app-menu-brand-wordmark">
+                        <span className="nmts-word-sleeping">Sleeping</span>
+                        <span className="nmts-word-stock">Stock</span>
+                      </div>
+                      <div className="nmts-app-menu-brand-nmts">NMTS</div>
+                    </div>
+                  </div>
                   {filteredNavItems.map((item) => {
                     const Icon = item.icon;
                     const isActive =

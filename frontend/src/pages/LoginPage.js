@@ -105,10 +105,10 @@ export function LoginPage() {
 
     const fetchActive = async () => {
       try {
-        const res = await axios.get(`${API}/login-screen/active`);
+        const res = await axios.get(`${API}/login-screen/active`, { timeout: 15000 });
         if (!cancelled) applyPayload(res.data || {});
       } catch {
-        /* keep current promo and form values */
+        /* keep current promo; split shell stays mounted regardless */
       }
     };
 
@@ -139,19 +139,21 @@ export function LoginPage() {
   };
 
   const showPromo = Boolean(promoUrl) && !promoFailed;
+  const useSplitShell = true; // two-panel shell mounted from first paint
 
   return (
     <div className="nmts-login-page" data-testid="login-page">
       <div className="nmts-login-overlay" />
 
       <main className="nmts-login-shell">
-        <div className={`nmts-login-panel${showPromo ? ' nmts-login-panel--split' : ''}`}>
+        <div className={`nmts-login-panel${useSplitShell ? ' nmts-login-panel--split' : ''}`}>
         <div className="nmts-login-panel-run" aria-hidden="true" />
         <div className="nmts-login-panel-face">
-        {showPromo && (
-          <aside className="nmts-login-promo" aria-label="Login promotional media">
+        <aside className="nmts-login-promo" aria-label="Login promotional media">
+            {showPromo ? (
+              <>
             <div className="nmts-login-promo-bg" aria-hidden="true">
-              <img src={promoPosterUrl || promoUrl} alt="" />
+              <img src={promoPosterUrl || promoUrl} alt="" decoding="async" />
             </div>
             <div className="nmts-login-promo-media">
               {promoKind === 'video' ? (
@@ -162,6 +164,7 @@ export function LoginPage() {
                   muted
                   loop
                   playsInline
+                  preload="auto"
                   controls={false}
                   disablePictureInPicture
                   data-testid="login-promo-video"
@@ -172,14 +175,17 @@ export function LoginPage() {
                 <img
                   src={promoUrl}
                   alt=""
+                  decoding="async"
+                  fetchPriority="high"
                   data-testid="login-promo-image"
                   style={loginDisplayStyle(promoDisplay, { forceContain: true })}
                   onError={() => setPromoFailed(true)}
                 />
               )}
             </div>
-          </aside>
-        )}
+              </>
+            ) : null}
+        </aside>
         <section className="nmts-login-card" aria-label="NMTS login">
           <div className="nmts-login-card-glow" />
 
