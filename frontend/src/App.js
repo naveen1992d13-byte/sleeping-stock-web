@@ -210,16 +210,32 @@ function AuthProvider({ children }) {
   }, []);
 
   const login = async (identifier, password) => {
-    const response = await axios.post(
-      `${API}/auth/login`,
-      {
-        email: String(identifier || '').trim(),
-        password,
-      },
-      { timeout: 30000, forceGlobalProcessing: true }
-    );
-
-    return saveUserSession(response.data.access_token, response.data.user);
+    const payload = {
+      email: String(identifier || '').trim(),
+      password,
+    };
+    // Retry transient gateway/upstream failures (common on the 1Gi Testing host
+    // when Chromium + uvicorn compete for RAM). Never retry definitive 401/403.
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        const response = await axios.post(
+          `${API}/auth/login`,
+          payload,
+          { timeout: 30000, forceGlobalProcessing: true }
+        );
+        return saveUserSession(response.data.access_token, response.data.user);
+      } catch (err) {
+        lastError = err;
+        const status = err?.response?.status;
+        const transient = !status || status === 502 || status === 503 || status === 504
+          || err?.code === 'ECONNABORTED' || err?.code === 'ERR_NETWORK';
+        console.warn('[nmts-auth] login attempt failed', { attempt, status, transient });
+        if (!transient || attempt === 3) break;
+        await new Promise((r) => setTimeout(r, 700 * attempt));
+      }
+    }
+    throw lastError;
   };
 
   const logout = () => {

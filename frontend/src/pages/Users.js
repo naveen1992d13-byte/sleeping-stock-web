@@ -216,7 +216,7 @@ export default function UsersPage() {
   }, [isMaster, isAdmin, user]);
 
   const loadDataSeq = React.useRef(0);
-  const loadData = async () => {
+  const loadData = async (retry = 0) => {
     const seq = ++loadDataSeq.current;
     try {
       const [stRes, bRes, dRes, brRes, uRes] = await Promise.all([
@@ -258,12 +258,22 @@ export default function UsersPage() {
       if (okStates || okBrands || okDealers || okBranches || okUsers) {
         window.dispatchEvent(new Event("nmts-masters-changed"));
       }
-      if (![okStates, okBrands, okDealers, okBranches, okUsers].every(Boolean)) {
-        toast.error('Some User Hub data failed to refresh; previous values kept');
+      const allOk = [okStates, okBrands, okDealers, okBranches, okUsers].every(Boolean);
+      if (!allOk) {
+        if (retry < 2) {
+          console.warn(`[nmts-hub] partial/failed load — retry ${retry + 1}`);
+          setTimeout(() => loadData(retry + 1), 900 * (retry + 1));
+        } else {
+          toast.error('Some User Hub data failed to refresh; previous values kept');
+        }
       }
     } catch (error) {
       if (seq !== loadDataSeq.current) return;
       console.error("User Hub data load failed", error);
+      if (retry < 2) {
+        setTimeout(() => loadData(retry + 1), 900 * (retry + 1));
+        return;
+      }
       toast.error(networkErrorMessage(error));
     }
   };
