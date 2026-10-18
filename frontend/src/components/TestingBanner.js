@@ -26,7 +26,8 @@ function newOperationId(prefix) {
 
 export function TestingBanner({ user = null }) {
   const enabled = isTestingUiEnabled();
-  const isMaster = String(user?.role || '').toLowerCase() === 'master';
+  const role = String(user?.role || '').toLowerCase();
+  const isMaster = role === 'master' || role === 'master_admin';
   const api = resolveApiUrl();
 
   const [meta, setMeta] = useState(() => ({
@@ -96,7 +97,9 @@ export function TestingBanner({ user = null }) {
   const ciLabel = pr?.ci?.label || 'unknown';
   const prTitle = pr?.title || '';
   const prNumber = pr?.pr_number || meta.pr_number || 'n/a';
-  const testedSha = pr?.deployed_sha || meta.commit_short || 'unknown-sha';
+  // Source of truth for the visible build badge is /deployment.json (static root).
+  // Never let a stale backend github/status deployed_sha override the live FE build.
+  const testedSha = meta.commit_short || shortSha(pr?.deployed_sha) || 'unknown-sha';
   const targetBranch = pr?.base_branch || pr?.production_base_branch || 'main';
 
   const inventorySummary = useMemo(() => {

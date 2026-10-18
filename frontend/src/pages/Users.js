@@ -215,7 +215,9 @@ export default function UsersPage() {
     return [];
   }, [isMaster, isAdmin, user]);
 
+  const loadDataSeq = React.useRef(0);
   const loadData = async () => {
+    const seq = ++loadDataSeq.current;
     try {
       const [stRes, bRes, dRes, brRes, uRes] = await Promise.all([
         fetch(`${API}/masters/states`, { headers }),
@@ -224,22 +226,43 @@ export default function UsersPage() {
         fetch(`${API}/masters/branches`, { headers }),
         fetch(`${API}/users/list`, { headers }),
       ]);
+      if (seq !== loadDataSeq.current) return;
+
+      const applyList = (res, json, setter, label) => {
+        if (!res.ok) {
+          console.warn(`[nmts-hub] ${label} HTTP ${res.status} — keeping prior data`);
+          return false;
+        }
+        if (!Array.isArray(json)) {
+          console.warn(`[nmts-hub] ${label} non-array payload — keeping prior data`);
+          return false;
+        }
+        setter(json);
+        return true;
+      };
 
       const [st, b, d, br, u] = await Promise.all([
-        stRes.json().catch(() => []),
-        bRes.json().catch(() => []),
-        dRes.json().catch(() => []),
-        brRes.json().catch(() => []),
-        uRes.json().catch(() => []),
+        stRes.json().catch(() => null),
+        bRes.json().catch(() => null),
+        dRes.json().catch(() => null),
+        brRes.json().catch(() => null),
+        uRes.json().catch(() => null),
       ]);
+      if (seq !== loadDataSeq.current) return;
 
-      setStates(Array.isArray(st) ? st : []);
-      setBrands(Array.isArray(b) ? b : []);
-      setDealers(Array.isArray(d) ? d : []);
-      setBranches(Array.isArray(br) ? br : []);
-      setUsers(Array.isArray(u) ? u : []);
-      window.dispatchEvent(new Event("nmts-masters-changed"));
+      const okStates = applyList(stRes, st, setStates, 'states');
+      const okBrands = applyList(bRes, b, setBrands, 'brands');
+      const okDealers = applyList(dRes, d, setDealers, 'dealers');
+      const okBranches = applyList(brRes, br, setBranches, 'branches');
+      const okUsers = applyList(uRes, u, setUsers, 'users');
+      if (okStates || okBrands || okDealers || okBranches || okUsers) {
+        window.dispatchEvent(new Event("nmts-masters-changed"));
+      }
+      if (![okStates, okBrands, okDealers, okBranches, okUsers].every(Boolean)) {
+        toast.error('Some User Hub data failed to refresh; previous values kept');
+      }
     } catch (error) {
+      if (seq !== loadDataSeq.current) return;
       console.error("User Hub data load failed", error);
       toast.error(networkErrorMessage(error));
     }

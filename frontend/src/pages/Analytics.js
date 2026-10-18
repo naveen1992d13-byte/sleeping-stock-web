@@ -313,7 +313,12 @@ export function Analytics() {
         if (seq !== requestSeq.current) return;
         const detail = err?.response?.data?.detail;
         const message = typeof detail === 'string' ? detail : (detail?.message || 'Failed to load this section');
+        // Keep prior section data on transient failures — never replace with empty.
         setSectionError((prev) => ({ ...prev, [key]: message }));
+        console.warn(`[nmts-analytics] ${key} failed — keeping prior data`, {
+          status: err?.response?.status,
+          message,
+        });
         toast.error(message);
       } finally {
         if (seq === requestSeq.current) {

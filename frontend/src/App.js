@@ -148,6 +148,9 @@ function AuthProvider({ children }) {
     localStorage.setItem('permissions', JSON.stringify(cleanUser.permissions));
     touchSessionActivity();
     setUser(cleanUser);
+    if (typeof console !== 'undefined') {
+      console.info('[nmts-auth] session saved', { role: cleanUser.role, email: cleanUser.email });
+    }
     return cleanUser;
   };
 
@@ -182,6 +185,7 @@ function AuthProvider({ children }) {
         })
         .catch((err) => {
           const status = err?.response?.status;
+          console.warn('[nmts-auth] /auth/me failed', { status, message: err?.message });
           if (status === 401 || status === 403) {
             clearAuthStorage();
             setUser(null);
@@ -192,6 +196,17 @@ function AuthProvider({ children }) {
       setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const onPageShow = (event) => {
+      if (event.persisted) {
+        console.info('[nmts-auth] App pageshow bfcache → reload');
+        window.location.reload();
+      }
+    };
+    window.addEventListener('pageshow', onPageShow);
+    return () => window.removeEventListener('pageshow', onPageShow);
   }, []);
 
   const login = async (identifier, password) => {
@@ -208,6 +223,7 @@ function AuthProvider({ children }) {
   };
 
   const logout = () => {
+    console.info('[nmts-auth] logout');
     clearAuthStorage();
     setUser(null);
   };

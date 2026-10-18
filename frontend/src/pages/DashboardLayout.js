@@ -456,8 +456,10 @@ export function DashboardLayout() {
     clearWorkspaceCache();
     logout();
     clearAuthStorage();
-    navigate('/login');
+    // Hard navigation prevents bfcache / keep-alive SPA documents from
+    // restoring a stale login shell after logout.
     toast.success('Logged out successfully');
+    window.location.replace('/login');
   };
 
   const openTab = (id, label, path, permissionLabel) => {

@@ -47,8 +47,23 @@ export function LoginPage() {
   const [promoKind, setPromoKind] = useState('image');
   const [promoFailed, setPromoFailed] = useState(false);
   const [promoDisplay, setPromoDisplay] = useState(null);
+  // loading | ready | error — error keeps the two-panel shell so a flaky
+  // /login-screen/active response cannot flash the compact "old" form.
+  const [promoLoadState, setPromoLoadState] = useState('loading');
   const { login } = useAuth();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    // Reject bfcache restores of a prior SPA document after logout/back.
+    const onPageShow = (event) => {
+      if (event.persisted) {
+        console.info('[nmts-auth] pageshow bfcache restore → hard reload');
+        window.location.reload();
+      }
+    };
+    window.addEventListener('pageshow', onPageShow);
+    return () => window.removeEventListener('pageshow', onPageShow);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -105,10 +120,14 @@ export function LoginPage() {
 
     const fetchActive = async () => {
       try {
-        const res = await axios.get(`${API}/login-screen/active`);
-        if (!cancelled) applyPayload(res.data || {});
+        const res = await axios.get(`${API}/login-screen/active`, { timeout: 15000 });
+        if (!cancelled) {
+          applyPayload(res.data || {});
+          setPromoLoadState('ready');
+        }
       } catch {
-        /* keep current promo and form values */
+        /* keep current promo; stay in split shell on transient failures */
+        if (!cancelled) setPromoLoadState((prev) => (prev === 'ready' ? 'ready' : 'error'));
       }
     };
 
@@ -125,27 +144,37 @@ export function LoginPage() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
+    const submitEmail = String(email || '').trim();
+    const submitPassLen = String(password || '').length;
+    console.info('[nmts-auth] login submit', { email: submitEmail, passLen: submitPassLen });
 
     try {
-      const loggedUser = await login(email.trim(), password);
+      const loggedUser = await login(submitEmail, password);
+      console.info('[nmts-auth] login ok', { role: loggedUser?.role, email: loggedUser?.email });
       toast.success('Login successful!');
       const path = seedHomeTab(loggedUser);
       navigate(path || '/');
     } catch (error) {
-      toast.error(error.response?.data?.detail || 'Login failed');
+      const status = error?.response?.status;
+      const detail = error?.response?.data?.detail;
+      console.warn('[nmts-auth] login failed', { status, detail, email: submitEmail, passLen: submitPassLen });
+      toast.error(detail || 'Login failed');
     } finally {
       setLoading(false);
     }
   };
 
   const showPromo = Boolean(promoUrl) && !promoFailed;
+  // Keep the two-panel shell while loading or after a fetch error so a slow
+  // /login-screen/active cannot flash the compact form and look like an old build.
+  const useSplitShell = showPromo || promoLoadState !== 'ready' || Boolean(promoUrl);
 
   return (
-    <div className="nmts-login-page" data-testid="login-page">
+    <div className="nmts-login-page" data-testid="login-page" data-nmts-build={process.env.REACT_APP_TESTING_COMMIT || ''}>
       <div className="nmts-login-overlay" />
 
       <main className="nmts-login-shell">
-        <div className={`nmts-login-panel${showPromo ? ' nmts-login-panel--split' : ''}`}>
+        <div className={`nmts-login-panel${useSplitShell ? ' nmts-login-panel--split' : ''}`}>
         <div className="nmts-login-panel-run" aria-hidden="true" />
         <div className="nmts-login-panel-face">
         {showPromo && (
