@@ -96,7 +96,8 @@ export function TestingBanner({ user = null }) {
   const ciLabel = pr?.ci?.label || 'unknown';
   const prTitle = pr?.title || '';
   const prNumber = pr?.pr_number || meta.pr_number || 'n/a';
-  const testedSha = pr?.deployed_sha || meta.commit_short || 'unknown-sha';
+  // Prefer static /deployment.json (FE deploy) over backend API sha.
+  const testedSha = meta.commit_short || pr?.deployed_sha || 'unknown-sha';
   const targetBranch = pr?.base_branch || pr?.production_base_branch || 'main';
 
   const inventorySummary = useMemo(() => {
@@ -262,15 +263,21 @@ export function TestingBanner({ user = null }) {
         zIndex: 80,
         background: '#92400E',
         color: '#FFFBEB',
-        fontSize: 12,
-        lineHeight: 1.4,
-        padding: '6px 12px',
+        fontSize: 11,
+        lineHeight: '22px',
+        height: 22,
+        minHeight: 22,
+        maxHeight: 22,
+        padding: '0 10px',
         display: 'flex',
-        flexWrap: 'wrap',
-        gap: '8px 16px',
+        flexWrap: 'nowrap',
+        gap: '4px 10px',
         justifyContent: 'center',
         alignItems: 'center',
         letterSpacing: '0.01em',
+        overflow: 'hidden',
+        whiteSpace: 'nowrap',
+        boxSizing: 'border-box',
       }}
     >
       <strong>TESTING ENVIRONMENT</strong>
@@ -292,10 +299,13 @@ export function TestingBanner({ user = null }) {
               background: mergeDisabled ? '#78350F' : '#F59E0B',
               color: '#111827',
               border: 0,
-              borderRadius: 6,
-              padding: '3px 8px',
+              borderRadius: 4,
+              padding: '0 6px',
+              height: 18,
+              fontSize: 10,
               fontWeight: 700,
               cursor: mergeDisabled ? 'not-allowed' : 'pointer',
+              lineHeight: '18px',
             }}
           >
             Merge to Production
@@ -310,8 +320,11 @@ export function TestingBanner({ user = null }) {
                 background: 'transparent',
                 color: '#FFFBEB',
                 border: '1px solid #FDE68A',
-                borderRadius: 6,
-                padding: '3px 8px',
+                borderRadius: 4,
+                padding: '0 6px',
+                height: 18,
+                fontSize: 10,
+                lineHeight: '18px',
                 cursor: busy ? 'not-allowed' : 'pointer',
               }}
             >
@@ -327,8 +340,11 @@ export function TestingBanner({ user = null }) {
               background: 'transparent',
               color: '#FFFBEB',
               border: '1px solid #FDE68A',
-              borderRadius: 6,
-              padding: '3px 8px',
+              borderRadius: 4,
+              padding: '0 6px',
+              height: 18,
+              fontSize: 10,
+              lineHeight: '18px',
               cursor: busy ? 'not-allowed' : 'pointer',
             }}
           >

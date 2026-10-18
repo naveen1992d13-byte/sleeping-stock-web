@@ -10,6 +10,7 @@ on:
         options:
           - build-artifact
           - stage-a-browser
+          - stage-a2-browser
 jobs:
   build-artifact:
     if: ${{ github.event.inputs.mode == 'build-artifact' }}
@@ -87,7 +88,7 @@ jobs:
           retention-days: 2
 
   stage-a-browser:
-    if: ${{ github.event.inputs.mode == 'stage-a-browser' }}
+    if: ${{ github.event.inputs.mode == 'stage-a-browser' || github.event.inputs.mode == 'stage-a2-browser' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -107,12 +108,18 @@ jobs:
           NMTS_E2E_BASE_URL: https://testing.sleepingstock.in
           NMTS_E2E_EMAIL: ${{ secrets.TESTING_MASTER_EMAIL }}
           NMTS_E2E_PASSWORD: ${{ secrets.TESTING_MASTER_PASSWORD }}
-        run: npx playwright test e2e/testing-stage-a.spec.js --project=chromium
+        run: | 
+          if [ "${{ github.event.inputs.mode }}" = "stage-a2-browser" ]; then
+            npx playwright test e2e/testing-stage-a2.spec.js --project=chromium
+          else
+            npx playwright test e2e/testing-stage-a.spec.js --project=chromium
+          fi
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: stage-a-screenshots
+          # includes stage-a2-*
           path: |
             frontend/test-results/
             frontend/e2e/test-results/

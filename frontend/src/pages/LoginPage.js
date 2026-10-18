@@ -6,7 +6,7 @@ import { getFirstAllowedMenuItem } from '@/config/menuConfig';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { User, Key, ArrowRight, Eye, EyeOff } from 'lucide-react';
-import { loginDisplayStyle } from './loginPromoCrop';
+import { LOGIN_PROMO_ASPECT } from './loginPromoCrop';
 import './LoginPage.css';
 
 function seedHomeTab(user) {
@@ -46,9 +46,13 @@ export function LoginPage() {
   const [promoPosterUrl, setPromoPosterUrl] = useState(null);
   const [promoKind, setPromoKind] = useState('image');
   const [promoFailed, setPromoFailed] = useState(false);
-  const [promoDisplay, setPromoDisplay] = useState(null);
+  const [promoAspect, setPromoAspect] = useState(LOGIN_PROMO_ASPECT);
   const { login } = useAuth();
   const navigate = useNavigate();
+
+  const onPromoDims = (w, h) => {
+    if (w > 0 && h > 0) setPromoAspect(w / h);
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -89,7 +93,6 @@ export function LoginPage() {
           setPromoUrl(nextUrl);
           setPromoPosterUrl(nextPoster);
           setPromoKind(nextKind);
-          setPromoDisplay(data?.display_settings || null);
         }
       }
       clearExpiry();
@@ -149,12 +152,15 @@ export function LoginPage() {
         <div className={`nmts-login-panel${useSplitShell ? ' nmts-login-panel--split' : ''}`}>
         <div className="nmts-login-panel-run" aria-hidden="true" />
         <div className="nmts-login-panel-face">
-        <aside className="nmts-login-promo" aria-label="Login promotional media">
+        <aside
+          className="nmts-login-promo"
+          aria-label="Login promotional media"
+          style={{ '--nmts-promo-aspect': String(promoAspect) }}
+          data-testid="login-promo-aside"
+        >
             {showPromo ? (
               <>
-            <div className="nmts-login-promo-bg" aria-hidden="true">
-              <img src={promoPosterUrl || promoUrl} alt="" decoding="async" />
-            </div>
+            <div className="nmts-login-promo-bg" aria-hidden="true" />
             <div className="nmts-login-promo-media">
               {promoKind === 'video' ? (
                 <video
@@ -168,7 +174,7 @@ export function LoginPage() {
                   controls={false}
                   disablePictureInPicture
                   data-testid="login-promo-video"
-                  style={loginDisplayStyle(promoDisplay, { forceContain: true })}
+                  onLoadedMetadata={(e) => onPromoDims(e.currentTarget.videoWidth, e.currentTarget.videoHeight)}
                   onError={() => setPromoFailed(true)}
                 />
               ) : (
@@ -178,7 +184,7 @@ export function LoginPage() {
                   decoding="async"
                   fetchPriority="high"
                   data-testid="login-promo-image"
-                  style={loginDisplayStyle(promoDisplay, { forceContain: true })}
+                  onLoad={(e) => onPromoDims(e.currentTarget.naturalWidth, e.currentTarget.naturalHeight)}
                   onError={() => setPromoFailed(true)}
                 />
               )}
