@@ -14,7 +14,7 @@ import logging
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("nmts.analytics_rollup")
@@ -103,6 +103,102 @@ def _analytics_bucket(days) -> str:
     if d <= 361:
         return AGING_BUCKETS[3]
     return AGING_BUCKETS[4]
+
+
+_EMPTY_DATE_MARKERS = frozenset({
+    "",
+    "-",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "never",
+    "never sold",
+    "never sold since purchase",
+    "not sold",
+    "not available",
+})
+
+
+def _parse_aging_date(value: Any):
+    """Parse common upload/archive date strings (DD-MM-YYYY, ISO, etc.)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).date()
+    text = str(value).strip()
+    if not text or text.casefold() in _EMPTY_DATE_MARKERS:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except Exception:
+        pass
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%y", "%d/%m/%y"):
+        try:
+            return datetime.strptime(text[:10], fmt).date()
+        except Exception:
+            continue
+    # "19-12-2025 00:00:00" etc.
+    head = re.split(r"[\sT]", text, maxsplit=1)[0]
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(head[:10], fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+def _extract_numeric_aging(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value))
+    if not match:
+        return None
+    try:
+        return max(0, int(float(match.group(0))))
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_aging_days(
+    row: Mapping[str, Any],
+    *,
+    side: str,
+    as_of_iso: str,
+) -> Optional[int]:
+    """Resolve purchase/sales aging days for Analytics bucketing.
+
+    Prefer stored numeric aging fields; otherwise derive from last receipt /
+    last sales date relative to the snapshot/archive date (not wall-clock
+    today). Missing/invalid values return None so the caller maps to >361.
+    """
+    side = (side or "purchase").lower()
+    if side == "sales":
+        numeric_keys = (
+            "sales_aging_days", "sales_ageing_days", "sales_aging", "sales_ageing",
+            "sales_aging_days_at_upload", "sale_aging", "sale_ageing",
+        )
+        date_keys = ("last_sales_date", "last_sale_date", "sales_date", "sale_date")
+    else:
+        numeric_keys = (
+            "purchase_aging_days", "purchase_ageing_days", "purchase_aging", "purchase_ageing",
+            "purchase_aging_days_at_upload", "receipt_aging", "receipt_ageing", "aging_days",
+        )
+        date_keys = ("last_receipt_date", "last_purchase_date", "receipt_date", "purchase_date")
+
+    for key in numeric_keys:
+        days = _extract_numeric_aging(row.get(key))
+        if days is not None:
+            return days
+
+    as_of = _parse_aging_date(as_of_iso) or _parse_aging_date(date_key_to_iso(iso_to_date_key(as_of_iso)))
+    if not as_of:
+        as_of = _ist_now().date()
+    for key in date_keys:
+        parsed = _parse_aging_date(row.get(key))
+        if parsed:
+            return max(0, (as_of - parsed).days)
+    return None
 
 
 def upload_no_date_key(upload_no: str) -> str:
@@ -368,6 +464,9 @@ def build_snapshot_docs(date_iso: str, rows: List[Dict[str, Any]]) -> List[Dict[
         branch_id = _text(r.get("branch_id") or r.get("branch"))
         part_number = _text(r.get("part_number"))
         key = (brand_id, dealer_id, branch_id, part_number.casefold())
+        # Archives often omit numeric aging and only store last_*_date.
+        purchase_days = resolve_aging_days(r, side="purchase", as_of_iso=date_iso)
+        sales_days = resolve_aging_days(r, side="sales", as_of_iso=date_iso)
         by_key[key] = {
             "snapshot_date_ist": date_iso,
             "brand_id": brand_id,
@@ -382,8 +481,8 @@ def build_snapshot_docs(date_iso: str, rows: List[Dict[str, Any]]) -> List[Dict[
             "available_qty": qty,
             "unit_value": unit,
             "total_value": value,
-            "purchase_aging_days": r.get("purchase_aging_days"),
-            "sales_aging_days": r.get("sales_aging_days"),
+            "purchase_aging_days": purchase_days,
+            "sales_aging_days": sales_days,
             "last_receipt_date": r.get("last_receipt_date"),
             "last_sales_date": r.get("last_sales_date"),
             "upload_no": r.get("upload_no"),
@@ -428,8 +527,11 @@ def build_daily_agg_docs(date_iso: str, snapshot_docs: List[Dict[str, Any]]) -> 
         g["stock_qty"] += qty
         g["stock_value"] += value
         g["line_count"] += 1
-        pb = _analytics_bucket(r.get("purchase_aging_days"))
-        sb = _analytics_bucket(r.get("sales_aging_days"))
+        # Re-resolve in case snapshot rows were written before aging backfill.
+        purchase_days = resolve_aging_days(r, side="purchase", as_of_iso=date_iso)
+        sales_days = resolve_aging_days(r, side="sales", as_of_iso=date_iso)
+        pb = _analytics_bucket(purchase_days)
+        sb = _analytics_bucket(sales_days)
         g["aging_purchase"][pb]["qty"] += qty
         g["aging_purchase"][pb]["value"] += value
         g["aging_purchase"][pb]["items"] += 1.0

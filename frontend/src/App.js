@@ -57,9 +57,49 @@ export const normalizePermissions = (permissions) => {
   return [];
 };
 
+export const isMasterLevelRole = (role) =>
+  role === 'master_admin' || role === 'master';
+
+export const isMasterAdminRole = (role) => role === 'master_admin';
+
+export const ROLE_LABELS = {
+  master_admin: 'Master Admin',
+  master: 'Master',
+  admin: 'Admin',
+  user: 'User',
+};
+
+export const roleLabel = (role) => ROLE_LABELS[role] || String(role || 'User');
+
+/** Roles the actor may create (exact hierarchy matrix; never includes Master Admin). */
+export const creatableRolesFor = (actorRole) => {
+  if (actorRole === 'master_admin') return ['master', 'admin', 'user'];
+  if (actorRole === 'master') return ['admin', 'user'];
+  if (actorRole === 'admin') return ['user'];
+  return [];
+};
+
+export const isProtectedMasterAdminUser = (row) => {
+  if (!row) return false;
+  if (row.role === 'master_admin') return true;
+  const email = String(row.email || '').trim().toLowerCase();
+  if (email === 'admin@sleepingstock.in' || email === 'testing.master@sleepingstock.in') return true;
+  if (row.is_testing_master) return true;
+  return false;
+};
+
+/** Production Master Admin mirrored into Testing (read-only base row). */
+export const isMirroredProductionMasterAdmin = (row) => {
+  if (!row) return false;
+  const email = String(row.email || '').trim().toLowerCase();
+  if (email !== 'admin@sleepingstock.in') return false;
+  const origin = String(row.data_origin || '').trim().toLowerCase();
+  return origin === '' || origin === 'production' || origin === 'snapshot';
+};
+
 export const canAccessPermission = (user, permissionName) => {
   if (!user) return false;
-  if (user.role === 'master') return true;
+  if (isMasterLevelRole(user.role)) return true;
   if (!permissionName) return true;
   return normalizePermissions(user.permissions).includes(permissionName);
 };
@@ -67,7 +107,7 @@ export const canAccessPermission = (user, permissionName) => {
 export const canAccessMenuItem = (user, item) => {
   if (!user || !item) return false;
   if (item.testingOnly && !isTestingUiEnabled()) return false;
-  if (item.masterOnly) return user.role === 'master';
+  if (item.masterOnly) return isMasterLevelRole(user.role);
   if (item.allRoles) return true;
   if (item.allowUser && user.role === 'user') return true;
   if (item.adminOnly && user.role === 'user') {

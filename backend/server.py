@@ -8,7 +8,7 @@ load_dotenv(ROOT_DIR / '.env')
 # values cannot override Codespaces/process secrets.
 
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request, Query
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -111,6 +111,11 @@ try:
 except ImportError:
     import testing_runtime
 
+try:
+    from . import roles as role_defs
+except ImportError:
+    import roles as role_defs
+
 testing_runtime.assert_env_isolation()
 
 mongo_url = resolve_mongo_url()
@@ -138,6 +143,16 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
 # Create the main app
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
+
+try:
+    from .testing_overlay import ProductionWriteBlocked as _ProductionWriteBlocked
+except ImportError:
+    from testing_overlay import ProductionWriteBlocked as _ProductionWriteBlocked  # type: ignore
+
+
+@app.exception_handler(_ProductionWriteBlocked)
+async def _production_write_blocked_handler(request: Request, exc: _ProductionWriteBlocked):
+    return JSONResponse(status_code=403, content={"detail": str(exc) or "Forbidden"})
 
 # Socket.IO for real-time notifications
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
@@ -217,7 +232,7 @@ def normalize_email(value: str) -> str:
 
 
 def _apply_testing_master_permissions(user: dict) -> dict:
-    """Testing Master Admin (role=master) always receives the full module list.
+    """Testing Master Admin / Master always receive the full module list.
 
     Production Master Admin already bypasses permission checks via role. This
     only fills the payload in APP_ENV=testing so no module is omitted if a
@@ -225,7 +240,7 @@ def _apply_testing_master_permissions(user: dict) -> dict:
     """
     if not user:
         return user
-    if testing_runtime.is_testing_env() and str(user.get("role") or "").lower() == "master":
+    if testing_runtime.is_testing_env() and role_defs.is_master_level(user.get("role")):
         from testing_snapshot import MASTER_PERMISSION_LABELS
         user["permissions"] = list(MASTER_PERMISSION_LABELS)
     return user
@@ -582,7 +597,7 @@ async def login(login_data: LoginRequest):
 
     # Nightly maintenance (23:00–04:00 IST): block normal-user login.
     # Master may still log in for read-only Storage/archive monitoring.
-    if maint.in_maintenance_window() and str(user.get("role") or "").lower() != "master":
+    if maint.in_maintenance_window() and not role_defs.is_master_level(user.get("role")):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=maint.MAINTENANCE_MESSAGE,
@@ -633,19 +648,18 @@ async def get_users(current_user: UserResponse = Depends(get_current_user)):
 
 @api_router.post("/users", response_model=UserResponse)
 async def create_user(user_data: UserCreate, current_user: UserResponse = Depends(get_current_user)):
-    # Master can create admins and users, Admin can only create users
-    if current_user.role == "master":
-        if user_data.role not in ["master", "admin", "user"]:
-            raise HTTPException(status_code=400, detail="Invalid role")
-    elif current_user.role == "admin":
-        if user_data.role != "user":
-            raise HTTPException(status_code=403, detail="Admins can only create users")
+    # Four-level hierarchy: Master Admin → Master/Admin/User; Master → Admin/User; Admin → User.
+    # No one may create Master Admin via UI or API.
+    if not (_is_master_level_user(current_user) or _role_of(current_user) == role_defs.ROLE_ADMIN):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    user_data.role = _enforce_creatable_role(current_user, user_data.role)
+
+    if _role_of(current_user) == role_defs.ROLE_ADMIN:
         user_data.brand = current_user.brand
         user_data.group = current_user.group
         user_data.permissions = {}
-    else:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     user_data.email = normalize_email(user_data.email)
     user_data.user_id = (user_data.user_id or "").strip()
 
@@ -695,13 +709,18 @@ async def create_user(user_data: UserCreate, current_user: UserResponse = Depend
 
 @api_router.delete("/users/{user_id}")
 async def delete_user(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role != "master":
-        raise HTTPException(status_code=403, detail="Only master can delete users")
-    
-    result = await db.users.delete_one({"id": user_id})
+    if not _is_master_level_user(current_user):
+        raise HTTPException(status_code=403, detail="Only Master Admin or Master can delete users")
+
+    target = await _find_user_doc(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    _forbid_protected_master_admin(target, "deleted")
+
+    result = await db.users.delete_one({"id": target["id"]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
     return {"message": "User deleted successfully"}
 
 # Update user permissions
@@ -874,7 +893,7 @@ async def _apply_selected_upload_scope(ctx: dict, current_user: UserResponse, br
         selected_branch=branch,
         allowed_branches=allowed,
     )
-    if role == "master":
+    if role_defs.is_master_level(role):
         ctx["brand_name"] = brand
         ctx["brand"] = brand
         ctx["dealer_name"] = dealer
@@ -892,7 +911,7 @@ async def process_product_upload(
     dealer: str = "",
     branch: str = "",
 ):
-    if current_user.role not in ["master", "admin", "user"]:
+    if current_user.role not in ["master_admin", "master", "admin", "user"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     upload_scope.require_specific_upload_scope(brand, dealer, branch)
 
@@ -1104,7 +1123,7 @@ async def get_uploads(
     branch: str = None,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    if current_user.role not in ["master", "admin", "user"]:
+    if current_user.role not in ["master_admin", "master", "admin", "user"]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     query = {}
@@ -1114,7 +1133,7 @@ async def get_uploads(
     def is_all(value: str) -> bool:
         return not value or str(value).startswith("All ") or value == "N/A"
 
-    if current_user.role == "master":
+    if _is_master_level_user(current_user):
         if not is_all(brand):
             query["brand_name"] = brand
         if not is_all(dealer):
@@ -1151,7 +1170,7 @@ async def publish_upload(upload_id: str, current_user: UserResponse = Depends(ge
 
 @api_router.delete("/uploads/reset")
 async def reset_uploads(type: str = None, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role != "master":
+    if (not _is_master_level_user(current_user)):
         raise HTTPException(status_code=403, detail="Only Master Admin can reset data")
 
     query = {}
@@ -1271,7 +1290,7 @@ async def export_uploaded_products(current_user: UserResponse = Depends(get_curr
 @api_router.delete("/upload/reset-products")
 async def reset_all_products(current_user: UserResponse = Depends(get_current_user)):
     """Delete all uploaded products - Master Admin only"""
-    if current_user.role != "master":
+    if (not _is_master_level_user(current_user)):
         raise HTTPException(status_code=403, detail="Only Master Admin can reset data")
     
     result = await db.products.delete_many({})
@@ -1348,14 +1367,14 @@ async def create_order(order_data: OrderCreate, current_user: UserResponse = Dep
 
 @api_router.put("/orders/{order_id}/action")
 async def action_order(order_id: str, action: OrderAction, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
+    if current_user.role not in ["master_admin", "master", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     order = await db.orders.find_one({"id": order_id}, {"_id": 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     
-    if order["assigned_to"] != current_user.id and current_user.role != "master":
+    if order["assigned_to"] != current_user.id and (not _is_master_level_user(current_user)):
         raise HTTPException(status_code=403, detail="Not authorized to action this order")
     
     if action.status not in ["approved", "rejected"]:
@@ -1687,7 +1706,7 @@ async def send_order_requests(request_data: dict, current_user: UserResponse = D
 @api_router.delete("/orders/reset-all")
 async def reset_all_order_data(current_user: UserResponse = Depends(get_current_user)):
     """Delete all order stock data - Master Admin only"""
-    if current_user.role != "master":
+    if (not _is_master_level_user(current_user)):
         raise HTTPException(status_code=403, detail="Only Master Admin can reset data")
     
     result = await db.order_stocks.delete_many({})
@@ -1939,7 +1958,7 @@ async def reset_user_password(
     data: ResetPasswordRequest,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    if current_user.role not in ["master", "admin"]:
+    if current_user.role not in ["master_admin", "master", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_user = await db.users.find_one({"id": user_id}, {"_id": 0})
@@ -1976,22 +1995,23 @@ async def reset_user_password(
 
 @api_router.put("/profile/{user_id}/status")
 async def toggle_user_status(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    # Only admin and master can change status
-    if current_user.role not in ["master", "admin"]:
+    # Only admin and master-level can change status
+    if not (_is_master_level_user(current_user) or _role_of(current_user) == role_defs.ROLE_ADMIN):
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     # Cannot deactivate yourself
     if current_user.id == user_id:
         raise HTTPException(status_code=400, detail="Cannot change your own status")
-    
-    user = await db.users.find_one({"id": user_id}, {"_id": 0})
+
+    user = await _find_user_doc(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    _forbid_protected_master_admin(user, "deactivated or reactivated")
     _ensure_can_manage_user(current_user, user)
-    
+
     new_status = "inactive" if user.get("status") == "active" else "active"
     await db.users.update_one(
-        {"id": user_id},
+        {"id": user["id"]},
         {"$set": {"status": new_status}}
     )
     
@@ -2059,7 +2079,7 @@ async def get_brands_and_groups(current_user: UserResponse = Depends(get_current
 @api_router.post("/brands")
 async def create_brand(brand: BrandCreate, current_user: UserResponse = Depends(get_current_user)):
     """Create a new brand"""
-    if current_user.role not in ["master", "admin"]:
+    if current_user.role not in ["master_admin", "master", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     # Check if brand already exists
@@ -2076,7 +2096,7 @@ async def create_brand(brand: BrandCreate, current_user: UserResponse = Depends(
 @api_router.delete("/brands/{brand_name}")
 async def delete_brand(brand_name: str, current_user: UserResponse = Depends(get_current_user)):
     """Delete a brand"""
-    if current_user.role not in ["master", "admin"]:
+    if current_user.role not in ["master_admin", "master", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     result = await db.brands.delete_one({"name": brand_name})
@@ -2087,7 +2107,7 @@ async def delete_brand(brand_name: str, current_user: UserResponse = Depends(get
 @api_router.post("/groups")
 async def create_group(group: GroupCreate, current_user: UserResponse = Depends(get_current_user)):
     """Create a new group"""
-    if current_user.role not in ["master", "admin"]:
+    if current_user.role not in ["master_admin", "master", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     # Check if group already exists
@@ -2104,7 +2124,7 @@ async def create_group(group: GroupCreate, current_user: UserResponse = Depends(
 @api_router.delete("/groups/{group_name}")
 async def delete_group(group_name: str, current_user: UserResponse = Depends(get_current_user)):
     """Delete a group"""
-    if current_user.role not in ["master", "admin"]:
+    if current_user.role not in ["master_admin", "master", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     result = await db.groups.delete_one({"name": group_name})
@@ -2120,25 +2140,31 @@ async def initialize_system():
     return result
 
 async def ensure_master_user_exists():
-    """Create the default master admin if no master user exists yet.
+    """Create the default Master Admin if no top-tier account exists yet.
     Called automatically on backend startup, and also exposed via POST /api/init
     for manual/idempotent use. Both paths share this single implementation so
     there is exactly one place that defines the default admin credentials.
     """
     if os.getenv("NMTS_DISABLE_DEFAULT_MASTER_SEED", "").strip().lower() in {"1", "true", "yes", "on"}:
         return {"message": "Default master seed disabled"}
-    master = await db.users.find_one({"role": "master"})
+    master = await db.users.find_one({
+        "$or": [
+            {"role": role_defs.ROLE_MASTER_ADMIN},
+            {"role": "master"},
+            {"email": {"$regex": r"^admin@sleepingstock\.in$", "$options": "i"}},
+        ]
+    })
     if not master:
         master_user = User(
             username="Master Admin",
             email="admin@sleepingstock.in",
             password=hash_password("admin123"),
-            role="master"
+            role=role_defs.ROLE_MASTER_ADMIN,
         )
         doc = master_user.model_dump()
         doc['created_at'] = doc['created_at'].isoformat()
         await db.users.insert_one(doc)
-        return {"message": "Master user created", "email": "admin@sleepingstock.in", "password": "admin123"}
+        return {"message": "Master Admin created", "email": "admin@sleepingstock.in", "password": "admin123"}
     return {"message": "System already initialized"}
 
 # ==================== UPLOAD TRACKING ====================
@@ -2224,13 +2250,29 @@ def _permission_list(value):
     return normalize_permissions(value)
 
 
+
+def _role_of(user) -> str:
+    if user is None:
+        return ""
+    if isinstance(user, dict):
+        return role_defs.normalize_role(user.get("role"))
+    return role_defs.normalize_role(getattr(user, "role", None))
+
+
+def _is_master_level_user(user) -> bool:
+    return role_defs.is_master_level(_role_of(user))
+
+
+def _is_master_admin_user(user) -> bool:
+    return role_defs.is_master_admin(_role_of(user))
+
 async def _ensure_master(current_user: UserResponse):
-    if current_user.role != "master":
-        raise HTTPException(status_code=403, detail="Only Master Admin can perform this action")
+    if not _is_master_level_user(current_user):
+        raise HTTPException(status_code=403, detail="Only Master Admin or Master can perform this action")
 
 
 async def _ensure_master_or_admin(current_user: UserResponse):
-    if current_user.role not in ["master", "admin"]:
+    if not (_is_master_level_user(current_user) or _role_of(current_user) == role_defs.ROLE_ADMIN):
         raise HTTPException(status_code=403, detail="Not authorized")
 
 
@@ -2238,8 +2280,36 @@ def _is_same_dealer(current_user: UserResponse, target: dict) -> bool:
     return target.get("brand") == current_user.brand and target.get("group") == current_user.group
 
 
+def _forbid_protected_master_admin(target: Optional[dict], action: str = "modified"):
+    """Master Admin accounts are immutable for delete / deactivate / demote / role change."""
+    if role_defs.is_protected_master_admin_doc(target):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Master Admin accounts cannot be {action}",
+        )
+
+
+async def _find_user_doc(user_id: str) -> Optional[dict]:
+    return await db.users.find_one(
+        {"$or": [{"id": user_id}, {"userId": user_id}, {"user_id": user_id}]},
+        {"_id": 0},
+    )
+
+
+def _enforce_creatable_role(actor, target_role: str):
+    normalized = role_defs.normalize_role(target_role)
+    if normalized not in role_defs.ALL_ROLES:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    if not role_defs.can_create_role(_role_of(actor), normalized):
+        raise HTTPException(
+            status_code=403,
+            detail=role_defs.creation_forbidden_detail(_role_of(actor), normalized),
+        )
+    return normalized
+
+
 async def _ensure_can_view_user(current_user: UserResponse, user_id: str):
-    if current_user.id == user_id or current_user.role == "master":
+    if current_user.id == user_id or _is_master_level_user(current_user):
         return
     if current_user.role == "admin":
         target = await db.users.find_one({"id": user_id}, {"_id": 0, "brand": 1, "group": 1})
@@ -2250,11 +2320,11 @@ async def _ensure_can_view_user(current_user: UserResponse, user_id: str):
 
 def _ensure_can_manage_user(current_user: UserResponse, target: dict):
     """Admins manage only role=user accounts of their own brand and dealer."""
-    if current_user.role == "master":
+    if _is_master_level_user(current_user):
         return
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    if target.get("role") != "user":
+    if role_defs.normalize_role(target.get("role")) != role_defs.ROLE_USER:
         raise HTTPException(status_code=403, detail="Admin can manage only users")
     if not _is_same_dealer(current_user, target):
         raise HTTPException(status_code=403, detail="Not authorized for this user")
@@ -2907,13 +2977,12 @@ async def list_hub_users(current_user: UserResponse = Depends(get_current_user))
 async def create_hub_user(data: UserHubCreate, current_user: UserResponse = Depends(get_current_user)):
     await _ensure_master_or_admin(current_user)
 
-    if current_user.role == "admin" and data.role != "user":
-        raise HTTPException(status_code=403, detail="Admin can create only users")
-
     if data.password != data.confirmPassword:
         raise HTTPException(status_code=400, detail="Password not matching")
 
-    if current_user.role == "admin":
+    data.role = _enforce_creatable_role(current_user, data.role)
+
+    if _role_of(current_user) == role_defs.ROLE_ADMIN:
         allowed_permissions = set(_permission_list(current_user.permissions))
         requested_permissions = set(data.permissions or [])
 
@@ -2924,9 +2993,6 @@ async def create_hub_user(data: UserHubCreate, current_user: UserResponse = Depe
         data.dealer = current_user.group
         if not data.branch:
             data.branch = current_user.location
-
-    if data.role not in ["master", "admin", "user"]:
-        raise HTTPException(status_code=400, detail="Invalid role")
 
     data.userId = (data.userId or "").strip()
     data.email = normalize_email(data.email)
@@ -3003,8 +3069,21 @@ async def update_hub_user(user_id: str, data: UserHubUpdate, current_user: UserR
         raise HTTPException(status_code=404, detail="User not found")
 
     raw = data.model_dump()
-    if current_user.role == "admin":
-        if target.get("role") != "user":
+    protected = role_defs.is_protected_master_admin_doc(target)
+
+    if protected:
+        # Never allow demote / role change / deactivate on Master Admin.
+        if raw.get("role") is not None and role_defs.normalize_role(raw.get("role")) != role_defs.ROLE_MASTER_ADMIN:
+            raise HTTPException(status_code=403, detail="Master Admin accounts cannot be role-changed or demoted")
+        raw.pop("role", None)
+        if raw.get("status") is not None and str(raw.get("status") or "").strip().lower() != "active":
+            raise HTTPException(status_code=403, detail="Master Admin accounts cannot be deactivated")
+        # Mirrored Production Master Admin stays read-only in Testing.
+        if testing_runtime.is_testing_env() and role_defs.is_mirrored_production_master_admin(target):
+            raise HTTPException(status_code=403, detail="Mirrored Production Master Admin is read-only in Testing")
+
+    if _role_of(current_user) == role_defs.ROLE_ADMIN:
+        if role_defs.normalize_role(target.get("role")) != role_defs.ROLE_USER:
             raise HTTPException(status_code=403, detail="Admin can update only users")
         if target.get("brand") != current_user.brand or target.get("group") != current_user.group:
             raise HTTPException(status_code=403, detail="Not authorized for this user")
@@ -3014,6 +3093,17 @@ async def update_hub_user(user_id: str, data: UserHubUpdate, current_user: UserR
             allowed_permissions = set(_permission_list(current_user.permissions))
             if not set(raw["permissions"]).issubset(allowed_permissions):
                 raise HTTPException(status_code=403, detail="Admin cannot assign permissions not given by Master")
+    elif raw.get("role") is not None:
+        new_role = role_defs.normalize_role(raw.get("role"))
+        if new_role != role_defs.normalize_role(target.get("role")):
+            if new_role == role_defs.ROLE_MASTER_ADMIN:
+                raise HTTPException(status_code=403, detail="No one can create another Master Admin")
+            if not role_defs.can_create_role(_role_of(current_user), new_role):
+                raise HTTPException(
+                    status_code=403,
+                    detail=role_defs.creation_forbidden_detail(_role_of(current_user), new_role),
+                )
+            raw["role"] = new_role
 
     update_data = {}
     for key, value in raw.items():
@@ -3040,7 +3130,12 @@ async def update_hub_user(user_id: str, data: UserHubUpdate, current_user: UserR
 async def delete_hub_user(user_id: str, current_user: UserResponse = Depends(get_current_user)):
     await _ensure_master(current_user)
 
-    result = await db.users.delete_one({"$or": [{"id": user_id}, {"userId": user_id}, {"user_id": user_id}]})
+    target = await _find_user_doc(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    _forbid_protected_master_admin(target, "deleted")
+
+    result = await db.users.delete_one({"id": target["id"]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -3049,7 +3144,7 @@ async def delete_hub_user(user_id: str, current_user: UserResponse = Depends(get
 
 @api_router.get("/scope/options")
 async def get_scope_options(current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role == "master":
+    if _is_master_level_user(current_user):
         states = await db.states.find({"status": "active"}, {"_id": 0, "code": 1, "name": 1}).sort("name", 1).to_list(1000)
         brands = await db.brands.find({}, {"_id": 0, "code": 1, "name": 1, "status": 1}).sort("name", 1).to_list(1000)
         dealers = await db.dealers.find({}, {"_id": 0, "name": 1, "brand": 1, "brand_name": 1, "status": 1}).sort("name", 1).to_list(1000)
@@ -3106,7 +3201,7 @@ async def get_dashboard_summary(
     product_query = {}
     user_query = {}
 
-    if current_user.role == "master":
+    if _is_master_level_user(current_user):
         if brand and brand != "All Brands":
             product_query["brand_name"] = brand
             user_query["brand"] = brand
@@ -3159,7 +3254,7 @@ async def get_dashboard_summary(
 def _branch_master_query(current_user: UserResponse, brand=None, dealer=None, branch=None) -> dict:
     """Same Brand/Dealer/Branch scope as upload cards, applied to db.branches."""
     query: dict = {}
-    if current_user.role == "master":
+    if _is_master_level_user(current_user):
         if not _is_all_scope(brand):
             query["$or"] = [{"brand": brand}, {"brand_name": brand}]
         if not _is_all_scope(dealer):
@@ -3371,7 +3466,7 @@ async def upload_template(
 @api_router.get("/templates")
 async def list_templates(current_user: UserResponse = Depends(get_current_user)):
     query = {}
-    if current_user.role != "master":
+    if (not _is_master_level_user(current_user)):
         query["brand"] = current_user.brand
 
     return await db.templates.find(query, {"_id": 0, "fileBytes": 0}).sort("uploadedAt", -1).to_list(1000)
@@ -3385,7 +3480,7 @@ async def download_template(template_id: str, current_user: UserResponse = Depen
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
 
-    if current_user.role != "master" and template.get("brand") != current_user.brand:
+    if (not _is_master_level_user(current_user)) and template.get("brand") != current_user.brand:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     # Prefer S3/object-store; fall back to legacy fileBytes for old templates.
@@ -3538,7 +3633,7 @@ async def _build_upload_context_v2(current_user: UserResponse):
 
 
 def _apply_role_scope_v2(query: dict, current_user: UserResponse, brand=None, dealer=None, branch=None):
-    if current_user.role == "master":
+    if _is_master_level_user(current_user):
         if not _is_all_scope(brand):
             query["brand_name"] = brand
         if not _is_all_scope(dealer):
@@ -3566,7 +3661,7 @@ async def upload_product_center_v2(
     branch: str = Form(""),
     current_user: UserResponse = Depends(get_current_user),
 ):
-    if current_user.role not in ["master", "admin", "user"]:
+    if current_user.role not in ["master_admin", "master", "admin", "user"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     upload_scope.require_specific_upload_scope(brand, dealer, branch)
     if not file.filename.lower().endswith((".xlsx", ".xls")):
@@ -3877,7 +3972,7 @@ async def _finalize_product_publish(
 
 @api_router.put("/uploads/{upload_id}/publish-v2")
 async def publish_upload_v2(upload_id: str, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin", "user"]:
+    if current_user.role not in ["master_admin", "master", "admin", "user"]:
         raise HTTPException(status_code=403, detail="You are not allowed to publish uploads")
     upload = await db.uploads.find_one({"id": upload_id}, {"_id": 0, "raw_file_bytes": 0})
     if not upload:
@@ -4049,7 +4144,7 @@ class CancelUploadRequest(BaseModel):
 
 @api_router.put("/uploads/{upload_id}/cancel-v2")
 async def cancel_upload_v2(upload_id: str, data: CancelUploadRequest, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
+    if current_user.role not in ["master_admin", "master", "admin"]:
         raise HTTPException(status_code=403, detail="Only Master/Admin can cancel")
     upload = await db.uploads.find_one({"id": upload_id}, {"_id": 0})
     if not upload:
@@ -4359,7 +4454,7 @@ async def product_hub_branch_summary(
     fast no matter how many lakhs of rows exist in the raw products collection."""
     date_key = _nmts_date_key()
     query = {"active_date_key": date_key}
-    if current_user.role == "master":
+    if _is_master_level_user(current_user):
         if not _is_all_scope(brand):
             query["brand_name"] = brand
         if not _is_all_scope(dealer):
@@ -5215,7 +5310,7 @@ async def _create_order_v2(rows, current_user: UserResponse, source: str, file_n
     ctx = await get_user_upload_context(current_user)
     scope = scope or {}
     role = (current_user.role or '').lower()
-    if role == 'master':
+    if role_defs.is_master_level(role):
         if scope.get('brand'): ctx['brand_name'] = _order_clean_text(scope.get('brand'))
         if scope.get('dealer'): ctx['dealer_name'] = _order_clean_text(scope.get('dealer'))
         if scope.get('branch'): ctx['branch'] = _order_clean_text(scope.get('branch'))
@@ -5350,7 +5445,7 @@ async def order_desk_orders(
     current_user: UserResponse = Depends(get_current_user),
 ):
     role = (current_user.role or '').lower()
-    query = {} if role == 'master' else ({'dealer_name': current_user.group} if role == 'admin' else {'created_by': current_user.id})
+    query = {} if role_defs.is_master_level(role) else ({'dealer_name': current_user.group} if role == 'admin' else {'created_by': current_user.id})
     if brand and not str(brand).startswith('All '): query['brand_name'] = brand
     if dealer and not str(dealer).startswith('All '): query['dealer_name'] = dealer
     if branch and not str(branch).startswith('All '): query['branch'] = branch
@@ -5440,7 +5535,7 @@ async def order_desk_order_detail(
         raise HTTPException(status_code=404, detail='Order not found')
     order_id = order.get('id') or order_id
     role = (current_user.role or '').lower()
-    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+    if (not role_defs.is_master_level(role)) and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
     items = await odw.enrich_order_items(
@@ -5554,7 +5649,7 @@ async def order_desk_check_availability(order_id: str, brand: Optional[str] = No
     if not brand or str(brand).startswith('All ') or not dealer or str(dealer).startswith('All ') or not branch or str(branch).startswith('All '):
         raise HTTPException(status_code=400, detail='Select a valid Brand, Dealer and Branch before Check Availability')
     role = (current_user.role or '').lower()
-    if role != 'master' and dealer != current_user.group:
+    if (not role_defs.is_master_level(role)) and dealer != current_user.group:
         raise HTTPException(status_code=403, detail='Selected dealer is outside your permitted scope')
     if role == 'user' and branch != current_user.location:
         raise HTTPException(status_code=403, detail='Selected branch is outside your permitted scope')
@@ -5738,7 +5833,7 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
         raise HTTPException(status_code=404, detail='Order not found')
     odg.assert_order_not_finished(order)
     role = (current_user.role or '').lower()
-    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+    if (not role_defs.is_master_level(role)) and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized for this order')
 
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
@@ -6186,7 +6281,7 @@ async def order_desk_auto_source_start(order_id: str, payload: dict = None, curr
         raise HTTPException(status_code=404, detail='Order not found')
     odg.assert_order_not_finished(order)
     role = (current_user.role or '').lower()
-    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+    if (not role_defs.is_master_level(role)) and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized for this order')
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
     if not items:
@@ -6244,7 +6339,7 @@ async def order_desk_auto_source_continue(order_id: str, current_user: UserRespo
     if not order:
         raise HTTPException(status_code=404, detail='Order not found')
     role = (current_user.role or '').lower()
-    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+    if (not role_defs.is_master_level(role)) and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
     result = await _auto_source_advance(order_id, actor=current_user, reason='continue')
     refreshed = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
@@ -6266,7 +6361,7 @@ async def order_desk_factory_decision(order_id: str, payload: dict, current_user
     odg.assert_order_not_finished(order)
     role = (current_user.role or '').lower()
     is_creator = order.get('created_by') == current_user.id
-    if role != 'master' and not is_creator and order.get('dealer_name') != current_user.group:
+    if (not role_defs.is_master_level(role)) and not is_creator and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Only the order creator (or Master/Admin scope) can decide')
     action = str((payload or {}).get('action') or '').strip().lower()
     if action not in ('move_to_factory', 'cancel_remaining'):
@@ -6703,7 +6798,7 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
         raise HTTPException(status_code=404, detail='Order not found')
 
     role = (current_user.role or '').lower()
-    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+    if (not role_defs.is_master_level(role)) and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized to send requests for this order')
 
     odg.assert_order_not_finished(order)
@@ -6839,7 +6934,7 @@ async def order_desk_add_items(order_id: str, payload: dict, current_user: UserR
         raise HTTPException(status_code=404, detail='Order not found')
     odg.assert_order_not_finished(order)
     role = (current_user.role or '').lower()
-    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+    if (not role_defs.is_master_level(role)) and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
     rows = payload.get('rows') or payload.get('items') or []
     if not rows:
@@ -6904,7 +6999,7 @@ async def order_desk_re_enquire(order_id: str, payload: dict = None, current_use
         raise HTTPException(status_code=404, detail='Order not found')
     odg.assert_order_not_finished(order)
     role = (current_user.role or '').lower()
-    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+    if (not role_defs.is_master_level(role)) and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
 
     item_ids = [str(x) for x in ((payload or {}).get('item_ids') or []) if x]
@@ -6987,7 +7082,7 @@ async def order_desk_request_cancellation(order_id: str, item_id: str, payload: 
         raise HTTPException(status_code=404, detail='Order item not found')
     odg.assert_order_not_finished(order)
     role = (current_user.role or '').lower()
-    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+    if (not role_defs.is_master_level(role)) and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
 
     reason = _order_clean_text((payload or {}).get('reason'))
@@ -7314,7 +7409,7 @@ async def cancel_request_group_timeout(request_number: str, payload: dict = None
         raise HTTPException(status_code=404, detail='Request not found')
     role = (current_user.role or '').lower()
     is_requester = group_doc.get('requested_by') == current_user.id or (role != 'user' and group_doc.get('requesting_dealer') == current_user.group)
-    if role != 'master' and not is_requester:
+    if (not role_defs.is_master_level(role)) and not is_requester:
         raise HTTPException(status_code=403, detail='Not authorized to cancel this request')
 
     timer = odw.evaluate_group_timer(group_doc)
@@ -7395,7 +7490,7 @@ async def save_factory_system_order(
     existing = (item.get('system_order_number') or '').strip()
     now = datetime.now(timezone.utc).isoformat()
     if existing and existing != number:
-        if role != 'master':
+        if (not role_defs.is_master_level(role)):
             raise HTTPException(status_code=403, detail='Only Master Admin can correct System Order Number')
         reason = (body.correction_reason or '').strip()
         if not reason:
@@ -7539,7 +7634,7 @@ async def finish_order_desk_order(order_id: str, current_user: UserResponse = De
     if not order:
         raise HTTPException(status_code=404, detail='Order not found')
     role = (current_user.role or '').lower()
-    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+    if (not role_defs.is_master_level(role)) and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized for this order')
     if order.get('finished_at'):
         return {'message': 'Order already finished', 'order': order, 'already_finished': True}
@@ -7582,7 +7677,7 @@ async def _load_order_fulfillment(order_id: str, current_user: UserResponse):
     if not order:
         raise HTTPException(status_code=404, detail='Order not found')
     role = (current_user.role or '').lower()
-    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+    if (not role_defs.is_master_level(role)) and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized for this order')
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
     items = await odw.enrich_order_items(db, order, items)
@@ -7712,7 +7807,7 @@ async def request_center_list(
     view=outgoing -> requests this user/dealer raised. view=all -> both."""
     role = (current_user.role or '').lower()
     outgoing_query, incoming_query = {}, {}
-    if role == 'master':
+    if role_defs.is_master_level(role):
         pass
     elif role == 'admin':
         outgoing_query['requesting_dealer'] = current_user.group
@@ -7727,7 +7822,7 @@ async def request_center_list(
         query = outgoing_query
     else:
         clauses = [q for q in (outgoing_query, incoming_query) if q]
-        query = {'$or': clauses} if (role != 'master' and clauses) else {}
+        query = {'$or': clauses} if ((not role_defs.is_master_level(role)) and clauses) else {}
 
     # Global dashboard scope is applied directionally for each Request Center view:
     # incoming = supplying/source scope, outgoing = requesting/destination scope,
@@ -7741,7 +7836,7 @@ async def request_center_list(
     selected_brand = _selected(brand, 'All Brands')
     selected_dealer = _selected(dealer, 'All Dealers')
     selected_branch = _selected(branch, 'All Branches')
-    if role != 'master':
+    if (not role_defs.is_master_level(role)):
         # Never allow a client to broaden or replace the authenticated assignment.
         assigned_dealer = (current_user.group or '').strip()
         assigned_branch = (current_user.location or '').strip()
@@ -8115,7 +8210,7 @@ async def _sync_request_header_after_item_decision(req: dict, now: str):
 def _is_request_supplier(doc: dict, current_user: UserResponse) -> bool:
     """Same scope as Request Center incoming: Admin by dealer, User by dealer + branch."""
     role = (current_user.role or '').lower()
-    if role == 'master':
+    if role_defs.is_master_level(role):
         return True
     if not doc or doc.get('supplying_dealer') != current_user.group:
         return False
@@ -8499,7 +8594,7 @@ async def _request_logistics_transition(request_id: str, new_status: str, remark
         raise HTTPException(status_code=404, detail='Request not found')
     role = (current_user.role or '').lower()
     is_supplier = _is_request_supplier(req, current_user)
-    is_requester = role == 'master' or req.get('requested_by') == current_user.id or (role != 'user' and req.get('requesting_dealer') == current_user.group)
+    is_requester = role_defs.is_master_level(role) or req.get('requested_by') == current_user.id or (role != 'user' and req.get('requesting_dealer') == current_user.group)
     if new_status == 'Dispatched' and not is_supplier:
         raise HTTPException(status_code=403, detail='Only the supplying scope can dispatch accepted parts')
     # Completed is marked by requesting scope after physical receipt (replaces Receive step).
@@ -8636,7 +8731,7 @@ def _mobile_dashboard_scope_query(
     if not exact(branch):
         raise HTTPException(status_code=400, detail="Select an exact Branch in the Dashboard filter")
 
-    if current_user.role != "master":
+    if (not _is_master_level_user(current_user)):
         if current_user.brand and str(current_user.brand).casefold() != str(brand).strip().casefold():
             raise HTTPException(status_code=403, detail="Selected Brand is outside your permitted scope")
         if current_user.group and str(current_user.group).casefold() != str(dealer).strip().casefold():
@@ -8679,7 +8774,7 @@ def _stock_snapshot_quantity(product: dict) -> float:
 def _verification_scope_query(current_user: UserResponse, brand: str = None, dealer: str = None, branch: str = None):
     query = {}
     exact = lambda v: v and v != "N/A" and not str(v).startswith("All ")
-    if current_user.role == "master":
+    if _is_master_level_user(current_user):
         if exact(brand): query["brand_name"] = _exact_ci(brand)
         if exact(dealer): query["dealer_name"] = _exact_ci(dealer)
         if exact(branch): query["branch"] = _exact_ci(branch)
@@ -9059,7 +9154,7 @@ async def export_all_mobile_stock_verifications(
     """
     query = {}
     exact = lambda value: value and value != "N/A" and not str(value).startswith("All ")
-    if current_user.role == "master":
+    if _is_master_level_user(current_user):
         if exact(brand): query["brand_name"] = _exact_ci(brand)
         if exact(dealer): query["dealer_name"] = _exact_ci(dealer)
         if exact(branch): query["branch"] = _exact_ci(branch)
@@ -9112,7 +9207,7 @@ async def export_all_mobile_stock_verifications(
         width = min(max(len(str(cell.value or "")) for cell in col) + 2, 42)
         ws.column_dimensions[openpyxl.utils.get_column_letter(col[0].column)].width = width
     output = BytesIO(); wb.save(output); output.seek(0)
-    filename = "perpetual_stock_master.xlsx" if current_user.role == "master" else ("perpetual_stock_admin.xlsx" if current_user.role == "admin" else "perpetual_stock_branch.xlsx")
+    filename = "perpetual_stock_master.xlsx" if _is_master_level_user(current_user) else ("perpetual_stock_admin.xlsx" if current_user.role == "admin" else "perpetual_stock_branch.xlsx")
     return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
@@ -9878,7 +9973,7 @@ async def testing_deployment_metadata():
 def _require_testing_master(current_user: UserResponse):
     if not testing_runtime.is_testing_env():
         raise HTTPException(status_code=404, detail="Not a testing environment")
-    if str(current_user.role or "").lower() != "master":
+    if not role_defs.is_master_level(current_user.role):
         raise HTTPException(status_code=403, detail="Testing Master / Master Admin only")
 
 
@@ -10112,7 +10207,7 @@ async def maintenance_guard(request: Request, call_next):
     if not api_path.startswith("/"):
         api_path = "/" + api_path
 
-    if role == "master":
+    if role_defs.is_master_level(role):
         if maint.is_mutating_method(method) and not maint.is_master_readonly_path(api_path):
             # Allow archive retry / storage read helpers that are monitoring-critical
             if api_path.startswith("/storage/archives") and method == "POST" and (
@@ -10242,6 +10337,11 @@ async def seed_master_user_on_startup():
     except Exception as e:
         logger.error(f"Startup init check failed: {e}")
     try:
+        migrate_result = await role_defs.migrate_legacy_master_roles(db)
+        logger.info("Legacy master role migration: %s", migrate_result)
+    except Exception as e:
+        logger.error("Legacy master role migration failed: %s", e)
+    try:
         await ensure_product_hub_indexes()
         logger.info("Product Hub indexes verified")
         await reports_center.ensure_indexes()
@@ -10270,6 +10370,11 @@ async def seed_master_user_on_startup():
                 import testing_overlay as _testing_overlay
             await _testing_overlay.ensure_overlay_indexes(testing_db_raw)
             logger.info("Testing overlay indexes verified")
+            try:
+                restore = await role_defs.restore_mirrored_master_admin_visibility(db)
+                logger.info("Mirrored Master Admin tombstone restore: %s", restore)
+            except Exception as exc:
+                logger.warning("Mirrored Master Admin tombstone restore failed: %s", exc)
             try:
                 from . import testing_verify as _testing_verify
             except ImportError:

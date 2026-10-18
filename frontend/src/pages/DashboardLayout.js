@@ -101,7 +101,8 @@ export function DashboardLayout() {
   const [dealerOptions, setDealerOptions] = useState([]);
   const [branchOptions, setBranchOptions] = useState([]);
 
-  const isMaster = user?.role === "master";
+  // Master Admin + Master share global Brand/Dealer/Branch scope (unchanged rules).
+  const isMaster = user?.role === "master_admin" || user?.role === "master";
   const isAdmin = user?.role === "admin";
 
   const getUserBrand = () => user?.brand || "N/A";
@@ -109,7 +110,13 @@ export function DashboardLayout() {
   const getUserBranch = () => user?.branch || user?.location || "N/A";
   const getDisplayUserName = () => user?.name || user?.username || user?.email || "User";
   const getDisplayRole = () =>
-    user?.role === "master" ? "Master Admin" : user?.role === "admin" ? "Admin" : "User";
+    user?.role === "master_admin"
+      ? "Master Admin"
+      : user?.role === "master"
+        ? "Master"
+        : user?.role === "admin"
+          ? "Admin"
+          : "User";
 
   const [scopeBrand, setScopeBrand] = useState("N/A");
   const [scopeDealer, setScopeDealer] = useState("N/A");
@@ -602,6 +609,14 @@ export function DashboardLayout() {
                   aria-label="Main navigation"
                   onCloseAutoFocus={(e) => e.preventDefault()}
                 >
+                  <div className="nmts-app-menu-brand" data-testid="app-menu-brand-header">
+                    <img
+                      src="/sleeping-stock-logo-transparent.png"
+                      alt="NMTS"
+                      className="nmts-app-menu-brand-logo"
+                    />
+                    <span className="nmts-app-menu-brand-title">Sleeping Stock NMTS</span>
+                  </div>
                   {filteredNavItems.map((item) => {
                     const Icon = item.icon;
                     const isActive =

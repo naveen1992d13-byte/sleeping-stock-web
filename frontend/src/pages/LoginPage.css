@@ -47,7 +47,8 @@
 }
 
 .nmts-login-panel--split {
-  width: min(1100px, 94vw);
+  /* Proportionally smaller at 100% zoom so the full promo stays visible. */
+  width: min(920px, 90vw);
 }
 
 .nmts-login-panel-run {
@@ -124,7 +125,7 @@
 }
 
 .nmts-login-panel--split .nmts-login-panel-face {
-  min-height: 480px;
+  min-height: 400px;
 }
 
 .nmts-login-panel-face::before {
@@ -217,7 +218,7 @@
   z-index: 2;
   flex: 1 1 auto;
   width: 100%;
-  min-height: 480px;
+  min-height: 400px;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -246,14 +247,14 @@
 .nmts-login-content {
   position: relative;
   z-index: 1;
-  min-height: 480px;
-  padding: 18px 28px 16px;
+  min-height: 400px;
+  padding: 14px 22px 12px;
   display: flex;
   flex-direction: column;
 }
 
 .nmts-login-brand {
-  height: 132px;
+  height: 108px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -261,7 +262,7 @@
 }
 
 .nmts-login-logo {
-  width: 128px;
+  width: 108px;
   max-width: 100%;
   height: auto;
   object-fit: contain;
@@ -278,7 +279,7 @@
 .nmts-login-header h1 {
   margin: 0;
   color: #f7f8f7;
-  font-size: clamp(20px, 2.4vw, 26px);
+  font-size: clamp(18px, 2.1vw, 22px);
   line-height: 1.15;
   font-weight: 600;
   letter-spacing: -0.5px;
@@ -313,11 +314,11 @@
 }
 
 .nmts-login-field {
-  height: 46px;
+  height: 40px;
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 0 14px;
+  padding: 0 12px;
   border-radius: 9px;
   border: 1px solid rgba(181, 189, 184, 0.35);
   background: linear-gradient(180deg, rgba(13, 16, 16, 0.76), rgba(22, 25, 24, 0.82));
@@ -388,7 +389,7 @@
 .nmts-login-button {
   position: relative;
   width: 100% !important;
-  height: 46px !important;
+  height: 40px !important;
   margin-top: 4px;
   border: 1px solid rgba(153, 226, 89, 0.42) !important;
   border-radius: 9px !important;

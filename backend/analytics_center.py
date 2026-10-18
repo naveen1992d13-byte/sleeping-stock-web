@@ -737,6 +737,56 @@ def _aggs_to_branch_maps(
     return out
 
 
+def _aging_buckets_need_repair(aging: Optional[dict]) -> bool:
+    """True when pre-aggregated aging looks collapsed into >361 (legacy null days)."""
+    if not aging:
+        return True
+    total = 0.0
+    above = 0.0
+    for name, slot in (aging or {}).items():
+        val = _num((slot or {}).get("value"))
+        total += val
+        if str(name).startswith(">"):
+            above += val
+    if total <= 0:
+        return False
+    return (above / total) >= 0.98
+
+
+async def _aggs_from_snapshots_for_dates(
+    date_keys: List[str],
+    scope: dict,
+    category: Optional[str],
+) -> Dict[str, List[dict]]:
+    """Build daily-agg shaped rows from finalized snapshots with correct aging."""
+    if not date_keys:
+        return {}
+    snap_maps = await _read_finalized_parts_for_dates(date_keys, scope, category, None)
+    out: Dict[str, List[dict]] = {}
+    for dk, part_map in snap_maps.items():
+        iso = rollup.date_key_to_iso(dk)
+        snap_docs = []
+        for row in part_map.values():
+            snap_docs.append(
+                {
+                    "snapshot_date_ist": iso,
+                    "brand_name": row.get("brand_name"),
+                    "dealer_name": row.get("dealer_name"),
+                    "branch_name": row.get("branch"),
+                    "category": row.get("category") or row.get("part_category") or "",
+                    "available_qty": row.get("qty"),
+                    "total_value": row.get("value"),
+                    "purchase_aging_days": row.get("purchase_aging_days"),
+                    "sales_aging_days": row.get("sales_aging_days"),
+                    "last_receipt_date": row.get("last_receipt_date"),
+                    "last_sales_date": row.get("last_sales_date"),
+                }
+            )
+        if snap_docs:
+            out[dk] = rollup.build_daily_agg_docs(iso, snap_docs)
+    return out
+
+
 async def _successful_rollup_keys(date_keys: List[str]) -> set:
     if not date_keys:
         return set()
@@ -745,7 +795,22 @@ async def _successful_rollup_keys(date_keys: List[str]) -> set:
         {"rollup_date_ist": {"$in": isos}, "status": rollup.STATUS_SUCCESS},
         {"_id": 0, "rollup_date_ist": 1},
     ).to_list(5000)
-    return {rollup.iso_to_date_key(r["rollup_date_ist"]) for r in rows if r.get("rollup_date_ist")}
+    keys = {rollup.iso_to_date_key(r["rollup_date_ist"]) for r in rows if r.get("rollup_date_ist")}
+    if keys:
+        return keys
+    # Legacy: snapshots/aggs written before status collection existed still count as finalized.
+    for coll, field in (
+        (rollup.DAILY_AGG_COLLECTION, "rollup_date_ist"),
+        (rollup.SNAPSHOT_COLLECTION, "snapshot_date_ist"),
+    ):
+        legacy = await db[coll].distinct(field, {field: {"$in": isos}})
+        for value in legacy or []:
+            dk = rollup.iso_to_date_key(value)
+            if dk:
+                keys.add(dk)
+        if keys:
+            return keys
+    return keys
 
 
 async def _build_daily_stock_series(
@@ -781,6 +846,28 @@ async def _build_daily_stock_series(
         dk = rollup.iso_to_date_key(_text(r.get("rollup_date_ist")))
         if dk:
             by_date_rows[dk].append(r)
+
+    # Synthesise / repair daily aggs from snapshots when missing or when aging
+    # collapsed into >361 because purchase_aging_days was null at rollup time.
+    repair_keys = []
+    for dk in load_keys:
+        if dk not in success_keys and dk not in by_date_rows:
+            continue
+        rows = by_date_rows.get(dk) or []
+        if not rows:
+            repair_keys.append(dk)
+            continue
+        if any(
+            _aging_buckets_need_repair(r.get("aging_purchase"))
+            or _aging_buckets_need_repair(r.get("aging_sales"))
+            for r in rows
+        ):
+            repair_keys.append(dk)
+    if repair_keys:
+        rebuilt = await _aggs_from_snapshots_for_dates(repair_keys, scope, category)
+        for dk, rows in rebuilt.items():
+            by_date_rows[dk] = rows
+            success_keys.add(dk)
 
     by_date: Dict[str, Dict[Tuple[str, str, str, str], dict]] = {}
     uploaded_by_date: Dict[str, set] = {}

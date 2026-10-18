@@ -245,6 +245,7 @@ export function Analytics() {
   const [partType, setPartType] = useState('All');
   const [agingType, setAgingType] = useState('purchase');
   const [agingDays, setAgingDays] = useState('all');
+  const [stockTrendMode, setStockTrendMode] = useState('closing'); // closing | change
   const [loading, setLoading] = useState(false);
   const [sectionLoading, setSectionLoading] = useState({ stock: false, aging: false, orders: false, requests: false });
   const [sectionError, setSectionError] = useState({ stock: null, aging: null, orders: null, requests: null });
@@ -336,37 +337,55 @@ export function Analytics() {
     load();
   }, [load]);
 
-  // —— Daily stock: missing snapshot = No Data (omit from line); actual zero stays 0 ——
+  // —— Daily stock: Opening = prior day's Closing; missing prior → Opening N/A ——
   const stockPoints = useMemo(() => {
-    const rows = (stockTrend?.series || []).map((d, idx, arr) => {
+    const series = stockTrend?.series || [];
+    const rows = series.map((d, idx) => {
       const missing = d.data_status === 'NO_UPLOAD' || isNullMetric(d.closing);
-      const raw = missing ? null : Number(d.closing);
-      let change = 'no-change';
-      if (!missing) {
-        // Find previous non-missing point
-        let prev = null;
+      const closing = missing ? null : Number(d.closing);
+      // Prefer backend opening (prior finalized day); else previous series closing.
+      let opening = null;
+      let openingAvailable = false;
+      if (!isNullMetric(d.opening)) {
+        opening = Number(d.opening);
+        openingAvailable = true;
+      } else {
         for (let i = idx - 1; i >= 0; i -= 1) {
-          const p = arr[i];
+          const p = series[i];
           if (p.data_status !== 'NO_UPLOAD' && !isNullMetric(p.closing)) {
-            prev = Number(p.closing);
+            opening = Number(p.closing);
+            openingAvailable = true;
             break;
           }
         }
-        if (prev == null) change = 'no-change';
-        else if (raw > prev) change = 'up';
-        else if (raw < prev) change = 'down';
       }
+      let stockChange = null;
+      let change = 'flat';
+      if (!missing && openingAvailable) {
+        stockChange = closing - opening;
+        if (stockChange > 0) change = 'up';
+        else if (stockChange < 0) change = 'down';
+        else change = 'flat';
+      } else if (!missing && !openingAvailable) {
+        stockChange = null;
+        change = 'flat';
+      }
+      const chartRaw = stockTrendMode === 'change' ? stockChange : closing;
       return {
         date: d.date,
         label: dayLabel(d.date),
-        value: missing ? null : fmtChart(raw),
-        raw,
+        opening,
+        openingAvailable,
+        closing,
+        stockChange,
+        value: isNullMetric(chartRaw) ? null : fmtChart(chartRaw),
+        raw: chartRaw,
         data_status: missing ? 'NO_UPLOAD' : d.data_status,
         change,
       };
     });
     return rows;
-  }, [stockTrend, fmtChart]);
+  }, [stockTrend, fmtChart, stockTrendMode]);
   const stockChartPoints = useMemo(
     () => stockPoints.filter((d) => d.data_status !== 'NO_UPLOAD' && !isNullMetric(d.raw)),
     [stockPoints]
@@ -612,12 +631,24 @@ export function Analytics() {
         {/* 1. Daily Stock Value Trend */}
         <SectionCard
           title="Daily Stock Value Trend"
-          hint="Stock value by upload date for the selected month. Days with no upload are not shown."
+          hint="Opening = previous day's Closing. Stock Change = Closing − Opening. Days with no upload are omitted from the chart."
           metricMode={metricMode}
           testId="analytics-section-stock-trend"
           loading={sectionLoading.stock}
           error={sectionError.stock}
         >
+          <div className="mb-1.5 flex justify-end">
+            <select
+              className={selectClass}
+              value={stockTrendMode}
+              onChange={(e) => setStockTrendMode(e.target.value)}
+              data-testid="analytics-stock-trend-mode"
+              aria-label="Stock trend chart mode"
+            >
+              <option value="closing">Closing Stock Trend</option>
+              <option value="change">Stock Change Trend</option>
+            </select>
+          </div>
           <div className="h-[210px] w-full">
             {stockChartPoints.length ? (
               <ResponsiveContainer width="100%" height="100%">
@@ -626,14 +657,23 @@ export function Analytics() {
                   <XAxis dataKey="label" tick={axisTick} />
                   <YAxis tick={axisTick} tickFormatter={yTickFormatter} width={36} />
                   <Tooltip
-                    formatter={(v) => [isValue ? `₹ ${v} L` : v, isValue ? 'Stock Value' : 'Stock Qty']}
+                    formatter={(v) => [
+                      isValue ? `₹ ${v} L` : v,
+                      stockTrendMode === 'change'
+                        ? (isValue ? 'Stock Change' : 'Qty Change')
+                        : (isValue ? 'Closing Stock' : 'Closing Qty'),
+                    ]}
                     labelFormatter={(_, payload) => displayDate(payload?.[0]?.payload?.date)}
                     contentStyle={{ fontSize: 11 }}
                   />
                   <Line
                     type="monotone"
                     dataKey="value"
-                    name={isValue ? 'Stock Value' : 'Stock Qty'}
+                    name={
+                      stockTrendMode === 'change'
+                        ? (isValue ? 'Stock Change' : 'Qty Change')
+                        : (isValue ? 'Closing Stock' : 'Closing Qty')
+                    }
                     stroke="#22c55e"
                     strokeWidth={2.2}
                     dot={(props) => {
@@ -644,7 +684,7 @@ export function Analytics() {
                           ? '#16a34a'
                           : payload?.change === 'down'
                             ? '#dc2626'
-                            : '#22c55e';
+                            : '#9ca3af';
                       return <circle cx={cx} cy={cy} r={3.5} fill={fill} stroke="#fff" strokeWidth={1} />;
                     }}
                     activeDot={{ r: 5 }}
@@ -667,32 +707,68 @@ export function Analytics() {
             columns={[
               { key: 'date', label: 'Date', align: 'left', render: (r) => displayDate(r.date) },
               {
-                key: 'value',
-                label: isValue ? 'Stock Value' : 'Stock Qty',
+                key: 'opening',
+                label: 'Opening Stock',
                 align: 'right',
                 mono: true,
-                render: (r) => (r.data_status === 'NO_UPLOAD' || isNullMetric(r.raw) ? 'No Data' : fmtMetric(r.raw)),
+                render: (r) => {
+                  if (r.data_status === 'NO_UPLOAD') return 'No Data';
+                  if (!r.openingAvailable) return 'N/A';
+                  return fmtMetric(r.opening);
+                },
               },
               {
-                key: 'change',
-                label: 'Δ',
-                align: 'center',
+                key: 'closing',
+                label: 'Closing Stock',
+                align: 'right',
+                mono: true,
+                render: (r) => (r.data_status === 'NO_UPLOAD' || isNullMetric(r.closing) ? 'No Data' : fmtMetric(r.closing)),
+              },
+              {
+                key: 'stockChange',
+                label: 'Stock Change',
+                align: 'right',
+                mono: true,
                 render: (r) => {
-                  if (r.data_status === 'NO_UPLOAD' || isNullMetric(r.raw)) return '—';
-                  if (r.change === 'up') {
-                    return <span className="font-bold text-emerald-600" title="Increase">⬆</span>;
+                  if (r.data_status === 'NO_UPLOAD' || isNullMetric(r.closing)) return '—';
+                  if (!r.openingAvailable || isNullMetric(r.stockChange)) {
+                    return (
+                      <span className="inline-flex items-center gap-1 text-gray-400" title="No prior day">
+                        <span aria-hidden="true">●</span> N/A
+                      </span>
+                    );
                   }
-                  if (r.change === 'down') {
-                    return <span className="font-bold text-red-600" title="Decrease">⬇</span>;
-                  }
-                  return <span className="text-gray-400" title="No change">●</span>;
+                  const indicator =
+                    r.change === 'up' ? (
+                      <span className="font-bold text-emerald-600" title="Increase">⬆</span>
+                    ) : r.change === 'down' ? (
+                      <span className="font-bold text-red-600" title="Decrease">⬇</span>
+                    ) : (
+                      <span className="text-gray-400" title="No change">●</span>
+                    );
+                  return (
+                    <span className="inline-flex items-center justify-end gap-1">
+                      {indicator}
+                      <span
+                        className={
+                          r.change === 'up'
+                            ? 'text-emerald-700'
+                            : r.change === 'down'
+                              ? 'text-red-700'
+                              : 'text-gray-600'
+                        }
+                      >
+                        {fmtMetric(r.stockChange)}
+                      </span>
+                    </span>
+                  );
                 },
               },
             ]}
-            rows={stockPoints}
+            rows={stockPoints.filter((r) => r.data_status !== 'NO_UPLOAD')}
           />
           <p className="text-[9px] text-gray-400">
-            Missing snapshot = No Data (omitted from chart). Actual zero is shown as 0. ⬆ increase / ⬇ decrease vs prior upload day.
+            Opening Stock = previous day&apos;s Closing. If prior-day data is unavailable, Opening shows N/A (not zero). ⬆ increase / ⬇ decrease / ● no change.
           </p>
         </SectionCard>
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -201,10 +202,33 @@ async def cleanup_testing_data(
         return {"ok": True, "status": "dry_run", "receipt": receipt}
 
     deleted: Dict[str, int] = {}
+    try:
+        from . import roles as role_defs
+    except ImportError:
+        import roles as role_defs  # type: ignore
+
     for name in TESTING_CREATED_COLLECTIONS:
-        result = await test_db[name].delete_many({})
+        if name == "users":
+            # Never remove Master Admin accounts via Clear Testing Data.
+            protected_emails = sorted(role_defs.ORIGINAL_MASTER_ADMIN_EMAILS)
+            result = await test_db[name].delete_many({
+                "role": {"$nin": [role_defs.ROLE_MASTER_ADMIN, "Master Admin"]},
+                "email": {
+                    "$not": {
+                        "$regex": "^(?:"
+                        + "|".join(re.escape(e) for e in protected_emails)
+                        + ")$",
+                        "$options": "i",
+                    }
+                },
+                "is_testing_master": {"$ne": True},
+            })
+        else:
+            result = await test_db[name].delete_many({})
         deleted[name] = int(getattr(result, "deleted_count", 0) or 0)
     ov = await test_db[overlay.OVERLAY_COLLECTION].delete_many({})
+    # Drop tombstones but never leave the mirrored Production Master Admin hidden —
+    # clearing all tombstones already restores visibility; keep that behaviour.
     tb = await test_db[overlay.TOMBSTONE_COLLECTION].delete_many({})
     snap = await test_db["testing_snapshot_meta"].delete_many({})
     deleted[overlay.OVERLAY_COLLECTION] = int(getattr(ov, "deleted_count", 0) or 0)

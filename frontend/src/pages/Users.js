@@ -22,7 +22,16 @@ import {
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useWorkspaceScope } from "../workspaceScope";
 import { Button } from "../components/ui/button";
-import { useAuth, API } from "../App";
+import {
+  useAuth,
+  API,
+  isMasterLevelRole,
+  isMasterAdminRole,
+  roleLabel,
+  creatableRolesFor,
+  isProtectedMasterAdminUser,
+  isMirroredProductionMasterAdmin,
+} from "../App";
 import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
 import NMTSMobile from "./NMTSMobile";
 import { toast } from "sonner";
@@ -79,10 +88,16 @@ function networkErrorMessage(error) {
 export default function UsersPage() {
   const { user } = useAuth();
   const outletScope = useWorkspaceScope();
-  const isMaster = user?.role === "master";
+  // Master Admin + Master share User Hub master-level controls (scope unchanged).
+  const isMaster = isMasterLevelRole(user?.role);
+  const isMasterAdmin = isMasterAdminRole(user?.role);
   const isAdmin = user?.role === "admin";
   const navigate = useNavigate();
   const isNormalUser = user?.role === "user";
+  const creatableRoleOptions = creatableRolesFor(user?.role).map((r) => ({
+    value: r,
+    label: roleLabel(r),
+  }));
 
   const scopeBrand = outletScope.scopeBrand || "All Brands";
   const scopeDealer = outletScope.scopeDealer || "All Dealers";
@@ -659,6 +674,12 @@ export default function UsersPage() {
   const openEditUser = (item) => {
     if (isNormalUser) return toast.warning("You are not allowed to edit users");
     if (isAdmin && item.role !== "user") return toast.warning("Admin can edit only User role");
+    if (isMirroredProductionMasterAdmin(item)) {
+      return toast.warning("Mirrored Production Master Admin is read-only in Testing");
+    }
+    if (isProtectedMasterAdminUser(item) && !isMaster) {
+      return toast.warning("Not authorized to edit Master Admin");
+    }
     setEditingUser(item);
     setNewUser({
       userId: item.userId || item.user_id || "",
@@ -681,6 +702,15 @@ export default function UsersPage() {
   const saveUser = async () => {
     if (isNormalUser) return toast.warning("You are not allowed to create users");
     if (isAdmin && newUser.role !== "user") return toast.warning("Admin can create only User role");
+    if (!editingUser && newUser.role === "master_admin") {
+      return toast.warning("No one can create another Master Admin");
+    }
+    if (!editingUser && !creatableRolesFor(user?.role).includes(newUser.role)) {
+      return toast.warning(`You can only create: ${creatableRolesFor(user?.role).map(roleLabel).join(", ") || "no roles"}`);
+    }
+    if (editingUser && isProtectedMasterAdminUser(editingUser) && newUser.role !== "master_admin") {
+      return toast.warning("Master Admin accounts cannot be role-changed or demoted");
+    }
     if (!editingUser && newUser.password !== newUser.confirmPassword) return toast.warning("Password not matching");
 
     const payload = isAdmin
@@ -742,6 +772,9 @@ export default function UsersPage() {
   const toggleUserStatus = async (item) => {
     const id = item.id;
     if (!id) return toast.error("User ID not found");
+    if (isProtectedMasterAdminUser(item)) {
+      return toast.warning("Master Admin accounts cannot be deactivated");
+    }
     if (isAdmin && item.role !== "user") return toast.warning("Admin can manage only User role");
 
     const res = await fetch(`${API}/profile/${id}/status`, {
@@ -754,6 +787,9 @@ export default function UsersPage() {
   };
 
   const performDeleteUser = async (item) => {
+    if (isProtectedMasterAdminUser(item)) {
+      return toast.warning("Master Admin accounts cannot be deleted");
+    }
     const res = await fetch(`${API}/users/${item.id}`, {
       method: "DELETE",
       headers,
@@ -764,7 +800,10 @@ export default function UsersPage() {
   };
 
   const deleteUser = (item) => {
-    if (!isMaster) return toast.warning("Only Master can delete users");
+    if (!isMaster) return toast.warning("Only Master Admin or Master can delete users");
+    if (isProtectedMasterAdminUser(item)) {
+      return toast.warning("Master Admin accounts cannot be deleted");
+    }
     openConfirm({
       title: "Delete User",
       message: "Delete this user?",
@@ -982,13 +1021,15 @@ export default function UsersPage() {
             {filteredUsers.map((u, i) => {
               const dealer = u.dealer || u.group || "-";
               const branch = u.branch || u.location || "-";
+              const protectedMa = isProtectedMasterAdminUser(u);
+              const mirroredMa = isMirroredProductionMasterAdmin(u);
               return (
                 <tr key={i} className="border-b">
                   <td className="p-3 whitespace-nowrap">{u.userId || u.user_id || "-"}</td>
                   <td className="p-3 min-w-[120px]">{u.name || u.username || "-"}</td>
                   <td className="p-3 whitespace-nowrap">{u.mobile || u.phone || "-"}</td>
                   <td className="p-3 min-w-[160px]">{u.email || "-"}</td>
-                  <td className="p-3 capitalize whitespace-nowrap">{u.role || "-"}</td>
+                  <td className="p-3 whitespace-nowrap">{roleLabel(u.role)}</td>
                   <td className="p-3 whitespace-nowrap">{u.state || "-"}</td>
                   <td className="p-3">{u.brand || "-"}</td>
                   <td className="p-3 min-w-[100px]">{dealer}</td>
@@ -1014,7 +1055,7 @@ export default function UsersPage() {
                       onClick={() => navigate(`/profile/${u.id}`)}
                     />
 
-                    {(isMaster || isAdmin) && (
+                    {(isMaster || isAdmin) && !mirroredMa && (
                       <>
                         <Edit
                           size={16}
@@ -1023,26 +1064,30 @@ export default function UsersPage() {
                           onClick={() => openEditUser(u)}
                         />
 
-                        <KeyRound
-                          size={16}
-                          title="Reset Password"
-                          style={{ cursor: "pointer", color: "#2563EB" }}
-                          onClick={() => openResetPasswordModal(u)}
-                        />
+                        {!protectedMa && (
+                          <KeyRound
+                            size={16}
+                            title="Reset Password"
+                            style={{ cursor: "pointer", color: "#2563EB" }}
+                            onClick={() => openResetPasswordModal(u)}
+                          />
+                        )}
 
-                        <Power
-                          size={17}
-                          title={(u.status || "active") === "active" ? "Deactivate User" : "Activate User"}
-                          style={{
-                            cursor: "pointer",
-                            color: (u.status || "active") === "active" ? "#16A34A" : "#DC2626",
-                          }}
-                          onClick={() => toggleUserStatus(u)}
-                        />
+                        {!protectedMa && (
+                          <Power
+                            size={17}
+                            title={(u.status || "active") === "active" ? "Deactivate User" : "Activate User"}
+                            style={{
+                              cursor: "pointer",
+                              color: (u.status || "active") === "active" ? "#16A34A" : "#DC2626",
+                            }}
+                            onClick={() => toggleUserStatus(u)}
+                          />
+                        )}
                       </>
                     )}
 
-                    {isMaster && (
+                    {isMaster && !protectedMa && (
                       <Trash2
                         size={16}
                         title="Delete"
@@ -1075,8 +1120,17 @@ export default function UsersPage() {
               label="Role"
               value={newUser.role}
               onChange={(v) => setNewUser({ ...newUser, role: v })}
-              options={isMaster ? ["master", "admin", "user"] : ["user"]}
-              disabled={isAdmin}
+              options={
+                editingUser && isProtectedMasterAdminUser(editingUser)
+                  ? [{ value: "master_admin", label: "Master Admin" }]
+                  : creatableRoleOptions.length
+                    ? creatableRoleOptions
+                    : [{ value: "user", label: "User" }]
+              }
+              disabled={
+                isAdmin
+                || (editingUser && isProtectedMasterAdminUser(editingUser))
+              }
             />
 
             <Select
@@ -1404,7 +1458,11 @@ function Select({ label, value, onChange, options, disabled = false }) {
       <label className="font-bold block mb-1">{label}</label>
       <select disabled={disabled} value={value} onChange={(e) => onChange(e.target.value)} className="w-full px-4 py-3 rounded-xl border bg-white" style={{ color: COLORS.text }}>
         <option value="">Select</option>
-        {(options || []).filter(Boolean).map((x) => <option key={x} value={x}>{x}</option>)}
+        {(options || []).filter(Boolean).map((x) => {
+          const optValue = typeof x === "object" ? x.value : x;
+          const optLabel = typeof x === "object" ? (x.label || x.value) : x;
+          return <option key={optValue} value={optValue}>{optLabel}</option>;
+        })}
       </select>
     </div>
   );

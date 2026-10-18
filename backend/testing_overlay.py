@@ -1093,6 +1093,23 @@ class OverlayCollection:
         existing = await self.find_one(query)
         if not existing:
             return _WriteResult(matched_count=0, modified_count=0)
+        if self.name == "users":
+            try:
+                from . import roles as role_defs
+            except ImportError:
+                import roles as role_defs  # type: ignore
+            if role_defs.is_mirrored_production_master_admin(existing):
+                raise ProductionWriteBlocked(
+                    "Mirrored Production Master Admin is read-only in Testing"
+                )
+            if role_defs.is_protected_master_admin_doc(existing):
+                # Block demote / deactivate via overlay even if API checks are bypassed.
+                payload = update if isinstance(update, Mapping) else {}
+                set_fields = payload.get("$set") if isinstance(payload.get("$set"), Mapping) else {}
+                if "role" in set_fields and role_defs.normalize_role(set_fields.get("role")) != role_defs.ROLE_MASTER_ADMIN:
+                    raise ProductionWriteBlocked("Master Admin accounts cannot be role-changed or demoted")
+                if "status" in set_fields and str(set_fields.get("status") or "").strip().lower() != "active":
+                    raise ProductionWriteBlocked("Master Admin accounts cannot be deactivated")
         ident = doc_id(existing)
         if await self._is_testing_owned(ident, existing):
             return await self._test.update_one(identity_query(ident) if ident else query, update)
@@ -1168,10 +1185,33 @@ class OverlayCollection:
 
     async def delete_one(self, query, *args, **kwargs):
         if self._local_only():
+            existing_local = await self._test.find_one(query)
+            if self.name == "users":
+                try:
+                    from . import roles as role_defs
+                except ImportError:
+                    import roles as role_defs  # type: ignore
+                if role_defs.is_protected_master_admin_doc(existing_local):
+                    raise ProductionWriteBlocked(
+                        "Master Admin accounts cannot be deleted"
+                    )
             return await self._test.delete_one(query)
         existing = await self.find_one(query)
         if not existing:
             return _WriteResult(deleted_count=0)
+        if self.name == "users":
+            try:
+                from . import roles as role_defs
+            except ImportError:
+                import roles as role_defs  # type: ignore
+            if role_defs.is_protected_master_admin_doc(existing):
+                raise ProductionWriteBlocked(
+                    "Master Admin accounts cannot be deleted or tombstoned"
+                )
+            if role_defs.is_mirrored_production_master_admin(existing):
+                raise ProductionWriteBlocked(
+                    "Mirrored Production Master Admin cannot receive a Testing tombstone"
+                )
         ident = doc_id(existing)
         if await self._is_testing_owned(ident, existing):
             result = await self._test.delete_one(identity_query(ident) if ident else query)

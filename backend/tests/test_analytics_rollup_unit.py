@@ -216,6 +216,37 @@ def test_build_daily_agg_docs_buckets_and_totals():
     assert abs(g["aging_sales"][">361 Days"]["value"] - 100) < 1e-6
 
 
+def test_resolve_aging_days_from_archive_dates():
+    """S3 archives omit numeric aging; derive from last_*_date vs snapshot day."""
+    row = {
+        "last_receipt_date": "19-12-2025",
+        "last_sales_date": "Never Sold Since Purchase",
+        "purchase_aging_days": None,
+        "sales_aging_days": None,
+    }
+    # 2026-09-15 − 2025-12-19 = 270 days → 181–270 bucket
+    days = ar.resolve_aging_days(row, side="purchase", as_of_iso="2026-09-15")
+    assert days == 270
+    assert ar._analytics_bucket(days) == "181–270 Days"
+    assert ar.resolve_aging_days(row, side="sales", as_of_iso="2026-09-15") is None
+
+    snaps = ar.build_snapshot_docs("2026-09-15", [{
+        "brand_name": "Hyundai",
+        "dealer_name": "FPL",
+        "branch": "Koyambedu",
+        "part_number": "ACF30",
+        "part_category": "Genuine Accessories",
+        "quantity": 2,
+        "mav": 100,
+        "total_value": 200,
+        **row,
+    }])
+    assert snaps[0]["purchase_aging_days"] == 270
+    aggs = ar.build_daily_agg_docs("2026-09-15", snaps)
+    assert abs(aggs[0]["aging_purchase"]["181–270 Days"]["value"] - 200) < 1e-6
+    assert abs(aggs[0]["aging_purchase"][">361 Days"]["value"] - 0) < 1e-6
+
+
 def test_query_daily_aggs_scope_filter():
     db = FakeDB()
     db[ar.DAILY_AGG_COLLECTION] = FakeColl([

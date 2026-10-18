@@ -56,8 +56,12 @@ _MP4_CONTAINERS = frozenset({
 
 
 def require_master(current_user) -> None:
-    if str(getattr(current_user, "role", "") or "").lower() != "master":
-        raise HTTPException(status_code=403, detail="Master Admin only")
+    try:
+        from . import roles as role_defs
+    except ImportError:
+        import roles as role_defs  # type: ignore
+    if not role_defs.is_master_level(getattr(current_user, "role", None)):
+        raise HTTPException(status_code=403, detail="Master Admin or Master only")
 
 
 def require_testing_master(current_user) -> None:
