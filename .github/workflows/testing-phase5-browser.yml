@@ -29,6 +29,7 @@ jobs:
           REACT_APP_TESTING_BRANCH: ${{ github.ref_name }}
           REACT_APP_TESTING_COMMIT: ${{ github.sha }}
           GENERATE_SOURCEMAP: "false"
+          CI: "false"
           NODE_OPTIONS: --max-old-space-size=2048
         run: |
           SHORT="$(echo "${GITHUB_SHA}" | cut -c1-7)"
