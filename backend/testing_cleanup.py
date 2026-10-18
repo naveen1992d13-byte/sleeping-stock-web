@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +41,16 @@ TESTING_CREATED_COLLECTIONS = (
 PRESERVE_COLLECTIONS = (
     overlay.AUDIT_COLLECTION,
     overlay.OPERATION_COLLECTION,
+)
+
+# After Clear Testing Data wipes tombstones, re-hide these Production hub
+# collections so Testing User Hub stays testing-only (fresh-start isolation).
+HUB_ISOLATION_COLLECTIONS = (
+    "brands",
+    "dealers",
+    "branches",
+    "states",
+    "users",
 )
 
 
@@ -160,6 +171,61 @@ async def inventory(test_db) -> Dict[str, Any]:
     }
 
 
+async def reisolate_testing_hub_from_production(test_db) -> Dict[str, Any]:
+    """Tombstone Production hub entities + hide Production admin@ credential.
+
+    Used after Clear Testing Data (which drops all tombstones) and by the
+    fresh-start reset script so User Hub counts stay testing-only.
+    Never writes to Production.
+    """
+    try:
+        from . import roles as role_defs
+        from .mongo_connection import build_mongo_client_args
+    except ImportError:
+        import roles as role_defs  # type: ignore
+        from mongo_connection import build_mongo_client_args  # type: ignore
+
+    from motor.motor_asyncio import AsyncIOMotorClient
+
+    readonly_url = overlay.resolve_production_readonly_url()
+    readonly_url, tls_kwargs = build_mongo_client_args(readonly_url)
+    prod_client = AsyncIOMotorClient(readonly_url, **tls_kwargs)
+    prod_db = prod_client[testing_runtime.PRODUCTION_DB_NAME]
+    tombs = test_db[overlay.TOMBSTONE_COLLECTION]
+    now = datetime.now(timezone.utc).isoformat()
+    tombstoned: Dict[str, int] = {}
+    try:
+        for name in HUB_ISOLATION_COLLECTIONS:
+            ids: List[str] = []
+            cursor = prod_db[name].find({}, {"_id": 0, "id": 1})
+            async for row in cursor:
+                ident = str(row.get("id") or "").strip()
+                if ident:
+                    ids.append(ident)
+            n = 0
+            for ident in ids:
+                await tombs.update_one(
+                    {"collection": name, "production_id": ident},
+                    {
+                        "$set": {
+                            "collection": name,
+                            "production_id": ident,
+                            "op": "tombstone",
+                            "reason": "testing_hub_isolation",
+                            "updated_at": now,
+                        },
+                        "$setOnInsert": {"created_at": now},
+                    },
+                    upsert=True,
+                )
+                n += 1
+            tombstoned[name] = n
+        hide = await role_defs.hide_mirrored_production_master_admin(test_db, raw_db=test_db)
+    finally:
+        prod_client.close()
+    return {"tombstoned": tombstoned, "hide_mirrored": hide}
+
+
 async def cleanup_testing_data(
     test_db,
     *,
@@ -201,15 +267,50 @@ async def cleanup_testing_data(
         return {"ok": True, "status": "dry_run", "receipt": receipt}
 
     deleted: Dict[str, int] = {}
+    try:
+        from . import roles as role_defs
+    except ImportError:
+        import roles as role_defs  # type: ignore
+
     for name in TESTING_CREATED_COLLECTIONS:
-        result = await test_db[name].delete_many({})
-        deleted[name] = int(getattr(result, "deleted_count", 0) or 0)
+        if name == "users":
+            # Never remove Master Admin accounts via Clear Testing Data.
+            # Match by role OR protected email OR is_testing_master — any one
+            # of these must keep the row (OR-protect, not AND-delete-filter gaps).
+            protected_emails = sorted(role_defs.ORIGINAL_MASTER_ADMIN_EMAILS)
+            email_rx = "^(?:" + "|".join(re.escape(e) for e in protected_emails) + ")$"
+            victims = []
+            cursor = test_db[name].find({}, {"_id": 0})
+            async for row in cursor:
+                if role_defs.is_protected_master_admin_doc(row):
+                    continue
+                if re.match(email_rx, str(row.get("email") or ""), flags=re.I):
+                    continue
+                victims.append(row.get("id"))
+            removed = 0
+            for ident in victims:
+                if not ident:
+                    continue
+                result = await test_db[name].delete_one({"id": ident})
+                removed += int(getattr(result, "deleted_count", 0) or 0)
+            deleted[name] = removed
+        else:
+            result = await test_db[name].delete_many({})
+            deleted[name] = int(getattr(result, "deleted_count", 0) or 0)
     ov = await test_db[overlay.OVERLAY_COLLECTION].delete_many({})
+    # Drop testing tombstones/overlays. Production admin@ must stay hidden in
+    # Testing (credential isolation) — re-apply hide after the wipe.
     tb = await test_db[overlay.TOMBSTONE_COLLECTION].delete_many({})
     snap = await test_db["testing_snapshot_meta"].delete_many({})
     deleted[overlay.OVERLAY_COLLECTION] = int(getattr(ov, "deleted_count", 0) or 0)
     deleted[overlay.TOMBSTONE_COLLECTION] = int(getattr(tb, "deleted_count", 0) or 0)
     deleted["testing_snapshot_meta"] = int(getattr(snap, "deleted_count", 0) or 0)
+
+    try:
+        isolate = await reisolate_testing_hub_from_production(test_db)
+        receipt["hub_isolation"] = isolate
+    except Exception as exc:
+        logger.warning("reisolate_testing_hub_from_production after cleanup failed: %s", exc)
 
     s3_info = list_testing_s3_objects()
     storage = s3_storage.get_storage()

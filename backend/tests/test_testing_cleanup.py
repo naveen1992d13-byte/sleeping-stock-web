@@ -72,6 +72,11 @@ def test_cleanup_live_deletes_testing_created_only(monkeypatch):
     tc.list_testing_s3_objects = lambda limit=5000: {
         "prefix": "testing/", "object_count": 0, "bytes": 0, "keys_preview": [], "keys": []
     }
+
+    async def fake_reisolate(test_db):
+        return {"tombstoned": {}, "hide_mirrored": {"tombstoned": 0, "ids": []}}
+
+    monkeypatch.setattr(tc, "reisolate_testing_hub_from_production", fake_reisolate)
     result = asyncio.run(tc.cleanup_testing_data(
         db,
         confirm_text="CLEAR TESTING DATA",

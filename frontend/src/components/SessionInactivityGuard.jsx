@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useLocation } from 'react-router-dom';
 import { useAuth } from '../App';
 import { toast } from 'sonner';
 import {
@@ -16,7 +16,6 @@ const ACTIVITY_EVENTS = ['mousedown', 'keydown', 'scroll', 'touchstart', 'click'
  */
 export function SessionInactivityGuard() {
   const { user, logout } = useAuth();
-  const navigate = useNavigate();
   const location = useLocation();
 
   useEffect(() => {
@@ -34,8 +33,9 @@ export function SessionInactivityGuard() {
       if (isSessionExpiredByInactivity()) {
         logout();
         clearAuthStorage();
-        navigate('/login', { replace: true });
         toast.info('Session expired due to inactivity. Please sign in again.');
+        // Hard navigation — same as manual logout — avoids bfcache/SPA restore.
+        window.location.replace('/login');
       }
     }, 60 * 1000);
 
@@ -43,7 +43,7 @@ export function SessionInactivityGuard() {
       ACTIVITY_EVENTS.forEach((ev) => window.removeEventListener(ev, onActivity));
       window.clearInterval(interval);
     };
-  }, [user, logout, navigate, location.pathname]);
+  }, [user, logout, location.pathname]);
 
   return null;
 }

@@ -502,10 +502,18 @@ async def archive_product_history_for_date(db, archive_date: str, force: bool = 
     # Do NOT block the HTTP response on per-row analytics Mongo upserts.
     # Integrity of the S3 archive is already verified above.
     async def _bg_analytics():
+        # Prefer the idempotent 11:00 PM finalizer. If it already succeeded before
+        # archive/prune, this is a no-op; otherwise it writes the durable rollup.
         try:
-            await write_analytics_snapshots_for_date(db, date_iso, rows)
+            import analytics_rollup as analytics_rollup
+
+            await analytics_rollup.finalize_analytics_rollup_for_date(db, date_iso, force=False)
         except Exception as exc:
-            logger.warning("Analytics snapshot Mongo write skipped for %s: %s", date_iso, exc)
+            logger.warning("Analytics rollup after archive skipped for %s: %s", date_iso, exc)
+            try:
+                await write_analytics_snapshots_for_date(db, date_iso, rows)
+            except Exception as exc2:
+                logger.warning("Analytics snapshot Mongo write skipped for %s: %s", date_iso, exc2)
 
     try:
         asyncio.create_task(_bg_analytics())

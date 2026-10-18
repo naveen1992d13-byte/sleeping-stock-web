@@ -1,7 +1,7 @@
 import { User, Upload, Package, FileSpreadsheet, ClipboardCheck, ClipboardList, BarChart3, Globe, Megaphone, HelpCircle, Smartphone, History, ScanLine, HardDrive, Image } from 'lucide-react';
 
 export const APPLICATION_MENU_ITEMS = [
-  { path: '/users', label: 'User Hub', icon: User, id: 'users', adminOnly: true },
+  { path: '/users', label: 'User Hub', icon: User, id: 'users', adminOnly: true, allowUser: true },
   { path: '/upload', label: 'Upload Center', icon: Upload, id: 'upload', adminOnly: true },
   { path: '/products', label: 'Product Hub', icon: Package, id: 'products' },
   { path: '/product-history', label: 'Product Hub History', icon: FileSpreadsheet, id: 'product-history', adminOnly: true },
@@ -15,7 +15,7 @@ export const APPLICATION_MENU_ITEMS = [
   { path: '/login-screen-manager', label: 'Login Screen Manager', icon: Image, id: 'login-screen-manager', masterOnly: true },
   { path: '/notice-board', label: 'Notice Board', icon: Megaphone, id: 'dashboard' },
   { path: '/query', label: 'Query Desk', icon: HelpCircle, id: 'query', allRoles: true },
-  { path: '/sleeping-stock-mobile', label: 'Sleeping Stock Mobile', icon: Smartphone, id: 'sleeping-stock-mobile', allRoles: true },
+  { path: '/sleeping-stock-mobile', label: 'Sleeping Stock Mobile', icon: Smartphone, id: 'sleeping-stock-mobile', allRoles: true, sidebarHidden: true },
   { path: '/stock-audit', label: 'Stock Audit', icon: ScanLine, id: 'stock-audit', allRoles: true },
 ];
 
@@ -26,5 +26,5 @@ export const APPLICATION_PERMISSION_LABELS = APPLICATION_MENU_ITEMS
 /** First sidebar module the user may open (for home fallback). */
 export function getFirstAllowedMenuItem(user, canAccessMenuItem) {
   if (!user || typeof canAccessMenuItem !== 'function') return null;
-  return APPLICATION_MENU_ITEMS.find((item) => canAccessMenuItem(user, item)) || null;
+  return APPLICATION_MENU_ITEMS.find((item) => !item.sidebarHidden && canAccessMenuItem(user, item)) || null;
 }

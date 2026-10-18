@@ -170,10 +170,16 @@ def discover_mirror_collections(source_db) -> list[str]:
 
 
 def is_protected_user(doc: Mapping[str, Any] | None) -> bool:
+    """Users that must never be overwritten / ingested from Production snapshot."""
     if not doc:
         return False
     email = str(doc.get("email") or "").strip().casefold()
-    return email == TESTING_MASTER_EMAIL.casefold() or bool(doc.get("is_testing_master"))
+    if email == TESTING_MASTER_EMAIL.casefold() or bool(doc.get("is_testing_master")):
+        return True
+    # Never copy Production Master Admin credential into nmts_testing.
+    if email == "admin@sleepingstock.in":
+        return True
+    return False
 
 
 def activation_identity(collection: str, doc: Mapping[str, Any] | None = None) -> tuple[str, ...]:
@@ -299,7 +305,7 @@ def testing_master_parity_fields() -> dict[str, Any]:
     return {
         "username": "Testing Master Admin",
         "name": "Testing Master Admin",
-        "role": "master",
+        "role": "master_admin",
         "status": "active",
         "permissions": list(MASTER_PERMISSION_LABELS),
         "brand": "",
@@ -311,6 +317,7 @@ def testing_master_parity_fields() -> dict[str, Any]:
         "data_origin": "testing",
         "is_snapshot_reference": False,
         "is_testing_master": True,
+        "user_id": "TSTMST001",
     }
 
 

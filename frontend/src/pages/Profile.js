@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useMatch } from 'react-router-dom';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
@@ -9,8 +9,11 @@ import { Mail, Phone, Calendar, Activity, Lock, MapPin, Building, Users, Shield 
 import { toast } from 'sonner';
 
 export function Profile() {
-  const { userId } = useParams();
-  const { user: currentUser } = useAuth();
+  const params = useParams();
+  // Keep-alive mounts Profile outside <Outlet />, so also read :userId via useMatch.
+  const profileMatch = useMatch('/profile/:userId');
+  const userId = params.userId || profileMatch?.params?.userId;
+  const { user: currentUser, refreshUser } = useAuth();
   const navigate = useNavigate();
   const [profile, setProfile] = useState(null);
   const [activityLogs, setActivityLogs] = useState([]);
@@ -65,8 +68,15 @@ export function Profile() {
   const handleUpdateProfile = async (e) => {
     e.preventDefault();
     try {
-      await axios.put(`${API}/profile/${targetUserId}`, editForm);
+      await axios.put(`${API}/profile/${targetUserId}`, {
+        username: String(editForm.username || '').trim(),
+        email: String(editForm.email || '').trim().toLowerCase(),
+        phone: String(editForm.phone || '').trim(),
+      });
       toast.success('Profile updated successfully');
+      if (currentUser?.id === targetUserId && typeof refreshUser === 'function') {
+        await refreshUser();
+      }
       fetchProfileData();
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Error updating profile');

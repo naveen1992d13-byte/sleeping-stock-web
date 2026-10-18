@@ -1,20 +1,23 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   LOGIN_PROMO_ASPECT,
-  LOGIN_PROMO_FILL,
+  LOGIN_PROMO_ASPECT_LABEL,
   LOGIN_PROMO_HEIGHT,
-  LOGIN_PROMO_OUTPUT_HEIGHT,
-  LOGIN_PROMO_OUTPUT_WIDTH,
   LOGIN_PROMO_WIDTH,
+  captureLoginVideoPoster,
+  displaySettingsFromCropper,
+  isLoginVideoFile,
 } from './loginPromoCrop';
 
-function layout(img, viewW, viewH, mode, zoom, ox, oy) {
+function layout(mediaW, mediaH, viewW, viewH, mode, zoom, ox, oy) {
+  const width = mediaW || 1;
+  const height = mediaH || 1;
   const base = mode === 'contain'
-    ? Math.min(viewW / img.width, viewH / img.height)
-    : Math.max(viewW / img.width, viewH / img.height);
+    ? Math.min(viewW / width, viewH / height)
+    : Math.max(viewW / width, viewH / height);
   const scale = base * zoom;
-  const w = img.width * scale;
-  const h = img.height * scale;
+  const w = width * scale;
+  const h = height * scale;
   return {
     x: (viewW - w) / 2 + ox,
     y: (viewH - h) / 2 + oy,
@@ -26,11 +29,14 @@ function layout(img, viewW, viewH, mode, zoom, ox, oy) {
 
 export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
   const viewRef = useRef(null);
-  const imgRef = useRef(null);
+  const mediaRef = useRef(null);
   const dragRef = useRef(null);
+  const isVideo = isLoginVideoFile(file);
   const [src, setSrc] = useState('');
+  const [blurSrc, setBlurSrc] = useState('');
   const [ready, setReady] = useState(false);
-  const [mode, setMode] = useState('cover');
+  const [mediaSize, setMediaSize] = useState({ w: LOGIN_PROMO_WIDTH, h: LOGIN_PROMO_HEIGHT });
+  const [mode, setMode] = useState('contain');
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [viewSize, setViewSize] = useState({ w: LOGIN_PROMO_WIDTH, h: LOGIN_PROMO_HEIGHT });
@@ -39,12 +45,13 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
   useEffect(() => {
     const url = URL.createObjectURL(file);
     setSrc(url);
+    setBlurSrc(isVideo ? '' : url);
     setReady(false);
-    setMode('cover');
+    setMode('contain');
     setZoom(1);
     setOffset({ x: 0, y: 0 });
     return () => URL.revokeObjectURL(url);
-  }, [file]);
+  }, [file, isVideo]);
 
   useEffect(() => {
     const el = viewRef.current;
@@ -60,10 +67,30 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
   }, []);
 
   const placed = useMemo(() => {
-    const img = imgRef.current;
-    if (!ready || !img) return null;
-    return layout(img, viewSize.w, viewSize.h, mode, zoom, offset.x, offset.y);
-  }, [ready, mode, zoom, offset, viewSize]);
+    if (!ready) return null;
+    return layout(mediaSize.w, mediaSize.h, viewSize.w, viewSize.h, mode, zoom, offset.x, offset.y);
+  }, [ready, mediaSize, mode, zoom, offset, viewSize]);
+
+  const markReady = (width, height, frameUrl) => {
+    setMediaSize({ w: width || LOGIN_PROMO_WIDTH, h: height || LOGIN_PROMO_HEIGHT });
+    if (frameUrl) setBlurSrc(frameUrl);
+    setReady(true);
+  };
+
+  const captureVideoFrame = () => {
+    const video = mediaRef.current;
+    if (!video) return;
+    markReady(video.videoWidth, video.videoHeight);
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, video.videoWidth || LOGIN_PROMO_WIDTH);
+      canvas.height = Math.max(1, video.videoHeight || LOGIN_PROMO_HEIGHT);
+      canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+      setBlurSrc(canvas.toDataURL('image/jpeg', 0.72));
+    } catch {
+      /* poster-less blur still prefers contain foreground */
+    }
+  };
 
   const onPointerDown = (e) => {
     if (!placed) return;
@@ -86,7 +113,7 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
   };
 
   const reset = () => {
-    setMode('cover');
+    setMode('contain');
     setZoom(1);
     setOffset({ x: 0, y: 0 });
   };
@@ -98,31 +125,35 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
   };
 
   const confirm = async () => {
-    const img = imgRef.current;
-    if (!img || !placed) return;
+    if (!placed) return;
     setBusy(true);
     try {
-      const canvas = document.createElement('canvas');
-      canvas.width = LOGIN_PROMO_OUTPUT_WIDTH;
-      canvas.height = LOGIN_PROMO_OUTPUT_HEIGHT;
-      const ctx = canvas.getContext('2d');
-      ctx.fillStyle = LOGIN_PROMO_FILL;
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = 'high';
-      const sx = canvas.width / viewSize.w;
-      ctx.drawImage(img, placed.x * sx, placed.y * sx, placed.w * sx, placed.h * sx);
-      const blob = await new Promise((resolve, reject) => {
-        canvas.toBlob((next) => (next ? resolve(next) : reject(new Error('Crop failed'))), 'image/png');
+      const displaySettings = displaySettingsFromCropper({
+        mode,
+        zoom,
+        offset,
+        viewSize,
+        mediaWidth: mediaSize.w,
+        mediaHeight: mediaSize.h,
       });
-      const name = String(file.name || 'login-image').replace(/\.[^.]+$/, '') + '.png';
-      onConfirm(new File([blob], name, { type: 'image/png' }));
+      const posterFile = isVideo ? await captureLoginVideoPoster(file) : null;
+      onConfirm({ file, posterFile, displaySettings });
     } catch {
       onCancel?.();
     } finally {
       setBusy(false);
     }
   };
+
+  const mediaStyle = placed ? {
+    position: 'absolute',
+    left: placed.x,
+    top: placed.y,
+    width: placed.w,
+    height: placed.h,
+    maxWidth: 'none',
+    zIndex: 1,
+  } : { opacity: 0 };
 
   return (
     <div className="lsm-crop-overlay" role="presentation" onMouseDown={(e) => e.target === e.currentTarget && onCancel?.()}>
@@ -131,7 +162,9 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
           <h3>{title}</h3>
           <button type="button" className="lsm-crop-close" onClick={onCancel} aria-label="Close">×</button>
         </div>
-        <p className="lsm-crop-note">Final preview · {LOGIN_PROMO_WIDTH}×{LOGIN_PROMO_HEIGHT} Login area</p>
+        <p className="lsm-crop-note">
+          {isVideo ? 'One muted looping video · poster used for the blurred background' : `Final preview · ${LOGIN_PROMO_WIDTH}×${LOGIN_PROMO_HEIGHT} (${LOGIN_PROMO_ASPECT_LABEL})`}
+        </p>
         <div
           ref={viewRef}
           className="lsm-crop-view"
@@ -141,23 +174,35 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
           onPointerUp={endDrag}
           onPointerCancel={endDrag}
         >
-          {src && (
+          {blurSrc && (
+            <div className="lsm-media-blur" aria-hidden="true">
+              <img src={blurSrc} alt="" />
+            </div>
+          )}
+          {src && (isVideo ? (
+            <video
+              ref={mediaRef}
+              src={src}
+              autoPlay
+              muted
+              loop
+              playsInline
+              controls={false}
+              disablePictureInPicture
+              draggable={false}
+              onLoadedData={captureVideoFrame}
+              style={mediaStyle}
+            />
+          ) : (
             <img
-              ref={imgRef}
+              ref={mediaRef}
               src={src}
               alt=""
               draggable={false}
-              onLoad={() => setReady(true)}
-              style={placed ? {
-                position: 'absolute',
-                left: placed.x,
-                top: placed.y,
-                width: placed.w,
-                height: placed.h,
-                maxWidth: 'none',
-              } : { opacity: 0 }}
+              onLoad={(e) => markReady(e.currentTarget.naturalWidth, e.currentTarget.naturalHeight)}
+              style={mediaStyle}
             />
-          )}
+          ))}
         </div>
         <label className="lsm-crop-zoom">
           Zoom
@@ -173,8 +218,9 @@ export function LoginImageCropper({ file, title, onConfirm, onCancel }) {
         <div className="lsm-crop-actions">
           <button type="button" className="lsm-crop-btn" onClick={reset}>Reset</button>
           <button type="button" className="lsm-crop-btn" onClick={fitFull}>Fit Full Image</button>
+          <button type="button" className="lsm-crop-btn" onClick={() => { setMode('cover'); setZoom(1); setOffset({ x: 0, y: 0 }); }}>Fill Frame</button>
           <button type="button" className="lsm-crop-btn lsm-crop-btn--primary" disabled={busy || !ready} onClick={confirm}>
-            {busy ? 'Saving…' : 'Confirm Crop'}
+            {busy ? 'Saving…' : (isVideo ? 'Confirm Video' : 'Confirm Crop')}
           </button>
         </div>
       </div>

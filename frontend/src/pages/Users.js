@@ -3,6 +3,7 @@ import {
   Users,
   UserPlus,
   Settings,
+  Smartphone,
   Plus,
   Edit,
   Trash2,
@@ -18,10 +19,21 @@ import {
   Upload,
   Download,
 } from "lucide-react";
-import { useOutletContext } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { useWorkspaceScope } from "../workspaceScope";
 import { Button } from "../components/ui/button";
-import { useAuth, API } from "../App";
+import {
+  useAuth,
+  API,
+  isMasterLevelRole,
+  isMasterAdminRole,
+  roleLabel,
+  creatableRolesFor,
+  isProtectedMasterAdminUser,
+  isMirroredProductionMasterAdmin,
+} from "../App";
 import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
+import NMTSMobile from "./NMTSMobile";
 import { toast } from "sonner";
 import { NmtsConfirmDialog } from "../components/NmtsConfirmDialog";
 import { NmtsModal } from "../components/NmtsModal";
@@ -40,6 +52,16 @@ const COLORS = {
 };
 
 const MENU_LIST = APPLICATION_PERMISSION_LABELS;
+const HUB_SECTIONS = ["website", "mobile", "add", "settings"];
+
+function normalizeHubSection(raw, { isMaster, isAdmin }) {
+  const value = String(raw || "website").toLowerCase();
+  const mapped = value === "list" ? "website" : value === "app" ? "mobile" : value;
+  if (!HUB_SECTIONS.includes(mapped)) return "website";
+  if (mapped === "settings" && !isMaster) return "website";
+  if (mapped === "add" && !(isMaster || isAdmin)) return "website";
+  return mapped;
+}
 
 async function apiErrorMessage(res, fallback) {
   try {
@@ -65,10 +87,17 @@ function networkErrorMessage(error) {
 
 export default function UsersPage() {
   const { user } = useAuth();
-  const outletScope = useOutletContext() || {};
-  const isMaster = user?.role === "master";
+  const outletScope = useWorkspaceScope();
+  // Master Admin + Master share User Hub master-level controls (scope unchanged).
+  const isMaster = isMasterLevelRole(user?.role);
+  const isMasterAdmin = isMasterAdminRole(user?.role);
   const isAdmin = user?.role === "admin";
+  const navigate = useNavigate();
   const isNormalUser = user?.role === "user";
+  const creatableRoleOptions = creatableRolesFor(user?.role).map((r) => ({
+    value: r,
+    label: roleLabel(r),
+  }));
 
   const scopeBrand = outletScope.scopeBrand || "All Brands";
   const scopeDealer = outletScope.scopeDealer || "All Dealers";
@@ -90,12 +119,19 @@ export default function UsersPage() {
     return `${API}/masters/branches/${encodeURIComponent(name)}${qs ? `?${qs}` : ""}`;
   };
 
-  const [activeTab, setActiveTab] = useState("list");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [mobileReady, setMobileReady] = useState(false);
   const [settingsTab, setSettingsTab] = useState("brand");
+  const activeTab = normalizeHubSection(searchParams.get("section"), { isMaster, isAdmin });
+  const selectSection = (next) => {
+    const section = normalizeHubSection(next, { isMaster, isAdmin });
+    setSearchParams({ section }, { replace: true });
+  };
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
 
   const [users, setUsers] = useState([]);
+  const [mobileUsers, setMobileUsers] = useState([]);
   const [states, setStates] = useState([]);
   const [brands, setBrands] = useState([]);
   const [dealers, setDealers] = useState([]);
@@ -179,7 +215,9 @@ export default function UsersPage() {
     return [];
   }, [isMaster, isAdmin, user]);
 
-  const loadData = async () => {
+  const loadDataSeq = React.useRef(0);
+  const loadData = async (retry = 0) => {
+    const seq = ++loadDataSeq.current;
     try {
       const [stRes, bRes, dRes, brRes, uRes] = await Promise.all([
         fetch(`${API}/masters/states`, { headers }),
@@ -188,23 +226,54 @@ export default function UsersPage() {
         fetch(`${API}/masters/branches`, { headers }),
         fetch(`${API}/users/list`, { headers }),
       ]);
+      if (seq !== loadDataSeq.current) return;
+
+      const applyList = (res, json, setter, label) => {
+        if (!res.ok) {
+          console.warn(`[nmts-hub] ${label} HTTP ${res.status} — keeping prior data`);
+          return false;
+        }
+        if (!Array.isArray(json)) {
+          console.warn(`[nmts-hub] ${label} non-array payload — keeping prior data`);
+          return false;
+        }
+        setter(json);
+        return true;
+      };
 
       const [st, b, d, br, u] = await Promise.all([
-        stRes.json().catch(() => []),
-        bRes.json().catch(() => []),
-        dRes.json().catch(() => []),
-        brRes.json().catch(() => []),
-        uRes.json().catch(() => []),
+        stRes.json().catch(() => null),
+        bRes.json().catch(() => null),
+        dRes.json().catch(() => null),
+        brRes.json().catch(() => null),
+        uRes.json().catch(() => null),
       ]);
+      if (seq !== loadDataSeq.current) return;
 
-      setStates(Array.isArray(st) ? st : []);
-      setBrands(Array.isArray(b) ? b : []);
-      setDealers(Array.isArray(d) ? d : []);
-      setBranches(Array.isArray(br) ? br : []);
-      setUsers(Array.isArray(u) ? u : []);
-      window.dispatchEvent(new Event("nmts-masters-changed"));
+      const okStates = applyList(stRes, st, setStates, 'states');
+      const okBrands = applyList(bRes, b, setBrands, 'brands');
+      const okDealers = applyList(dRes, d, setDealers, 'dealers');
+      const okBranches = applyList(brRes, br, setBranches, 'branches');
+      const okUsers = applyList(uRes, u, setUsers, 'users');
+      if (okStates || okBrands || okDealers || okBranches || okUsers) {
+        window.dispatchEvent(new Event("nmts-masters-changed"));
+      }
+      const allOk = [okStates, okBrands, okDealers, okBranches, okUsers].every(Boolean);
+      if (!allOk) {
+        if (retry < 2) {
+          console.warn(`[nmts-hub] partial/failed load — retry ${retry + 1}`);
+          setTimeout(() => loadData(retry + 1), 900 * (retry + 1));
+        } else {
+          toast.error('Some User Hub data failed to refresh; previous values kept');
+        }
+      }
     } catch (error) {
+      if (seq !== loadDataSeq.current) return;
       console.error("User Hub data load failed", error);
+      if (retry < 2) {
+        setTimeout(() => loadData(retry + 1), 900 * (retry + 1));
+        return;
+      }
       toast.error(networkErrorMessage(error));
     }
   };
@@ -219,11 +288,38 @@ export default function UsersPage() {
     }
   };
 
+  const loadMobileStats = async () => {
+    try {
+      const params = new URLSearchParams();
+      if (!isAllValue(scopeBrand)) params.set("brand_name", scopeBrand);
+      if (!isAllValue(scopeDealer)) params.set("dealer_name", scopeDealer);
+      if (!isAllValue(scopeBranch)) params.set("branch", scopeBranch);
+      const qs = params.toString();
+      const res = await fetch(`${API}/mobile/users${qs ? `?${qs}` : ""}`, { headers: authHeaders });
+      const data = await res.json().catch(() => []);
+      setMobileUsers(Array.isArray(data) ? data : []);
+    } catch {
+      setMobileUsers([]);
+    }
+  };
+
   useEffect(() => {
     loadData();
     loadTemplates();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    loadMobileStats();
+    const refresh = () => { loadMobileStats(); };
+    window.addEventListener("nmts-mobile-users-changed", refresh);
+    return () => window.removeEventListener("nmts-mobile-users-changed", refresh);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopeBrand, scopeDealer, scopeBranch, user?.id]);
+
+  useEffect(() => {
+    if (activeTab === "mobile") setMobileReady(true);
+  }, [activeTab]);
 
   useEffect(() => {
     if (isAdmin) {
@@ -284,13 +380,32 @@ export default function UsersPage() {
     ));
     const scopedBrands = brands.filter(b => isAllValue(scopeBrand) || b.name === scopeBrand);
     const scopedStates = states.filter(st => isAllValue(scopeBrand) || scopedUsers.some(u => u.state === st.name || u.state === st.code));
+    const scopedMobile = mobileUsers.filter((mu) => {
+      const uBrand = mu.brand_name || "";
+      const uDealer = mu.dealer_name || "";
+      const uBranch = mu.branch || "";
+      return (isAllValue(scopeBrand) || uBrand === scopeBrand) &&
+        (isAllValue(scopeDealer) || uDealer === scopeDealer) &&
+        (isAllValue(scopeBranch) || uBranch === scopeBranch);
+    });
+    const websiteActive = scopedUsers.filter((x) => String(x.status || "active").toLowerCase() === "active").length;
+    const websiteInactive = scopedUsers.filter((x) => String(x.status || "active").toLowerCase() !== "active").length;
+    const mobileAdmin = (mu) => String(mu.admin_status || mu.status || "active").toLowerCase();
+    const mobileActive = scopedMobile.filter((mu) => mobileAdmin(mu) === "active").length;
+    const mobileInactive = scopedMobile.filter((mu) => mobileAdmin(mu) !== "active").length;
     return {
-      totalUsers: scopedUsers.length,
-      activeUsers: scopedUsers.filter((x) => String(x.status || "active").toLowerCase() === "active").length,
-      inactiveUsers: scopedUsers.filter((x) => String(x.status || "active").toLowerCase() !== "active").length,
+      totalUsers: scopedUsers.length + scopedMobile.length,
+      activeUsers: websiteActive + mobileActive,
+      inactiveUsers: websiteInactive + mobileInactive,
+      websiteTotal: scopedUsers.length,
+      websiteActive,
+      websiteInactive,
+      mobileTotal: scopedMobile.length,
+      mobileActive,
+      mobileInactive,
       states: scopedStates.length, brands: scopedBrands.length, dealers: scopedDealers.length, branches: scopedBranches.length,
     };
-  }, [scopedUsers, states, brands, dealers, branches, scopeBrand, scopeDealer, scopeBranch]);
+  }, [scopedUsers, mobileUsers, states, brands, dealers, branches, scopeBrand, scopeDealer, scopeBranch]);
 
   const filteredUsers = scopedUsers.filter((u) => {
     const s = search.toLowerCase();
@@ -592,6 +707,12 @@ export default function UsersPage() {
   const openEditUser = (item) => {
     if (isNormalUser) return toast.warning("You are not allowed to edit users");
     if (isAdmin && item.role !== "user") return toast.warning("Admin can edit only User role");
+    if (isMirroredProductionMasterAdmin(item)) {
+      return toast.warning("Mirrored Production Master Admin is read-only in Testing");
+    }
+    if (isProtectedMasterAdminUser(item) && !isMaster) {
+      return toast.warning("Not authorized to edit Master Admin");
+    }
     setEditingUser(item);
     setNewUser({
       userId: item.userId || item.user_id || "",
@@ -608,12 +729,21 @@ export default function UsersPage() {
       status: item.status || "active",
       permissions: Array.isArray(item.permissions) ? item.permissions : [],
     });
-    setActiveTab("add");
+    selectSection("add");
   };
 
   const saveUser = async () => {
     if (isNormalUser) return toast.warning("You are not allowed to create users");
     if (isAdmin && newUser.role !== "user") return toast.warning("Admin can create only User role");
+    if (!editingUser && newUser.role === "master_admin") {
+      return toast.warning("No one can create another Master Admin");
+    }
+    if (!editingUser && !creatableRolesFor(user?.role).includes(newUser.role)) {
+      return toast.warning(`You can only create: ${creatableRolesFor(user?.role).map(roleLabel).join(", ") || "no roles"}`);
+    }
+    if (editingUser && isProtectedMasterAdminUser(editingUser) && newUser.role !== "master_admin") {
+      return toast.warning("Master Admin accounts cannot be role-changed or demoted");
+    }
     if (!editingUser && newUser.password !== newUser.confirmPassword) return toast.warning("Password not matching");
 
     const payload = isAdmin
@@ -653,7 +783,7 @@ export default function UsersPage() {
       if (!res.ok) return toast.error((await res.json()).detail || "User update failed");
       toast.success("User updated successfully");
       resetUserForm();
-      setActiveTab("list");
+      selectSection("website");
       loadData();
       return;
     }
@@ -668,13 +798,17 @@ export default function UsersPage() {
 
     toast.success("User created successfully");
     resetUserForm();
-    setActiveTab("list");
+    selectSection("website");
     loadData();
   };
 
   const toggleUserStatus = async (item) => {
     const id = item.id;
     if (!id) return toast.error("User ID not found");
+    if (isProtectedMasterAdminUser(item)) {
+      return toast.warning("Master Admin accounts cannot be deactivated");
+    }
+    if (isAdmin && item.role !== "user") return toast.warning("Admin can manage only User role");
 
     const res = await fetch(`${API}/profile/${id}/status`, {
       method: "PUT",
@@ -686,6 +820,9 @@ export default function UsersPage() {
   };
 
   const performDeleteUser = async (item) => {
+    if (isProtectedMasterAdminUser(item)) {
+      return toast.warning("Master Admin accounts cannot be deleted");
+    }
     const res = await fetch(`${API}/users/${item.id}`, {
       method: "DELETE",
       headers,
@@ -696,7 +833,10 @@ export default function UsersPage() {
   };
 
   const deleteUser = (item) => {
-    if (!isMaster) return toast.warning("Only Master can delete users");
+    if (!isMaster) return toast.warning("Only Master Admin or Master can delete users");
+    if (isProtectedMasterAdminUser(item)) {
+      return toast.warning("Master Admin accounts cannot be deleted");
+    }
     openConfirm({
       title: "Delete User",
       message: "Delete this user?",
@@ -710,6 +850,7 @@ export default function UsersPage() {
     if (!isMaster && !isAdmin) {
       return toast.warning("Not allowed");
     }
+    if (isAdmin && item.role !== "user") return toast.warning("Admin can reset only User role");
     setResetTarget(item);
     setResetPasswordValue("");
     setResetPasswordConfirm("");
@@ -830,29 +971,30 @@ export default function UsersPage() {
   };
 
   return (
-    <div className="space-y-6 p-0 md:p-0" style={{ color: COLORS.text }}>
+    <div className="space-y-6 p-0 md:p-0" data-testid="user-hub-page" style={{ color: COLORS.text }}>
 
       <div className="grid grid-cols-2 xl:grid-cols-7 gap-4 mb-5">
-        <Stat title="Total Users" value={stats.totalUsers} icon={Users} />
-        <Stat title="Active Users" value={stats.activeUsers} icon={Power} />
-        <Stat title="Inactive" value={stats.inactiveUsers} icon={Power} />
+        <Stat title="Total Users" value={stats.totalUsers} icon={Users} breakdown={{ website: stats.websiteTotal, mobile: stats.mobileTotal }} />
+        <Stat title="Active Users" value={stats.activeUsers} icon={Power} breakdown={{ website: stats.websiteActive, mobile: stats.mobileActive }} />
+        <Stat title="Inactive" value={stats.inactiveUsers} icon={Power} breakdown={{ website: stats.websiteInactive, mobile: stats.mobileInactive }} />
         <Stat title="States" value={stats.states} icon={MapPin} />
         <Stat title="Brands" value={stats.brands} icon={Building2} />
         <Stat title="Dealers" value={stats.dealers} icon={Users} />
         <Stat title="Branches" value={stats.branches} icon={MapPin} />
       </div>
 
-      <div className="flex flex-wrap gap-3 mb-5">
-        <Tab active={activeTab === "list"} onClick={() => setActiveTab("list")} icon={Users} label="User List" />
+      <div className="flex flex-wrap gap-3 mb-5" data-testid="user-hub-nav">
+        <Tab active={activeTab === "website"} onClick={() => selectSection("website")} icon={Users} label="Website Users" testId="user-hub-tab-website" />
+        <Tab active={activeTab === "mobile"} onClick={() => selectSection("mobile")} icon={Smartphone} label="Mobile Users & Pairing Code" testId="user-hub-tab-mobile" />
         {(isMaster || isAdmin) && (
-          <Tab active={activeTab === "add"} onClick={() => setActiveTab("add")} icon={UserPlus} label={editingUser ? "Edit User" : "Add New User"} />
+          <Tab active={activeTab === "add"} onClick={() => selectSection("add")} icon={UserPlus} label={editingUser ? "Edit User" : "Add User"} testId="user-hub-tab-add" />
         )}
         {isMaster && (
-          <Tab active={activeTab === "settings"} onClick={() => setActiveTab("settings")} icon={Settings} label="Settings" />
+          <Tab active={activeTab === "settings"} onClick={() => selectSection("settings")} icon={Settings} label="Settings" testId="user-hub-tab-settings" />
         )}
       </div>
 
-      {activeTab === "list" && (
+      {activeTab === "website" && (
         <Panel>
           <div className="flex justify-between mb-4 gap-3">
             <h2 className="text-xl font-bold">Created User List <span className="text-xs font-medium" style={{ color: COLORS.muted }}>(Top filter applied)</span></h2>
@@ -912,13 +1054,15 @@ export default function UsersPage() {
             {filteredUsers.map((u, i) => {
               const dealer = u.dealer || u.group || "-";
               const branch = u.branch || u.location || "-";
+              const protectedMa = isProtectedMasterAdminUser(u);
+              const mirroredMa = isMirroredProductionMasterAdmin(u);
               return (
                 <tr key={i} className="border-b">
                   <td className="p-3 whitespace-nowrap">{u.userId || u.user_id || "-"}</td>
                   <td className="p-3 min-w-[120px]">{u.name || u.username || "-"}</td>
                   <td className="p-3 whitespace-nowrap">{u.mobile || u.phone || "-"}</td>
                   <td className="p-3 min-w-[160px]">{u.email || "-"}</td>
-                  <td className="p-3 capitalize whitespace-nowrap">{u.role || "-"}</td>
+                  <td className="p-3 whitespace-nowrap">{roleLabel(u.role)}</td>
                   <td className="p-3 whitespace-nowrap">{u.state || "-"}</td>
                   <td className="p-3">{u.brand || "-"}</td>
                   <td className="p-3 min-w-[100px]">{dealer}</td>
@@ -937,9 +1081,14 @@ export default function UsersPage() {
                   </td>
                   <td className="p-3 whitespace-nowrap">
                     <div className="flex gap-3 items-center">
-                    <Eye size={16} title="View" />
+                    <Eye
+                      size={16}
+                      title="View Profile"
+                      style={{ cursor: "pointer", color: "#475569" }}
+                      onClick={() => navigate(`/profile/${u.id}`)}
+                    />
 
-                    {(isMaster || isAdmin) && (
+                    {(isMaster || isAdmin) && !mirroredMa && (
                       <>
                         <Edit
                           size={16}
@@ -948,26 +1097,30 @@ export default function UsersPage() {
                           onClick={() => openEditUser(u)}
                         />
 
-                        <KeyRound
-                          size={16}
-                          title="Reset Password"
-                          style={{ cursor: "pointer", color: "#2563EB" }}
-                          onClick={() => openResetPasswordModal(u)}
-                        />
+                        {!protectedMa && (
+                          <KeyRound
+                            size={16}
+                            title="Reset Password"
+                            style={{ cursor: "pointer", color: "#2563EB" }}
+                            onClick={() => openResetPasswordModal(u)}
+                          />
+                        )}
 
-                        <Power
-                          size={17}
-                          title={(u.status || "active") === "active" ? "Deactivate User" : "Activate User"}
-                          style={{
-                            cursor: "pointer",
-                            color: (u.status || "active") === "active" ? "#16A34A" : "#DC2626",
-                          }}
-                          onClick={() => toggleUserStatus(u)}
-                        />
+                        {!protectedMa && (
+                          <Power
+                            size={17}
+                            title={(u.status || "active") === "active" ? "Deactivate User" : "Activate User"}
+                            style={{
+                              cursor: "pointer",
+                              color: (u.status || "active") === "active" ? "#16A34A" : "#DC2626",
+                            }}
+                            onClick={() => toggleUserStatus(u)}
+                          />
+                        )}
                       </>
                     )}
 
-                    {isMaster && (
+                    {isMaster && !protectedMa && (
                       <Trash2
                         size={16}
                         title="Delete"
@@ -1000,8 +1153,17 @@ export default function UsersPage() {
               label="Role"
               value={newUser.role}
               onChange={(v) => setNewUser({ ...newUser, role: v })}
-              options={isMaster ? ["master", "admin", "user"] : ["user"]}
-              disabled={isAdmin}
+              options={
+                editingUser && isProtectedMasterAdminUser(editingUser)
+                  ? [{ value: "master_admin", label: "Master Admin" }]
+                  : creatableRoleOptions.length
+                    ? creatableRoleOptions
+                    : [{ value: "user", label: "User" }]
+              }
+              disabled={
+                isAdmin
+                || (editingUser && isProtectedMasterAdminUser(editingUser))
+              }
             />
 
             <Select
@@ -1180,6 +1342,18 @@ export default function UsersPage() {
         </Panel>
       )}
 
+      {mobileReady && (
+        <div
+          data-testid="user-hub-mobile-embed"
+          style={{ display: activeTab === "mobile" ? undefined : "none" }}
+        >
+          <NMTSMobile
+            hideInternalNav
+            sectionOverride="mobile"
+          />
+        </div>
+      )}
+
       <NmtsConfirmDialog
         open={!!confirmDlg}
         title={confirmDlg?.title || ""}
@@ -1274,12 +1448,18 @@ function Header() {
   );
 }
 
-function Stat({ title, value, icon: Icon }) {
+function Stat({ title, value, icon: Icon, breakdown }) {
   return (
     <div className="rounded-2xl p-4 shadow-sm" style={{ backgroundColor: COLORS.card, border: `1px solid ${COLORS.border}` }}>
       <Icon className="h-5 w-5 mb-3" />
       <p className="text-sm">{title}</p>
       <h2 className="text-3xl font-bold">{value}</h2>
+      {breakdown && (
+        <div className="mt-2 text-xs leading-5" style={{ color: COLORS.muted }} data-testid="user-hub-stat-breakdown">
+          <div>Website: {breakdown.website}</div>
+          <div>Mobile: {breakdown.mobile}</div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1288,8 +1468,8 @@ function Panel({ children }) {
   return <div className="rounded-2xl p-5 shadow-sm" style={{ backgroundColor: COLORS.card, border: `1px solid ${COLORS.border}` }}>{children}</div>;
 }
 
-function Tab({ active, onClick, icon: Icon, label }) {
-  return <Button onClick={onClick} style={{ backgroundColor: active ? COLORS.active : COLORS.primary }}><Icon className="h-4 w-4 mr-2" /> {label}</Button>;
+function Tab({ active, onClick, icon: Icon, label, testId }) {
+  return <Button data-testid={testId} onClick={onClick} style={{ backgroundColor: active ? COLORS.active : COLORS.primary }}><Icon className="h-4 w-4 mr-2" /> {label}</Button>;
 }
 
 function MiniTab({ active, onClick, label }) {
@@ -1311,7 +1491,11 @@ function Select({ label, value, onChange, options, disabled = false }) {
       <label className="font-bold block mb-1">{label}</label>
       <select disabled={disabled} value={value} onChange={(e) => onChange(e.target.value)} className="w-full px-4 py-3 rounded-xl border bg-white" style={{ color: COLORS.text }}>
         <option value="">Select</option>
-        {(options || []).filter(Boolean).map((x) => <option key={x} value={x}>{x}</option>)}
+        {(options || []).filter(Boolean).map((x) => {
+          const optValue = typeof x === "object" ? x.value : x;
+          const optLabel = typeof x === "object" ? (x.label || x.value) : x;
+          return <option key={optValue} value={optValue}>{optLabel}</option>;
+        })}
       </select>
     </div>
   );

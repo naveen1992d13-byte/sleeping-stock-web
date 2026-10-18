@@ -6,6 +6,7 @@ import { getFirstAllowedMenuItem } from '@/config/menuConfig';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { User, Key, ArrowRight, Eye, EyeOff } from 'lucide-react';
+import { loginDisplayStyle } from './loginPromoCrop';
 import './LoginPage.css';
 
 function seedHomeTab(user) {
@@ -42,9 +43,27 @@ export function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [maintenance, setMaintenance] = useState(null);
   const [promoUrl, setPromoUrl] = useState(null);
+  const [promoPosterUrl, setPromoPosterUrl] = useState(null);
+  const [promoKind, setPromoKind] = useState('image');
   const [promoFailed, setPromoFailed] = useState(false);
+  const [promoDisplay, setPromoDisplay] = useState(null);
+  // loading | ready | error — error keeps the two-panel shell so a flaky
+  // /login-screen/active response cannot flash the compact "old" form.
+  const [promoLoadState, setPromoLoadState] = useState('loading');
   const { login } = useAuth();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    // Reject bfcache restores of a prior SPA document after logout/back.
+    const onPageShow = (event) => {
+      if (event.persisted) {
+        console.info('[nmts-auth] pageshow bfcache restore → hard reload');
+        window.location.reload();
+      }
+    };
+    window.addEventListener('pageshow', onPageShow);
+    return () => window.removeEventListener('pageshow', onPageShow);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -72,13 +91,20 @@ export function LoginPage() {
     };
 
     const applyPayload = (data) => {
-      const path = data?.image_url;
-      const nextUrl = path ? `${API.replace(/\/api$/, '')}${path}` : null;
-      if (lastUrl !== nextUrl) {
-        lastUrl = nextUrl;
+      const origin = API.replace(/\/api$/, '');
+      const mediaPath = data?.media_url || data?.image_url;
+      const posterPath = data?.poster_url || (data?.media_kind === 'video' ? data?.image_url : mediaPath);
+      const nextUrl = mediaPath ? `${origin}${mediaPath}` : null;
+      const nextPoster = posterPath ? `${origin}${posterPath}` : nextUrl;
+      const nextKind = data?.media_kind === 'video' ? 'video' : 'image';
+      if (lastUrl !== `${nextKind}:${nextUrl}:${nextPoster}`) {
+        lastUrl = `${nextKind}:${nextUrl}:${nextPoster}`;
         if (!cancelled) {
           setPromoFailed(false);
           setPromoUrl(nextUrl);
+          setPromoPosterUrl(nextPoster);
+          setPromoKind(nextKind);
+          setPromoDisplay(data?.display_settings || null);
         }
       }
       clearExpiry();
@@ -94,10 +120,14 @@ export function LoginPage() {
 
     const fetchActive = async () => {
       try {
-        const res = await axios.get(`${API}/login-screen/active`);
-        if (!cancelled) applyPayload(res.data || {});
+        const res = await axios.get(`${API}/login-screen/active`, { timeout: 15000 });
+        if (!cancelled) {
+          applyPayload(res.data || {});
+          setPromoLoadState('ready');
+        }
       } catch {
-        /* keep current promo and form values */
+        /* keep current promo; stay in split shell on transient failures */
+        if (!cancelled) setPromoLoadState((prev) => (prev === 'ready' ? 'ready' : 'error'));
       }
     };
 
@@ -114,43 +144,68 @@ export function LoginPage() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
+    const submitEmail = String(email || '').trim();
+    const submitPassLen = String(password || '').length;
+    console.info('[nmts-auth] login submit', { email: submitEmail, passLen: submitPassLen });
 
     try {
-      const loggedUser = await login(email.trim(), password);
+      const loggedUser = await login(submitEmail, password);
+      console.info('[nmts-auth] login ok', { role: loggedUser?.role, email: loggedUser?.email });
       toast.success('Login successful!');
       const path = seedHomeTab(loggedUser);
       navigate(path || '/');
     } catch (error) {
-      toast.error(error.response?.data?.detail || 'Login failed');
+      const status = error?.response?.status;
+      const detail = error?.response?.data?.detail;
+      console.warn('[nmts-auth] login failed', { status, detail, email: submitEmail, passLen: submitPassLen });
+      toast.error(detail || 'Login failed');
     } finally {
       setLoading(false);
     }
   };
 
   const showPromo = Boolean(promoUrl) && !promoFailed;
+  // Keep the two-panel shell while loading or after a fetch error so a slow
+  // /login-screen/active cannot flash the compact form and look like an old build.
+  const useSplitShell = showPromo || promoLoadState !== 'ready' || Boolean(promoUrl);
 
   return (
-    <div className="nmts-login-page" data-testid="login-page">
+    <div className="nmts-login-page" data-testid="login-page" data-nmts-build={process.env.REACT_APP_TESTING_COMMIT || ''}>
       <div className="nmts-login-overlay" />
 
       <main className="nmts-login-shell">
-        <div className={`nmts-login-panel${showPromo ? ' nmts-login-panel--split' : ''}`}>
+        <div className={`nmts-login-panel${useSplitShell ? ' nmts-login-panel--split' : ''}`}>
         <div className="nmts-login-panel-run" aria-hidden="true" />
         <div className="nmts-login-panel-face">
         {showPromo && (
-          <div className="nmts-login-panel-blur" aria-hidden="true">
-            <img src={promoUrl} alt="" />
-          </div>
-        )}
-        {showPromo && (
-          <aside className="nmts-login-promo" aria-label="Login promotional image">
+          <aside className="nmts-login-promo" aria-label="Login promotional media">
+            <div className="nmts-login-promo-bg" aria-hidden="true">
+              <img src={promoPosterUrl || promoUrl} alt="" />
+            </div>
             <div className="nmts-login-promo-media">
-              <img
-                src={promoUrl}
-                alt=""
-                data-testid="login-promo-image"
-                onError={() => setPromoFailed(true)}
-              />
+              {promoKind === 'video' ? (
+                <video
+                  src={promoUrl}
+                  poster={promoPosterUrl || undefined}
+                  autoPlay
+                  muted
+                  loop
+                  playsInline
+                  controls={false}
+                  disablePictureInPicture
+                  data-testid="login-promo-video"
+                  style={loginDisplayStyle(promoDisplay, { forceContain: true })}
+                  onError={() => setPromoFailed(true)}
+                />
+              ) : (
+                <img
+                  src={promoUrl}
+                  alt=""
+                  data-testid="login-promo-image"
+                  style={loginDisplayStyle(promoDisplay, { forceContain: true })}
+                  onError={() => setPromoFailed(true)}
+                />
+              )}
             </div>
           </aside>
         )}

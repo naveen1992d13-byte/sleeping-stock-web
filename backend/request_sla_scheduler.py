@@ -1,8 +1,8 @@
 """Request Center SLA scheduler — automatic timeout + mobile reminder pushes.
 
-Reuses existing cancel-timeout / response_deadline fields. Does not change
-SLA minute buckets (30 / 45 / 60). Reminders fire at first third, second
-third, and one minute before the unchanged deadline.
+Reuses existing cancel-timeout / response_deadline fields. SLA minutes follow
+15 minutes per 5 part lines. Reminders fire at first third, second third,
+and one minute before the unchanged deadline.
 """
 from __future__ import annotations
 

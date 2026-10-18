@@ -1,17 +1,18 @@
 import axios from 'axios';
 
 import { API_BASE_URL, REQUEST_TIMEOUT_MS, normalizeApiBaseUrl } from './config/env';
-import { getSession, getSessionToken, clearSession } from './services/session';
+import { getSession, getSessionToken, clearSession, isBranchTransferredPayload } from './services/session';
 
 let onSessionInvalidated = null;
 
 export class ApiError extends Error {
-  constructor(message, { status = 0, kind = 'server', data = null } = {}) {
+  constructor(message, { status = 0, kind = 'server', data = null, code = '' } = {}) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.kind = kind;
     this.data = data;
+    this.code = code || '';
   }
 }
 
@@ -51,9 +52,19 @@ function errorFromAxios(error) {
       : axiosMessage || 'Unable to connect to the NMTS server.';
     return new ApiError(message, { status: 0, kind: 'network', data: null });
   }
-  const message = extractFastApiDetail(error?.response?.data) || `Request failed (${status})`;
+  const data = error?.response?.data || null;
+  const detail = data && typeof data === 'object' ? data.detail : null;
+  const code = (detail && typeof detail === 'object' && detail.code) || data?.code || '';
+  const message = extractFastApiDetail(data) || `Request failed (${status})`;
   const kind = status === 401 || status === 403 ? 'auth' : 'server';
-  return new ApiError(message, { status, kind, data: error?.response?.data || null });
+  return new ApiError(message, { status, kind, data, code });
+}
+
+export function isBranchTransferredError(error) {
+  if (!error) return false;
+  if (error.code === 'BRANCH_TRANSFERRED') return true;
+  if (isBranchTransferredPayload(error.data)) return true;
+  return /branch has been transferred/i.test(String(error.message || ''));
 }
 
 async function request(method, path, { data, params, auth = true, baseUrl } = {}) {
@@ -96,6 +107,7 @@ export const verifyPairing = ({ mobileUserId, pairingType, pairingCode, pairingT
   });
 
 export const validateSession = () => request('get', '/mobile/session/validate');
+export const sendHeartbeat = () => request('post', '/mobile/session/heartbeat');
 export const registerPushToken = (pushToken) => request('put', '/mobile/devices/push-token', { data: { push_token: pushToken } });
 export const getNotifications = () => request('get', '/mobile/notifications');
 export const acceptNotification = (requestGroupKey) => request('post', '/mobile/notifications/accept', { data: { request_group_key: requestGroupKey } });

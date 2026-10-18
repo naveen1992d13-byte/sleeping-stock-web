@@ -115,10 +115,12 @@ def test_ingest_name_is_documentdb_safe():
 def test_testing_master_is_protected_and_has_full_permissions():
     assert is_protected_user({"email": "testing.master@sleepingstock.in"})
     assert is_protected_user({"is_testing_master": True, "email": "other@x"})
-    assert not is_protected_user({"email": "admin@sleepingstock.in", "role": "master"})
+    # Production Master Admin credential must never be snapshotted into Testing.
+    assert is_protected_user({"email": "admin@sleepingstock.in", "role": "master"})
+    assert not is_protected_user({"email": "someone@example.com", "role": "admin"})
     from testing_snapshot import testing_master_parity_fields as master_parity_fields
     fields = master_parity_fields()
-    assert fields["role"] == "master"
+    assert fields["role"] == "master_admin"
     for label in (
         "User Hub", "Upload Center", "Product Hub", "Product Hub History",
         "Order Desk", "Request Center", "Reports", "Analytics",

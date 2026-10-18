@@ -39,12 +39,12 @@ def _part():
 class TestTimerAndFreezeHelpers:
     def test_response_time_buckets(self):
         import order_desk_workflow as odw
-        assert odw.response_time_minutes_for_lines(1) == 30
-        assert odw.response_time_minutes_for_lines(20) == 30
-        assert odw.response_time_minutes_for_lines(21) == 45
-        assert odw.response_time_minutes_for_lines(50) == 45
-        assert odw.response_time_minutes_for_lines(51) == 60
-        assert odw.response_time_minutes_for_lines(100) == 60
+        assert odw.response_time_minutes_for_lines(1) == 15
+        assert odw.response_time_minutes_for_lines(5) == 15
+        assert odw.response_time_minutes_for_lines(6) == 30
+        assert odw.response_time_minutes_for_lines(10) == 30
+        assert odw.response_time_minutes_for_lines(11) == 45
+        assert odw.response_time_minutes_for_lines(20) == 60
 
     def test_reminder_offsets_do_not_extend_deadline(self):
         import order_desk_workflow as odw
