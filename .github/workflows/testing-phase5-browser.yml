@@ -26,35 +26,62 @@ jobs:
           REACT_APP_BACKEND_URL: https://testing.sleepingstock.in
           REACT_APP_APP_ENV: testing
           REACT_APP_TESTING_PR: ""
-          REACT_APP_TESTING_BRANCH: testing-six-fixes
-          REACT_APP_TESTING_COMMIT: 62b20fc
-          REACT_APP_TESTING_DEPLOYED_AT: "2026-10-18 20:08:04 IST"
+          REACT_APP_TESTING_BRANCH: ${{ github.ref_name }}
+          REACT_APP_TESTING_COMMIT: ${{ github.sha }}
           GENERATE_SOURCEMAP: "false"
           NODE_OPTIONS: --max-old-space-size=2048
         run: |
+          SHORT="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          IST="$(TZ=Asia/Kolkata date +'%Y-%m-%d %H:%M:%S IST')"
+          UTC="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          export REACT_APP_TESTING_COMMIT="$SHORT"
+          export REACT_APP_TESTING_DEPLOYED_AT="$IST"
           npm ci --ignore-scripts || npm install --ignore-scripts
           npm run build
-          python3 - <<'PY'
-          import json
+          python3 - <<PY
+          import json, os
           from pathlib import Path
+          sha = os.environ["GITHUB_SHA"]
+          short = sha[:7]
           Path("build/deployment.json").write_text(json.dumps({
             "environment": "testing",
             "app_env": "testing",
             "pr_number": None,
-            "git_branch": "testing-six-fixes",
-            "commit": "62b20fc4d5eaddeb59326e4b5940c14d17e0a728",
-            "commit_short": "62b20fc",
-            "deployed_at": "2026-10-18T14:38:04Z",
-            "deployed_at_ist": "2026-10-18 20:08:04 IST",
+            "git_branch": os.environ.get("GITHUB_REF_NAME") or "testing-six-fixes",
+            "commit": sha,
+            "commit_short": short,
+            "deployed_at": os.environ.get("UTC") or "",
+            "deployed_at_ist": os.environ.get("IST") or "",
+            "backend_port": 8001,
+            "service": "nmts-backend-testing",
+            "built_on": "github-actions",
+          }, indent=2) + "\n")
+          PY
+          # inject times into python via env
+          UTC="$UTC" IST="$IST" GITHUB_SHA="$GITHUB_SHA" GITHUB_REF_NAME="${GITHUB_REF_NAME}" python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          sha = os.environ["GITHUB_SHA"]
+          Path("build/deployment.json").write_text(json.dumps({
+            "environment": "testing",
+            "app_env": "testing",
+            "pr_number": None,
+            "git_branch": os.environ.get("GITHUB_REF_NAME") or "testing-six-fixes",
+            "commit": sha,
+            "commit_short": sha[:7],
+            "deployed_at": os.environ["UTC"],
+            "deployed_at_ist": os.environ["IST"],
             "backend_port": 8001,
             "service": "nmts-backend-testing",
             "built_on": "github-actions",
           }, indent=2) + "\n")
           PY
           cp -f ../deploy/testing/robots.txt build/robots.txt
+          echo "Built short=$SHORT"
+          cat build/deployment.json
       - uses: actions/upload-artifact@v4
         with:
-          name: testing-frontend-62b20fc
+          name: testing-frontend
           path: frontend/build/
           retention-days: 2
 
@@ -85,6 +112,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: stage-a-screenshots
-          path: frontend/test-results/
+          path: |
+            frontend/test-results/
+            frontend/e2e/test-results/
           if-no-files-found: ignore
           retention-days: 5
