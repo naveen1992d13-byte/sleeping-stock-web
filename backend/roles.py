@@ -159,14 +159,12 @@ async def migrate_legacy_master_roles(db, raw_db=None) -> dict:
     return {"promoted": promoted}
 
 
-async def restore_mirrored_master_admin_visibility(db, raw_db=None) -> dict:
-    """Remove Testing tombstones that hide the mirrored Production Master Admin.
+async def hide_mirrored_production_master_admin(db, raw_db=None) -> dict:
+    """Hide Production admin@ from Testing merge (credential isolation).
 
-    Important: the merged overlay view already hides tombstoned ids, so this
-    must resolve candidate ids from the raw Testing DB / production base — not
-    only from a normal merged find. Snapshot copies of the original Master are
-    revived as testing-visible Master Admin rows when Production no longer has
-    the account.
+    Writes tombstones directly on the raw Testing DB so API delete guards that
+    block user-driven tombstones of mirrored masters do not apply. Never
+    touches Production. Testing Master Admin (testing.master@) is never hidden.
     """
     try:
         from . import testing_overlay as overlay
@@ -176,69 +174,66 @@ async def restore_mirrored_master_admin_visibility(db, raw_db=None) -> dict:
         import testing_runtime  # type: ignore
 
     if not testing_runtime.is_testing_env():
-        return {"removed": 0, "skipped": "not_testing"}
+        return {"tombstoned": 0, "skipped": "not_testing"}
 
-    email_regex = r"^(?:admin@sleepingstock\.in|testing\.master@sleepingstock\.in)$"
+    tombs_db = raw_db if raw_db is not None else db
     ids: list[str] = []
-    revived = 0
 
-    # 1) Raw Testing users (includes snapshot orphans invisible to merge).
-    if raw_db is not None:
-        cursor = raw_db.users.find(
-            {"email": {"$regex": email_regex, "$options": "i"}},
-            {"_id": 0, "id": 1, "email": 1, "role": 1, "data_origin": 1, "is_testing_master": 1},
+    # Production-base rows (live read via overlay).
+    try:
+        cursor = db.users.find(
+            {
+                overlay.QUERY_BASE_ONLY: True,
+                "email": {"$regex": r"^admin@sleepingstock\.in$", "$options": "i"},
+            },
+            {"_id": 0, "id": 1, "email": 1, "data_origin": 1},
         )
         async for row in cursor:
-            ident = str(row.get("id") or "").strip()
-            if ident:
-                ids.append(ident)
-            origin = str(row.get("data_origin") or "").strip().lower()
-            # Snapshot leftovers are not testing-created, so merge skips them.
-            # Revive as a Testing-owned Master Admin so the account is visible.
-            if origin == "snapshot" and is_protected_master_admin_doc(row):
-                result = await raw_db.users.update_one(
-                    {"id": ident} if ident else {"email": row.get("email")},
-                    {
-                        "$set": {
-                            "role": ROLE_MASTER_ADMIN,
-                            "data_origin": testing_runtime.DATA_ORIGIN_TESTING,
-                            "is_testing_master": True,
-                            "status": "active",
-                        }
-                    },
-                )
-                revived += int(getattr(result, "modified_count", 0) or 0)
+            if row.get("id") and is_mirrored_production_master_admin(row):
+                ids.append(str(row["id"]))
+    except Exception:
+        pass
 
-    # 2) Merged + production-base lookups (best-effort).
-    for query in (
-        {"email": {"$regex": email_regex, "$options": "i"}},
-        {overlay.QUERY_BASE_ONLY: True, "email": {"$regex": email_regex, "$options": "i"}},
-    ):
-        try:
-            cursor = db.users.find(query, {"_id": 0, "id": 1, "email": 1, "role": 1, "data_origin": 1})
-            async for row in cursor:
-                if row.get("id"):
-                    ids.append(str(row["id"]))
-        except Exception:
-            continue
+    # Snapshot leftovers of admin@ in nmts_testing (not testing-created).
+    if raw_db is not None:
+        cursor = raw_db.users.find(
+            {"email": {"$regex": r"^admin@sleepingstock\.in$", "$options": "i"}},
+            {"_id": 0, "id": 1, "email": 1, "data_origin": 1, "is_testing_master": 1},
+        )
+        async for row in cursor:
+            origin = str(row.get("data_origin") or "").strip().lower()
+            if origin in ("", "production", "snapshot") and row.get("id"):
+                ids.append(str(row["id"]))
+            # Remove snapshot copy of Production admin — never keep Prod credential hash.
+            if origin == "snapshot" and not bool(row.get("is_testing_master")):
+                await raw_db.users.delete_one({"id": row["id"]})
 
     ids = sorted({i for i in ids if i})
-    removed = 0
-    tombs_db = raw_db if raw_db is not None else db
     tombs = tombs_db[overlay.TOMBSTONE_COLLECTION]
-    if ids:
-        result = await tombs.delete_many(
-            {"collection": "users", "production_id": {"$in": ids}}
+    tombstoned = 0
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    for ident in ids:
+        result = await tombs.update_one(
+            {"collection": "users", "production_id": ident},
+            {
+                "$set": {
+                    "collection": "users",
+                    "production_id": ident,
+                    "op": "tombstone",
+                    "reason": "hide_mirrored_production_master_admin",
+                    "updated_at": now,
+                },
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
         )
-        removed = int(getattr(result, "deleted_count", 0) or 0)
-    result2 = await tombs.delete_many(
-        {
-            "collection": "users",
-            "$or": [
-                {"email": {"$regex": email_regex, "$options": "i"}},
-                {"doc.email": {"$regex": email_regex, "$options": "i"}},
-            ],
-        }
-    )
-    removed += int(getattr(result2, "deleted_count", 0) or 0)
-    return {"removed": removed, "ids": ids, "revived": revived}
+        if getattr(result, "upserted_id", None) is not None or int(getattr(result, "modified_count", 0) or 0):
+            tombstoned += 1
+    return {"tombstoned": tombstoned, "ids": ids}
+
+
+# Back-compat alias — previous name restored visibility; now hides Prod credential.
+async def restore_mirrored_master_admin_visibility(db, raw_db=None) -> dict:
+    return await hide_mirrored_production_master_admin(db, raw_db=raw_db)

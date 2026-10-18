@@ -1235,6 +1235,21 @@ class OverlayCollection:
 
     async def delete_many(self, query, *args, **kwargs):
         if self._local_only():
+            if self.name == "users":
+                try:
+                    from . import roles as role_defs
+                except ImportError:
+                    import roles as role_defs  # type: ignore
+                rows = await _as_list(self._test.find(query, {"_id": 0}))
+                deleted = 0
+                for row in rows:
+                    if role_defs.is_protected_master_admin_doc(row):
+                        raise ProductionWriteBlocked(
+                            "Master Admin accounts cannot be deleted"
+                        )
+                    result = await self._test.delete_one(identity_query(doc_id(row)) if doc_id(row) else {"id": row.get("id")})
+                    deleted += int(getattr(result, "deleted_count", 0) or 0)
+                return _WriteResult(deleted_count=deleted)
             return await self._test.delete_many(query)
         rows = await self._collect_merged(query)
         deleted = 0

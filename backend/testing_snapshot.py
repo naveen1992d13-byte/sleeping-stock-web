@@ -299,7 +299,7 @@ def testing_master_parity_fields() -> dict[str, Any]:
     return {
         "username": "Testing Master Admin",
         "name": "Testing Master Admin",
-        "role": "master",
+        "role": "master_admin",
         "status": "active",
         "permissions": list(MASTER_PERMISSION_LABELS),
         "brand": "",
@@ -311,6 +311,7 @@ def testing_master_parity_fields() -> dict[str, Any]:
         "data_origin": "testing",
         "is_snapshot_reference": False,
         "is_testing_master": True,
+        "user_id": "TSTMST001",
     }
 
 

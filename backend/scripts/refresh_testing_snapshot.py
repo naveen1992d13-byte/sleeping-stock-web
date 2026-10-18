@@ -248,7 +248,13 @@ def _write_meta(path: Path, payload: dict[str, Any]) -> None:
 
 def _preserve_check(target_db) -> dict[str, int]:
     counts = {name: target_db[name].count_documents({}) for name in PRESERVE_TARGET_COLLECTIONS}
-    master = target_db.users.find_one({"email": TESTING_MASTER_EMAIL, "role": "master"}, {"_id": 0, "password": 0})
+    master = target_db.users.find_one(
+        {
+            "email": TESTING_MASTER_EMAIL,
+            "role": {"$in": ["master_admin", "master"]},
+        },
+        {"_id": 0, "password": 0},
+    )
     if not master:
         raise RuntimeError("Testing Master Admin is missing; refusing snapshot refresh")
     return counts

@@ -589,6 +589,14 @@ async def login(login_data: LoginRequest):
             detail="Incorrect User ID/Email or password"
         )
 
+    # Testing must never authenticate with the Production Master Admin credential
+    # surfaced via the read-only overlay (same email + password hash as nmts).
+    if testing_runtime.is_testing_env() and role_defs.is_mirrored_production_master_admin(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Production Master Admin cannot sign in to Testing. Use testing.master@sleepingstock.in.",
+        )
+
     if str(user.get("status") or "").strip().lower() == "inactive":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -716,6 +724,8 @@ async def delete_user(user_id: str, current_user: UserResponse = Depends(get_cur
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     _forbid_protected_master_admin(target, "deleted")
+    if current_user.id == target.get("id"):
+        raise HTTPException(status_code=403, detail="Cannot delete the account performing this action")
 
     result = await db.users.delete_one({"id": target["id"]})
     if result.deleted_count == 0:
@@ -730,9 +740,15 @@ class PermissionUpdate(BaseModel):
 @api_router.put("/users/{user_id}/permissions")
 async def update_user_permissions(user_id: str, data: PermissionUpdate, current_user: UserResponse = Depends(get_current_user)):
     await _ensure_master(current_user)
+
+    target = await _find_user_doc(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if testing_runtime.is_testing_env() and role_defs.is_mirrored_production_master_admin(target):
+        raise HTTPException(status_code=403, detail="Mirrored Production Master Admin is read-only in Testing")
     
     result = await db.users.update_one(
-        {"id": user_id},
+        {"id": target["id"]},
         {"$set": {"permissions": data.permissions}}
     )
     
@@ -1965,6 +1981,12 @@ async def reset_user_password(
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    if testing_runtime.is_testing_env() and role_defs.is_mirrored_production_master_admin(target_user):
+        raise HTTPException(status_code=403, detail="Mirrored Production Master Admin is read-only in Testing")
+    if role_defs.is_protected_master_admin_doc(target_user) and current_user.id != target_user.get("id"):
+        # Only the Master Admin account itself may rotate its own password.
+        raise HTTPException(status_code=403, detail="Master Admin password can only be changed by that account")
+
     if current_user.role == "admin":
         if target_user.get("role") != "user":
             raise HTTPException(status_code=403, detail="Admin can reset only user password")
@@ -2166,6 +2188,52 @@ async def ensure_master_user_exists():
         await db.users.insert_one(doc)
         return {"message": "Master Admin created", "email": "admin@sleepingstock.in", "password": "admin123"}
     return {"message": "System already initialized"}
+
+
+async def ensure_testing_master_user_exists():
+    """Idempotent Testing Master Admin upsert (testing env only).
+
+    Password comes from NMTS_TESTING_MASTER_PASSWORD and is applied only when
+    the account is created. Existing password hashes are never overwritten and
+    never logged.
+    """
+    if not testing_runtime.is_testing_env():
+        return {"message": "not_testing"}
+    email = "testing.master@sleepingstock.in"
+    target = testing_db_raw if testing_db_raw is not None else db
+    try:
+        from . import testing_snapshot as _ts
+    except ImportError:
+        import testing_snapshot as _ts  # type: ignore
+
+    existing = await target.users.find_one(
+        {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}},
+        {"_id": 0, "password": 0},
+    )
+    parity = _ts.testing_master_parity_fields()
+    parity["role"] = role_defs.ROLE_MASTER_ADMIN
+    if existing:
+        await target.users.update_one(
+            {"id": existing["id"]} if existing.get("id") else {"email": email},
+            {"$set": parity},
+        )
+        return {"message": "Testing Master Admin parity applied", "created": False}
+
+    secret = (os.getenv("NMTS_TESTING_MASTER_PASSWORD") or "").strip()
+    if not secret:
+        return {"message": "Testing Master Admin missing; NMTS_TESTING_MASTER_PASSWORD unset", "created": False}
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "id": str(uuid.uuid4()),
+        "email": email,
+        "password": hash_password(secret),
+        "phone": "",
+        "last_login": None,
+        "created_at": now,
+        **parity,
+    }
+    await target.users.insert_one(doc)
+    return {"message": "Testing Master Admin created", "created": True}
 
 # ==================== UPLOAD TRACKING ====================
 
@@ -2970,7 +3038,11 @@ async def list_hub_users(current_user: UserResponse = Depends(get_current_user))
             "location": current_user.location
         }
 
-    return await db.users.find(query, {"_id": 0, "password": 0}).sort("created_at", -1).to_list(1000)
+    rows = await db.users.find(query, {"_id": 0, "password": 0}).sort("created_at", -1).to_list(1000)
+    if testing_runtime.is_testing_env():
+        # Never surface Production Master Admin (or its credential) in Testing Hub.
+        rows = [r for r in rows if not role_defs.is_mirrored_production_master_admin(r)]
+    return rows
 
 
 @api_router.post("/users/create")
@@ -3134,6 +3206,8 @@ async def delete_hub_user(user_id: str, current_user: UserResponse = Depends(get
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     _forbid_protected_master_admin(target, "deleted")
+    if current_user.id == target.get("id"):
+        raise HTTPException(status_code=403, detail="Cannot delete the account performing this action")
 
     result = await db.users.delete_one({"id": target["id"]})
     if result.deleted_count == 0:
@@ -10374,13 +10448,18 @@ async def seed_master_user_on_startup():
             await _testing_overlay.ensure_overlay_indexes(testing_db_raw)
             logger.info("Testing overlay indexes verified")
             try:
-                restore = await role_defs.restore_mirrored_master_admin_visibility(
+                hide = await role_defs.hide_mirrored_production_master_admin(
                     db,
                     raw_db=testing_db_raw,
                 )
-                logger.info("Mirrored Master Admin tombstone restore: %s", restore)
+                logger.info("Hide mirrored Production Master Admin in Testing: %s", hide)
             except Exception as exc:
-                logger.warning("Mirrored Master Admin tombstone restore failed: %s", exc)
+                logger.warning("Hide mirrored Production Master Admin failed: %s", exc)
+            try:
+                ensure_tm = await ensure_testing_master_user_exists()
+                logger.info("Testing Master Admin ensure: %s", ensure_tm.get("message"))
+            except Exception as exc:
+                logger.warning("Testing Master Admin ensure failed: %s", exc)
             try:
                 from . import testing_verify as _testing_verify
             except ImportError:

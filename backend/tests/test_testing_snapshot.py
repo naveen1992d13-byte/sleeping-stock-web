@@ -118,7 +118,7 @@ def test_testing_master_is_protected_and_has_full_permissions():
     assert not is_protected_user({"email": "admin@sleepingstock.in", "role": "master"})
     from testing_snapshot import testing_master_parity_fields as master_parity_fields
     fields = master_parity_fields()
-    assert fields["role"] == "master"
+    assert fields["role"] == "master_admin"
     for label in (
         "User Hub", "Upload Center", "Product Hub", "Product Hub History",
         "Order Desk", "Request Center", "Reports", "Analytics",

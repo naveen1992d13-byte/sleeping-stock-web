@@ -28,7 +28,7 @@ ENV_FILE = BACKEND / ".env"
 
 TESTING_EMAIL = "testing.master@sleepingstock.in"
 TESTING_USERNAME = "Testing Master Admin"
-TESTING_ROLE = "master"
+TESTING_ROLE = "master_admin"
 
 
 def _load_env() -> None:
@@ -56,18 +56,19 @@ async def seed(reset: bool) -> int:
 
     existing = await db.users.find_one({"email": TESTING_EMAIL}, {"_id": 0, "password": 0})
     parity = testing_master_parity_fields()
+    parity["role"] = TESTING_ROLE
     if not existing or not existing.get("user_id"):
-        parity["user_id"] = "TS-SSMASTER01"
+        parity["user_id"] = "TSTMST001"
 
     if existing and not reset:
         await db.users.update_one({"email": TESTING_EMAIL}, {"$set": parity})
-        print(f"PARITY_APPLIED email={TESTING_EMAIL} role=master id={existing.get('id')}")
+        print(f"PARITY_APPLIED email={TESTING_EMAIL} role={TESTING_ROLE} id={existing.get('id')}")
         print(f"permissions={len(parity['permissions'])} modules")
         print("Password was not rotated. Pass --reset to rotate it.")
         client.close()
         return 0
 
-    password = secrets.token_urlsafe(18)
+    password = (os.environ.get("NMTS_TESTING_MASTER_PASSWORD") or "").strip() or secrets.token_urlsafe(18)
     hashed = pwd_context.hash(password)
     now = datetime.now(timezone.utc).isoformat()
 

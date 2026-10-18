@@ -307,17 +307,20 @@ sudo cp -f "$DEPLOYMENT_JSON" "$FRONTEND_DEST/deployment.json"
 sudo rm -rf "$PREV_DEST"
 
 # Reload Testing nginx vhost so X-NMTS-Build matches this release (never touch prod vhost content).
-if [[ -f "$ROOT/deploy/testing/nginx-nmts-testing.conf" ]]; then
-  # Preserve Certbot-managed TLS server block; only ensure headers include exists.
-  if sudo nginx -t 2>/dev/null; then
-    # systemctl reload hits a NAMESPACE sandbox bug on this host; signal master directly.
-    sudo nginx -s reload || sudo systemctl reload nginx || true
+# Always run nginx -t before any reload; never modify Production vhost files.
+if [[ -f "$ROOT/deploy/testing/nginx-nmts-testing.conf" || -f /etc/nginx/nmts-testing-headers.inc ]]; then
+  if ! sudo nginx -t; then
+    echo "ERROR: nginx -t failed — refusing reload (Production + Testing nginx unchanged)" >&2
+    exit 1
   fi
+  # systemctl reload hits a NAMESPACE sandbox bug on this host; signal master directly.
+  sudo nginx -s reload || sudo systemctl reload nginx || true
 fi
 
 TEST_PID_AFTER=""
 HEALTH_OK=""
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 15 18 20 24 30; do
+echo "Waiting for Testing health check on :${TEST_PORT} ..."
+for _ in $(seq 1 40); do
   TEST_PID_AFTER="$(pid_on_port "$TEST_PORT" || true)"
   if [[ -n "$TEST_PID_AFTER" ]] && curl -fsS "http://127.0.0.1:${TEST_PORT}/api/maintenance/status" >/dev/null 2>&1; then
     HEALTH_OK="1"

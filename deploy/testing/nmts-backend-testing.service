@@ -12,8 +12,13 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/nmts-testing/backend/venv/bin/python -m uvicorn server:socket_app --host 127.0.0.1 --port 8001
 ExecStartPost=/bin/bash -c 'for i in $(seq 1 45); do /usr/bin/curl -fsS http://127.0.0.1:8001/api/maintenance/status >/dev/null && exit 0; sleep 1; done; echo "nmts-backend-testing health check failed" >&2; exit 1'
 TimeoutStartSec=90
+TimeoutStopSec=45
 Restart=on-failure
 RestartSec=5
+# Cap Testing backend RSS on the shared t3.micro so a runaway process is
+# SIGKILL'd by cgroup instead of taking down the host / Production :8000.
+MemoryMax=650M
+MemoryHigh=550M
 
 # Never bind 8000 — that is the production backend.
 

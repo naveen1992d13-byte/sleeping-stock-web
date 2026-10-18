@@ -210,30 +210,42 @@ async def cleanup_testing_data(
     for name in TESTING_CREATED_COLLECTIONS:
         if name == "users":
             # Never remove Master Admin accounts via Clear Testing Data.
+            # Match by role OR protected email OR is_testing_master — any one
+            # of these must keep the row (OR-protect, not AND-delete-filter gaps).
             protected_emails = sorted(role_defs.ORIGINAL_MASTER_ADMIN_EMAILS)
-            result = await test_db[name].delete_many({
-                "role": {"$nin": [role_defs.ROLE_MASTER_ADMIN, "Master Admin"]},
-                "email": {
-                    "$not": {
-                        "$regex": "^(?:"
-                        + "|".join(re.escape(e) for e in protected_emails)
-                        + ")$",
-                        "$options": "i",
-                    }
-                },
-                "is_testing_master": {"$ne": True},
-            })
+            email_rx = "^(?:" + "|".join(re.escape(e) for e in protected_emails) + ")$"
+            victims = []
+            cursor = test_db[name].find({}, {"_id": 0})
+            async for row in cursor:
+                if role_defs.is_protected_master_admin_doc(row):
+                    continue
+                if re.match(email_rx, str(row.get("email") or ""), flags=re.I):
+                    continue
+                victims.append(row.get("id"))
+            removed = 0
+            for ident in victims:
+                if not ident:
+                    continue
+                result = await test_db[name].delete_one({"id": ident})
+                removed += int(getattr(result, "deleted_count", 0) or 0)
+            deleted[name] = removed
         else:
             result = await test_db[name].delete_many({})
-        deleted[name] = int(getattr(result, "deleted_count", 0) or 0)
+            deleted[name] = int(getattr(result, "deleted_count", 0) or 0)
     ov = await test_db[overlay.OVERLAY_COLLECTION].delete_many({})
-    # Drop tombstones but never leave the mirrored Production Master Admin hidden —
-    # clearing all tombstones already restores visibility; keep that behaviour.
+    # Drop testing tombstones/overlays. Production admin@ must stay hidden in
+    # Testing (credential isolation) — re-apply hide after the wipe.
     tb = await test_db[overlay.TOMBSTONE_COLLECTION].delete_many({})
     snap = await test_db["testing_snapshot_meta"].delete_many({})
     deleted[overlay.OVERLAY_COLLECTION] = int(getattr(ov, "deleted_count", 0) or 0)
     deleted[overlay.TOMBSTONE_COLLECTION] = int(getattr(tb, "deleted_count", 0) or 0)
     deleted["testing_snapshot_meta"] = int(getattr(snap, "deleted_count", 0) or 0)
+
+    try:
+        hide = await role_defs.hide_mirrored_production_master_admin(test_db, raw_db=test_db)
+        receipt["hide_mirrored_production_master"] = hide
+    except Exception as exc:
+        logger.warning("hide_mirrored_production_master_admin after cleanup failed: %s", exc)
 
     s3_info = list_testing_s3_objects()
     storage = s3_storage.get_storage()
