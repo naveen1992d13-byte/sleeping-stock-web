@@ -1,30 +1,38 @@
 const { test, expect } = require('@playwright/test');
+const fs = require('fs');
+const path = require('path');
 
 const BASE = process.env.NMTS_E2E_BASE_URL || 'https://testing.sleepingstock.in';
 const EMAIL = process.env.NMTS_E2E_EMAIL || '';
 const PASSWORD = process.env.NMTS_E2E_PASSWORD || '';
+const OUT = path.join(__dirname, '..', 'test-results');
 
 test.describe('Stage A UI', () => {
   test.use({ viewport: { width: 1600, height: 900 } });
 
   test('login split card sized with vw/vh; two-panel from first paint', async ({ page }) => {
+    fs.mkdirSync(OUT, { recursive: true });
     await page.goto(BASE + '/');
     await expect(page.getByTestId('login-page')).toBeVisible({ timeout: 30000 });
     const panel = page.locator('.nmts-login-panel--split');
     await expect(panel).toBeVisible();
+    await expect(page.locator('.nmts-login-promo')).toBeVisible();
+    await expect(page.getByTestId('login-email-input')).toBeVisible();
     const box = await panel.boundingBox();
     expect(box).toBeTruthy();
-    // ~52vw width and within ~62vh height on 1600x900 (allow tolerance)
     expect(box.width).toBeGreaterThan(700);
     expect(box.width).toBeLessThanOrEqual(860);
     expect(box.height).toBeGreaterThan(300);
     expect(box.height).toBeLessThanOrEqual(580);
-    await expect(page.locator('.nmts-login-promo')).toBeVisible();
-    await expect(page.getByTestId('login-email-input')).toBeVisible();
+    // promo column should occupy space (no blank collapsed panel)
+    const promoBox = await page.locator('.nmts-login-promo').boundingBox();
+    expect(promoBox.width).toBeGreaterThan(300);
+    await page.screenshot({ path: path.join(OUT, 'stage-a-login.png'), fullPage: true });
   });
 
   test('menu dark theme + Sleeping Stock NMTS header', async ({ page }) => {
     test.skip(!EMAIL || !PASSWORD, 'credentials required');
+    fs.mkdirSync(OUT, { recursive: true });
     await page.goto(BASE + '/');
     await page.getByTestId('login-email-input').fill(EMAIL);
     await page.getByTestId('login-password-input').fill(PASSWORD);
@@ -38,7 +46,8 @@ test.describe('Stage A UI', () => {
     await expect(brand.locator('.nmts-app-menu-brand-nmts')).toHaveText('NMTS');
     const menu = page.locator('.nmts-app-menu-dropdown');
     await expect(menu).toBeVisible();
-    const bg = await menu.evaluate((el) => getComputedStyle(el).backgroundColor + getComputedStyle(el).backgroundImage);
-    expect(bg.toLowerCase()).not.toContain('rgb(255, 255, 255)');
+    const bg = await menu.evaluate((el) => getComputedStyle(el).backgroundImage || getComputedStyle(el).backgroundColor);
+    expect(String(bg).toLowerCase()).not.toContain('rgb(255, 255, 255)');
+    await page.screenshot({ path: path.join(OUT, 'stage-a-menu.png'), fullPage: false });
   });
 });

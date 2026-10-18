@@ -1,8 +1,65 @@
 name: Testing Phase 5 Browser QA
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: build-artifact | stage-a-browser
+        required: true
+        default: build-artifact
+        type: choice
+        options:
+          - build-artifact
+          - stage-a-browser
 jobs:
-  browser-qa:
+  build-artifact:
+    if: ${{ github.event.inputs.mode == 'build-artifact' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install and build Testing frontend
+        working-directory: frontend
+        env:
+          REACT_APP_BACKEND_URL: https://testing.sleepingstock.in
+          REACT_APP_APP_ENV: testing
+          REACT_APP_TESTING_PR: ""
+          REACT_APP_TESTING_BRANCH: testing-six-fixes
+          REACT_APP_TESTING_COMMIT: 62b20fc
+          REACT_APP_TESTING_DEPLOYED_AT: "2026-10-18 20:08:04 IST"
+          GENERATE_SOURCEMAP: "false"
+          NODE_OPTIONS: --max-old-space-size=2048
+        run: |
+          npm ci --ignore-scripts || npm install --ignore-scripts
+          npm run build
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          Path("build/deployment.json").write_text(json.dumps({
+            "environment": "testing",
+            "app_env": "testing",
+            "pr_number": None,
+            "git_branch": "testing-six-fixes",
+            "commit": "62b20fc4d5eaddeb59326e4b5940c14d17e0a728",
+            "commit_short": "62b20fc",
+            "deployed_at": "2026-10-18T14:38:04Z",
+            "deployed_at_ist": "2026-10-18 20:08:04 IST",
+            "backend_port": 8001,
+            "service": "nmts-backend-testing",
+            "built_on": "github-actions",
+          }, indent=2) + "\n")
+          PY
+          cp -f ../deploy/testing/robots.txt build/robots.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: testing-frontend-62b20fc
+          path: frontend/build/
+          retention-days: 2
+
+  stage-a-browser:
+    if: ${{ github.event.inputs.mode == 'stage-a-browser' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -23,3 +80,11 @@ jobs:
           NMTS_E2E_EMAIL: ${{ secrets.TESTING_MASTER_EMAIL }}
           NMTS_E2E_PASSWORD: ${{ secrets.TESTING_MASTER_PASSWORD }}
         run: npx playwright test e2e/testing-stage-a.spec.js --project=chromium
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-a-screenshots
+          path: frontend/test-results/
+          if-no-files-found: ignore
+          retention-days: 5
