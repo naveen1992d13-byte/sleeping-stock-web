@@ -39,30 +39,19 @@
   max-height: calc(100vh - var(--nmts-banner-h) - 24px);
 }
 
-/* Viewport-driven card: layout 65vw × zoom 0.8 ⇒ ~52vw on screen (Stage A 80%-zoom look at 100%). */
+/* Net ~52vw on screen (Stage A 80%-zoom look at 100% browser zoom). Viewport-only; promo never drives size. */
 .nmts-login-zoom {
-  width: min(65vw, 1375px);
-  max-width: min(65vw, 1375px);
-  zoom: 0.8;
-  max-height: calc((100vh - var(--nmts-banner-h) - 24px) / 0.8);
+  width: min(52vw, 1100px);
+  max-width: min(52vw, 1100px);
+  max-height: calc(100vh - var(--nmts-banner-h) - 24px);
   display: flex;
   justify-content: center;
   align-items: center;
 }
 
-@supports not (zoom: 1) {
-  .nmts-login-zoom {
-    zoom: normal;
-    width: min(52vw, 1100px);
-    max-width: min(52vw, 1100px);
-    max-height: calc(100vh - var(--nmts-banner-h) - 24px);
-  }
-
-  .nmts-login-zoom-inner {
-    width: 125%;
-    transform: scale(0.8);
-    transform-origin: center center;
-  }
+.nmts-login-zoom-inner {
+  width: 100%;
+  max-height: inherit;
 }
 
 .nmts-login-panel {
@@ -462,7 +451,6 @@
   .nmts-login-zoom {
     width: min(92vw, 480px);
     max-width: 92vw;
-    zoom: 1;
     max-height: none;
   }
 

@@ -16,7 +16,7 @@ async function assertLayout(page, vp) {
   await page.goto(BASE + '/', { waitUntil: 'networkidle' });
   await expect(page.getByTestId('login-page')).toBeVisible({ timeout: 30000 });
 
-  const panel = page.getByTestId('login-card-panel');
+  const panel = page.getByTestId('login-zoom-wrap');
   const formCol = page.getByTestId('login-form-column');
   const promo = page.getByTestId('login-promo-aside');
   const btn = page.getByTestId('login-submit-button');
