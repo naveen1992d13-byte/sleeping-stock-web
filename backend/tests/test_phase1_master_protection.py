@@ -66,11 +66,10 @@ def test_cleanup_preserves_testing_master(monkeypatch):
         "prefix": "testing/", "object_count": 0, "bytes": 0, "keys_preview": [], "keys": []
     }
 
-    # hide_mirrored uses production base lookup — stub to no-op ids
-    async def fake_hide(db_arg, raw_db=None):
-        return {"tombstoned": 0, "ids": []}
+    async def fake_reisolate(test_db):
+        return {"tombstoned": {"brands": 0}, "hide_mirrored": {"tombstoned": 0, "ids": []}}
 
-    monkeypatch.setattr(role_defs, "hide_mirrored_production_master_admin", fake_hide)
+    monkeypatch.setattr(tc, "reisolate_testing_hub_from_production", fake_reisolate)
 
     result = asyncio.run(tc.cleanup_testing_data(
         db,
