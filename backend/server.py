@@ -5396,17 +5396,24 @@ async def order_desk_orders(
     if branch and not str(branch).startswith('All '): query['branch'] = branch
     if role == 'admin': query['dealer_name'] = current_user.group
     if role == 'user': query.update({'created_by': current_user.id, 'branch': current_user.location})
+    date_from_iso = None
+    date_to_iso = None
     if date_from or date_to:
         from zoneinfo import ZoneInfo
         ist = ZoneInfo("Asia/Kolkata")
         created = {}
         try:
+            # created_at is stored as ISO-8601 *strings* in Mongo/DocumentDB.
+            # Comparing against BSON datetimes matches zero live TS rows and
+            # leaves only unfiltered S3 archive merges (old dates).
             if date_from:
                 start = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=ist).astimezone(timezone.utc)
-                created["$gte"] = start
+                date_from_iso = start.isoformat()
+                created["$gte"] = date_from_iso
             if date_to:
                 end = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=ist) + timedelta(days=1)
-                created["$lt"] = end.astimezone(timezone.utc)
+                date_to_iso = end.astimezone(timezone.utc).isoformat()
+                created["$lt"] = date_to_iso
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date range")
         if created:
@@ -5441,6 +5448,8 @@ async def order_desk_orders(
             brand=query.get('brand_name'),
             dealer=query.get('dealer_name') if role != 'user' else None,
             branch=query.get('branch') if role == 'user' or (branch and not str(branch).startswith('All ')) else None,
+            date_from=date_from_iso,
+            date_to=date_to_iso,
             limit=1000,
         )
         if archived:
@@ -7629,8 +7638,8 @@ async def finish_order_desk_order(order_id: str, current_user: UserResponse = De
         reqs_by_item.setdefault(req.get('order_item_id'), []).append(req)
     readiness = odw.evaluate_finish_readiness(order, items, reqs_by_item)
     if not readiness.get('can_finish'):
-        raise HTTPException(status_code=400, detail={
-            'message': 'Order cannot be finished yet',
+        raise HTTPException(status_code=409, detail={
+            'message': odw.finish_block_reason(readiness),
             **readiness,
         })
     now = datetime.now(timezone.utc).isoformat()

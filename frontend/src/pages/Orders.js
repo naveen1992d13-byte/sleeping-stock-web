@@ -1016,7 +1016,7 @@ export function Orders({ scopeOverride } = {}) {
             <div className="text-sm text-slate-600">
               Factory Order entry stays locked until Branch and Dealer stages are exhausted. Apply one Factory Order No to multiple selected parts.
             </div>
-            {factoryUnlocked && (
+            {factoryUnlocked && canSaveSystemOrder && (
               <div className="flex flex-wrap items-end gap-2">
                 <label className="text-xs text-slate-600">
                   <input
@@ -1039,12 +1039,17 @@ export function Orders({ scopeOverride } = {}) {
                     placeholder="Apply to selected parts"
                   />
                 </label>
-                <Button size="sm" disabled={!canSaveSystemOrder || factorySaving === 'bulk' || orderFinished} onClick={applyFactoryBulk}>
+                <Button size="sm" disabled={factorySaving === 'bulk' || orderFinished} onClick={applyFactoryBulk}>
                   {factorySaving === 'bulk' ? 'Applying…' : 'Apply to Selected'}
                 </Button>
               </div>
             )}
-            {!factoryUnlocked && <div className="text-xs text-slate-500">Factory Order entry is locked until the existing workflow opens this stage.</div>}
+            {factoryUnlocked && !canSaveSystemOrder && (
+              <div className="text-xs text-amber-700" data-testid="factory-waiting-admin-msg">
+                Waiting for Admin/Master to enter the Factory Order No
+              </div>
+            )}
+            {!factoryUnlocked && <div className="text-xs text-slate-500">Factory Order entry is locked until Branch and Dealer stages are exhausted and no Branch/Dealer request is open.</div>}
           </div>
         )}
 
@@ -1057,7 +1062,7 @@ export function Orders({ scopeOverride } = {}) {
               {finishing ? 'Finishing…' : 'Finish Order'}
             </Button>
             {!finishReadiness.can_finish && (
-              <div className="text-xs text-amber-700">
+              <div className="text-xs text-amber-700" data-testid="finish-blocked-reason">
                 {(finishReadiness.unresolved_requests || []).length ? 'Unresolved request still open. ' : ''}
                 {(finishReadiness.remaining_open_items || []).length ? 'Remaining qty is still open. ' : ''}
                 {(finishReadiness.missing_factory_order_no || []).length ? 'Factory Order No missing on a factory row.' : ''}
@@ -1196,7 +1201,7 @@ export function Orders({ scopeOverride } = {}) {
                                       ? 'Factory Order Number is locked while a branch availability request is still active.'
                                       : canSaveSystemOrder
                                       ? 'Enter System Order Number to fulfill remaining Factory quantity.'
-                                      : 'View only — Admin / Master Admin enter the System Order Number.'}
+                                      : 'Waiting for Admin/Master to enter the Factory Order No'}
                                   </div>
                                 )
                               )}

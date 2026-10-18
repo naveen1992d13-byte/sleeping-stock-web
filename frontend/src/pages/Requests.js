@@ -181,7 +181,9 @@ export function Requests() {
   }, [tab, scopeBrand, scopeDealer, scopeBranch, highlightRequest]);
 
   useEffect(() => {
-    if (tab === 'outgoing') setSubFilter('sent');
+    // Default "All" on My Requests so Approved/Picking Finished TS rows stay visible
+    // after mobile accept (previously default "Request Sent" hid them).
+    if (tab === 'outgoing') setSubFilter('');
     else if (tab === 'incoming') setSubFilter('sent');
     else if (tab === 'dispatches') setSubFilter('picking_finished');
     else if (tab === 'receipts') setSubFilter('in_transit');
@@ -327,7 +329,7 @@ export function Requests() {
   };
 
   const subFilters = tab === 'outgoing'
-    ? [['sent', 'Request Sent'], ['picking', 'Picking'], ['picking_finished', 'Picking Finished']]
+    ? [['', 'All'], ['sent', 'Request Sent'], ['picking', 'Picking'], ['picking_finished', 'Picking Finished']]
     : tab === 'incoming'
       ? [['sent', 'Request Received'], ['picking', 'Picking']]
       : tab === 'dispatches'

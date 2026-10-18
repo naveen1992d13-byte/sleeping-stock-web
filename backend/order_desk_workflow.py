@@ -711,6 +711,35 @@ def _item_remaining_qty(item: Dict[str, Any]) -> float:
     return _f(item.get('required_qty')) - _f(item.get('accepted_qty')) - _f(item.get('factory_fulfilled_qty'))
 
 
+def _item_is_factory_required(item: Dict[str, Any], remaining: float) -> bool:
+    """True when the row still needs a *saved* Factory Order No.
+
+    Assigning ``factory_order_qty`` (e.g. dealer Auto Suggest remainder) only
+    marks the row for Factory — it does **not** satisfy Finish. Cancelled
+    remainder is resolved and never factory-required.
+    """
+    if is_item_cancelled(item):
+        return False
+    if _clean(item.get('system_order_number')):
+        # Already has a saved number; not missing (caller checks emptiness).
+        return True
+    factory_qty = _f(item.get('factory_order_qty') or item.get('factory_qty'))
+    fulfilled = _f(item.get('factory_fulfilled_qty'))
+    if factory_qty > 0 or fulfilled > 0:
+        return True
+    if item.get('no_further_stock'):
+        return True
+    if _clean(item.get('enquiry_stage')).lower() == 'factory':
+        return True
+    if _clean(item.get('request_status')) == REQUEST_STATUS_FACTORY:
+        return True
+    if _clean(item.get('factory_stage_status')).lower() == 'open' and remaining > 0:
+        return True
+    if _clean(item.get('expected_next_outcome')) == 'Factory Order' and remaining > 0:
+        return True
+    return False
+
+
 def evaluate_finish_readiness(order: Dict[str, Any], items: List[Dict[str, Any]], requests_by_item: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     """Order-level Finish is allowed only when no request is still open,
     remaining qty is zero, and every factory-required row has a Factory Order No.
@@ -721,6 +750,14 @@ def evaluate_finish_readiness(order: Dict[str, Any], items: List[Dict[str, Any]]
     for item in items or []:
         item_id = item.get('id')
         remaining = 0 if is_item_cancelled(item) else max(0, int(_item_remaining_qty(item)))
+        # factory_order_qty without a saved System Order Number is still open work
+        if (
+            remaining <= 0
+            and not is_item_cancelled(item)
+            and not _clean(item.get('system_order_number'))
+            and _f(item.get('factory_order_qty') or item.get('factory_qty')) > 0
+        ):
+            remaining = max(0, int(_f(item.get('factory_order_qty') or item.get('factory_qty'))))
         if remaining > 0:
             remaining_open.append(item_id)
         for req in requests_by_item.get(item_id, []) if requests_by_item else []:
@@ -730,9 +767,7 @@ def evaluate_finish_readiness(order: Dict[str, Any], items: List[Dict[str, Any]]
                     'request_number': req.get('request_number'),
                     'level': req.get('level') or req.get('source_type'),
                 })
-        factory_qty = max(0, int(_f(item.get('factory_fulfilled_qty') or item.get('factory_order_qty') or item.get('factory_qty'))))
-        factory_required = (remaining > 0 or factory_qty > 0) and not is_item_cancelled(item)
-        if factory_required and not _clean(item.get('system_order_number')):
+        if _item_is_factory_required(item, remaining) and not _clean(item.get('system_order_number')):
             missing_factory_order_no.append(item_id)
     return {
         'can_finish': not unresolved and not missing_factory_order_no and not remaining_open,
@@ -740,6 +775,18 @@ def evaluate_finish_readiness(order: Dict[str, Any], items: List[Dict[str, Any]]
         'missing_factory_order_no': missing_factory_order_no,
         'remaining_open_items': remaining_open,
     }
+
+
+def finish_block_reason(readiness: Dict[str, Any]) -> str:
+    """Exact human reason string for Finish 409 responses / UI."""
+    parts = []
+    if readiness.get('unresolved_requests'):
+        parts.append('Unresolved request still open')
+    if readiness.get('remaining_open_items'):
+        parts.append('Remaining qty is still open')
+    if readiness.get('missing_factory_order_no'):
+        parts.append('Factory Order No missing on a factory row')
+    return '; '.join(parts) or 'Order cannot be finished yet'
 
 
 _ACCEPTED_REQUEST_STATUSES = {
