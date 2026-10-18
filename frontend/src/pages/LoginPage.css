@@ -234,8 +234,8 @@
   overflow: visible;
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  align-self: stretch;
+  justify-content: flex-start;
+  align-self: flex-start;
 }
 
 .nmts-login-panel--split .nmts-login-card {
