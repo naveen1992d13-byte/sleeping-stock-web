@@ -40,11 +40,12 @@
   max-height: calc(100vh - var(--nmts-banner-h) - 24px);
 }
 
-/* Net ~52vw on screen (Stage A 80%-zoom look at 100% browser zoom). Viewport-only; promo never drives size. */
+/* Stage A4: card height ~64vh; promo is 6:5 so width = height×1.2 + form column. Cap width ≤64vw. */
 .nmts-login-zoom {
-  /* Keep within 48–56vw; bias high enough that 40% form fits a 32-char email at 1366. */
-  width: min(55vw, 1100px);
-  max-width: min(55vw, 1100px);
+  --nmts-card-h: min(64vh, 32vw, calc(100vh - var(--nmts-banner-h) - 48px));
+  height: var(--nmts-card-h);
+  width: min(64vw, calc(var(--nmts-card-h) * 2));
+  max-width: 64vw;
   max-height: calc(100vh - var(--nmts-banner-h) - 24px);
   display: flex;
   justify-content: center;
@@ -53,12 +54,14 @@
 
 .nmts-login-zoom-inner {
   width: 100%;
+  height: 100%;
   max-height: inherit;
 }
 
 .nmts-login-panel {
   position: relative;
   width: 100%;
+  height: 100%;
   border-radius: 22px;
   background: transparent;
   box-shadow:
@@ -69,7 +72,7 @@
 
 .nmts-login-panel--split {
   width: 100%;
-  height: auto;
+  height: 100%;
   max-height: inherit;
   aspect-ratio: auto;
 }
@@ -149,7 +152,7 @@
 
 .nmts-login-panel--split .nmts-login-panel-face {
   min-height: 0;
-  height: auto;
+  height: 100%;
 }
 
 .nmts-login-panel-face::before {
@@ -167,8 +170,10 @@
 .nmts-login-promo {
   position: relative;
   z-index: 3;
-  flex: 0 0 60%;
-  width: 60%;
+  flex: 0 0 auto;
+  height: 100%;
+  width: auto;
+  aspect-ratio: 6 / 5;
   min-width: 0;
   overflow: hidden;
   display: flex;
@@ -176,7 +181,6 @@
   justify-content: center;
   background: #0b0f12;
   align-self: stretch;
-  aspect-ratio: auto;
 }
 
 .nmts-login-promo-bg {
@@ -193,6 +197,8 @@
   width: 100%;
   height: 100%;
   min-height: 0;
+  overflow: hidden;
+  background: #0b0f12;
 }
 
 .nmts-login-promo-media img,
@@ -200,8 +206,8 @@
   display: block;
   width: 100%;
   height: 100%;
-  object-fit: cover;
-  object-position: center top;
+  object-fit: contain;
+  object-position: center center;
   background: #0b0f12;
 }
 
@@ -224,10 +230,11 @@
 .nmts-login-card {
   position: relative;
   z-index: 3;
-  flex: 0 0 40%;
-  width: 40%;
+  flex: 1 1 auto;
+  width: auto;
   min-width: 0;
   min-height: 0;
+  height: 100%;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -236,13 +243,13 @@
   display: flex;
   flex-direction: column;
   justify-content: center;
-  /* Form column drives card height; do not stretch past content (keeps empty-under ≤40px). */
-  align-self: flex-start;
+  align-self: stretch;
 }
 
 .nmts-login-panel--split .nmts-login-card {
-  flex: 0 0 40%;
-  width: 40%;
+  flex: 1 1 auto;
+  width: auto;
+  height: 100%;
 }
 
 .nmts-login-card-glow {
@@ -272,19 +279,21 @@
 }
 
 .nmts-login-brand {
-  height: 108px;
+  height: 64px;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
+  overflow: visible;
   flex-shrink: 0;
 }
 
 .nmts-login-logo {
-  width: 108px;
+  height: 56px;
+  width: auto;
   max-width: 100%;
-  height: auto;
+  max-height: 56px;
   object-fit: contain;
+  object-position: center;
   filter: drop-shadow(0 10px 14px rgba(0, 0, 0, 0.55));
 }
 
@@ -454,9 +463,18 @@
 
 @media (max-width: 900px) {
   .nmts-login-zoom {
+    --nmts-card-h: auto;
+    height: auto;
     width: min(92vw, 480px);
     max-width: 92vw;
     max-height: none;
+  }
+
+  .nmts-login-zoom-inner,
+  .nmts-login-panel,
+  .nmts-login-panel--split,
+  .nmts-login-panel--split .nmts-login-panel-face {
+    height: auto;
   }
 
   .nmts-login-panel--split .nmts-login-panel-face {
@@ -467,11 +485,14 @@
   .nmts-login-panel--split .nmts-login-card {
     width: 100%;
     flex: none;
+    height: auto;
   }
 
   .nmts-login-promo {
-    height: min(36vw, 28vh);
-    max-height: 28vh;
+    aspect-ratio: 6 / 5;
+    width: 100%;
+    height: auto;
+    max-height: 36vh;
   }
 
   .nmts-login-content {

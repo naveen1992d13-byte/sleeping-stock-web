@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { API, useAuth, canAccessPermission, canAccessMenuItem } from '@/App';
@@ -6,6 +6,7 @@ import { getFirstAllowedMenuItem } from '@/config/menuConfig';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { User, Key, ArrowRight, Eye, EyeOff } from 'lucide-react';
+import { LOGIN_PROMO_ASPECT, LOGIN_PROMO_FILL, loginDisplayStyle } from './loginPromoCrop';
 import './LoginPage.css';
 
 function seedHomeTab(user) {
@@ -35,6 +36,13 @@ function seedHomeTab(user) {
   return '/';
 }
 
+function ratioNearPromoAspect(width, height) {
+  if (!width || !height) return false;
+  const ratio = width / height;
+  const target = LOGIN_PROMO_ASPECT;
+  return Math.abs(ratio - target) / target <= 0.05;
+}
+
 export function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -45,6 +53,8 @@ export function LoginPage() {
   const [promoPosterUrl, setPromoPosterUrl] = useState(null);
   const [promoKind, setPromoKind] = useState('image');
   const [promoFailed, setPromoFailed] = useState(false);
+  const [displaySettings, setDisplaySettings] = useState(null);
+  const [mediaNatural, setMediaNatural] = useState({ w: 0, h: 0 });
   const { login } = useAuth();
   const navigate = useNavigate();
 
@@ -80,6 +90,7 @@ export function LoginPage() {
       const nextUrl = mediaPath ? `${origin}${mediaPath}` : null;
       const nextPoster = posterPath ? `${origin}${posterPath}` : nextUrl;
       const nextKind = data?.media_kind === 'video' ? 'video' : 'image';
+      const nextSettings = data?.display_settings || null;
       if (lastUrl !== `${nextKind}:${nextUrl}:${nextPoster}`) {
         lastUrl = `${nextKind}:${nextUrl}:${nextPoster}`;
         if (!cancelled) {
@@ -87,8 +98,10 @@ export function LoginPage() {
           setPromoUrl(nextUrl);
           setPromoPosterUrl(nextPoster);
           setPromoKind(nextKind);
+          setMediaNatural({ w: 0, h: 0 });
         }
       }
+      if (!cancelled) setDisplaySettings(nextSettings);
       clearExpiry();
       if (data?.type === 'scheduled' && data?.end_at) {
         const endMs = new Date(data.end_at).getTime();
@@ -136,7 +149,24 @@ export function LoginPage() {
   };
 
   const showPromo = Boolean(promoUrl) && !promoFailed;
-  const useSplitShell = true; // two-panel shell mounted from first paint
+  const useSplitShell = true; // two-panel shell mounted from first paint — no layout shift on promo swap
+
+  const mediaStyle = useMemo(() => {
+    const near = ratioNearPromoAspect(mediaNatural.w, mediaNatural.h);
+    const base = loginDisplayStyle(displaySettings, { forceContain: !near });
+    return {
+      ...base,
+      objectFit: near ? 'cover' : 'contain',
+      background: LOGIN_PROMO_FILL,
+    };
+  }, [displaySettings, mediaNatural.w, mediaNatural.h]);
+
+  const onMediaMeta = (el) => {
+    if (!el) return;
+    const w = el.naturalWidth || el.videoWidth || 0;
+    const h = el.naturalHeight || el.videoHeight || 0;
+    if (w > 0 && h > 0) setMediaNatural({ w, h });
+  };
 
   return (
     <div className="nmts-login-page" data-testid="login-page">
@@ -165,6 +195,8 @@ export function LoginPage() {
                   controls={false}
                   disablePictureInPicture
                   data-testid="login-promo-video"
+                  style={mediaStyle}
+                  onLoadedMetadata={(e) => onMediaMeta(e.currentTarget)}
                   onError={() => setPromoFailed(true)}
                 />
               ) : (
@@ -174,6 +206,8 @@ export function LoginPage() {
                   decoding="async"
                   fetchPriority="high"
                   data-testid="login-promo-image"
+                  style={mediaStyle}
+                  onLoad={(e) => onMediaMeta(e.currentTarget)}
                   onError={() => setPromoFailed(true)}
                 />
               )}
@@ -185,11 +219,12 @@ export function LoginPage() {
           <div className="nmts-login-card-glow" />
 
           <div className="nmts-login-content">
-            <div className="nmts-login-brand">
+            <div className="nmts-login-brand" data-testid="login-emblem">
               <img
                 src="/LoginPage Image.png"
                 alt="Sleeping Stock Logo"
                 className="nmts-login-logo"
+                data-testid="login-emblem-img"
               />
             </div>
 
