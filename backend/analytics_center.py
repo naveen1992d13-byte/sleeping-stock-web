@@ -2343,21 +2343,33 @@ async def ensure_analytics_indexes():
     await rollup.ensure_rollup_indexes(db)
 
 
+def _require_master_level(current_user) -> None:
+    role = str(getattr(current_user, "role", None) or "").strip().lower()
+    if role not in {"master", "master_admin"}:
+        raise HTTPException(403, "Master Admin or Master only")
+
+
 @router.get("/rollup/status")
 async def analytics_rollup_status(
     date: Optional[str] = None,
     current_user=Depends(_current_user),
 ):
     """Master-only: last/selected finalized Analytics rollup status."""
-    if getattr(current_user, "role", None) != "master":
-        raise HTTPException(403, "Master only")
+    _require_master_level(current_user)
     last = await rollup.last_successful_rollup_date(db, on_or_before=date)
     selected = await rollup.get_rollup_status(db, date) if date else None
     latest = await rollup.get_rollup_status(db, last) if last else None
+    unavailable = None
+    if date and not selected:
+        unavailable = {
+            "rollup_date_ist": date,
+            "status": rollup.STATUS_UNAVAILABLE,
+            "message": "No finalized rollup for this date",
+        }
     return {
         "data_updated_up_to": last,
         "yesterday_ist": rollup.yesterday_ist_iso(),
-        "selected": selected,
+        "selected": selected or unavailable,
         "latest_success": latest,
     }
 
@@ -2368,11 +2380,11 @@ async def analytics_rollup_finalize(
     force: bool = False,
     current_user=Depends(_current_user),
 ):
-    """Master-only: run the idempotent daily Analytics finalizer for one IST date.
+    """Master-only: idempotent single-date Analytics finalizer.
 
-    Used on Testing to backfill durable DB snapshots without waiting for 11:00 PM IST.
+    Incremental only — one IST date per call. Historical multi-date backfill
+    is disabled after the Testing fresh-start reset.
     """
-    if getattr(current_user, "role", None) != "master":
-        raise HTTPException(403, "Master only")
+    _require_master_level(current_user)
     target = date or rollup.yesterday_ist_iso()
     return await rollup.finalize_analytics_rollup_for_date(db, target, force=force)

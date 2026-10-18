@@ -27,6 +27,12 @@ DAILY_AGG_COLLECTION = "analytics_daily_aggs"
 STATUS_SUCCESS = "success"
 STATUS_FAILED = "failed"
 STATUS_RUNNING = "running"
+STATUS_UNAVAILABLE = "unavailable"
+
+# Incremental finalize only — never walk historical calendars after fresh-start.
+MAX_INCREMENTAL_DATES = 1
+# Cap in-memory source rows during finalize (t3.micro / MemoryMax=400M).
+MAX_SOURCE_ROWS_PER_DATE = 25000
 
 AGING_BUCKETS = [
     "0–90 Days",
@@ -370,6 +376,15 @@ async def _load_rows_from_archives(db, date_iso: str) -> Tuple[List[dict], List[
             if uno and not upload_matches_date(uno, date_iso):
                 continue
             rows.append(r)
+            if len(rows) >= MAX_SOURCE_ROWS_PER_DATE:
+                logger.warning(
+                    "analytics archive row cap hit date=%s cap=%s",
+                    date_iso,
+                    MAX_SOURCE_ROWS_PER_DATE,
+                )
+                break
+        if len(rows) >= MAX_SOURCE_ROWS_PER_DATE:
+            break
     return rows, used_keys
 
 
@@ -405,15 +420,16 @@ async def _load_latest_published_rows(db, date_iso: str) -> List[dict]:
             }
         },
         {"$replaceRoot": {"newRoot": "$doc"}},
+        {"$limit": MAX_SOURCE_ROWS_PER_DATE},
     ]
     try:
-        return await db.products.aggregate(pipeline, allowDiskUse=True).to_list(500000)
+        return await db.products.aggregate(pipeline, allowDiskUse=True).to_list(MAX_SOURCE_ROWS_PER_DATE)
     except Exception as exc:
         logger.warning("rollup aggregate failed for %s: %s", date_iso, exc)
         rows = await db.products.find(
             {"publish_status": "Published", "active_date_key": {"$in": [date_key, date_iso]}},
             {"_id": 0},
-        ).sort([("published_at", -1), ("updated_at", -1)]).to_list(500000)
+        ).sort([("published_at", -1), ("updated_at", -1)]).to_list(MAX_SOURCE_ROWS_PER_DATE)
         latest: Dict[Tuple[str, str, str, str], dict] = {}
         for r in rows:
             pk = (
@@ -654,11 +670,37 @@ async def finalize_analytics_rollup_for_date(
 
 
 async def backfill_analytics_rollups(db, dates: List[str], *, force: bool = False) -> dict:
+    """Disabled for historical calendars.
+
+    After the Testing fresh-start reset, only incremental single-date finalize
+    is allowed (publish hook / nightly scheduler / explicit one-date API).
+    """
+    clean = [date_key_to_iso(iso_to_date_key(d)) for d in (dates or []) if d]
+    if len(clean) > MAX_INCREMENTAL_DATES:
+        return {
+            "requested": len(clean),
+            "success": 0,
+            "failed": len(clean),
+            "error": "historical_backfill_disabled",
+            "message": (
+                f"Refusing multi-date historical backfill ({len(clean)} dates). "
+                f"Finalize at most {MAX_INCREMENTAL_DATES} newly uploaded date at a time."
+            ),
+            "results": [],
+        }
     results = []
-    for d in dates:
+    for d in clean:
         results.append(await finalize_analytics_rollup_for_date(db, d, force=force))
     ok = sum(1 for r in results if r.get("status") == STATUS_SUCCESS)
-    return {"requested": len(dates), "success": ok, "failed": len(dates) - ok, "results": results}
+    return {"requested": len(clean), "success": ok, "failed": len(clean) - ok, "results": results}
+
+
+async def schedule_incremental_rollup_for_date(db, date_iso: str) -> dict:
+    """Idempotent single-date finalize used after Upload publish (no historical walk)."""
+    iso = date_key_to_iso(iso_to_date_key(date_iso))
+    if not _is_plausible_iso(iso):
+        return {"status": STATUS_UNAVAILABLE, "rollup_date_ist": date_iso, "error": "invalid date"}
+    return await finalize_analytics_rollup_for_date(db, iso, force=False)
 
 
 async def query_daily_aggs(

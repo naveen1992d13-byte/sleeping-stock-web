@@ -4031,6 +4031,20 @@ async def _finalize_product_publish(
         )
     except Exception as exc:
         logger.warning("publish archive enqueue failed: %s", exc)
+    # Phase 4: incremental Analytics rollup for this published date only
+    # (no historical backfill). Failures must not block publish.
+    rollup_info = None
+    try:
+        import analytics_rollup as _ar
+        date_iso = _ar.date_key_to_iso(str(date_key))
+        rollup_info = await _ar.schedule_incremental_rollup_for_date(db, date_iso)
+        logger.info(
+            "Incremental analytics rollup after publish date=%s status=%s",
+            date_iso,
+            (rollup_info or {}).get("status"),
+        )
+    except Exception as exc:
+        logger.warning("incremental analytics rollup after publish failed: %s", exc)
     return {
         "message": (
             "Already published — Product Hub/status reconciled successfully"
@@ -4041,6 +4055,7 @@ async def _finalize_product_publish(
         "available_qty": totals["available_qty"],
         "total_value": totals["total_value"],
         "reconciled": already_published_products,
+        "analytics_rollup": rollup_info,
     }
 
 

@@ -118,9 +118,11 @@ export function DashboardLayout() {
           ? "Admin"
           : "User";
 
-  const [scopeBrand, setScopeBrand] = useState("N/A");
-  const [scopeDealer, setScopeDealer] = useState("N/A");
-  const [scopeBranch, setScopeBranch] = useState("N/A");
+  // Master starts on All* (empty string). Non-master still uses "N/A" until
+  // the user effect assigns brand/dealer/branch — Analytics waits on "N/A".
+  const [scopeBrand, setScopeBrand] = useState(() => (user?.role === "master_admin" || user?.role === "master" ? "" : "N/A"));
+  const [scopeDealer, setScopeDealer] = useState(() => (user?.role === "master_admin" || user?.role === "master" ? "" : "N/A"));
+  const [scopeBranch, setScopeBranch] = useState(() => (user?.role === "master_admin" || user?.role === "master" ? "" : "N/A"));
   const [scopeMasters, setScopeMasters] = useState({ brands: [], dealers: [], branches: [] });
 
   const isAllScope = (value) => !value || String(value).startsWith("All ") || value === "N/A";

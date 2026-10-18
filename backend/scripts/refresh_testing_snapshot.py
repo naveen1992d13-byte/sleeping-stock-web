@@ -417,6 +417,26 @@ def refresh(rollback: bool, reset_testing_created: bool, dry_run: bool) -> int:
         preserve_after = _preserve_check(target_db)
         _log(f"Active snapshot {version} date={business_date} products={live_counts.get('products', 0)} collections={len(collections)}")
         _log(f"Preserved after refresh: users={preserve_after['users']} orders={preserve_after['orders']} uploads={preserve_after['uploads']}")
+        # Fresh-start isolation: never re-surface Production hub masters/credentials
+        # into Testing User Hub after a snapshot refresh (overlay + tombstones).
+        try:
+            import asyncio as _asyncio
+            from motor.motor_asyncio import AsyncIOMotorClient
+            from mongo_connection import build_mongo_client_args as _build
+            import testing_cleanup as tc
+
+            async def _reisolate():
+                write_url, write_kw = _build(resolve_mongo_url())
+                client = AsyncIOMotorClient(write_url, **write_kw)
+                try:
+                    return await tc.reisolate_testing_hub_from_production(client[TARGET_DB])
+                finally:
+                    client.close()
+
+            isolate = _asyncio.run(_reisolate())
+            _log(f"Hub re-isolation after snapshot refresh: {isolate}")
+        except Exception as exc:
+            _log(f"WARNING: hub re-isolation after snapshot refresh failed: {exc}")
         return 0
     except Exception:
         _log("Activation failed; deleting the new version only and keeping the previous snapshot")

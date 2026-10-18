@@ -15,10 +15,11 @@ TimeoutStartSec=90
 TimeoutStopSec=45
 Restart=on-failure
 RestartSec=5
-# Cap Testing backend RSS on the shared t3.micro so a runaway process is
-# SIGKILL'd by cgroup instead of taking down the host / Production :8000.
-MemoryMax=650M
-MemoryHigh=550M
+# Cap Testing RSS on the shared t3.micro (913 MiB). Prefer Testing as the OOM
+# victim so Production :8000 is never selected first.
+MemoryMax=400M
+MemoryHigh=350M
+OOMScoreAdjust=500
 
 # Never bind 8000 — that is the production backend.
 
