@@ -17,6 +17,18 @@ import openpyxl
 UPLOAD_V2_BATCH_SIZE = 1500
 
 
+def next_stream_batch(iterator):
+    """Pull one (batch, stats) from a stream iterator; None when exhausted.
+
+    Intended for asyncio.to_thread / run_in_executor so openpyxl CPU work stays
+    off the event loop between awaits.
+    """
+    try:
+        return next(iterator)
+    except StopIteration:
+        return None
+
+
 def open_inventory_worksheet(raw_bytes: bytes):
     """Open workbook in read-only mode; prefer a sheet named Inventory."""
     wb = openpyxl.load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)

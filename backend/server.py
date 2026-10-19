@@ -3690,19 +3690,11 @@ async def upload_product_center_v2(
             "idempotent": True,
         }
 
-    # Validate workbook headers via read_only open (no full in-memory sheet graph).
-    try:
-        probe_wb, _probe_ws = product_upload_stream.open_inventory_worksheet(raw_bytes)
-        probe_wb.close()
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Unable to read this Excel file. Please save it as .xlsx (Excel Workbook) and upload again.",
-        )
-
     upload_no = await generate_upload_no("product", context["brand_code"])
 
-    # HARD REQUIRE: original Excel must land in private REAL S3 before upload succeeds.
+    # HARD REQUIRE: original Excel lands on private REAL S3 BEFORE any parse.
+    # Key includes upload_no so archives are never overwritten; s3_storage also
+    # refuses different-sha overwrites (allow_replace=False).
     storage = s3_storage.get_storage()
     if not storage.is_s3():
         s3_storage.ensure_s3()
@@ -3802,8 +3794,42 @@ async def upload_product_center_v2(
             detail="Upload failed: Excel was not stored on private REAL S3 (missing storage_key).",
         )
 
-    # Replace any other Waiting same-day upload for this part/branch/date scope.
-    await _supersede_waiting_product_uploads_v2(context, date_key, keep_upload_id=upload_id)
+    # Persist S3 pointer on the processing row immediately (size + sha already set).
+    await db.uploads.update_one(
+        {"id": upload_id},
+        {"$set": {
+            "storage_provider": (stored_excel or {}).get("storage_provider"),
+            "storage_key": (stored_excel or {}).get("storage_key"),
+            "content_type": (stored_excel or {}).get("content_type"),
+            "sha256": (stored_excel or {}).get("sha256") or file_sha,
+            "file_size": file_size,
+            "archived_at": (stored_excel or {}).get("archived_at"),
+            "updated_at": _nmts_now().isoformat(),
+        }},
+    )
+
+    # Validate workbook only AFTER durable S3 store (off the event loop).
+    try:
+        def _probe_ok():
+            wb, _ws = product_upload_stream.open_inventory_worksheet(raw_bytes)
+            wb.close()
+            return True
+        await asyncio.to_thread(_probe_ok)
+    except Exception:
+        await db.uploads.update_one(
+            {"id": upload_id},
+            {"$set": {
+                "status": "Failed",
+                "publish_status": "Failed",
+                "processing_lock": False,
+                "error": "Excel unreadable after S3 store",
+                "updated_at": _nmts_now().isoformat(),
+            }},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to read this Excel file. Please save it as .xlsx (Excel Workbook) and upload again.",
+        )
 
     rows_processed = 0
     rows_imported = 0
@@ -3815,7 +3841,7 @@ async def upload_product_center_v2(
     seen_parts = set()
 
     try:
-        for batch, stats in product_upload_stream.stream_product_items(
+        stream_iter = product_upload_stream.stream_product_items(
             raw_bytes,
             upload_id=upload_id,
             upload_no=upload_no,
@@ -3826,7 +3852,13 @@ async def upload_product_center_v2(
             normalize_part_category=_normalize_part_category,
             stamp=testing_runtime.stamp_testing_origin,
             batch_size=product_upload_stream.UPLOAD_V2_BATCH_SIZE,
-        ):
+        )
+        while True:
+            # openpyxl CPU off the event loop so /auth/me stays responsive.
+            item = await asyncio.to_thread(product_upload_stream.next_stream_batch, stream_iter)
+            if item is None:
+                break
+            batch, stats = item
             rows_processed += int(stats.get("rows_processed") or 0)
             rejected.extend(stats.get("rejected") or [])
             unique_batch = []
@@ -3848,7 +3880,6 @@ async def upload_product_center_v2(
                     total_available_qty += qty
                     total_value += val
                     rows_imported += 1
-            # Free batch promptly between chunks.
             del batch, unique_batch
             await asyncio.sleep(0)
     except Exception as exc:
@@ -3878,6 +3909,12 @@ async def upload_product_center_v2(
                 f"({type(exc).__name__})"
             ),
         )
+
+    # Only after a successful parse: replace prior same-day Waiting drafts for this
+    # branch. Prior Excel objects on S3 are never deleted (unique upload_no keys;
+    # Failed row keeps its storage_key). Published uploads are not touched.
+    if rows_imported:
+        await _supersede_waiting_product_uploads_v2(context, date_key, keep_upload_id=upload_id)
 
     status_text = "Uploaded" if rows_imported else "Failed"
     upload_doc = {

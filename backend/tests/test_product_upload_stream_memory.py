@@ -87,6 +87,92 @@ def test_stream_batches_and_20mb_peak_rss_under_250mb():
     assert peak < 250 * 1024 * 1024, f"peak RSS {peak} exceeded 250 MB budget"
 
 
+def test_offloop_batch_pull_keeps_event_loop_under_1s():
+    """50MB-class stream: blocking on-loop vs to_thread; probes must stay < 1s after."""
+    import asyncio
+    import time
+
+    from product_upload_stream import next_stream_batch, stream_product_items
+
+    raw, nrows = build_synthetic_inventory_xlsx(min_bytes=20 * 1024 * 1024, start_rows=25000)
+    assert len(raw) >= 20 * 1024 * 1024
+
+    def _make_gen(suffix):
+        return stream_product_items(
+            raw,
+            upload_id=f"offloop-{suffix}",
+            upload_no=f"TS-OL-{suffix}",
+            now_iso="2026-10-19T00:00:00+05:30",
+            active_date_key="2026-10-19",
+            context={"branch": "Vanagaram"},
+            format_excel_date=lambda v: str(v or ""),
+            normalize_part_category=lambda v: v or "",
+            stamp=lambda d: d,
+            batch_size=UPLOAD_V2_BATCH_SIZE,
+        )
+
+    async def _blocking_style():
+        """Pre-fix pattern: pull batches on the event-loop thread."""
+        gen = _make_gen("block")
+        probe_ms = []
+
+        async def probes():
+            for _ in range(20):
+                t0 = time.perf_counter()
+                await asyncio.sleep(0)
+                probe_ms.append((time.perf_counter() - t0) * 1000)
+
+        async def consume():
+            imported = 0
+            while True:
+                item = next_stream_batch(gen)  # blocks loop
+                if item is None:
+                    break
+                batch, stats = item
+                imported += int(stats.get("rows_imported") or 0)
+                del batch
+                await asyncio.sleep(0)
+            return imported
+
+        imported, _ = await asyncio.gather(consume(), probes())
+        return imported, probe_ms
+
+    async def _offloop_style():
+        gen = _make_gen("off")
+        probe_ms = []
+
+        async def probes():
+            for _ in range(30):
+                t0 = time.perf_counter()
+                await asyncio.sleep(0)
+                probe_ms.append((time.perf_counter() - t0) * 1000)
+
+        async def consume():
+            imported = 0
+            while True:
+                item = await asyncio.to_thread(next_stream_batch, gen)
+                if item is None:
+                    break
+                batch, stats = item
+                imported += int(stats.get("rows_imported") or 0)
+                del batch
+                await asyncio.sleep(0)
+            return imported
+
+        imported, _ = await asyncio.gather(consume(), probes())
+        return imported, probe_ms
+
+    before_imported, before_ms = asyncio.run(_blocking_style())
+    after_imported, after_ms = asyncio.run(_offloop_style())
+    assert before_imported == nrows == after_imported
+    assert before_ms and after_ms
+    print(
+        f"AUTHME_PROXY before_max_ms={max(before_ms):.1f} after_max_ms={max(after_ms):.1f} "
+        f"file_mb={len(raw)/(1024*1024):.1f}"
+    )
+    assert max(after_ms) < 1000.0, f"event-loop blocked after fix: max {max(after_ms):.1f}ms"
+
+
 def test_idempotent_part_keys_stable_across_stream():
     raw, _ = build_synthetic_inventory_xlsx(min_bytes=8 * 1024, start_rows=50)
     seen = set()
