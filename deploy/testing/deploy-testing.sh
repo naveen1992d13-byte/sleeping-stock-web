@@ -24,6 +24,10 @@ Usage:
 
 Checks out the selected git object in /opt/nmts-testing, builds the testing
 frontend, writes deployment metadata, and restarts nmts-backend-testing only.
+
+NMTS_SKIP_FE_BUILD=1  backend-only deploy: no npm build, no rsync of the
+                      frontend, and the backend is never stopped for a build
+                      (only the final restart). The live frontend stays as is.
 EOF
 }
 
@@ -213,6 +217,20 @@ if ! grep -q '^ARCHIVE_PRUNE_ENABLED=false$' "$ROOT/backend/.env"; then
     printf 'ARCHIVE_PRUNE_ENABLED=false\n' >> "$ROOT/backend/.env"
   fi
 fi
+# Testing runs the Analytics-only nightly rollup (23:00 IST) because the full
+# archive scheduler stays off here. Production keeps the default (false).
+if ! grep -q '^ANALYTICS_ROLLUP_SCHEDULER_ENABLED=true$' "$ROOT/backend/.env"; then
+  if grep -q '^ANALYTICS_ROLLUP_SCHEDULER_ENABLED=' "$ROOT/backend/.env"; then
+    sed -i 's/^ANALYTICS_ROLLUP_SCHEDULER_ENABLED=.*/ANALYTICS_ROLLUP_SCHEDULER_ENABLED=true/' "$ROOT/backend/.env"
+  else
+    printf 'ANALYTICS_ROLLUP_SCHEDULER_ENABLED=true\n' >> "$ROOT/backend/.env"
+  fi
+fi
+
+SKIP_FE_BUILD=""
+if [[ "${NMTS_SKIP_FE_BUILD:-}" == "1" ]]; then
+  SKIP_FE_BUILD="1"
+fi
 
 DEPLOYED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 DEPLOYED_AT_IST="$(TZ=Asia/Kolkata date +'%Y-%m-%d %H:%M:%S IST')"
@@ -228,6 +246,7 @@ cat > "$DEPLOYMENT_JSON" <<EOF
   "deployed_at": "$DEPLOYED_AT",
   "deployed_at_ist": "$DEPLOYED_AT_IST",
   "backend_port": $TEST_PORT,
+  "frontend_build": "$([[ -n "$SKIP_FE_BUILD" ]] && echo skipped || echo built)",
   "service": "nmts-backend-testing"
 }
 EOF
@@ -244,33 +263,42 @@ if [[ -f "$ROOT/deploy/testing/nmts-backend-testing.service" ]]; then
   sudo systemctl daemon-reload
 fi
 
-# This instance has ~1Gi RAM; CRA OOMs if the testing backend is also resident.
-# Stopping :8001 here is the known 502 Connection-refused window. Nginx cannot
-# proxy to a stopped uvicorn. Restart + health wait below close that window.
-if systemctl is-active --quiet "$SERVICE"; then
-  echo "Stopping $SERVICE during frontend build to free RAM (expected brief Testing 502)..."
-  sudo systemctl stop "$SERVICE"
+if [[ -n "$SKIP_FE_BUILD" ]]; then
+  echo "NMTS_SKIP_FE_BUILD=1: backend-only deploy — no frontend build, no rsync, backend not stopped for a build."
+  # Only the metadata file is refreshed; the live frontend bundle is untouched.
+  if [[ -d "$FRONTEND_DEST" ]]; then
+    sudo cp -f "$DEPLOYMENT_JSON" "$FRONTEND_DEST/deployment.json"
+    sudo chown nginx:nginx "$FRONTEND_DEST/deployment.json"
+  fi
+else
+  # This instance has ~1Gi RAM; CRA OOMs if the testing backend is also resident.
+  # Stopping :8001 here is the known 502 Connection-refused window. Nginx cannot
+  # proxy to a stopped uvicorn. Restart + health wait below close that window.
+  if systemctl is-active --quiet "$SERVICE"; then
+    echo "Stopping $SERVICE during frontend build to free RAM (expected brief Testing 502)..."
+    sudo systemctl stop "$SERVICE"
+  fi
+
+  echo "Building testing frontend (API=https://testing.sleepingstock.in APP_ENV=testing)..."
+  cd "$ROOT/frontend"
+  REACT_APP_BACKEND_URL=https://testing.sleepingstock.in \
+    REACT_APP_APP_ENV=testing \
+    REACT_APP_TESTING_PR="${PR_NUMBER}" \
+    REACT_APP_TESTING_BRANCH="${RESOLVED_BRANCH}" \
+    REACT_APP_TESTING_COMMIT="${RESOLVED_SHORT}" \
+    REACT_APP_TESTING_DEPLOYED_AT="${DEPLOYED_AT_IST}" \
+    GENERATE_SOURCEMAP=false \
+    NODE_OPTIONS=--max-old-space-size=2048 \
+    npm run build
+
+  cp -f "$DEPLOYMENT_JSON" "$ROOT/frontend/build/deployment.json"
+
+  sudo mkdir -p "$FRONTEND_DEST"
+  sudo rsync -a --delete "$ROOT/frontend/build/" "$FRONTEND_DEST/"
+  sudo cp -f "$DEPLOYMENT_JSON" "$FRONTEND_DEST/deployment.json"
+  sudo cp -f "$ROOT/deploy/testing/robots.txt" "$FRONTEND_DEST/robots.txt"
+  sudo chown -R nginx:nginx "$FRONTEND_DEST"
 fi
-
-echo "Building testing frontend (API=https://testing.sleepingstock.in APP_ENV=testing)..."
-cd "$ROOT/frontend"
-REACT_APP_BACKEND_URL=https://testing.sleepingstock.in \
-  REACT_APP_APP_ENV=testing \
-  REACT_APP_TESTING_PR="${PR_NUMBER}" \
-  REACT_APP_TESTING_BRANCH="${RESOLVED_BRANCH}" \
-  REACT_APP_TESTING_COMMIT="${RESOLVED_SHORT}" \
-  REACT_APP_TESTING_DEPLOYED_AT="${DEPLOYED_AT_IST}" \
-  GENERATE_SOURCEMAP=false \
-  NODE_OPTIONS=--max-old-space-size=2048 \
-  npm run build
-
-cp -f "$DEPLOYMENT_JSON" "$ROOT/frontend/build/deployment.json"
-
-sudo mkdir -p "$FRONTEND_DEST"
-sudo rsync -a --delete "$ROOT/frontend/build/" "$FRONTEND_DEST/"
-sudo cp -f "$DEPLOYMENT_JSON" "$FRONTEND_DEST/deployment.json"
-sudo cp -f "$ROOT/deploy/testing/robots.txt" "$FRONTEND_DEST/robots.txt"
-sudo chown -R nginx:nginx "$FRONTEND_DEST"
 
 echo "Restarting $SERVICE only..."
 sudo systemctl restart "$SERVICE"

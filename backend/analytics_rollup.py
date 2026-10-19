@@ -1,20 +1,26 @@
 """Finalized Analytics daily rollup — 11:00 PM IST, before archive/prune.
 
-Historical dates prefer that day's verified product-history archives (S3).
-Live Mongo products are used only when no date-matched archive exists
-(e.g. the business day being finalized at 11:00 PM before archive runs).
+One IST date is finalized from that day's Published Product Hub rows, one
+brand/dealer/branch at a time (bounded memory, throttled for the shared
+DocumentDB). Writes:
+  - analytics_daily_aggs: one row per date/brand/dealer/branch/part type with
+    both aging bases x 5 buckets and missing-aging totals (screen source)
+  - analytics_stock_daily_snapshots: per-part rows (Auto Perpetual fallback)
+
+Aging is measured as of the snapshot date. Request paths never call this
+module's builders and never read S3; the S3 archive fallback lives only in
+scripts/analytics_snapshot.py.
 
 Screen APIs must read pre-aggregated daily metrics — never the 100k+ part rows.
 """
 from __future__ import annotations
 
-import gzip
-import json
+import asyncio
 import logging
 import re
-from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+import uuid
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("nmts.analytics_rollup")
@@ -27,6 +33,17 @@ DAILY_AGG_COLLECTION = "analytics_daily_aggs"
 STATUS_SUCCESS = "success"
 STATUS_FAILED = "failed"
 STATUS_RUNNING = "running"
+STATUS_NO_SOURCE = "no_source"
+STATUS_LOCKED = "locked"
+
+# v2: aging from source dates as of the snapshot date, missing-aging totals,
+# build_id stale-row cleanup. v1 rows are shown as "rebuild needed".
+ROLLUP_VERSION = 2
+
+BRANCH_PAUSE_SECONDS = 0.25
+DATE_PAUSE_SECONDS = 2.0
+WRITE_BATCH = 500
+RUNNING_LEASE_SECONDS = 90 * 60
 
 AGING_BUCKETS = [
     "0–90 Days",
@@ -35,6 +52,37 @@ AGING_BUCKETS = [
     "271–361 Days",
     ">361 Days",
 ]
+AGING_BASES = ("purchase", "sales")
+
+# Upload v1 stores *_ageing_days (British spelling); v2 stores only the dates.
+_STORED_DAYS_FIELDS = {
+    "purchase": ("purchase_aging_days", "purchase_ageing_days"),
+    "sales": ("sales_aging_days", "sales_ageing_days"),
+}
+_SOURCE_DATE_FIELDS = {
+    "purchase": ("last_receipt_date", "last_purchase_date", "receipt_date"),
+    "sales": ("last_sales_date", "last_sale_date", "sales_date"),
+}
+_DATE_FORMATS = ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d.%m.%Y", "%d-%b-%Y", "%d %b %Y")
+_EXCEL_EPOCH = date(1899, 12, 30)
+
+SOURCE_PROJECTION = {
+    "_id": 0,
+    "brand_id": 1, "brand_code": 1, "brand_name": 1,
+    "dealer_id": 1, "dealer_code": 1, "dealer_name": 1,
+    "branch_id": 1, "branch": 1, "part_number": 1, "part_name": 1, "item_name": 1,
+    "part_category": 1, "category": 1,
+    "quantity": 1, "available_qty_number": 1,
+    "mav": 1, "mav_value": 1, "unit_value_number": 1,
+    "total_value": 1, "total_value_number": 1,
+    "purchase_aging_days": 1, "sales_aging_days": 1,
+    "purchase_ageing_days": 1, "sales_ageing_days": 1,
+    "last_receipt_date": 1, "last_sales_date": 1,
+    "upload_no": 1, "published_at": 1, "updated_at": 1,
+}
+
+BranchKey = Tuple[Any, Any, Any]  # raw (brand_name, dealer_name, branch) values
+RowsForBranch = Callable[[BranchKey], AsyncIterator[dict]]
 
 try:
     from . import part_category as pc
@@ -105,6 +153,65 @@ def _analytics_bucket(days) -> str:
     return AGING_BUCKETS[4]
 
 
+def parse_source_date(value: Any) -> Optional[date]:
+    """Parse an upload date cell (dd-mm-YYYY from uploads, ISO, Excel serial)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text or text == "-":
+        return None
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    if len(text) >= 10:
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    try:
+        serial = float(text)
+    except ValueError:
+        return None
+    if 20000 <= serial <= 80000:  # Excel serial day number (1954..2119)
+        return _EXCEL_EPOCH + timedelta(days=int(serial))
+    return None
+
+
+def _stored_days(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+    if not match:
+        return None
+    try:
+        return max(0, int(float(match.group(0))))
+    except (TypeError, ValueError):
+        return None
+
+
+def aging_days_as_of(row: Dict[str, Any], basis: str, snapshot_date: date) -> Optional[int]:
+    """Aging days on the snapshot date; None when the row has no usable aging."""
+    for field in _SOURCE_DATE_FIELDS[basis]:
+        parsed = parse_source_date(row.get(field))
+        if parsed:
+            return max(0, (snapshot_date - parsed).days)
+    for field in _STORED_DAYS_FIELDS[basis]:
+        days = _stored_days(row.get(field))
+        if days is not None:
+            return days
+    return None
+
+
+def _snapshot_date(date_iso: str) -> date:
+    return datetime.strptime(date_key_to_iso(iso_to_date_key(date_iso)), "%Y-%m-%d").date()
+
+
 def upload_no_date_key(upload_no: str) -> str:
     """Extract YYMMDD digits from upload numbers like PUHY260919004 / TS-PUHY261016001."""
     digits = re.sub(r"\D", "", str(upload_no or ""))
@@ -154,16 +261,37 @@ def _is_plausible_iso(date_iso: Optional[str]) -> bool:
     return True
 
 
-async def last_successful_rollup_date(db, *, on_or_before: Optional[str] = None) -> Optional[str]:
+def rollup_version_of(status_row: Optional[dict]) -> int:
+    try:
+        return int((status_row or {}).get("rollup_version") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def is_current_success(status_row: Optional[dict]) -> bool:
+    return bool(status_row) and status_row.get("status") == STATUS_SUCCESS and rollup_version_of(status_row) >= ROLLUP_VERSION
+
+
+async def last_successful_rollup_date(
+    db,
+    *,
+    on_or_before: Optional[str] = None,
+    min_version: Optional[int] = None,
+) -> Optional[str]:
     q: Dict[str, Any] = {"status": STATUS_SUCCESS, "rollup_date_ist": {"$gte": "2020-01-01"}}
     if on_or_before:
         q["rollup_date_ist"] = {
             "$gte": "2020-01-01",
             "$lte": date_key_to_iso(iso_to_date_key(on_or_before)),
         }
+    if min_version:
+        q["rollup_version"] = {"$gte": int(min_version)}
     row = await db[STATUS_COLLECTION].find_one(q, {"_id": 0, "rollup_date_ist": 1}, sort=[("rollup_date_ist", -1)])
     if row and _is_plausible_iso(row.get("rollup_date_ist")):
         return str(row["rollup_date_ist"])
+    if min_version:
+        # Legacy collections carry no version; never treat them as current.
+        return None
     # Prefer daily aggs / snapshots only when status rows are missing.
     for coll, field in ((DAILY_AGG_COLLECTION, "rollup_date_ist"), (SNAPSHOT_COLLECTION, "snapshot_date_ist")):
         snap_q: Dict[str, Any] = {field: {"$gte": "2020-01-01"}}
@@ -207,235 +335,120 @@ def _row_qty_unit_value(r: dict) -> Tuple[float, float, float]:
     return qty, unit, value
 
 
-async def _load_rows_from_archives(db, date_iso: str) -> Tuple[List[dict], List[str]]:
-    """Load that IST date's verified product-history archives (non-cancelled, date-matched)."""
-    try:
-        from s3_storage import get_storage
-    except ImportError:
-        from .s3_storage import get_storage  # type: ignore
-
-    storage = get_storage()
-    if not storage.is_s3():
-        return [], []
-
-    mans = await db.archive_manifests.find(
-        {
-            "module": "product-history",
-            "archive_date": date_iso,
-            "status": {"$in": ["VERIFIED", "PRUNED"]},
-        },
-        {"_id": 0},
-    ).to_list(5000)
-    chosen = []
-    for m in mans:
-        key = str(m.get("storage_key") or "")
-        if not key or "/cancelled/" in key:
-            continue
-        # Prefer /current/ objects; allow flat keys that still encode the date.
-        if "/current/" not in key and f"/{date_iso}/" not in key:
-            continue
-        fname = key.rsplit("/", 1)[-1]
-        # Require upload date inside filename to match the archive date when present.
-        if re.search(r"\d{6}", fname) and not upload_matches_date(fname, date_iso):
-            # Still allow when filename has no upload-style token beyond the date path.
-            if not any(tok.startswith("PU") or tok.startswith("TS-PU") for tok in fname.replace(".", "_").split("_")):
-                pass
-            else:
-                continue
-        chosen.append(m)
-
-    if not chosen:
-        return [], []
-
-    rows: List[dict] = []
-    used_keys: List[str] = []
-    for m in chosen:
-        key = m["storage_key"]
-        try:
-            data, _ctype = storage.download_bytes(key)
-        except FileNotFoundError:
-            logger.warning("analytics archive missing in storage date=%s key=%s", date_iso, key)
-            continue
-        except Exception as exc:
-            logger.warning("analytics archive download failed date=%s key=%s err=%s", date_iso, key, exc)
-            continue
-        used_keys.append(key)
-        try:
-            text = gzip.decompress(data).decode()
-        except Exception as exc:
-            logger.warning("analytics archive decompress failed date=%s key=%s err=%s", date_iso, key, exc)
-            continue
-        for line in text.splitlines():
-            if not line.strip():
-                continue
-            r = json.loads(line)
-            # Drop rows whose upload_no belongs to another calendar day.
-            uno = _text(r.get("upload_no"))
-            if uno and not upload_matches_date(uno, date_iso):
-                continue
-            rows.append(r)
-    return rows, used_keys
+def _row_category(r: dict) -> str:
+    return pc.normalize_part_category(str(r.get("category") or r.get("part_category") or "")) or "Others"
 
 
-async def _load_latest_published_rows(db, date_iso: str) -> List[dict]:
-    date_key = iso_to_date_key(date_iso)
-    date_iso = date_key_to_iso(date_key)
-    pipeline = [
-        {"$match": {"publish_status": "Published", "active_date_key": {"$in": [date_key, date_iso]}}},
-        {
-            "$project": {
-                "brand_id": 1, "brand_code": 1, "brand_name": 1,
-                "dealer_id": 1, "dealer_code": 1, "dealer_name": 1,
-                "branch_id": 1, "branch": 1, "part_number": 1, "part_name": 1, "item_name": 1,
-                "part_category": 1, "category": 1,
-                "quantity": 1, "available_qty_number": 1,
-                "mav": 1, "mav_value": 1, "unit_value_number": 1,
-                "total_value": 1, "total_value_number": 1,
-                "purchase_aging_days": 1, "sales_aging_days": 1,
-                "last_receipt_date": 1, "last_sales_date": 1,
-                "upload_no": 1, "published_at": 1, "updated_at": 1,
-            }
-        },
-        {"$sort": {"published_at": -1, "updated_at": -1}},
-        {
-            "$group": {
-                "_id": {
-                    "brand": {"$ifNull": ["$brand_name", ""]},
-                    "dealer": {"$ifNull": ["$dealer_name", ""]},
-                    "branch": {"$ifNull": ["$branch", ""]},
-                    "part": {"$ifNull": ["$part_number", ""]},
-                },
-                "doc": {"$first": "$$ROOT"},
-            }
-        },
-        {"$replaceRoot": {"newRoot": "$doc"}},
-    ]
-    try:
-        return await db.products.aggregate(pipeline, allowDiskUse=True).to_list(500000)
-    except Exception as exc:
-        logger.warning("rollup aggregate failed for %s: %s", date_iso, exc)
-        rows = await db.products.find(
-            {"publish_status": "Published", "active_date_key": {"$in": [date_key, date_iso]}},
-            {"_id": 0},
-        ).sort([("published_at", -1), ("updated_at", -1)]).to_list(500000)
-        latest: Dict[Tuple[str, str, str, str], dict] = {}
-        for r in rows:
-            pk = (
-                _text(r.get("brand_name")).casefold(),
-                _text(r.get("dealer_name")).casefold(),
-                _text(r.get("branch")).casefold(),
-                _text(r.get("part_number")).casefold(),
-            )
-            if pk not in latest:
-                latest[pk] = r
-        return list(latest.values())
-
-
-async def load_source_rows_for_date(db, date_iso: str) -> Tuple[List[dict], str, List[str]]:
-    """Return (rows, source_kind, archive_keys).
-
-    source_kind is 'archive' when date-matched verified archives were used,
-    otherwise 'live_products' for that active_date_key only.
-    """
-    iso = date_key_to_iso(iso_to_date_key(date_iso))
-    arch_rows, keys = await _load_rows_from_archives(db, iso)
-    if arch_rows:
-        # Deduplicate archive rows newest-first when duplicates exist.
-        arch_rows.sort(key=lambda r: str(r.get("published_at") or r.get("updated_at") or ""), reverse=True)
-        latest: Dict[Tuple[str, str, str, str], dict] = {}
-        for r in arch_rows:
-            pk = (
-                _text(r.get("brand_name")).casefold(),
-                _text(r.get("dealer_name")).casefold(),
-                _text(r.get("branch")).casefold(),
-                _text(r.get("part_number")).casefold(),
-            )
-            if pk not in latest:
-                latest[pk] = r
-        return list(latest.values()), "archive", keys
-    live = await _load_latest_published_rows(db, iso)
-    return live, "live_products", []
+def snapshot_doc_from_row(
+    date_iso: str,
+    snapshot_date: date,
+    r: Dict[str, Any],
+    *,
+    now: str,
+    build_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    qty, unit, value = _row_qty_unit_value(r)
+    doc = {
+        "snapshot_date_ist": date_iso,
+        "brand_id": _text(r.get("brand_id") or r.get("brand_code")),
+        "dealer_id": _text(r.get("dealer_id") or r.get("dealer_code") or r.get("dealer_name")),
+        "branch_id": _text(r.get("branch_id") or r.get("branch") or r.get("branch_name")),
+        "brand_name": r.get("brand_name"),
+        "dealer_name": r.get("dealer_name"),
+        "branch_name": r.get("branch") if "branch" in r else r.get("branch_name"),
+        "part_number": _text(r.get("part_number")),
+        "part_name": r.get("item_name") or r.get("part_name"),
+        "category": r.get("part_category") or r.get("category") or "",
+        "available_qty": qty,
+        "unit_value": unit,
+        "total_value": value,
+        # Computed as of the snapshot date (None = genuinely missing aging).
+        "purchase_aging_days": aging_days_as_of(r, "purchase", snapshot_date),
+        "sales_aging_days": aging_days_as_of(r, "sales", snapshot_date),
+        "last_receipt_date": r.get("last_receipt_date"),
+        "last_sales_date": r.get("last_sales_date"),
+        "upload_no": r.get("upload_no"),
+        "updated_at": now,
+        "finalized": True,
+        "rollup_version": ROLLUP_VERSION,
+    }
+    if build_id:
+        doc["build_id"] = build_id
+    return doc
 
 
 def build_snapshot_docs(date_iso: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     date_iso = date_key_to_iso(iso_to_date_key(date_iso))
+    snap_date = _snapshot_date(date_iso)
     now = _utc_now_iso()
     by_key: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
     for r in rows:
-        qty, unit, value = _row_qty_unit_value(r)
-        brand_id = _text(r.get("brand_id") or r.get("brand_code"))
-        dealer_id = _text(r.get("dealer_id") or r.get("dealer_code") or r.get("dealer_name"))
-        branch_id = _text(r.get("branch_id") or r.get("branch"))
-        part_number = _text(r.get("part_number"))
-        key = (brand_id, dealer_id, branch_id, part_number.casefold())
-        by_key[key] = {
-            "snapshot_date_ist": date_iso,
-            "brand_id": brand_id,
-            "dealer_id": dealer_id,
-            "branch_id": branch_id,
-            "brand_name": r.get("brand_name"),
-            "dealer_name": r.get("dealer_name"),
-            "branch_name": r.get("branch"),
-            "part_number": part_number,
-            "part_name": r.get("item_name") or r.get("part_name"),
-            "category": r.get("part_category") or r.get("category") or "",
-            "available_qty": qty,
-            "unit_value": unit,
-            "total_value": value,
-            "purchase_aging_days": r.get("purchase_aging_days"),
-            "sales_aging_days": r.get("sales_aging_days"),
-            "last_receipt_date": r.get("last_receipt_date"),
-            "last_sales_date": r.get("last_sales_date"),
-            "upload_no": r.get("upload_no"),
-            "updated_at": now,
-            "finalized": True,
-        }
+        doc = snapshot_doc_from_row(date_iso, snap_date, r, now=now)
+        key = (doc["brand_id"], doc["dealer_id"], doc["branch_id"], doc["part_number"].casefold())
+        by_key[key] = doc
     return list(by_key.values())
+
+
+def _empty_slot() -> Dict[str, float]:
+    return {"qty": 0.0, "value": 0.0, "items": 0.0}
+
+
+def new_agg_group(date_iso: str, brand: str, dealer: str, branch: str, category: str, *, now: str) -> Dict[str, Any]:
+    return {
+        "rollup_date_ist": date_iso,
+        "brand_name": brand,
+        "dealer_name": dealer,
+        "branch_name": branch,
+        "category": category,
+        "stock_qty": 0.0,
+        "stock_value": 0.0,
+        "line_count": 0,
+        "aging_purchase": {b: _empty_slot() for b in AGING_BUCKETS},
+        "aging_sales": {b: _empty_slot() for b in AGING_BUCKETS},
+        # Missing aging is counted under >361 Days AND reported here.
+        "missing_aging_purchase": _empty_slot(),
+        "missing_aging_sales": _empty_slot(),
+        "updated_at": now,
+        "finalized": True,
+        "rollup_version": ROLLUP_VERSION,
+    }
+
+
+def add_part_to_group(g: Dict[str, Any], qty: float, value: float, purchase_days, sales_days) -> None:
+    g["stock_qty"] += qty
+    g["stock_value"] += value
+    g["line_count"] += 1
+    for basis, days in (("purchase", purchase_days), ("sales", sales_days)):
+        slot = g[f"aging_{basis}"][_analytics_bucket(days)]
+        slot["qty"] += qty
+        slot["value"] += value
+        slot["items"] += 1.0
+        if days is None:
+            miss = g[f"missing_aging_{basis}"]
+            miss["qty"] += qty
+            miss["value"] += value
+            miss["items"] += 1.0
 
 
 def build_daily_agg_docs(date_iso: str, snapshot_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Pre-aggregate per brand/dealer/branch/category for fast screen reads."""
     date_iso = date_key_to_iso(iso_to_date_key(date_iso))
+    snap_date = _snapshot_date(date_iso)
     now = _utc_now_iso()
     groups: Dict[Tuple[str, str, str, str], dict] = {}
     for r in snapshot_docs:
-        cat = pc.normalize_part_category(str(r.get("category") or r.get("part_category") or "")) or "Others"
-        key = (
-            _text(r.get("brand_name")),
-            _text(r.get("dealer_name")),
-            _text(r.get("branch_name")),
-            cat,
-        )
+        cat = _row_category(r)
+        key = (_text(r.get("brand_name")), _text(r.get("dealer_name")), _text(r.get("branch_name")), cat)
         g = groups.get(key)
         if not g:
-            g = {
-                "rollup_date_ist": date_iso,
-                "brand_name": key[0],
-                "dealer_name": key[1],
-                "branch_name": key[2],
-                "category": cat,
-                "stock_qty": 0.0,
-                "stock_value": 0.0,
-                "line_count": 0,
-                "aging_purchase": {b: {"qty": 0.0, "value": 0.0, "items": 0.0} for b in AGING_BUCKETS},
-                "aging_sales": {b: {"qty": 0.0, "value": 0.0, "items": 0.0} for b in AGING_BUCKETS},
-                "updated_at": now,
-                "finalized": True,
-            }
-            groups[key] = g
-        qty = _num(r.get("available_qty"))
-        value = _num(r.get("total_value"))
-        g["stock_qty"] += qty
-        g["stock_value"] += value
-        g["line_count"] += 1
-        pb = _analytics_bucket(r.get("purchase_aging_days"))
-        sb = _analytics_bucket(r.get("sales_aging_days"))
-        g["aging_purchase"][pb]["qty"] += qty
-        g["aging_purchase"][pb]["value"] += value
-        g["aging_purchase"][pb]["items"] += 1.0
-        g["aging_sales"][sb]["qty"] += qty
-        g["aging_sales"][sb]["value"] += value
-        g["aging_sales"][sb]["items"] += 1.0
+            g = groups[key] = new_agg_group(date_iso, *key, now=now)
+        add_part_to_group(
+            g,
+            _num(r.get("available_qty")),
+            _num(r.get("total_value")),
+            aging_days_as_of(r, "purchase", snap_date),
+            aging_days_as_of(r, "sales", snap_date),
+        )
     return list(groups.values())
 
 
@@ -445,43 +458,208 @@ def _totals(rows: List[Dict[str, Any]], *, qty_key: str, value_key: str) -> Tupl
     return qty, value, len(rows)
 
 
+def _close(a: float, b: float) -> bool:
+    return abs(a - b) <= max(0.01, abs(a) * 1e-9)
+
+
+async def _aiter_rows(cursor) -> AsyncIterator[dict]:
+    """Iterate a Motor/overlay cursor without materialising it (fakes: to_list)."""
+    if hasattr(cursor, "__aiter__"):
+        async for row in cursor:
+            yield row
+        return
+    for row in await cursor.to_list(None):
+        yield row
+
+
+async def _count(coll, query: dict) -> int:
+    if hasattr(coll, "count_documents"):
+        return int(await coll.count_documents(query))
+    return len(await coll.find(query, {"_id": 0, "build_id": 1}).to_list(None))
+
+
+def _date_match(iso: str) -> dict:
+    return {"publish_status": "Published", "active_date_key": {"$in": [iso_to_date_key(iso), iso]}}
+
+
+async def list_source_branches(db, date_iso: str) -> List[BranchKey]:
+    """Distinct (brand, dealer, branch) with Published rows on that date (DB-side group)."""
+    iso = date_key_to_iso(iso_to_date_key(date_iso))
+    match = _date_match(iso)
+    seen: Dict[Tuple[str, str, str], BranchKey] = {}
+    try:
+        pipeline = [
+            {"$match": match},
+            {"$group": {"_id": {"brand": "$brand_name", "dealer": "$dealer_name", "branch": "$branch"}, "n": {"$sum": 1}}},
+        ]
+        rows = await db.products.aggregate(pipeline, allowDiskUse=True).to_list(20000)
+        for r in rows:
+            ident = r.get("_id") or {}
+            raw = (ident.get("brand"), ident.get("dealer"), ident.get("branch"))
+            seen.setdefault(tuple(_text(x) for x in raw), raw)
+    except Exception as exc:
+        logger.warning("rollup branch group failed for %s, streaming fallback: %s", iso, exc)
+        cursor = db.products.find(match, {"_id": 0, "brand_name": 1, "dealer_name": 1, "branch": 1})
+        async for r in _aiter_rows(cursor):
+            raw = (r.get("brand_name"), r.get("dealer_name"), r.get("branch"))
+            seen.setdefault(tuple(_text(x) for x in raw), raw)
+    return [seen[k] for k in sorted(seen)]
+
+
+def db_rows_for_branch(db, date_iso: str) -> RowsForBranch:
+    """Newest-first Published rows of one branch for that date (streamed)."""
+    iso = date_key_to_iso(iso_to_date_key(date_iso))
+
+    async def rows(branch_key: BranchKey) -> AsyncIterator[dict]:
+        brand, dealer, branch = branch_key
+        q = {**_date_match(iso), "brand_name": brand, "dealer_name": dealer, "branch": branch}
+        cursor = db.products.find(q, SOURCE_PROJECTION).sort([("published_at", -1), ("updated_at", -1)])
+        if hasattr(cursor, "batch_size"):
+            cursor = cursor.batch_size(WRITE_BATCH)
+        async for r in _aiter_rows(cursor):
+            yield r
+
+    return rows
+
+
+async def _write_snapshot_batch(db, docs: List[dict]) -> int:
+    if not docs:
+        return 0
+    try:
+        await db[SNAPSHOT_COLLECTION].insert_many(docs, ordered=False)
+        return len(docs)
+    except Exception as exc:
+        # Duplicate part keys under the unique index: keep the inserted rest.
+        details = getattr(exc, "details", None) or {}
+        errors = details.get("writeErrors") or []
+        if errors and all(int(e.get("code") or 0) == 11000 for e in errors):
+            logger.warning("rollup snapshot batch skipped %s duplicate part rows", len(errors))
+            return len(docs) - len(errors)
+        raise
+
+
+def _lease_active(status_row: dict) -> bool:
+    started = _text(status_row.get("started_at"))
+    if not started:
+        return False
+    try:
+        ts = datetime.fromisoformat(started.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - ts).total_seconds() < RUNNING_LEASE_SECONDS
+
+
 async def finalize_analytics_rollup_for_date(
     db,
     date_iso: str,
     *,
     force: bool = False,
+    branches: Optional[List[BranchKey]] = None,
+    rows_for_branch: Optional[RowsForBranch] = None,
+    source_kind: str = "products_db",
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    branch_pause: float = BRANCH_PAUSE_SECONDS,
+    progress: Optional[Callable[[str], Any]] = None,
 ) -> dict:
-    """Capture one IST date into durable snapshots + pre-aggregated daily metrics."""
+    """Capture one IST date into durable snapshots + pre-aggregated daily metrics.
+
+    Idempotent: a v2 success is skipped unless force. Rows are rewritten per
+    branch under a new build_id; rows of that date with any other build_id are
+    removed only after every branch was written.
+    """
     iso = date_key_to_iso(iso_to_date_key(date_iso))
     if not _is_plausible_iso(iso):
         return {"status": STATUS_FAILED, "rollup_date_ist": date_iso, "error": "invalid date"}
 
     existing = await get_rollup_status(db, iso)
-    if existing and existing.get("status") == STATUS_SUCCESS and not force:
+    if is_current_success(existing) and not force:
         return {**existing, "status": STATUS_SUCCESS, "skipped": True, "reason": "already_finalized"}
+    if existing and existing.get("status") == STATUS_RUNNING and _lease_active(existing) and not force:
+        return {"status": STATUS_LOCKED, "rollup_date_ist": iso, "reason": "another run holds the lease"}
 
-    await _set_status(db, iso, {"status": STATUS_RUNNING, "error": None, "started_at": _utc_now_iso()})
+    say = progress or (lambda msg: logger.info(msg))
+    if branches is None:
+        branches = await list_source_branches(db, iso)
+    if rows_for_branch is None:
+        rows_for_branch = db_rows_for_branch(db, iso)
+
+    if not branches:
+        # No source rows (no uploads, or already pruned): never overwrite an
+        # existing success and never write an empty "0" day.
+        say(f"rollup {iso}: no source rows ({source_kind}); existing data kept")
+        if existing and existing.get("status") == STATUS_SUCCESS:
+            return {**existing, "status": STATUS_NO_SOURCE, "kept_existing": True, "rollup_date_ist": iso}
+        return await _set_status(db, iso, {
+            "status": STATUS_NO_SOURCE,
+            "error": None,
+            "source_kind": source_kind,
+            "finalized_at": None,
+            "rollup_version": ROLLUP_VERSION,
+        })
+
+    build_id = uuid.uuid4().hex
+    await _set_status(db, iso, {
+        "status": STATUS_RUNNING,
+        "error": None,
+        "started_at": _utc_now_iso(),
+        "build_id": build_id,
+    })
     try:
-        source_rows, source_kind, archive_keys = await load_source_rows_for_date(db, iso)
-        docs = build_snapshot_docs(iso, source_rows)
-        aggs = build_daily_agg_docs(iso, docs)
-        snap_qty, snap_value, snap_n = _totals(docs, qty_key="available_qty", value_key="total_value")
-        agg_qty = sum(_num(a.get("stock_qty")) for a in aggs)
-        agg_value = sum(_num(a.get("stock_value")) for a in aggs)
-        agg_lines = sum(int(a.get("line_count") or 0) for a in aggs)
+        snap_date = _snapshot_date(iso)
+        now = _utc_now_iso()
+        part_qty = part_value = 0.0
+        part_n = written_n = agg_n = 0
+        for idx, branch_key in enumerate(branches, start=1):
+            brand, dealer, branch = branch_key
+            latest: Dict[str, dict] = {}
+            async for r in rows_for_branch(branch_key):
+                part = _text(r.get("part_number"))
+                if part and part.casefold() not in latest:
+                    latest[part.casefold()] = r  # newest-first stream: first wins
 
-        await db[SNAPSHOT_COLLECTION].delete_many({"snapshot_date_ist": iso})
-        await db[DAILY_AGG_COLLECTION].delete_many({"rollup_date_ist": iso})
-        if docs:
-            for i in range(0, len(docs), 1000):
-                await db[SNAPSHOT_COLLECTION].insert_many(docs[i : i + 1000], ordered=False)
-        if aggs:
-            await db[DAILY_AGG_COLLECTION].insert_many(aggs, ordered=False)
+            groups: Dict[str, dict] = {}
+            await db[SNAPSHOT_COLLECTION].delete_many(
+                {"snapshot_date_ist": iso, "brand_name": brand, "dealer_name": dealer, "branch_name": branch}
+            )
+            buf: List[dict] = []
+            for r in latest.values():
+                doc = snapshot_doc_from_row(iso, snap_date, r, now=now, build_id=build_id)
+                cat = _row_category(doc)
+                g = groups.get(cat)
+                if g is None:
+                    g = groups[cat] = new_agg_group(iso, _text(brand), _text(dealer), _text(branch), cat, now=now)
+                    g["build_id"] = build_id
+                add_part_to_group(g, doc["available_qty"], doc["total_value"],
+                                  doc["purchase_aging_days"], doc["sales_aging_days"])
+                part_qty += doc["available_qty"]
+                part_value += doc["total_value"]
+                part_n += 1
+                buf.append(doc)
+                if len(buf) >= WRITE_BATCH:
+                    written_n += await _write_snapshot_batch(db, buf)
+                    buf = []
+            written_n += await _write_snapshot_batch(db, buf)
+            for g in groups.values():
+                await db[DAILY_AGG_COLLECTION].update_one(
+                    {
+                        "rollup_date_ist": iso,
+                        "brand_name": g["brand_name"],
+                        "dealer_name": g["dealer_name"],
+                        "branch_name": g["branch_name"],
+                        "category": g["category"],
+                    },
+                    {"$set": g},
+                    upsert=True,
+                )
+            agg_n += len(groups)
+            say(f"rollup {iso}: branch {idx}/{len(branches)} {_text(brand)}/{_text(dealer)}/{_text(branch)} parts={len(latest)}")
+            latest.clear()
+            await sleep(branch_pause)
 
-        stored = await db[SNAPSHOT_COLLECTION].find(
-            {"snapshot_date_ist": iso}, {"_id": 0, "available_qty": 1, "total_value": 1}
-        ).to_list(500000)
-        store_qty, store_value, store_n = _totals(stored, qty_key="available_qty", value_key="total_value")
+        stale_snap = await db[SNAPSHOT_COLLECTION].delete_many({"snapshot_date_ist": iso, "build_id": {"$ne": build_id}})
+        stale_agg = await db[DAILY_AGG_COLLECTION].delete_many({"rollup_date_ist": iso, "build_id": {"$ne": build_id}})
+
+        store_n = await _count(db[SNAPSHOT_COLLECTION], {"snapshot_date_ist": iso, "build_id": build_id})
         stored_aggs = await db[DAILY_AGG_COLLECTION].find(
             {"rollup_date_ist": iso}, {"_id": 0, "stock_qty": 1, "stock_value": 1, "line_count": 1}
         ).to_list(50000)
@@ -490,20 +668,18 @@ async def finalize_analytics_rollup_for_date(
         store_agg_lines = sum(int(a.get("line_count") or 0) for a in stored_aggs)
 
         reconciled = (
-            abs(snap_qty - store_qty) <= max(0.01, abs(snap_qty) * 1e-9)
-            and abs(snap_value - store_value) <= max(0.01, abs(snap_value) * 1e-9)
-            and snap_n == store_n
-            and abs(agg_qty - store_agg_qty) <= max(0.01, abs(agg_qty) * 1e-9)
-            and abs(agg_value - store_agg_value) <= max(0.01, abs(agg_value) * 1e-9)
-            and agg_lines == store_agg_lines == store_n
+            store_n == written_n == part_n
+            and _close(part_qty, store_agg_qty)
+            and _close(part_value, store_agg_value)
+            and store_agg_lines == part_n
+            and len(stored_aggs) == agg_n
         )
         if not reconciled:
             raise RuntimeError(
                 f"rollup reconciliation failed for {iso}: "
-                f"snap(n={snap_n}, qty={snap_qty}, value={snap_value}) "
-                f"stored(n={store_n}, qty={store_qty}, value={store_value}) "
-                f"agg(n={agg_lines}, qty={agg_qty}, value={agg_value}) "
-                f"stored_agg(n={store_agg_lines}, qty={store_agg_qty}, value={store_agg_value})"
+                f"parts(n={part_n}, written={written_n}, stored={store_n}, qty={part_qty}, value={part_value}) "
+                f"aggs(n={agg_n}, stored={len(stored_aggs)}, lines={store_agg_lines}, "
+                f"qty={store_agg_qty}, value={store_agg_value})"
             )
 
         result = await _set_status(
@@ -512,29 +688,27 @@ async def finalize_analytics_rollup_for_date(
             {
                 "status": STATUS_SUCCESS,
                 "error": None,
+                "rollup_version": ROLLUP_VERSION,
+                "build_id": build_id,
                 "source_kind": source_kind,
-                "archive_keys": archive_keys[:50],
-                "archive_key_count": len(archive_keys),
-                "source_record_count": snap_n,
+                "branch_count": len(branches),
+                "source_record_count": part_n,
                 "snapshot_record_count": store_n,
                 "daily_agg_record_count": len(stored_aggs),
-                "source_total_qty": snap_qty,
-                "source_total_value": snap_value,
-                "snapshot_total_qty": store_qty,
-                "snapshot_total_value": store_value,
+                "source_total_qty": part_qty,
+                "source_total_value": part_value,
+                "snapshot_total_qty": part_qty,
+                "snapshot_total_value": part_value,
                 "daily_agg_total_qty": store_agg_qty,
                 "daily_agg_total_value": store_agg_value,
+                "stale_rows_removed": _deleted(stale_snap) + _deleted(stale_agg),
                 "reconciled": True,
                 "finalized_at": _utc_now_iso(),
             },
         )
         logger.info(
-            "Analytics rollup finalized date=%s source=%s rows=%s aggs=%s value=%.2f",
-            iso,
-            source_kind,
-            store_n,
-            len(stored_aggs),
-            store_value,
+            "Analytics rollup finalized date=%s v=%s source=%s branches=%s parts=%s aggs=%s value=%.2f",
+            iso, ROLLUP_VERSION, source_kind, len(branches), store_n, len(stored_aggs), store_agg_value,
         )
         return result
     except Exception as exc:
@@ -551,10 +725,26 @@ async def finalize_analytics_rollup_for_date(
         )
 
 
-async def backfill_analytics_rollups(db, dates: List[str], *, force: bool = False) -> dict:
+def _deleted(result: Any) -> int:
+    if isinstance(result, dict):
+        return int(result.get("deleted") or 0)
+    return int(getattr(result, "deleted_count", 0) or 0)
+
+
+async def backfill_analytics_rollups(
+    db,
+    dates: List[str],
+    *,
+    force: bool = False,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    date_pause: float = DATE_PAUSE_SECONDS,
+    progress: Optional[Callable[[str], Any]] = None,
+) -> dict:
     results = []
-    for d in dates:
-        results.append(await finalize_analytics_rollup_for_date(db, d, force=force))
+    for i, d in enumerate(dates):
+        if i:
+            await sleep(date_pause)
+        results.append(await finalize_analytics_rollup_for_date(db, d, force=force, sleep=sleep, progress=progress))
     ok = sum(1 for r in results if r.get("status") == STATUS_SUCCESS)
     return {"requested": len(dates), "success": ok, "failed": len(dates) - ok, "results": results}
 

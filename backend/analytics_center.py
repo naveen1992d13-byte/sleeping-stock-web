@@ -1,6 +1,7 @@
 """NMTS Analytics APIs — scope-aware dashboards using published Product Hub history."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections import defaultdict
@@ -718,12 +719,19 @@ def _aggs_to_branch_maps(
                 "unit": (value / qty) if qty else 0.0,
                 "aging_purchase": r.get("aging_purchase") or {},
                 "aging_sales": r.get("aging_sales") or {},
+                "missing_aging_purchase": dict(r.get("missing_aging_purchase") or {}),
+                "missing_aging_sales": dict(r.get("missing_aging_sales") or {}),
             }
         else:
             cur["qty"] += qty
             cur["value"] += value
             cur["items"] += items
             cur["unit"] = (cur["value"] / cur["qty"]) if cur["qty"] else 0.0
+            for side in ("missing_aging_purchase", "missing_aging_sales"):
+                src = r.get(side) or {}
+                dst = cur.setdefault(side, {})
+                for k in ("qty", "value", "items"):
+                    dst[k] = _num(dst.get(k)) + _num(src.get(k))
             # Merge aging bucket totals when no single-bucket filter is applied.
             if not aging_bucket:
                 for side in ("aging_purchase", "aging_sales"):
@@ -743,9 +751,63 @@ async def _successful_rollup_keys(date_keys: List[str]) -> set:
     isos = sorted({rollup.date_key_to_iso(rollup.iso_to_date_key(dk)) for dk in date_keys})
     rows = await db[rollup.STATUS_COLLECTION].find(
         {"rollup_date_ist": {"$in": isos}, "status": rollup.STATUS_SUCCESS},
-        {"_id": 0, "rollup_date_ist": 1},
+        {"_id": 0, "rollup_date_ist": 1, "rollup_version": 1},
     ).to_list(5000)
-    return {rollup.iso_to_date_key(r["rollup_date_ist"]) for r in rows if r.get("rollup_date_ist")}
+    # Only current-version rollups count; v1 days surface as "rebuild needed".
+    return {
+        rollup.iso_to_date_key(r["rollup_date_ist"])
+        for r in rows
+        if r.get("rollup_date_ist") and rollup.rollup_version_of(r) >= rollup.ROLLUP_VERSION
+    }
+
+
+async def _prior_scope_snapshot_key(scope: dict, before_dk: str) -> Optional[str]:
+    """Latest finalized date before before_dk that has rows for this scope."""
+    q: Dict[str, Any] = {"rollup_date_ist": {"$lt": rollup.date_key_to_iso(before_dk)}}
+    if scope.get("brand"):
+        q["brand_name"] = scope["brand"]
+    if scope.get("dealer"):
+        q["dealer_name"] = scope["dealer"]
+    if scope.get("branch"):
+        q["branch_name"] = scope["branch"]
+    for _ in range(5):
+        row = await db[rollup.DAILY_AGG_COLLECTION].find_one(
+            q, {"_id": 0, "rollup_date_ist": 1}, sort=[("rollup_date_ist", -1)]
+        )
+        if not row or not rollup._is_plausible_iso(row.get("rollup_date_ist")):
+            return None
+        dk = rollup.iso_to_date_key(row["rollup_date_ist"])
+        if dk in await _successful_rollup_keys([dk]):
+            return dk
+        q["rollup_date_ist"] = {"$lt": row["rollup_date_ist"]}
+    return None
+
+
+async def _snapshot_status(date_keys: List[str], updated_up_to: Optional[str]) -> dict:
+    """ok / unavailable / rebuild_needed for the finalized Analytics window."""
+    coll = db[rollup.STATUS_COLLECTION]
+    if not updated_up_to:
+        legacy = await coll.find_one({"status": rollup.STATUS_SUCCESS}, {"_id": 0, "rollup_date_ist": 1})
+        status = "rebuild_needed" if legacy else "unavailable"
+        return {
+            "snapshot_status": status,
+            "rebuild_needed_dates": [],
+            "snapshot_message": "Snapshot unavailable (rebuild needed)",
+        }
+    isos = sorted({rollup.date_key_to_iso(dk) for dk in date_keys})
+    rows = await coll.find(
+        {"rollup_date_ist": {"$in": isos}, "status": rollup.STATUS_SUCCESS},
+        {"_id": 0, "rollup_date_ist": 1, "rollup_version": 1},
+    ).to_list(5000) if isos else []
+    old = sorted(
+        str(r["rollup_date_ist"]) for r in rows
+        if r.get("rollup_date_ist") and rollup.rollup_version_of(r) < rollup.ROLLUP_VERSION
+    )
+    return {
+        "snapshot_status": "rebuild_needed" if old else "ok",
+        "rebuild_needed_dates": old,
+        "snapshot_message": "Snapshot unavailable (rebuild needed)" if old else None,
+    }
 
 
 async def _build_daily_stock_series(
@@ -762,34 +824,43 @@ async def _build_daily_stock_series(
     """Screen path: pre-aggregated daily rollups only (never 100k+ part rows)."""
     expected_branches = await _expected_branch_names(scope, current_user)
     consolidated = not bool(scope.get("branch"))
-    prior_key = None
-    if date_keys:
-        prior_iso = await rollup.last_successful_rollup_date(
-            db, on_or_before=rollup.date_key_to_iso(rollup.iso_to_date_key(_prev_date_key(date_keys[0])))
-        )
-        if prior_iso:
-            prior_key = rollup.iso_to_date_key(prior_iso)
+    # Opening = previous available snapshot's Closing for this scope, also
+    # across month boundaries; none at all => Opening N/A.
+    prior_key = await _prior_scope_snapshot_key(scope, date_keys[0]) if date_keys else None
     load_keys = list(date_keys)
     if prior_key and prior_key not in load_keys:
         load_keys.append(prior_key)
 
-    agg_rows = await rollup.query_daily_aggs(db, load_keys, scope, category)
+    # Scope-level rows (all part types) decide whether a day has a snapshot;
+    # the Part Type filter is applied afterwards so a real zero stays 0.
+    agg_rows = await rollup.query_daily_aggs(db, load_keys, scope, None)
     success_keys = await _successful_rollup_keys(load_keys)
+    want_cat = (
+        pc.normalize_part_category(str(category))
+        if category and not pc.is_all_part_type(category)
+        else None
+    )
 
     by_date_rows: Dict[str, List[dict]] = defaultdict(list)
+    present_branches: Dict[str, set] = defaultdict(set)
     for r in agg_rows:
         dk = rollup.iso_to_date_key(_text(r.get("rollup_date_ist")))
-        if dk:
-            by_date_rows[dk].append(r)
+        if not dk or dk not in success_keys:
+            continue
+        br = _text(r.get("branch_name")).casefold()
+        if br:
+            present_branches[dk].add(br)
+        if want_cat and r.get("category") != want_cat:
+            continue
+        by_date_rows[dk].append(r)
 
     by_date: Dict[str, Dict[Tuple[str, str, str, str], dict]] = {}
     uploaded_by_date: Dict[str, set] = {}
     upload_meta: Dict[str, Dict[str, dict]] = {}
-    for dk, rows in by_date_rows.items():
-        part_map = _aggs_to_branch_maps(rows, aging_type, aging_bucket)
+    for dk, branches in present_branches.items():
+        part_map = _aggs_to_branch_maps(by_date_rows.get(dk, []), aging_type, aging_bucket)
         by_date[dk] = part_map
-        branches = {_text(row.get("branch")).casefold() for row in part_map.values() if _text(row.get("branch"))}
-        uploaded_by_date[dk] = branches
+        uploaded_by_date[dk] = set(branches)
         upload_meta[dk] = {
             b: {
                 "published_at": None,
@@ -799,25 +870,12 @@ async def _build_daily_stock_series(
             }
             for b in branches
         }
-    # Finalized empty days (genuine zero stock) still count as present.
-    for dk in success_keys:
-        if dk not in by_date:
-            by_date[dk] = {}
-            uploaded_by_date.setdefault(dk, set())
-            upload_meta.setdefault(dk, {})
 
     last_avail_key: Optional[str] = prior_key
+    last_avail_map: Dict = {}
     if prior_key:
         prior_status = _day_upload_status(prior_key, uploaded_by_date, expected_branches, consolidated)
-        if prior_key in success_keys and prior_key not in by_date_rows:
-            # Empty finalized prior day.
-            last_avail_map = {}
-        else:
-            last_avail_map = _filter_map_branches(by_date.get(prior_key, {}), prior_status["allowed_branch_keys"])
-            if prior_key in success_keys and not by_date.get(prior_key) and not prior_status["allowed_branch_keys"]:
-                last_avail_map = {}
-    else:
-        last_avail_map = {}
+        last_avail_map = _filter_map_branches(by_date.get(prior_key, {}), prior_status["allowed_branch_keys"])
 
     daily: List[dict] = []
     full_days = partial_days = no_days = 0
@@ -827,8 +885,8 @@ async def _build_daily_stock_series(
     period_added = period_reduced = 0.0
     for dk in date_keys:
         status_info = _day_upload_status(dk, uploaded_by_date, expected_branches, consolidated)
-        # Finalized-only: missing successful rollup => No Data; successful empty => 0.
-        if dk not in success_keys:
+        # Finalized-only: no current snapshot for this scope => null ("No snapshot"), never 0.
+        if dk not in success_keys or not uploaded_by_date.get(dk):
             status_info = {
                 **status_info,
                 "data_status": "NO_UPLOAD",
@@ -838,18 +896,6 @@ async def _build_daily_stock_series(
                 "uploaded_branches": [],
                 "missing_branches": status_info.get("missing_branches") or expected_branches,
                 "allowed_branch_keys": set(),
-            }
-        elif not by_date_rows.get(dk):
-            # Rollup succeeded with zero source rows — show 0, not No Data.
-            status_info = {
-                **status_info,
-                "data_status": "AVAILABLE",
-                "uploaded_branch_count": status_info.get("uploaded_branch_count") or 0,
-                "missing_branch_count": 0,
-                "coverage_percentage": 100.0 if not expected_branches else status_info.get("coverage_percentage") or 100.0,
-                "allowed_branch_keys": set(uploaded_by_date.get(dk) or set()) or (
-                    {_text(b).casefold() for b in expected_branches} if expected_branches else set()
-                ),
             }
         if status_info["data_status"] == "NO_UPLOAD":
             no_days += 1
@@ -861,8 +907,6 @@ async def _build_daily_stock_series(
             full_days += 1
         uploaded_branch_days += status_info["uploaded_branch_count"]
         curr_map = _filter_map_branches(by_date.get(dk, {}), status_info["allowed_branch_keys"])
-        if dk in success_keys and not by_date_rows.get(dk):
-            curr_map = {}
         stock_v, stock_q = _sum_map(curr_map)
         row = _empty_daily_row(dk, status_info)
         row["stock_value"] = stock_v
@@ -1105,9 +1149,15 @@ def _lost_qty_value(row: dict) -> Tuple[float, float]:
 
 
 
-async def _analytics_window(from_date: str, to_date: str) -> Tuple[str, str, List[str], Optional[str]]:
-    """Clamp Analytics to finalized historical dates only (never today)."""
-    last = await rollup.last_successful_rollup_date(db)
+async def _analytics_window(
+    from_date: str, to_date: str, *, min_version: Optional[int] = None
+) -> Tuple[str, str, List[str], Optional[str]]:
+    """Clamp Analytics to finalized historical dates only (never today).
+
+    Stock/Aging pass min_version so only current-version snapshots count;
+    Orders/Requests keep their previous window.
+    """
+    last = await rollup.last_successful_rollup_date(db, min_version=min_version)
     effective_to, updated_up_to = rollup.resolve_analytics_end_date(to_date, last_success=last)
     if not updated_up_to:
         return from_date, effective_to, [], None
@@ -1275,7 +1325,9 @@ async def analytics_stock_trend(
     _, _, _, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
-    _, effective_to, date_keys, updated_up_to = await _analytics_window(from_date, to_date)
+    _, effective_to, date_keys, updated_up_to = await _analytics_window(
+        from_date, to_date, min_version=rollup.ROLLUP_VERSION
+    )
     aging_bucket = _normalize_aging_days_filter(aging_days)
     payload = await _stock_trend_payload(
         scope, date_keys, aging_type, metric_type, category, current_user,
@@ -1284,6 +1336,7 @@ async def analytics_stock_trend(
     payload["from_date"] = from_date
     payload["to_date"] = effective_to
     payload["data_updated_up_to"] = updated_up_to
+    payload.update(await _snapshot_status(date_keys, updated_up_to))
     return payload
 
 
@@ -1389,18 +1442,23 @@ async def analytics_aging_trend(
     _, _, _, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
-    _, effective_to, date_keys, updated_up_to = await _analytics_window(from_date, to_date)
+    _, effective_to, date_keys, updated_up_to = await _analytics_window(
+        from_date, to_date, min_version=rollup.ROLLUP_VERSION
+    )
     aging_bucket = _normalize_aging_days_filter(aging_days)
+    snapshot_info = await _snapshot_status(date_keys, updated_up_to)
     if not date_keys:
         return {
             "buckets": [],
             "bucket_keys": list(ANALYTICS_CHART_BUCKETS),
             "stacked": [],
             "daily": [],
+            "missing_aging": None,
             "data_coverage": _coverage_payload(updated_up_to),
             "data_updated_up_to": updated_up_to,
             "from_date": from_date,
             "to_date": effective_to,
+            **snapshot_info,
         }
     # Aging panel needs full bucket breakdown — do not pre-filter the series by aging_days.
     ctx = await _build_daily_stock_series(
@@ -1408,16 +1466,30 @@ async def analytics_aging_trend(
         aging_bucket=None, updated_up_to=updated_up_to,
     )
     use_value = metric_type == "value"
-    # Item Wise = distinct part-line count (quantity of line items), Value Wise = stock value.
-    use_items = metric_type == "quantity"
+    # Item Wise = quantity (same measure as the stock trend), Value Wise = stock value.
     aging_side = _aging_field(aging_type)
+    missing_side = f"missing_{aging_side}"
+    # Missing aging is counted under >361 Days; report it unless another bucket is selected.
+    show_missing = aging_bucket in (None, ANALYTICS_CHART_BUCKETS[-1])
+
+    def _missing_for(part_map: Dict) -> Optional[dict]:
+        if not show_missing:
+            return None
+        out = {"items": 0.0, "qty": 0.0, "value": 0.0}
+        for row in part_map.values():
+            src = row.get(missing_side) or {}
+            for k in out:
+                out[k] += _num(src.get(k))
+        return out
     last_row = ctx["daily"][-1]
     bucket_totals = {b: {"value": None, "quantity": None, "items": None} for b in ANALYTICS_CHART_BUCKETS}
     stacked = defaultdict(lambda: {b: None for b in ANALYTICS_CHART_BUCKETS})
+    latest_missing = None
     if last_row["data_status"] != "NO_UPLOAD":
         dk = _iso_to_date_key(last_row["date"])
         status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
         curr_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
+        latest_missing = _missing_for(curr_map)
         bucket_totals = {b: {"value": 0.0, "quantity": 0.0, "items": 0.0} for b in ANALYTICS_CHART_BUCKETS}
         stacked = defaultdict(lambda: {b: 0.0 for b in ANALYTICS_CHART_BUCKETS})
         for row in curr_map.values():
@@ -1433,14 +1505,14 @@ async def analytics_aging_trend(
                 bucket_totals[b]["value"] += bv
                 bucket_totals[b]["quantity"] += bq
                 bucket_totals[b]["items"] += bi
-                metric = bv if use_value else (bi if use_items else bq)
+                metric = bv if use_value else bq
                 stacked[cat][b] = (stacked[cat][b] or 0.0) + metric
         if aging_bucket:
-            cat_total = bucket_totals[aging_bucket]["value"] if use_value else bucket_totals[aging_bucket]["items"]
+            cat_total = bucket_totals[aging_bucket]["value"] if use_value else bucket_totals[aging_bucket]["quantity"]
             cat_total = cat_total or 1.0
         else:
             cat_total = sum(
-                (bucket_totals[b]["value"] if use_value else bucket_totals[b]["items"])
+                (bucket_totals[b]["value"] if use_value else bucket_totals[b]["quantity"])
                 for b in ANALYTICS_CHART_BUCKETS
             ) or 1.0
     else:
@@ -1452,7 +1524,7 @@ async def analytics_aging_trend(
         items = bucket_totals[b]["items"]
         if aging_bucket and b != aging_bucket and v is not None:
             v = q = items = 0.0
-        m = v if use_value else items
+        m = v if use_value else q
         buckets_out.append(
             {
                 "bucket": b,
@@ -1476,6 +1548,7 @@ async def analytics_aging_trend(
                     "date": pt["date"],
                     "data_status": "NO_UPLOAD",
                     "total": None,
+                    "missing_aging": None,
                     **{b: None for b in ANALYTICS_CHART_BUCKETS},
                 }
             )
@@ -1490,13 +1563,15 @@ async def analytics_aging_trend(
                 if aging_bucket and b != aging_bucket:
                     continue
                 slot = aging.get(b) or {}
-                day_buckets[b] += _num(slot.get("value")) if use_value else _num(slot.get("items"))
+                day_buckets[b] += _num(slot.get("value")) if use_value else _num(slot.get("qty"))
+        # Sum of buckets == that day's Closing in the stock trend (same rows, same measure).
         total = sum(day_buckets.values())
         daily.append(
             {
                 "date": pt["date"],
                 "data_status": pt["data_status"],
                 "total": total,
+                "missing_aging": _missing_for(curr_map),
                 **{b: day_buckets[b] for b in ANALYTICS_CHART_BUCKETS},
             }
         )
@@ -1505,6 +1580,7 @@ async def analytics_aging_trend(
         "bucket_keys": list(ANALYTICS_CHART_BUCKETS),
         "stacked": stacked_out,
         "daily": daily,
+        "missing_aging": latest_missing,
         "data_coverage": ctx["coverage"],
         "data_updated_up_to": updated_up_to,
         "from_date": from_date,
@@ -1512,6 +1588,7 @@ async def analytics_aging_trend(
         "comparison_type": ctx["summary"].get("comparison_type"),
         "comparison_label": ctx["summary"].get("comparison_label"),
         "metric_type": metric_type,
+        **snapshot_info,
     }
 
 
@@ -2281,11 +2358,22 @@ async def analytics_rollup_finalize(
     force: bool = False,
     current_user=Depends(_current_user),
 ):
-    """Master-only: run the idempotent daily Analytics finalizer for one IST date.
+    """Master-only: start the idempotent daily Analytics finalizer for one IST date.
 
-    Used on Testing to backfill durable DB snapshots without waiting for 11:00 PM IST.
+    Runs in the background (never inside the request); poll /rollup/status.
+    Prefer scripts/analytics_snapshot.py for backfills.
     """
     if getattr(current_user, "role", None) != "master":
         raise HTTPException(403, "Master only")
-    target = date or rollup.yesterday_ist_iso()
-    return await rollup.finalize_analytics_rollup_for_date(db, target, force=force)
+    target = rollup.date_key_to_iso(rollup.iso_to_date_key(date or rollup.yesterday_ist_iso()))
+    if target >= rollup.today_ist_iso():
+        raise HTTPException(400, "Only past IST dates can be finalized (today is excluded)")
+
+    async def _run():
+        try:
+            await rollup.finalize_analytics_rollup_for_date(db, target, force=force)
+        except Exception as exc:
+            logger.error("Background Analytics finalize failed for %s: %s", target, exc)
+
+    asyncio.create_task(_run())
+    return {"status": "started", "rollup_date_ist": target, "poll": f"/api/analytics/rollup/status?date={target}"}
