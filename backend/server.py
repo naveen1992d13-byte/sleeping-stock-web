@@ -61,6 +61,7 @@ try:
     from . import history_archive
     from . import hybrid_history
     from . import archive_scheduler
+    from . import analytics_rollup_scheduler
     from . import archive_runs
     from . import maintenance as maint
     from . import excel_permissions
@@ -82,6 +83,7 @@ except ImportError:
     import history_archive
     import hybrid_history
     import archive_scheduler
+    import analytics_rollup_scheduler
     import archive_runs
     import maintenance as maint
     import excel_permissions
@@ -10544,6 +10546,8 @@ async def seed_master_user_on_startup():
         archive_target = testing_db_raw if testing_runtime.is_testing_env() and testing_db_raw is not None else db
         archive_scheduler.start_archive_scheduler(archive_target)
         logger.info("Archive scheduler started (ARCHIVE_PRUNE_ENABLED=%s)", s3_storage.archive_prune_enabled())
+        # Same handle Analytics reads from (overlay on Testing; rollup collections are Testing-local).
+        analytics_rollup_scheduler.start_analytics_rollup_scheduler(db)
 
         async def _sla_apply_timeout(header):
             await _apply_request_group_timeout(header, _sla_system_actor())
@@ -10585,6 +10589,10 @@ async def seed_master_user_on_startup():
 async def shutdown_db_client():
     try:
         await archive_scheduler.stop_archive_scheduler()
+    except Exception:
+        pass
+    try:
+        await analytics_rollup_scheduler.stop_analytics_rollup_scheduler()
     except Exception:
         pass
     try:

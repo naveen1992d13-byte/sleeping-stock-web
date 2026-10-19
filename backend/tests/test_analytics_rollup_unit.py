@@ -92,6 +92,8 @@ def _match(doc, query):
         if isinstance(v, dict):
             if "$in" in v and doc.get(k) not in v["$in"]:
                 return False
+            if "$ne" in v and doc.get(k) == v["$ne"]:
+                return False
             if "$lte" in v and str(doc.get(k) or "") > str(v["$lte"]):
                 return False
             if "$gte" in v and str(doc.get(k) or "") < str(v["$gte"]):
