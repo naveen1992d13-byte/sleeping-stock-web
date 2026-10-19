@@ -14,7 +14,38 @@ on:
           - stage-a3-browser
           - stage-a4-browser
           - stage-b-browser
+          - login-smoke
 jobs:
+  login-smoke:
+    if: ${{ github.event.inputs.mode == 'login-smoke' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Testing Master login + /auth/me
+        env:
+          NMTS_E2E_EMAIL: ${{ secrets.TESTING_MASTER_EMAIL }}
+          NMTS_E2E_PASSWORD: ${{ secrets.TESTING_MASTER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "${NMTS_E2E_EMAIL}"
+          test -n "${NMTS_E2E_PASSWORD}"
+          CODE=$(curl -sS -o /tmp/login.json -w '%{http_code}' -X POST \
+            'https://testing.sleepingstock.in/api/auth/login' \
+            -H 'Content-Type: application/json' \
+            --data-binary @- <<EOF
+          {"email":"${NMTS_E2E_EMAIL}","password":"${NMTS_E2E_PASSWORD}"}
+          EOF
+          )
+          echo "login_status=${CODE}"
+          test "${CODE}" = "200"
+          TOKEN=$(python3 -c 'import json; print(json.load(open("/tmp/login.json"))["access_token"])')
+          ME=$(curl -sS -o /tmp/me.json -w '%{http_code}' \
+            'https://testing.sleepingstock.in/api/auth/me' \
+            -H "Authorization: Bearer ${TOKEN}")
+          echo "me_status=${ME}"
+          test "${ME}" = "200"
+          python3 -c 'import json; u=json.load(open("/tmp/me.json")); assert u.get("role")=="master"; print("role=master username_set=", bool(u.get("username")))'
+
   build-artifact:
     if: ${{ github.event.inputs.mode == 'build-artifact' }}
     runs-on: ubuntu-latest
