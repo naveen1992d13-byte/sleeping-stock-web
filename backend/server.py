@@ -70,6 +70,7 @@ try:
     from . import hybrid_request_history
     from . import archive_keys as archive_keys
     from . import upload_scope
+    from . import product_upload_stream
     from . import order_desk_guards as odg
     from . import request_fulfillment as rff
     from . import request_in_transit_reminder
@@ -90,6 +91,7 @@ except ImportError:
     import hybrid_request_history
     import archive_keys
     import upload_scope
+    import product_upload_stream
     import order_desk_guards as odg
     import request_fulfillment as rff
     import request_in_transit_reminder
@@ -3598,6 +3600,46 @@ def _apply_role_scope_v2(query: dict, current_user: UserResponse, brand=None, de
     return query
 
 
+async def _rollback_product_upload_items_v2(upload_id: str) -> int:
+    """Delete any upload_items written for a failed/aborted product upload job."""
+    if not upload_id:
+        return 0
+    result = await db.upload_items.delete_many({"upload_id": upload_id})
+    return int(getattr(result, "deleted_count", 0) or 0)
+
+
+async def _supersede_waiting_product_uploads_v2(context: dict, date_key: str, *, keep_upload_id: str = "") -> dict:
+    """Drop prior same-day Waiting product uploads for this branch so retries stay idempotent."""
+    query = {
+        "upload_type": "product",
+        "publish_status": "Waiting",
+        "date_key": date_key,
+        "brand_name": context.get("brand_name") or context.get("brand"),
+        "dealer_name": context.get("dealer_name"),
+        "branch": context.get("branch"),
+    }
+    prior = await db.uploads.find(query, {"_id": 0, "id": 1, "sha256": 1}).to_list(50)
+    removed_uploads = 0
+    removed_items = 0
+    for doc in prior:
+        uid = str(doc.get("id") or "")
+        if not uid or uid == keep_upload_id:
+            continue
+        removed_items += await _rollback_product_upload_items_v2(uid)
+        await db.uploads.update_one(
+            {"id": uid},
+            {"$set": {
+                "status": "Failed",
+                "publish_status": "Failed",
+                "processing_lock": False,
+                "error": "Superseded by a newer same-day upload for this branch",
+                "updated_at": _nmts_now().isoformat(),
+            }},
+        )
+        removed_uploads += 1
+    return {"removed_uploads": removed_uploads, "removed_items": removed_items}
+
+
 @api_router.post("/upload/v2")
 async def upload_product_center_v2(
     file: UploadFile = File(...),
@@ -3613,17 +3655,51 @@ async def upload_product_center_v2(
         raise HTTPException(status_code=400, detail="Only Excel files are allowed")
 
     now = _nmts_now()
+    date_key = _nmts_date_key(now)
     context = await _build_upload_context_v2(current_user)
     context = await _apply_selected_upload_scope(context, current_user, brand, dealer, branch)
     raw_bytes = await file.read()
     file_size = len(raw_bytes)
+    file_sha = hashlib.sha256(raw_bytes).hexdigest()
+
+    # Idempotent retry: identical file already Uploaded/Waiting today for this branch.
+    existing = await db.uploads.find_one(
+        {
+            "upload_type": "product",
+            "sha256": file_sha,
+            "date_key": date_key,
+            "brand_name": context.get("brand_name") or context.get("brand"),
+            "dealer_name": context.get("dealer_name"),
+            "branch": context.get("branch"),
+            "publish_status": {"$in": ["Waiting", "Published"]},
+            "status": {"$nin": ["Failed", "Cancelled"]},
+        },
+        {"_id": 0, "raw_file_bytes": 0},
+    )
+    if existing:
+        return {
+            "message": "Upload already present for this file/branch/date (idempotent)",
+            "upload_no": existing.get("upload_no"),
+            "upload_id": existing.get("id"),
+            "rows_processed": existing.get("rows_processed"),
+            "rows_imported": existing.get("rows_imported"),
+            "failed_count": existing.get("failed_count") or 0,
+            "total_available_qty": existing.get("total_available_qty"),
+            "total_value": existing.get("total_value"),
+            "errors": existing.get("errors") or [],
+            "idempotent": True,
+        }
+
+    # Validate workbook headers via read_only open (no full in-memory sheet graph).
     try:
-        wb = openpyxl.load_workbook(BytesIO(raw_bytes), data_only=True)
+        probe_wb, _probe_ws = product_upload_stream.open_inventory_worksheet(raw_bytes)
+        probe_wb.close()
     except Exception:
         raise HTTPException(
             status_code=400,
             detail="Unable to read this Excel file. Please save it as .xlsx (Excel Workbook) and upload again.",
         )
+
     upload_no = await generate_upload_no("product", context["brand_code"])
 
     # HARD REQUIRE: original Excel must land in private REAL S3 before upload succeeds.
@@ -3654,6 +3730,35 @@ async def upload_product_center_v2(
         archive_keys.MODULE_LABEL_UPLOAD,
         "xlsx",
     )
+
+    # Claim the job early so a crash mid-stream is visible as Failed, not a silent lock.
+    processing_doc = testing_runtime.stamp_testing_origin({
+        "id": upload_id,
+        "upload_no": upload_no,
+        "original_upload_no": upload_no,
+        "upload_type": "product",
+        "file_name": file.filename,
+        "file_size": file_size,
+        "sha256": file_sha,
+        "status": "Processing",
+        "publish_status": "Failed",
+        "processing_lock": True,
+        "rows_processed": 0,
+        "rows_imported": 0,
+        "failed_count": 0,
+        "item_count": 0,
+        "total_available_qty": 0.0,
+        "total_value": 0.0,
+        "errors": [],
+        "upload_date": _nmts_display_date(now),
+        "upload_time": _nmts_display_time(now),
+        "date_key": date_key,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        **context,
+    })
+    await db.uploads.insert_one(processing_doc)
+
     try:
         stored_excel = await file_objects.store_bytes(
             module="uploads",
@@ -3663,6 +3768,17 @@ async def upload_product_center_v2(
             content_type=file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     except Exception as exc:
+        await _rollback_product_upload_items_v2(upload_id)
+        await db.uploads.update_one(
+            {"id": upload_id},
+            {"$set": {
+                "status": "Failed",
+                "publish_status": "Failed",
+                "processing_lock": False,
+                "error": f"S3 store failed: {type(exc).__name__}",
+                "updated_at": _nmts_now().isoformat(),
+            }},
+        )
         logger.error("Product Excel S3 store failed (upload aborted): %s", exc)
         raise HTTPException(
             status_code=503,
@@ -3670,87 +3786,98 @@ async def upload_product_center_v2(
         )
     provider = str((stored_excel or {}).get("storage_provider") or "").lower()
     if not (stored_excel or {}).get("storage_key") or provider not in {"s3", "real s3"}:
+        await _rollback_product_upload_items_v2(upload_id)
+        await db.uploads.update_one(
+            {"id": upload_id},
+            {"$set": {
+                "status": "Failed",
+                "publish_status": "Failed",
+                "processing_lock": False,
+                "error": "Excel missing storage_key after S3 store",
+                "updated_at": _nmts_now().isoformat(),
+            }},
+        )
         raise HTTPException(
             status_code=503,
             detail="Upload failed: Excel was not stored on private REAL S3 (missing storage_key).",
         )
 
-    # Prefer a worksheet explicitly named "Inventory" (case-insensitive) since that is
-    # the required worksheet name for the Product Hub inventory upload. Fall back to
-    # the active sheet for any older workbook that doesn't use that sheet name, so
-    # existing uploads never break.
-    ws = None
-    for sheet_name in wb.sheetnames:
-        if sheet_name.strip().lower() == "inventory":
-            ws = wb[sheet_name]
-            break
-    if ws is None:
-        ws = wb.active
+    # Replace any other Waiting same-day upload for this part/branch/date scope.
+    await _supersede_waiting_product_uploads_v2(context, date_key, keep_upload_id=upload_id)
 
     rows_processed = 0
     rows_imported = 0
     rejected = []
     total_available_qty = 0.0
     total_value = 0.0
-    item_docs = []
+    # Dedupe within the file by part+branch+date so a retry of a partial parse
+    # cannot insert the same part twice under this upload_id.
+    seen_parts = set()
 
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        if not any(row):
-            continue
-        rows_processed += 1
-        # Rule: reject a row ONLY when Part Number (column A) is missing. Part Name,
-        # Quantity, Category, Brand, Branch, and Dealer must never cause a row to be
-        # rejected — every other valid row is still imported.
-        part_no = str(row[0] or "").strip() if len(row) > 0 else ""
-        if not part_no:
-            rejected.append({"row": row_idx, "reason": "Part No Missing"})
-            continue
-        part_name = str(row[1] or "").strip() if len(row) > 1 else ""
-        loc = str(row[2] or "").strip() if len(row) > 2 else ""
-        qty = _safe_float(row[3] if len(row) > 3 else 0, 0.0)
-        last_receipt = _format_excel_date_v2(row[4] if len(row) > 4 else "")
-        last_sales = _format_excel_date_v2(row[5] if len(row) > 5 else "")
-        mav = _safe_float(row[6] if len(row) > 6 else 0, 0.0)
-        # Column H — Part Category. Never required; stored as-is (trimmed) even if
-        # it doesn't match one of the standard values below, so no row is ever
-        # rejected because of it.
-        part_category_raw = str(row[7] or "").strip() if len(row) > 7 else ""
-        part_category = _normalize_part_category(part_category_raw)
-        line_value = qty * mav
-        total_available_qty += qty
-        total_value += line_value
-        rows_imported += 1
-        item_docs.append(testing_runtime.stamp_testing_origin({
-            "id": str(uuid.uuid4()),
-            "upload_id": upload_id,
-            "upload_no": upload_no,
-            "upload_type": "product",
-            "part_number": part_no,
-            "item_name": part_name,
-            "loc": loc,
-            "bin_location": loc,
-            "quantity": qty,
-            "available_qty": qty,
-            "last_receipt_date": last_receipt,
-            "last_sales_date": last_sales,
-            "mav": mav,
-            "mav_value": mav,
-            "total_value": line_value,
-            "part_category": part_category,
-            # Explicit numeric fields (guaranteed float, never string) used for all
-            # summary/aggregation math so quantity/value can never be mis-summed
-            # due to string concatenation or mixed types coming from Excel.
-            "available_qty_number": float(qty),
-            "unit_value_number": float(mav),
-            "total_value_number": float(line_value),
-            "publish_status": "Waiting",
-            "active_date_key": _nmts_date_key(now),
-            "created_at": now.isoformat(),
-            **context,
-        }))
-
-    if item_docs:
-        await db.upload_items.insert_many(item_docs)
+    try:
+        for batch, stats in product_upload_stream.stream_product_items(
+            raw_bytes,
+            upload_id=upload_id,
+            upload_no=upload_no,
+            now_iso=now.isoformat(),
+            active_date_key=date_key,
+            context=context,
+            format_excel_date=_format_excel_date_v2,
+            normalize_part_category=_normalize_part_category,
+            stamp=testing_runtime.stamp_testing_origin,
+            batch_size=product_upload_stream.UPLOAD_V2_BATCH_SIZE,
+        ):
+            rows_processed += int(stats.get("rows_processed") or 0)
+            rejected.extend(stats.get("rejected") or [])
+            unique_batch = []
+            for doc in batch:
+                part_key = (
+                    str(doc.get("part_number") or "").strip().upper(),
+                    str(doc.get("branch") or "").strip().lower(),
+                    str(doc.get("active_date_key") or date_key),
+                )
+                if not part_key[0] or part_key in seen_parts:
+                    continue
+                seen_parts.add(part_key)
+                unique_batch.append(doc)
+            if unique_batch:
+                await db.upload_items.insert_many(unique_batch)
+                for doc in unique_batch:
+                    qty = float(doc.get("available_qty_number") or 0)
+                    val = float(doc.get("total_value_number") or 0)
+                    total_available_qty += qty
+                    total_value += val
+                    rows_imported += 1
+            # Free batch promptly between chunks.
+            del batch, unique_batch
+            await asyncio.sleep(0)
+    except Exception as exc:
+        rolled = await _rollback_product_upload_items_v2(upload_id)
+        await db.uploads.update_one(
+            {"id": upload_id},
+            {"$set": {
+                "status": "Failed",
+                "publish_status": "Failed",
+                "processing_lock": False,
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                "rows_processed": rows_processed,
+                "rows_imported": 0,
+                "item_count": 0,
+                "failed_count": len(rejected),
+                "partial_rows_removed": rolled,
+                "storage_provider": (stored_excel or {}).get("storage_provider"),
+                "storage_key": (stored_excel or {}).get("storage_key"),
+                "updated_at": _nmts_now().isoformat(),
+            }},
+        )
+        logger.error("Product upload/v2 failed mid-stream for %s: %s", upload_id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Upload failed while processing rows; partial rows were rolled back. "
+                f"({type(exc).__name__})"
+            ),
+        )
 
     status_text = "Uploaded" if rows_imported else "Failed"
     upload_doc = {
@@ -3761,16 +3888,16 @@ async def upload_product_center_v2(
         "file_name": file.filename,
         "file_size": file_size,
         # Do not embed multi-MB Excel blobs in MongoDB — they blow Atlas free-tier
-    # quotas and leave half-published Product Hub state when writes get blocked.
-    # Keep file metadata + S3/object-store pointer; legacy uploads without storage_key still work.
-    "raw_file_content_type": file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "storage_provider": (stored_excel or {}).get("storage_provider"),
-    "storage_key": (stored_excel or {}).get("storage_key"),
-    "original_filename": file.filename,
-    "content_type": (stored_excel or {}).get("content_type") or (file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-    "sha256": (stored_excel or {}).get("sha256"),
-    "archived_at": (stored_excel or {}).get("archived_at"),
-    "rows_processed": rows_processed,
+        # quotas and leave half-published Product Hub state when writes get blocked.
+        # Keep file metadata + S3/object-store pointer; legacy uploads without storage_key still work.
+        "raw_file_content_type": file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "storage_provider": (stored_excel or {}).get("storage_provider"),
+        "storage_key": (stored_excel or {}).get("storage_key"),
+        "original_filename": file.filename,
+        "content_type": (stored_excel or {}).get("content_type") or (file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "sha256": (stored_excel or {}).get("sha256") or file_sha,
+        "archived_at": (stored_excel or {}).get("archived_at"),
+        "rows_processed": rows_processed,
         "rows_imported": rows_imported,
         "failed_count": len(rejected),
         "item_count": rows_imported,
@@ -3778,14 +3905,20 @@ async def upload_product_center_v2(
         "total_value": total_value,
         "status": status_text,
         "publish_status": "Waiting" if rows_imported else "Failed",
+        "processing_lock": False,
         "errors": rejected,
         "upload_date": _nmts_display_date(now),
         "upload_time": _nmts_display_time(now),
-        "date_key": _nmts_date_key(now),
+        "date_key": date_key,
         "created_at": now.isoformat(),
+        "updated_at": _nmts_now().isoformat(),
         **context,
     }
-    await db.uploads.insert_one(testing_runtime.stamp_testing_origin(upload_doc))
+    await db.uploads.update_one(
+        {"id": upload_id},
+        {"$set": testing_runtime.stamp_testing_origin(upload_doc)},
+        upsert=True,
+    )
     try:
         await event_archive.maybe_enqueue_upload_stored(db, upload_doc)
     except Exception as exc:

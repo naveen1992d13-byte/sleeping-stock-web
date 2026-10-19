@@ -93,9 +93,41 @@ axios.interceptors.request.use((config) => {
   return config;
 });
 
+function SessionBootstrapError({ message, onRetry }) {
+  return (
+    <div
+      className="flex flex-col items-center justify-center gap-4 p-8 text-center"
+      style={{ minHeight: '50vh', color: '#111827' }}
+      data-testid="session-bootstrap-error"
+    >
+      <div style={{ fontSize: 18, fontWeight: 600 }}>Unable to reach the server</div>
+      <div style={{ fontSize: 14, color: '#6B7280', maxWidth: 420 }}>
+        {message || 'The API did not respond. Check your connection, then retry.'}
+      </div>
+      <button
+        type="button"
+        onClick={onRetry}
+        style={{
+          background: '#16A34A',
+          color: '#fff',
+          border: 0,
+          borderRadius: 8,
+          padding: '10px 18px',
+          fontWeight: 600,
+          cursor: 'pointer',
+        }}
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
 function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [authError, setAuthError] = useState(null);
+  const [authNonce, setAuthNonce] = useState(0);
 
   const saveUserSession = (token, loggedUser) => {
     const cleanUser = {
@@ -108,15 +140,19 @@ function AuthProvider({ children }) {
     localStorage.setItem('permissions', JSON.stringify(cleanUser.permissions));
     touchSessionActivity();
     setUser(cleanUser);
+    setAuthError(null);
     return cleanUser;
   };
 
   useEffect(() => {
+    let cancelled = false;
+
     if (isSessionExpiredByInactivity()) {
       clearAuthStorage();
       setUser(null);
+      setAuthError(null);
       setLoading(false);
-      return;
+      return undefined;
     }
 
     const token = localStorage.getItem('token');
@@ -133,21 +169,44 @@ function AuthProvider({ children }) {
     }
 
     if (token) {
-      axios.get(`${API}/auth/me`)
+      setLoading(true);
+      setAuthError(null);
+      axios.get(`${API}/auth/me`, { timeout: 15000 })
         .then((res) => {
+          if (cancelled) return;
           touchSessionActivity();
           saveUserSession(token, res.data);
         })
-        .catch(() => {
-          clearAuthStorage();
-          setUser(null);
+        .catch((err) => {
+          if (cancelled) return;
+          const status = err?.response?.status;
+          const isAuthReject = status === 401 || status === 403;
+          if (isAuthReject) {
+            clearAuthStorage();
+            setUser(null);
+            setAuthError(null);
+            return;
+          }
+          // Keep any cached user for Retry; show a clear error instead of a blank page.
+          const detail = err?.response?.data?.detail;
+          const msg = typeof detail === 'string'
+            ? detail
+            : (err?.code === 'ECONNABORTED'
+              ? 'Session check timed out while the server was busy.'
+              : (err?.message || 'Backend is unavailable.'));
+          setAuthError(msg);
         })
-        .finally(() => setLoading(false));
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
     } else {
       setLoading(false);
+      setAuthError(null);
     }
+
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [authNonce]);
 
   const login = async (identifier, password) => {
     const response = await axios.post(`${API}/auth/login`, {
@@ -161,27 +220,44 @@ function AuthProvider({ children }) {
   const logout = () => {
     clearAuthStorage();
     setUser(null);
+    setAuthError(null);
   };
 
   const refreshUser = async () => {
     const token = localStorage.getItem('token');
     if (!token) return null;
-    const res = await axios.get(`${API}/auth/me`);
+    const res = await axios.get(`${API}/auth/me`, { timeout: 15000 });
     return saveUserSession(token, res.data);
   };
 
+  const retrySession = () => {
+    setAuthError(null);
+    setLoading(true);
+    setAuthNonce((n) => n + 1);
+  };
+
   return (
-    <AuthContext.Provider value={{ user, login, logout, loading, refreshUser }}>
+    <AuthContext.Provider value={{ user, login, logout, loading, authError, retrySession, refreshUser }}>
       {children}
     </AuthContext.Provider>
   );
 }
 
 function ProtectedRoute({ children, permission, masterOnly = false, allowUser = false }) {
-  const { user, loading } = useAuth();
+  const { user, loading, authError, retrySession } = useAuth();
   const location = useLocation();
 
-  if (loading) return null;
+  if (loading) {
+    return (
+      <div className="p-8 text-sm text-center" style={{ color: '#6B7280' }} data-testid="session-loading">
+        Checking session…
+      </div>
+    );
+  }
+
+  if (authError) {
+    return <SessionBootstrapError message={authError} onRetry={retrySession} />;
+  }
 
   if (!user) {
     return <Navigate to="/login" replace state={{ from: location }} />;
@@ -204,9 +280,18 @@ function ProtectedRoute({ children, permission, masterOnly = false, allowUser = 
 
 /** Logged-in home: Analytics when allowed; otherwise first permitted module. */
 function HomeEntry() {
-  const { user, loading } = useAuth();
+  const { user, loading, authError, retrySession } = useAuth();
 
-  if (loading) return null;
+  if (loading) {
+    return (
+      <div className="p-8 text-sm text-center" style={{ color: '#6B7280' }} data-testid="session-loading">
+        Checking session…
+      </div>
+    );
+  }
+  if (authError) {
+    return <SessionBootstrapError message={authError} onRetry={retrySession} />;
+  }
   if (!user) return <LoginPage />;
 
   if (canAccessPermission(user, 'Analytics')) {
@@ -227,10 +312,17 @@ function HomeEntry() {
 
 /** Logged-out / is the existing LoginPage. Logged-in / enters the app. */
 function PublicHome() {
-  const { user, loading } = useAuth();
+  const { user, loading, authError, retrySession } = useAuth();
+  if (authError) {
+    return <SessionBootstrapError message={authError} onRetry={retrySession} />;
+  }
   if (user) return <HomeEntry />;
   if (loading && typeof localStorage !== 'undefined' && localStorage.getItem('token')) {
-    return null;
+    return (
+      <div className="p-8 text-sm text-center" style={{ color: '#6B7280' }} data-testid="session-loading">
+        Checking session…
+      </div>
+    );
   }
   return <LoginPage />;
 }
