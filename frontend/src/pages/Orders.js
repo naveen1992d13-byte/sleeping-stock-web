@@ -7,6 +7,7 @@ import { useWorkspaceScope } from '../workspaceScope';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { openOrderDeskPrint } from '@/utils/orderDeskPrint';
+import { fetchFeatureFlags } from '@/featureFlags';
 import { FileSpreadsheet, ClipboardPaste, Search, Send, ChevronDown, ChevronUp, Printer, Eraser, Plus, Lock, Download } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -265,6 +266,15 @@ export function Orders({ scopeOverride } = {}) {
   const [autoSuggestLoading, setAutoSuggestLoading] = useState('');
   const [autoSourceLoading, setAutoSourceLoading] = useState(false);
   const [factoryDecisionLoading, setFactoryDecisionLoading] = useState('');
+  // Fail closed: hidden until the backend confirms the flag is on.
+  const [sequentialAutoSourcing, setSequentialAutoSourcing] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    fetchFeatureFlags(API).then((flags) => {
+      if (!cancelled) setSequentialAutoSourcing(flags.sequential_auto_sourcing === true);
+    });
+    return () => { cancelled = true; };
+  }, []);
   const [nowMs, setNowMs] = useState(Date.now());
   const [factoryDrafts, setFactoryDrafts] = useState({});
   const [factorySaving, setFactorySaving] = useState('');
@@ -849,7 +859,7 @@ export function Orders({ scopeOverride } = {}) {
         </div>
       )}
 
-      {currentOrder && (
+      {sequentialAutoSourcing && currentOrder && (
         <div className="rounded-xl border bg-white p-4 flex flex-wrap items-center gap-3">
           <div className="flex-1 min-w-[220px]">
             <div className="text-sm font-semibold text-slate-800">Sequential Auto Sourcing</div>
@@ -873,7 +883,7 @@ export function Orders({ scopeOverride } = {}) {
         </div>
       )}
 
-      {(currentOrder?.factory_decision_required || currentOrder?.auto_sourcing_message) && (
+      {sequentialAutoSourcing && (currentOrder?.factory_decision_required || currentOrder?.auto_sourcing_message) && (
         <div className="rounded-xl border border-slate-300 bg-slate-50 p-4 space-y-3">
           <div className="text-sm font-semibold text-slate-900">
             {currentOrder.auto_sourcing_message || 'Auto Sourcing Completed – Factory Decision Required'}

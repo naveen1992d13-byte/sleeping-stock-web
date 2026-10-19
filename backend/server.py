@@ -75,6 +75,7 @@ try:
     from . import request_fulfillment as rff
     from . import request_in_transit_reminder
     from . import login_screen
+    from . import feature_flags
 except ImportError:
     import s3_storage
     import file_objects
@@ -96,6 +97,7 @@ except ImportError:
     import request_fulfillment as rff
     import request_in_transit_reminder
     import login_screen
+    import feature_flags
 
 s3_storage.load_storage_dotenv()
 
@@ -6134,6 +6136,8 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
 
 
 async def _auto_source_continue_safe(order_id: str, reason: str = ''):
+    if not feature_flags.sequential_auto_sourcing_enabled():
+        return
     try:
         await _auto_source_advance(order_id, actor=_sla_system_actor(), reason=reason)
     except Exception as exc:
@@ -6415,6 +6419,7 @@ async def _auto_source_advance(order_id: str, actor: UserResponse = None, reason
 @api_router.post('/order-desk/orders/{order_id}/auto-source/start')
 async def order_desk_auto_source_start(order_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     """Start sequential Auto Sourcing for an order (Own Branch → ranked suppliers → Last Chance → Factory Decision)."""
+    feature_flags.require_sequential_auto_sourcing()
     import order_auto_sourcing as oas
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
@@ -6475,6 +6480,7 @@ async def order_desk_auto_source_start(order_id: str, payload: dict = None, curr
 @api_router.post('/order-desk/orders/{order_id}/auto-source/continue')
 async def order_desk_auto_source_continue(order_id: str, current_user: UserResponse = Depends(get_current_user)):
     """Manual / system continue after reject, timeout, or partial acceptance."""
+    feature_flags.require_sequential_auto_sourcing()
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail='Order not found')
@@ -10051,6 +10057,12 @@ async def storage_archive_delete_mongo(
     )
 
 
+@api_router.get("/features")
+async def public_feature_flags():
+    """Unauthenticated, non-secret feature flags resolved by the backend."""
+    return feature_flags.public_features()
+
+
 @api_router.get("/testing/runtime")
 async def testing_runtime_status():
     """Non-secret testing banner / filter status. Production returns is_testing=false."""
@@ -10325,6 +10337,15 @@ async def testing_overlay_reset(payload: dict = None, current_user: UserResponse
 
 
 app.include_router(api_router)
+
+@app.middleware("http")
+async def testing_routes_guard(request: Request, call_next):
+    """Default-deny /api/testing/* outside a positively detected Testing process."""
+    if feature_flags.testing_route_blocked(request.url.path, request.method):
+        from starlette.responses import JSONResponse
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return await call_next(request)
+
 
 @app.middleware("http")
 async def maintenance_guard(request: Request, call_next):

@@ -22,6 +22,9 @@ import { TestingBanner } from './components/TestingBanner';
 
 const AuthContext = createContext(null);
 
+// Inlined at build time: only a Testing build (REACT_APP_APP_ENV=testing) mounts the banner.
+const IS_TESTING_BUILD = String(process.env.REACT_APP_APP_ENV || '').trim().toLowerCase() === 'testing';
+
 export const MENU_PERMISSIONS = {
   '/': 'Analytics',
   '/dashboard': 'Analytics',
@@ -337,7 +340,7 @@ function App() {
     <ProcessingProvider>
     <AuthProvider>
       <BrowserRouter>
-        <TestingBannerWithAuth />
+        {IS_TESTING_BUILD && <TestingBannerWithAuth />}
         <SessionInactivityGuard />
         <Toaster position="top-right" richColors />
         <Routes>
