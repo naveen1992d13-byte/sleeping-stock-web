@@ -577,7 +577,11 @@ async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
         data = preview["data"]
         data["actions"] = "pick_reject"
         data["can_snooze"] = False
-        data["confirm_window_seconds"] = 50
+        try:
+            from mobile_request_claim import CONFIRM_WINDOW_SECONDS as _confirm_secs
+        except ImportError:
+            _confirm_secs = 50 * 60
+        data["confirm_window_seconds"] = int(_confirm_secs)
         title = data.get("requestNumber") or display_number
         body = f"round={data.get('round')} {data.get('branchName') or ''} items={data.get('totalItems')} qty={data.get('totalQuantity')}"
 
@@ -632,7 +636,7 @@ async def notify_branch_request_push(db, group_doc: dict, kind: str = "new"):
             msg.setdefault("data", {})
             msg["data"]["actions"] = "pick_reject"
             msg["data"]["can_snooze"] = False
-            msg["data"]["confirm_window_seconds"] = "50"
+            msg["data"]["confirm_window_seconds"] = str(int(_confirm_secs))
             msg["data"]["type"] = "branch_request"
             if ring_deadline:
                 msg["data"]["ring_deadline_at"] = ring_deadline
@@ -676,7 +680,11 @@ def build_request_cycle_renotify_message(token: str, group_doc: dict) -> dict:
     msg["data"]["type"] = "request_cycle_renotify"
     msg["data"]["actions"] = "pick_reject"
     msg["data"]["can_snooze"] = False
-    msg["data"]["confirm_window_seconds"] = "50"
+    try:
+        from mobile_request_claim import CONFIRM_WINDOW_SECONDS as _confirm_secs
+    except ImportError:
+        _confirm_secs = 50 * 60
+    msg["data"]["confirm_window_seconds"] = str(int(_confirm_secs))
     return msg
 
 

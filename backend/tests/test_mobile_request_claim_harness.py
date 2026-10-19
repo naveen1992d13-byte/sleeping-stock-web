@@ -381,7 +381,7 @@ async def _test_simultaneous_pick_second_gets_already_picked(monkeypatch):
     first = await mobile_api.accept_notification(payload, session=_session("d1", "u1", "Ravi"))
     assert first["status"] == "picked"
     assert first.get("confirm_deadline_at")
-    assert first.get("confirm_window_seconds") == 50
+    assert first.get("confirm_window_seconds") == 3000
 
     with pytest.raises(HTTPException) as err:
         await mobile_api.accept_notification(

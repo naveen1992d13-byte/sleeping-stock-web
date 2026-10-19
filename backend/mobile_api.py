@@ -89,7 +89,10 @@ PAIRING_CODE_TTL_MINUTES = 10
 DEFAULT_NOTIFICATION_INTERVAL_MINUTES = 30
 SKIP_LIMIT = 0  # Snooze removed from request alert flow (Pick / Reject only)
 MOBILE_EXPIRED_LABEL = "EXPIRED – NO RESPONSE"
-PICK_CONFIRM_WINDOW_SECONDS = 50
+try:
+    from .mobile_request_claim import CONFIRM_WINDOW_SECONDS as PICK_CONFIRM_WINDOW_SECONDS
+except ImportError:
+    from mobile_request_claim import CONFIRM_WINDOW_SECONDS as PICK_CONFIRM_WINDOW_SECONDS
 ALREADY_PICKED_DEALER_MESSAGE = "This request was already picked by another dealer."
 MOBILE_TIMEOUT_REASON = "Cancelled – No Response"
 NOTIFICATION_HISTORY_HOURS = 36
@@ -2701,7 +2704,7 @@ async def list_branch_notifications(session=Depends(get_device_session)):
     )
 
     results = []
-    for key, group in groups.items():
+    for key, group in groups.items():  # noqa: C901 — existing grouping loop
         lines_for_group = group_lines.get(key) or []
         lock = _lock_for_group(lock_by_key, {**group, "request_group_key": key}, lines_for_group)
         action = action_by_key.get(key, {})
@@ -2822,10 +2825,10 @@ async def list_branch_notifications(session=Depends(get_device_session)):
 @router.post("/notifications/accept")
 async def accept_notification(payload: NotificationActionRequest, session=Depends(get_device_session)):
     from mobile_request_claim import (
-        CONFIRM_WINDOW_SECONDS,
         confirm_deadline_iso,
         is_confirm_expired,
         release_expired_claim,
+        resolve_confirm_window_seconds,
     )
 
     mobile_user_id = session["mobile_user"]["mobile_user_id"]
@@ -2834,6 +2837,7 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
     device_user_mobile = session["device"].get("device_user_mobile") or session["mobile_user"].get("mobile_number", "")
     branch = session["branch"]
     dealer = session["dealer_name"]
+    confirm_window_seconds = await resolve_confirm_window_seconds(db)
 
     # Brand-wide live lines so any dealer under the brand can race Pick.
     live_lines = await _brand_group_lines(payload.request_group_key, session, statuses=("Requested",))
@@ -2878,7 +2882,7 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
                 "can_edit": True,
                 "can_pick": False,
                 "confirm_deadline_at": existing.get("confirm_deadline_at"),
-                "confirm_window_seconds": CONFIRM_WINDOW_SECONDS,
+                "confirm_window_seconds": existing.get("confirm_window_seconds") or confirm_window_seconds,
             }
         raise HTTPException(status_code=409, detail=_already_picked_detail(existing))
 
@@ -2892,7 +2896,7 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         raise HTTPException(400, "This dealer already rejected this request")
 
     now_iso = _now_iso()
-    deadline = confirm_deadline_iso()
+    deadline = confirm_deadline_iso(window_seconds=confirm_window_seconds)
     lock_doc = {
         "request_group_key": canonical_key,
         "mobile_user_id": mobile_user_id,
@@ -2906,7 +2910,7 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         "lock_status": "picked",
         "picked_at": now_iso,
         "confirm_deadline_at": deadline,
-        "confirm_window_seconds": CONFIRM_WINDOW_SECONDS,
+        "confirm_window_seconds": confirm_window_seconds,
         "owner_last_seen_at": now_iso,
         "line_responses": {},
     }
@@ -2960,7 +2964,7 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         "can_edit": True,
         "can_pick": False,
         "confirm_deadline_at": deadline,
-        "confirm_window_seconds": CONFIRM_WINDOW_SECONDS,
+        "confirm_window_seconds": confirm_window_seconds,
     }
 
 

@@ -1,14 +1,18 @@
-"""Race-safe Pick claim + 50s confirmation window for mobile request alerts.
+"""Race-safe Pick claim + configurable confirmation window for mobile request alerts.
 
 Used by Testing and Production mobile APIs. Backward compatible: locks without
-confirm_deadline_at behave as before until the next Pick.
+confirm_deadline_at behave as before until the next Pick. Existing locks that
+already store confirm_window_seconds keep that stored value.
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-CONFIRM_WINDOW_SECONDS = 50
+# Default confirm window after Pick: 50 minutes (was hard-coded 50 seconds).
+DEFAULT_CONFIRM_WINDOW_MINUTES = 50
+CONFIRM_WINDOW_SECONDS = DEFAULT_CONFIRM_WINDOW_MINUTES * 60
+CONFIRM_WINDOW_SETTINGS_ID = "mobile_confirm_window_minutes"
 ALREADY_PICKED_MESSAGE = "This request was already picked by another dealer."
 
 
@@ -20,9 +24,49 @@ def now_iso() -> str:
     return now_utc().isoformat()
 
 
-def confirm_deadline_iso(from_dt: Optional[datetime] = None) -> str:
+def minutes_to_confirm_seconds(minutes: Any) -> int:
+    """Clamp configured minutes to a sane positive window (1..24h)."""
+    try:
+        mins = int(minutes)
+    except (TypeError, ValueError):
+        mins = DEFAULT_CONFIRM_WINDOW_MINUTES
+    if mins < 1:
+        mins = DEFAULT_CONFIRM_WINDOW_MINUTES
+    if mins > 24 * 60:
+        mins = 24 * 60
+    return mins * 60
+
+
+async def resolve_confirm_window_seconds(db) -> int:
+    """Read mobile_settings.mobile_confirm_window_minutes; default 50 minutes."""
+    if db is None:
+        return CONFIRM_WINDOW_SECONDS
+    settings = getattr(db, "mobile_settings", None)
+    if settings is None:
+        return CONFIRM_WINDOW_SECONDS
+    try:
+        row = await settings.find_one({"_id": CONFIRM_WINDOW_SETTINGS_ID})
+    except Exception:
+        return CONFIRM_WINDOW_SECONDS
+    if not row:
+        return CONFIRM_WINDOW_SECONDS
+    if row.get("minutes") is not None:
+        return minutes_to_confirm_seconds(row.get("minutes"))
+    if row.get("interval_minutes") is not None:
+        return minutes_to_confirm_seconds(row.get("interval_minutes"))
+    return CONFIRM_WINDOW_SECONDS
+
+
+def confirm_deadline_iso(
+    from_dt: Optional[datetime] = None,
+    *,
+    window_seconds: Optional[int] = None,
+) -> str:
     base = from_dt or now_utc()
-    return (base + timedelta(seconds=CONFIRM_WINDOW_SECONDS)).isoformat()
+    seconds = int(window_seconds) if window_seconds is not None else CONFIRM_WINDOW_SECONDS
+    if seconds < 1:
+        seconds = CONFIRM_WINDOW_SECONDS
+    return (base + timedelta(seconds=seconds)).isoformat()
 
 
 def parse_iso(value) -> Optional[datetime]:

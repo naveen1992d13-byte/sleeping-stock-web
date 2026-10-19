@@ -791,6 +791,7 @@ async def _test_device_not_registered_clears_token(monkeypatch):
 
 def test_constants():
     assert cycles.RING_TTL_SECONDS == 50
-    assert cycles.CONFIRM_WINDOW_SECONDS == 50
+    assert cycles.CONFIRM_WINDOW_SECONDS == 3000
     assert cycles.MAX_CYCLES == 3
-    assert claim.CONFIRM_WINDOW_SECONDS == 50
+    assert claim.CONFIRM_WINDOW_SECONDS == 3000
+    assert claim.DEFAULT_CONFIRM_WINDOW_MINUTES == 50
