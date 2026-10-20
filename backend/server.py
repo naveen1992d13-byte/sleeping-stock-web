@@ -5305,7 +5305,9 @@ def _send_requests_response(group_docs: list, duplicate: bool):
     attempt_ids = [g.get('attempt_id') or g.get('id') for g in groups]
     any_email_sent = any(g.get('email_sent') for g in groups)
     any_email_failed = any(
-        (not g.get('email_sent')) and g.get('email_status') not in ('pending', 'deferred_until_acceptance', None)
+        (not g.get('email_sent')) and g.get('email_status') not in ('pending', 'deferred_untilraise HTTPException(status_if role == 'user' and order.get('created_by') != current_user.id:
+        raise HTTPException(status_code=403, detail='Only the order creator can save System Order Number')
+    if role == 'admin' and order.get('dealer_name')code=403, detail='Not authorized to save System Order Number')if role not in ('master', 'admin', 'user'):_acceptance', None)
         for g in groups
     )
     errors = [g.get('email_error') for g in groups if g.get('email_error')]
@@ -7637,7 +7639,7 @@ async def save_factory_system_order(
     """Save generic System Order Number for Factory-stage remaining qty.
 
     Brand-agnostic (DPS / OEM / other). Closes remaining Factory sourcing qty.
-    Master Admin / Admin may save; Master may correct with audit reason.
+    The order creator, Admin, or Master may save; only Master may correct an exiThe order creator, Admin, or Master may save; only Master may correct an existing number with an audit reason.
     """
     role = (current_user.role or '').lower()
     if role not in ('master', 'admin'):
