@@ -46,7 +46,13 @@ def test_production_storage_unset_db_nmts_flag_off_and_testing_routes_404(monkey
 def test_production_storage_dev_flag_off(monkeypatch):
     _env(monkeypatch, app_env="production", db_name="nmts", storage="dev")
     assert ff.sequential_auto_sourcing_enabled() is False
-    assert ff.testing_route_blocked("/api/testing/cleanup", "POST") is True
+    assert ff.testing_route_blocked("/api/testing/cleanup", "POST") is Truedef test_assert ff.sequential_auto_sourcing_enabled() is False
+    assert ff.public_features() == {"sequential_auto_sourcing": False}testing_proces_env(monkeypatch, app_env="testing")
+    with pytest.raises(HTTPException):
+        ff.require_sequential_auto_sourcing()
+    _env(monkeypatch, app_env="testing", flag="true")
+    ff.require_sequential_auto_sourcing()  # explicit opt-in_env(monkeypatch, app_env="testing", flag="  ")
+    assert ff.sequential_auto_sourcing_enabled() is Falses_keeps_unfinished_feature_off_but_routes_allowed(monkeypatch):
 
 
 def test_default_deny_without_positive_testing_detection(monkeypatch):
