@@ -113,7 +113,7 @@ jobs:
           # Do not print secret values. Host/user are deployment routing metadata.
           echo "Deploying PR #${PR_NUMBER} ${HEAD_REF}@${HEAD_SHA} to testing only"
           ssh -p "$PORT" \
-            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
             -o StrictHostKeyChecking=yes \
             "${USER_NAME}@${TESTING_SSH_HOST}" \
             "NMTS_TESTING_ROOT=/opt/nmts-testing bash -s" <<EOF
