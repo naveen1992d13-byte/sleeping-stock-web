@@ -217,7 +217,8 @@ function compactRequestedFrom(item, selectedAllocations = []) {
 
 export function Orders({ scopeOverride } = {}) {
   const { user } = useAuth();
-  const canSaveSystemOrder = ['master', 'admin'].includes(String(user?.role || '').toLowerCase());
+  const canSaveSystemOrder = ['master', 'admin', 'user'].includes(String(user?.role || '').toLowerCase());
+  const canApproveCancellation = ['master', 'admin'].includes(String(user?.role || '').toLowerCase());
   const isMaster = String(user?.role || '').toLowerCase() === 'master';
   const outletScope = useWorkspaceScope();
   const {
@@ -545,13 +546,15 @@ export function Orders({ scopeOverride } = {}) {
         requestNumbers: data.request_numbers || [],
         emailSent: !!data.email_sent,
         emailError: data.email_error || null,
+        emailDeferred: !!data.email_deferred_until_acceptance,
         duplicate: !!data.duplicate,
         message: data.message || 'Requests sent',
         level,
       });
       dirtyAllocRef.current = false;
       if (data.email_sent) toast.success('Request created and emailed.');
-      else toast.success('Request created. Email pending/failed — use Retry Email if needed.');
+      else if (data.email_deferred_until_acceptance) toast.success('Sourcing attempt created. Email and PDF will be created after supplier acceptance.');
+      else toast.success('Request created. Email failed — use Retry Email if needed.');
       await loadOrder(currentOrder.id, false, { preserveStage: true });
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Unable to send requests');
@@ -666,14 +669,7 @@ export function Orders({ scopeOverride } = {}) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }), [items, partSearch, statusFilter, stageFilter]);
 
-  const totals = useMemo(() => ({const canSaveSystemOrder = ['master', 'admin', 'user'].includes(String(user?.role || '').toLowerCase());
-  const canApproveCancellation = ['master', 'admin'].includes(String(user?.role || '').toLowerCase());emailError: data.email_erroelse if (data.email_deferred_until_acceptance) toast.success('Sourcing attempt created. Email and PDF will be created after supplier acceptance.');
-      else toast.success('Request created. Email failed — use Retry Email if needed.');r || null,{sendRequestResult.emailSent
-              ? 'Email Sent'
-              : sendRequestResult.emailDeferred!sendRequestResult.emailSent && !sendRequestResult.emailDeferred && sendRequestResult.requWaiting for the order creator, Admin{ca'Waiting for the order creator, Admin, or Master to enter the Factory Order No'nApproveCancellation && !orderFinished && item.cancellation_status, or Master to enter the Factory Order NoestNumbers.map
-                ? 'Email and PDF pending — they will be created after supplier acceptance.'
-                : `Email Failed${sendRequestResult.emailError ? `: ${sendRequestResult.emailError}` : ''}. Request remains valid.`}
-        emailDeferred: !!data.email_deferred_until_acceptance,
+  const totals = useMemo(() => ({
     required: items.reduce((s, i) => s + Number(i.required_qty || 0), 0),
     accepted: items.reduce((s, i) => s + Number(i.accepted_qty || 0), 0),
     remaining: items.reduce((s, i) => s + Number(i.remaining_qty != null ? i.remaining_qty : Math.max(0, Number(i.required_qty || 0) - Number(i.accepted_qty || 0))), 0),
@@ -857,8 +853,14 @@ export function Orders({ scopeOverride } = {}) {
       {sendRequestResult && (
         <div className={`rounded-xl border p-4 ${sendRequestResult.emailSent ? 'bg-emerald-50 border-emerald-200' : 'bg-amber-50 border-amber-200'}`}>
           <div className="text-sm font-semibold">{sendRequestResult.requestNumbers.length ? `Request: ${sendRequestResult.requestNumbers.join(', ')}` : sendRequestResult.message}</div>
-          <div className="mt-1 text-xs">{sendRequestResult.emailSent ? 'Email Sent' : `Email Failed${sendRequestResult.emailError ? `: ${sendRequestResult.emailError}` : ''}. Request remains valid.`}</div>
-          {!sendRequestResult.emailSent && sendRequestResult.requestNumbers.map(rn => (
+          <div className="mt-1 text-xs">
+            {sendRequestResult.emailSent
+              ? 'Email Sent'
+              : sendRequestResult.emailDeferred
+                ? 'Email and PDF pending — they will be created after supplier acceptance.'
+                : `Email Failed${sendRequestResult.emailError ? `: ${sendRequestResult.emailError}` : ''}. Request remains valid.`}
+          </div>
+          {!sendRequestResult.emailSent && !sendRequestResult.emailDeferred && sendRequestResult.requestNumbers.map(rn => (
             <Button key={rn} size="sm" variant="outline" className="mt-2 mr-2" disabled={resendingNumber === rn} onClick={() => resendRequestEmail(rn)}>
               {resendingNumber === rn ? 'Retrying…' : `Retry Email (${rn})`}
             </Button>
@@ -1063,7 +1065,7 @@ export function Orders({ scopeOverride } = {}) {
             )}
             {factoryUnlocked && !canSaveSystemOrder && (
               <div className="text-xs text-amber-700" data-testid="factory-waiting-admin-msg">
-                Waiting for Admin/Master to enter the Factory Order No
+                Waiting for the order creator, Admin, or Master to enter the Factory Order No
               </div>
             )}
             {!factoryUnlocked && <div className="text-xs text-slate-500">Factory Order entry is locked until Branch and Dealer stages are exhausted and no Branch/Dealer request is open.</div>}
@@ -1147,7 +1149,7 @@ export function Orders({ scopeOverride } = {}) {
                         {!item.qty_locked && !orderFinished && !['Cancelled', 'Cancellation Requested', 'Accepted', 'Completed'].includes(item.request_status) && (
                           <Button size="sm" variant="outline" className="text-amber-800" onClick={() => { setCancelItem(item); setCancelOpen(true); setCancelReason(''); setCancelRemarks(''); }}>Request Cancellation</Button>
                         )}
-                        {canSaveSystemOrder && !orderFinished && item.cancellation_status === 'pending' && item.cancellation_request_id && (
+                        {canApproveCancellation && !orderFinished && item.cancellation_status === 'pending' && item.cancellation_request_id && (
                           <div className="flex gap-1">
                             <Button size="sm" variant="outline" className="text-emerald-800" disabled={loading} onClick={() => decideCancellation(item, 'approve')}>Approve Cancel</Button>
                             <Button size="sm" variant="outline" className="text-red-700" disabled={loading} onClick={() => decideCancellation(item, 'reject')}>Reject Cancel</Button>
@@ -1218,7 +1220,7 @@ export function Orders({ scopeOverride } = {}) {
                                       ? 'Factory Order Number is locked while a branch availability request is still active.'
                                       : canSaveSystemOrder
                                       ? 'Enter System Order Number to fulfill remaining Factory quantity.'
-                                      : 'Waiting for Admin/Master to enter the Factory Order No'}
+                                      : 'Waiting for the order creator, Admin, or Master to enter the Factory Order No'}
                                   </div>
                                 )
                               )}
