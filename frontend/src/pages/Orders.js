@@ -666,7 +666,14 @@ export function Orders({ scopeOverride } = {}) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }), [items, partSearch, statusFilter, stageFilter]);
 
-  const totals = useMemo(() => ({
+  const totals = useMemo(() => ({const canSaveSystemOrder = ['master', 'admin', 'user'].includes(String(user?.role || '').toLowerCase());
+  const canApproveCancellation = ['master', 'admin'].includes(String(user?.role || '').toLowerCase());emailError: data.email_erroelse if (data.email_deferred_until_acceptance) toast.success('Sourcing attempt created. Email and PDF will be created after supplier acceptance.');
+      else toast.success('Request created. Email failed — use Retry Email if needed.');r || null,{sendRequestResult.emailSent
+              ? 'Email Sent'
+              : sendRequestResult.emailDeferred!sendRequestResult.emailSent && !sendRequestResult.emailDeferred && sendRequestResult.requWaiting for the order creator, Admin{ca'Waiting for the order creator, Admin, or Master to enter the Factory Order No'nApproveCancellation && !orderFinished && item.cancellation_status, or Master to enter the Factory Order NoestNumbers.map
+                ? 'Email and PDF pending — they will be created after supplier acceptance.'
+                : `Email Failed${sendRequestResult.emailError ? `: ${sendRequestResult.emailError}` : ''}. Request remains valid.`}
+        emailDeferred: !!data.email_deferred_until_acceptance,
     required: items.reduce((s, i) => s + Number(i.required_qty || 0), 0),
     accepted: items.reduce((s, i) => s + Number(i.accepted_qty || 0), 0),
     remaining: items.reduce((s, i) => s + Number(i.remaining_qty != null ? i.remaining_qty : Math.max(0, Number(i.required_qty || 0) - Number(i.accepted_qty || 0))), 0),
