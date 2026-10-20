@@ -156,7 +156,7 @@ export function LoginScreenManager() {
   const chooseFile = async (kind, file, input) => {
     if (!file) return;
     if (kind === 'scheduled' && (!startAt || !endAt)) {
-      toast.error('Select Start and End date/time in IST');type="date" value={(starttype="time" value={(startAt.split('T')[1] || '').slice(0type="date" value={(endAt.split('T')[0] || '')} onCltype="time" value={(endAt.split('T')[1] || '').slice(0,5)} onClick={(e) => e.currentTarget.showPicker?.()} onChangeick={(e) => e.currentTarget.showPicker?.()} onChange,5)} onClick={(e) => e.currentTarget.showPicker?.()} onChangeAt.split('T')[0] || '')} onClick={(e) => e.currentTarget.showPicker?.()} onChange
+      toast.error('Select Start and End date/time in IST');
       if (input) input.value = '';
       return;
     }
@@ -276,16 +276,16 @@ export function LoginScreenManager() {
             )}
           </div>
           <label className="lsm-field">Start Date (IST)
-            <input className="lsm-input" type="date" value={(startAt.split('T')[0] || '')} onChange={(e) => setStartAt(`${e.target.value}T${(startAt.split('T')[1] || '00:00').slice(0,5)}`)} />
+            <input className="lsm-input" type="date" value={(startAt.split('T')[0] || '')} onClick={(e) => e.currentTarget.showPicker?.()} onChange={(e) => setStartAt(`${e.target.value}T${(startAt.split('T')[1] || '00:00').slice(0,5)}`)} />
           </label>
           <label className="lsm-field">Start Time (IST)
-            <input className="lsm-input" type="time" value={(startAt.split('T')[1] || '').slice(0,5)} onChange={(e) => setStartAt(`${startAt.split('T')[0] || ''}T${e.target.value}`)} />
+            <input className="lsm-input" type="time" value={(startAt.split('T')[1] || '').slice(0,5)} onClick={(e) => e.currentTarget.showPicker?.()} onChange={(e) => setStartAt(`${startAt.split('T')[0] || ''}T${e.target.value}`)} />
           </label>
           <label className="lsm-field">End Date (IST)
-            <input className="lsm-input" type="date" value={(endAt.split('T')[0] || '')} onChange={(e) => setEndAt(`${e.target.value}T${(endAt.split('T')[1] || '00:00').slice(0,5)}`)} />
+            <input className="lsm-input" type="date" value={(endAt.split('T')[0] || '')} onClick={(e) => e.currentTarget.showPicker?.()} onChange={(e) => setEndAt(`${e.target.value}T${(endAt.split('T')[1] || '00:00').slice(0,5)}`)} />
           </label>
           <label className="lsm-field">End Time (IST)
-            <input className="lsm-input" type="time" value={(endAt.split('T')[1] || '').slice(0,5)} onChange={(e) => setEndAt(`${endAt.split('T')[0] || ''}T${e.target.value}`)} />
+            <input className="lsm-input" type="time" value={(endAt.split('T')[1] || '').slice(0,5)} onClick={(e) => e.currentTarget.showPicker?.()} onChange={(e) => setEndAt(`${endAt.split('T')[0] || ''}T${e.target.value}`)} />
           </label>
           <label className="lsm-file" data-busy={busy ? 'true' : 'false'}>
             <span className="nmts-btn-primary lsm-file-btn">{busy ? 'Uploading…' : 'Upload Scheduled Media'}</span>
