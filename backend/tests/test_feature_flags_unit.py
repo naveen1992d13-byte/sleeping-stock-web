@@ -46,13 +46,7 @@ def test_production_storage_unset_db_nmts_flag_off_and_testing_routes_404(monkey
 def test_production_storage_dev_flag_off(monkeypatch):
     _env(monkeypatch, app_env="production", db_name="nmts", storage="dev")
     assert ff.sequential_auto_sourcing_enabled() is False
-    assert ff.testing_route_blocked("/api/testing/cleanup", "POST") is Truedef test_assert ff.sequential_auto_sourcing_enabled() is False
-    assert ff.public_features() == {"sequential_auto_sourcing": False}testing_proces_env(monkeypatch, app_env="testing")
-    with pytest.raises(HTTPException):
-        ff.require_sequential_auto_sourcing()
-    _env(monkeypatch, app_env="testing", flag="true")
-    ff.require_sequential_auto_sourcing()  # explicit opt-in_env(monkeypatch, app_env="testing", flag="  ")
-    assert ff.sequential_auto_sourcing_enabled() is Falses_keeps_unfinished_feature_off_but_routes_allowed(monkeypatch):
+    assert ff.testing_route_blocked("/api/testing/cleanup", "POST") is True
 
 
 def test_default_deny_without_positive_testing_detection(monkeypatch):
@@ -62,10 +56,10 @@ def test_default_deny_without_positive_testing_detection(monkeypatch):
     assert ff.testing_route_blocked("/api/testing/cleanup", "POST") is True
 
 
-def test_testing_process_flag_on_and_routes_allowed(monkeypatch):
+def test_testing_process_keeps_unfinished_feature_off_but_routes_allowed(monkeypatch):
     _env(monkeypatch, app_env="testing", db_name="nmts_testing", storage="testing")
-    assert ff.sequential_auto_sourcing_enabled() is True
-    assert ff.public_features() == {"sequential_auto_sourcing": True}
+    assert ff.sequential_auto_sourcing_enabled() is False
+    assert ff.public_features() == {"sequential_auto_sourcing": False}
     assert ff.testing_route_blocked("/api/testing/cleanup", "POST") is False
     assert ff.testing_route_blocked("/api/testing/github/merge", "POST") is False
 
@@ -85,7 +79,7 @@ def test_empty_override_falls_back_to_default(monkeypatch):
     _env(monkeypatch, db_name="nmts", flag="")
     assert ff.sequential_auto_sourcing_enabled() is False
     _env(monkeypatch, app_env="testing", flag="  ")
-    assert ff.sequential_auto_sourcing_enabled() is True
+    assert ff.sequential_auto_sourcing_enabled() is False
 
 
 def test_require_raises_403_disabled_when_off(monkeypatch):
@@ -94,7 +88,10 @@ def test_require_raises_403_disabled_when_off(monkeypatch):
         ff.require_sequential_auto_sourcing()
     assert exc.value.status_code == 403 and exc.value.detail == "disabled"
     _env(monkeypatch, app_env="testing")
-    ff.require_sequential_auto_sourcing()  # no raise
+    with pytest.raises(HTTPException):
+        ff.require_sequential_auto_sourcing()
+    _env(monkeypatch, app_env="testing", flag="true")
+    ff.require_sequential_auto_sourcing()  # explicit opt-in
 
 
 def test_non_testing_paths_untouched(monkeypatch):
