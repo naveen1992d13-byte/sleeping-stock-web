@@ -3673,7 +3673,7 @@ async def upload_product_center_v2(
             "brand_name": context.get("brand_name") or context.get("brand"),
             "dealer_name": context.get("dealer_name"),
             "branch": context.get("branch"),
-                        "publish_status": "Waiting",
+            "publish_status": "Waiting",
             "status": {"$nin": ["Failed", "Cancelled"]},
         },
         {"_id": 0, "raw_file_bytes": 0},
