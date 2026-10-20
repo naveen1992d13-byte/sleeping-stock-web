@@ -2,7 +2,7 @@
 
 SEQUENTIAL_AUTO_SOURCING_ENABLED:
   explicit env var wins (only true/1/yes = on; anything else = off);
-  unset => on only in a positively detected Testing process (APP_ENV=testing).
+  unset => off in every environment. This keeps unfinished UI fail-closed.
 
 /api/testing/*: allowed only when is_testing_env() is True, otherwise 404,
 regardless of DB_NAME / NMTS_STORAGE_ENV. GET /api/testing/runtime stays
@@ -31,7 +31,7 @@ def sequential_auto_sourcing_enabled() -> bool:
     raw = os.environ.get(ENV_SEQUENTIAL_AUTO_SOURCING)
     if raw is not None and str(raw).strip() != "":
         return str(raw).strip().lower() in _ON_VALUES
-    return testing_runtime.is_testing_env()
+    return False
 
 
 def require_sequential_auto_sourcing() -> None:
