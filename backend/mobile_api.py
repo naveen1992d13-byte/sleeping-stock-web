@@ -31,11 +31,11 @@ from io import BytesIO
 import qrcode
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Header, Request, UploadFile, File, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError, OperationFailure
 
@@ -43,6 +43,21 @@ try:
     from . import testing_runtime
 except ImportError:
     import testing_runtime
+
+from auto_perpetual_blind import (
+    apply_quantity_edit,
+    auto_count_phase,
+    compact_edit_status,
+    is_quantity_finalized,
+    public_auto_task,
+    quantities_equal,
+)
+from auto_perpetual_sessions import (
+    TODAY_SESSION_NOT_CREATED,
+    filter_session_tasks,
+    session_task_flags,
+    summarize_auto_sessions,
+)
 
 logger = logging.getLogger("nmts.mobile")
 
@@ -72,8 +87,13 @@ async def _web_current_user(credentials: HTTPAuthorizationCredentials = Depends(
 
 PAIRING_CODE_TTL_MINUTES = 10
 DEFAULT_NOTIFICATION_INTERVAL_MINUTES = 30
-SKIP_LIMIT = 2  # first two alerts may be skipped; third cannot
+SKIP_LIMIT = 0  # Snooze removed from request alert flow (Pick / Reject only)
 MOBILE_EXPIRED_LABEL = "EXPIRED – NO RESPONSE"
+try:
+    from .mobile_request_claim import CONFIRM_WINDOW_SECONDS as PICK_CONFIRM_WINDOW_SECONDS
+except ImportError:
+    from mobile_request_claim import CONFIRM_WINDOW_SECONDS as PICK_CONFIRM_WINDOW_SECONDS
+ALREADY_PICKED_DEALER_MESSAGE = "This request was already picked by another dealer."
 MOBILE_TIMEOUT_REASON = "Cancelled – No Response"
 NOTIFICATION_HISTORY_HOURS = 36
 OWNERSHIP_STATUS_LABELS = {
@@ -89,6 +109,8 @@ ERR_ALREADY_PICKED = "ALREADY_PICKED"
 ERR_NOT_OWNER = "NOT_OWNER"
 ERR_INVALID_STATE = "INVALID_STATE"
 ERR_TRANSFER_TARGET_INVALID = "TRANSFER_TARGET_INVALID"
+ERR_BRANCH_TRANSFERRED = "BRANCH_TRANSFERRED"
+BRANCH_TRANSFERRED_MESSAGE = "Your branch has been transferred. Please re-pair your device to continue."
 PRESENCE_ONLINE_SECONDS = 90
 
 
@@ -134,6 +156,32 @@ def _now_iso():
 
 def _hash_token(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+def branch_transferred_detail() -> dict:
+    return {
+        "code": ERR_BRANCH_TRANSFERRED,
+        "message": BRANCH_TRANSFERRED_MESSAGE,
+        "re_pair_required": True,
+    }
+
+
+def raise_branch_transferred() -> None:
+    raise HTTPException(status_code=401, detail=branch_transferred_detail())
+
+
+def is_branch_changed_device(device) -> bool:
+    return bool(device) and str(device.get("inactive_reason") or "") == "branch_changed"
+
+
+def session_predates_branch_change(session, mobile_user) -> bool:
+    if not session or not mobile_user:
+        return False
+    changed_at = mobile_user.get("branch_changed_at")
+    created_at = session.get("created_at")
+    if not changed_at or not created_at:
+        return False
+    return str(created_at) < str(changed_at)
 
 
 def _new_raw_token() -> str:
@@ -299,6 +347,101 @@ def _require_scope_selected(brand, dealer, branch):
         raise HTTPException(400, "Brand, Dealer and Branch must all be selected before generating a pairing code")
 
 
+def _same_text(left, right) -> bool:
+    return str(left or "").strip().casefold() == str(right or "").strip().casefold()
+
+
+def _is_all_scope_label(value) -> bool:
+    text = str(value or "").strip()
+    return (not text) or text == "N/A" or text.casefold().startswith("all ")
+
+
+async def _resolve_dealer_identity(brand: str, dealer: str) -> dict:
+    brand = (brand or "").strip()
+    dealer = (dealer or "").strip()
+    if not brand or not dealer:
+        raise HTTPException(400, "Brand and Dealer are required")
+    dealer_doc = await db.dealers.find_one(
+        {
+            "name": _scope_ci(dealer),
+            "$or": [{"brand": _scope_ci(brand)}, {"brand_name": _scope_ci(brand)}, {"brand_id": brand}],
+        },
+        {"_id": 0, "id": 1, "name": 1, "brand": 1, "brand_name": 1, "brand_id": 1, "code": 1, "dealer_code": 1},
+    )
+    if not dealer_doc:
+        raise HTTPException(400, f"Invalid dealer '{dealer}' for brand '{brand}'")
+    return dealer_doc
+
+
+def _branch_belongs_to_dealer(branch_doc: dict, dealer_doc: dict) -> bool:
+    dealer_id = str((dealer_doc or {}).get("id") or "").strip()
+    branch_dealer_id = str((branch_doc or {}).get("dealer_id") or "").strip()
+    if dealer_id and branch_dealer_id:
+        return dealer_id == branch_dealer_id
+    brand = (dealer_doc or {}).get("brand") or (dealer_doc or {}).get("brand_name")
+    name = (dealer_doc or {}).get("name")
+    return _same_text((branch_doc or {}).get("dealer") or (branch_doc or {}).get("dealer_name"), name) and _same_text(
+        (branch_doc or {}).get("brand") or (branch_doc or {}).get("brand_name"), brand
+    )
+
+
+async def _eligible_transfer_branches(brand: str, dealer: str, current_branch: str) -> list:
+    dealer_doc = await _resolve_dealer_identity(brand, dealer)
+    brand_name = dealer_doc.get("brand") or dealer_doc.get("brand_name") or brand
+    dealer_name = dealer_doc.get("name") or dealer
+    dealer_id = str(dealer_doc.get("id") or "").strip()
+    brand_clauses = [{"brand": _scope_ci(brand_name)}, {"brand_name": _scope_ci(brand_name)}]
+    if dealer_doc.get("brand_id"):
+        brand_clauses.append({"brand_id": dealer_doc.get("brand_id")})
+    dealer_clauses = [{"dealer": _scope_ci(dealer_name)}, {"dealer_name": _scope_ci(dealer_name)}]
+    if dealer_id:
+        dealer_clauses.append({"dealer_id": dealer_id})
+    rows = await db.branches.find(
+        {"$and": [{"$or": dealer_clauses}, {"$or": brand_clauses}]},
+        {"_id": 0},
+    ).sort("name", 1).to_list(1000)
+    out = []
+    for row in rows:
+        name = str(row.get("name") or "").strip()
+        if _is_all_scope_label(name) or _same_text(name, current_branch):
+            continue
+        if not _branch_belongs_to_dealer(row, dealer_doc):
+            continue
+        out.append({
+            "id": row.get("id"),
+            "name": name,
+            "brand": row.get("brand") or row.get("brand_name"),
+            "dealer": row.get("dealer") or row.get("dealer_name"),
+            "dealer_id": row.get("dealer_id") or dealer_id or None,
+            "brand_id": row.get("brand_id") or dealer_doc.get("brand_id"),
+        })
+    return out
+
+
+def _same_mobile_scope(left, right) -> bool:
+    def _norm(row):
+        return (
+            str((row or {}).get("brand_name") or "").strip().casefold(),
+            str((row or {}).get("dealer_name") or "").strip().casefold(),
+            str((row or {}).get("branch") or "").strip().casefold(),
+        )
+    return _norm(left) == _norm(right) and all(_norm(left))
+
+
+def _require_master_or_admin(current_user, action="this action"):
+    role = str(getattr(current_user, "role", "") or "").strip().lower()
+    if role not in ("master", "admin"):
+        raise HTTPException(403, f"Only Master/Admin can {action}")
+
+
+def _actor_scope(current_user) -> dict:
+    return {
+        "brand_name": str(getattr(current_user, "brand", "") or "").strip(),
+        "dealer_name": str(getattr(current_user, "group", "") or "").strip(),
+        "branch": str(getattr(current_user, "location", "") or "").strip(),
+    }
+
+
 def _scoped_query_for_user(current_user, brand=None, dealer=None, branch=None) -> dict:
     """
     Mirrors the existing NMTS role-scoping pattern (master: full access,
@@ -322,6 +465,22 @@ def _scoped_query_for_user(current_user, brand=None, dealer=None, branch=None) -
         q["dealer_name"] = current_user.group
         q["branch"] = current_user.location
     return q
+
+
+def _require_branch_scope(current_user, brand=None, dealer=None, branch=None) -> None:
+    q = _scoped_query_for_user(current_user, brand, dealer, branch)
+    for key, value, label in (("brand_name", brand, "Brand"), ("dealer_name", dealer, "Dealer"), ("branch", branch, "Branch")):
+        if q.get(key) and not _same_text(q[key], value):
+            raise HTTPException(403, f"{label} outside scope")
+
+
+async def _load_scoped_suggestion(current_user, suggestion_id: str) -> None:
+    sug = await db.auto_perpetual_suggestions.find_one(
+        {"id": suggestion_id}, {"_id": 0, "brand_name": 1, "dealer_name": 1, "branch": 1}
+    )
+    if not sug:
+        raise HTTPException(404, "Suggestion not found")
+    _require_branch_scope(current_user, sug.get("brand_name"), sug.get("dealer_name"), sug.get("branch"))
 
 
 # ==================== MODELS ====================
@@ -364,6 +523,14 @@ class PairingGenerateRequest(BaseModel):
     dealer_name: Optional[str] = None
     branch: Optional[str] = None
 
+    @field_validator("pairing_type", "mobile_user_id", "brand_name", "dealer_name", "branch", mode="before")
+    @classmethod
+    def _coerce_optional_str(cls, value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
 
 class PairingVerifyRequest(BaseModel):
     mobile_user_id: Optional[str] = None
@@ -382,6 +549,7 @@ class MobileUserBranchUpdate(BaseModel):
     brand_name: Optional[str] = None
     dealer_name: Optional[str] = None
     branch: str
+    confirm_pending_release: bool = False
 
 
 class DeviceStatusUpdate(BaseModel):
@@ -433,10 +601,31 @@ class StockVerificationSubmit(BaseModel):
     client_id: Optional[str] = None  # offline-queue idempotency key (Part 22)
     damage_qty: Optional[float] = 0
     verification_type: Optional[str] = "physical"  # physical | auto
+    correction_reason: Optional[str] = None
+    # Auto Perpetual only. Pre-change APKs omit this and keep one-shot finalize.
+    auto_count_phase: Optional[str] = None  # save | finalize
     # Accepted for mobile offline-queue compatibility; backend remains session-authoritative.
     part_name: Optional[str] = None
     verification_session_id: Optional[str] = None
     is_new_part: Optional[bool] = None
+
+
+class AutoCountSaveRequest(BaseModel):
+    part_number: str
+    physical_qty: float
+    location: Optional[str] = None
+    remark: Optional[str] = None
+    damage_qty: Optional[float] = 0
+    correction_reason: Optional[str] = None
+    client_id: Optional[str] = None
+    entry_method: Optional[str] = "MANUAL"
+    session_id: Optional[str] = None  # original session; omitted by old APKs
+
+
+class AutoFinalizeRequest(BaseModel):
+    part_numbers: Optional[List[str]] = None
+    client_id: Optional[str] = None
+    session_id: Optional[str] = None  # original session; omitted by old APKs
 
 
 class StockVerificationBatchSubmit(BaseModel):
@@ -481,6 +670,8 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
     Resolves a mobile device session from 'Authorization: Bearer <token>'.
     Scope (brand/dealer/branch) is read from the stored session — the
     mobile client's own claims about its branch are never trusted.
+    A transferred user's old token is always rejected with BRANCH_TRANSFERRED
+    and is never reactivated.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Missing device session token")
@@ -488,10 +679,17 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
     token_hash = _hash_token(raw_token)
 
     session = await db.mobile_sessions.find_one({"session_token_hash": token_hash}, {"_id": 0})
-    if not session:
+    device = None
+    if session:
+        device = await db.mobile_devices.find_one({"device_id": session["device_id"]}, {"_id": 0})
+    else:
+        device = await db.mobile_devices.find_one({"session_token_hash": token_hash}, {"_id": 0})
+        if is_branch_changed_device(device):
+            raise_branch_transferred()
         raise HTTPException(401, "Invalid or expired device session")
 
-    device = await db.mobile_devices.find_one({"device_id": session["device_id"]}, {"_id": 0})
+    if is_branch_changed_device(device):
+        raise_branch_transferred()
     if not device or device.get("status") != "active":
         raise HTTPException(403, "Device is inactive or removed — please re-pair")
     if device.get("session_active") is False:
@@ -500,6 +698,8 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
     mobile_user = await db.mobile_users.find_one({"mobile_user_id": device["mobile_user_id"]}, {"_id": 0})
     if not mobile_user or mobile_user.get("status") != "active":
         raise HTTPException(403, "Mobile user is inactive")
+    if session_predates_branch_change(session, mobile_user):
+        raise_branch_transferred()
 
     seen_at = _now_iso()
     await db.mobile_devices.update_one(
@@ -524,9 +724,9 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
     return {
         "device": device,
         "mobile_user": mobile_user,
-        "brand_name": device["brand_name"],
-        "dealer_name": device["dealer_name"],
-        "branch": device["branch"],
+        "brand_name": mobile_user.get("brand_name") or device.get("brand_name"),
+        "dealer_name": mobile_user.get("dealer_name") or device.get("dealer_name"),
+        "branch": mobile_user.get("branch") or device.get("branch"),
     }
 
 
@@ -534,15 +734,13 @@ async def get_device_session(authorization: Optional[str] = Header(None)):
 
 @router.post("/users", response_model=MobileUserResponse)
 async def create_mobile_user(payload: MobileUserCreate, current_user: UserResponse = Depends(_web_current_user)):
+    _require_master_or_admin(current_user, "create mobile users")
     if current_user.role == "master":
         brand, dealer, branch = payload.brand_name, payload.dealer_name, payload.branch
         _require_scope_selected(brand, dealer, branch)
-    elif current_user.role == "admin":
+    else:
         brand, dealer = current_user.brand, current_user.group
         branch = payload.branch
-        _require_scope_selected(brand, dealer, branch)
-    else:
-        brand, dealer, branch = current_user.brand, current_user.group, current_user.location
         _require_scope_selected(brand, dealer, branch)
 
     brand, dealer, branch = await _resolve_canonical_pairing_scope(brand, dealer, branch)
@@ -598,9 +796,8 @@ async def list_mobile_users(
 
 @router.get("/users/{mobile_user_id}", response_model=MobileUserResponse)
 async def get_mobile_user(mobile_user_id: str, current_user: UserResponse = Depends(_web_current_user)):
-    row = await db.mobile_users.find_one({"mobile_user_id": mobile_user_id}, {"_id": 0, "password_hash": 0})
-    if not row:
-        raise HTTPException(404, "Mobile user not found")
+    row = await _assert_mobile_user_access(current_user, mobile_user_id)
+    row.pop("password_hash", None)
     enriched = await _enrich_mobile_user_presence([row])
     return enriched[0]
 
@@ -610,8 +807,7 @@ async def set_mobile_user_status(mobile_user_id: str, payload: DeviceStatusUpdat
     if payload.status not in ("active", "inactive"):
         raise HTTPException(400, "status must be active or inactive")
     await _assert_mobile_user_access(current_user, mobile_user_id)
-    if current_user.role not in ("master", "admin", "user"):
-        raise HTTPException(403, "Not allowed")
+    _require_master_or_admin(current_user, "change mobile user status")
     result = await db.mobile_users.update_one(
         {"mobile_user_id": mobile_user_id}, {"$set": {"status": payload.status, "updated_at": _now_iso()}}
     )
@@ -653,8 +849,7 @@ async def set_mobile_user_attendance(
     payload: MobileUserAttendanceUpdate,
     current_user: UserResponse = Depends(_web_current_user),
 ):
-    if current_user.role not in ("master", "admin", "user"):
-        raise HTTPException(403, "Not allowed")
+    _require_master_or_admin(current_user, "change mobile user attendance")
     if payload.status not in ("active", "inactive"):
         raise HTTPException(400, "status must be active or inactive")
     row = await _assert_mobile_user_access(current_user, mobile_user_id)
@@ -701,43 +896,160 @@ async def list_today_attendance(
     return {"attendance_date": attendance_date, "records": {r["mobile_user_id"]: r["status"] for r in rows}}
 
 
+async def _pending_transfer_work(mobile_user_id: str) -> dict:
+    locks = await db.mobile_request_group_locks.find(
+        {
+            "mobile_user_id": mobile_user_id,
+            "lock_status": {"$nin": ["picking_completed", "accepted", "rejected"]},
+        },
+        {"_id": 0, "request_group_key": 1, "lock_status": 1, "branch": 1, "dealer_name": 1, "picked_at": 1},
+    ).to_list(200)
+    assignments = await db.auto_perpetual_assignments.find(
+        {"mobile_user_id": mobile_user_id, "status": "pending"},
+        {"_id": 0, "part_number": 1, "loc": 1, "allocation_date": 1, "branch": 1, "status": 1},
+    ).to_list(200)
+    return {
+        "pending_requests": locks,
+        "pending_assignments": assignments,
+        "has_pending": bool(locks or assignments),
+    }
+
+
+@router.get("/users/{mobile_user_id}/transfer-pending")
+async def get_transfer_pending(mobile_user_id: str, current_user: UserResponse = Depends(_web_current_user)):
+    _require_master_or_admin(current_user, "review a mobile user's pending transfer work")
+    await _assert_mobile_user_access(current_user, mobile_user_id)
+    return await _pending_transfer_work(mobile_user_id)
+
+
+@router.get("/users/{mobile_user_id}/transfer-branches")
+async def list_transfer_branches(mobile_user_id: str, current_user: UserResponse = Depends(_web_current_user)):
+    _require_master_or_admin(current_user, "list transfer branches")
+    row = await _assert_mobile_user_access(current_user, mobile_user_id)
+    dealer_doc = await _resolve_dealer_identity(row.get("brand_name"), row.get("dealer_name"))
+    branches = await _eligible_transfer_branches(row.get("brand_name"), row.get("dealer_name"), row.get("branch"))
+    return {
+        "brand_name": dealer_doc.get("brand") or dealer_doc.get("brand_name") or row.get("brand_name"),
+        "dealer_name": dealer_doc.get("name") or row.get("dealer_name"),
+        "dealer_id": dealer_doc.get("id"),
+        "branches": branches,
+    }
+
+
 @router.put("/users/{mobile_user_id}/branch")
 async def change_mobile_user_branch(mobile_user_id: str, payload: MobileUserBranchUpdate, current_user: UserResponse = Depends(_web_current_user)):
-    user_doc = await db.mobile_users.find_one({"mobile_user_id": mobile_user_id}, {"_id": 0})
+    _require_master_or_admin(current_user, "transfer a mobile user's branch")
+    user_doc = await db.mobile_users.find_one({"mobile_user_id": mobile_user_id, "deleted_at": {"$exists": False}}, {"_id": 0})
     if not user_doc:
         raise HTTPException(404, "Mobile user not found")
 
-    if current_user.role == "master":
-        brand = payload.brand_name or user_doc.get("brand_name")
-        dealer = payload.dealer_name or user_doc.get("dealer_name")
-        branch = payload.branch
-    elif current_user.role == "admin":
-        if user_doc.get("brand_name") != current_user.brand or user_doc.get("dealer_name") != current_user.group:
+    current_scope = {
+        "brand_name": user_doc.get("brand_name"),
+        "dealer_name": user_doc.get("dealer_name"),
+        "branch": user_doc.get("branch"),
+    }
+    if current_user.role != "master":
+        actor = _actor_scope(current_user)
+        if (
+            not _same_text(user_doc.get("brand_name"), actor["brand_name"])
+            or not _same_text(user_doc.get("dealer_name"), actor["dealer_name"])
+        ):
             raise HTTPException(403, "Mobile user is outside your Brand/Dealer scope")
-        brand, dealer, branch = current_user.brand, current_user.group, payload.branch
-    else:
-        raise HTTPException(403, "Only Master/Admin can change a mobile user's branch")
+    if payload.dealer_name and not _same_text(payload.dealer_name, current_scope["dealer_name"]):
+        raise HTTPException(400, "Cross-dealer transfer is not allowed")
+    if payload.brand_name and not _same_text(payload.brand_name, current_scope["brand_name"]):
+        raise HTTPException(400, "Cross-dealer transfer is not allowed")
+    brand = current_scope["brand_name"]
+    dealer = current_scope["dealer_name"]
+    branch = payload.branch
+    if _is_all_scope_label(branch) or _same_text(branch, current_scope["branch"]):
+        raise HTTPException(400, "Select a different destination branch")
     _require_scope_selected(brand, dealer, branch)
+    eligible = await _eligible_transfer_branches(current_scope["brand_name"], current_scope["dealer_name"], current_scope["branch"])
+    if not any(_same_text(item.get("name"), branch) for item in eligible):
+        raise HTTPException(400, "Destination branch is outside this mobile user's Brand/Dealer")
     brand, dealer, branch = await _resolve_canonical_pairing_scope(brand, dealer, branch)
+    if not _same_text(dealer, current_scope["dealer_name"]) or not _same_text(brand, current_scope["brand_name"]):
+        raise HTTPException(400, "Cross-dealer transfer is not allowed")
+    destination = {"brand_name": brand, "dealer_name": dealer, "branch": branch}
+    if _same_mobile_scope(current_scope, destination):
+        raise HTTPException(400, "Select a different destination branch")
+
+    pending = await _pending_transfer_work(mobile_user_id)
+    if pending["has_pending"] and not payload.confirm_pending_release:
+        raise HTTPException(status_code=409, detail={
+            "code": "PENDING_WORK",
+            "message": "This mobile user has pending requests or work. Review and confirm after using the existing release process.",
+            "pending_requests": pending["pending_requests"],
+            "pending_assignments": pending["pending_assignments"],
+        })
+    if pending["pending_requests"]:
+        if not payload.confirm_pending_release:
+            raise HTTPException(status_code=409, detail={
+                "code": "PENDING_WORK",
+                "message": "Release pending requests before moving this mobile user.",
+                "pending_requests": pending["pending_requests"],
+                "pending_assignments": pending["pending_assignments"],
+            })
+        for lock in pending["pending_requests"]:
+            try:
+                await _release_lock(
+                    lock.get("request_group_key"),
+                    "SHIFT_CHANGE",
+                    "Released through Transfer Branch after Admin confirmation",
+                    current_user.id,
+                    getattr(current_user, "username", "") or current_user.id,
+                    "web_admin",
+                )
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
+
+    now = _now_iso()
+    from_branch = current_scope.get("branch") or ""
+    try:
+        import mobile_push
+        await mobile_push.notify_branch_transferred(
+            db,
+            mobile_user_id=mobile_user_id,
+            from_branch=from_branch,
+            to_branch=branch,
+        )
+    except Exception as exc:
+        logger.warning("branch-transfer push failed for %s: %s", mobile_user_id, exc)
 
     await db.mobile_users.update_one({"mobile_user_id": mobile_user_id}, {"$set": {
         "brand_name": brand, "dealer_name": dealer, "branch": branch,
-        "updated_at": _now_iso(), "branch_changed_at": _now_iso(),
+        "updated_at": now, "branch_changed_at": now,
         "branch_changed_by": current_user.id,
+        "active_device_count": 0,
     }})
     await db.mobile_sessions.delete_many({"mobile_user_id": mobile_user_id})
-    # Any unused Re-pair QR generated for the old scope must stop working.
     await db.mobile_pairing_codes.update_many(
         {"mobile_user_id": mobile_user_id, "pairing_type": "REPAIR", "used": False},
-        {"$set": {"used": True, "used_at": _now_iso(), "invalidated_reason": "branch_changed"}},
+        {"$set": {"used": True, "used_at": now, "invalidated_reason": "branch_changed"}},
     )
     await db.mobile_devices.update_many(
-        {"mobile_user_id": mobile_user_id, "status": "active"},
-        {"$set": {"status": "inactive", "inactive_reason": "branch_changed", "updated_at": _now_iso()}},
+        {"mobile_user_id": mobile_user_id},
+        {"$set": {
+            "status": "inactive",
+            "session_active": False,
+            "push_enabled": False,
+            "inactive_reason": "branch_changed",
+            "updated_at": now,
+            "session_revoked_at": now,
+        }},
     )
-    await db.mobile_users.update_one({"mobile_user_id": mobile_user_id}, {"$set": {"active_device_count": 0}})
-    await _audit(current_user, "mobile_user_branch_changed", mobile_user_id, {"brand_name": brand, "dealer_name": dealer, "branch": branch})
-    return {"message": "Branch updated. Generate a Re-pair QR for this user.", "mobile_user_id": mobile_user_id, "branch": branch}
+    await _audit(current_user, "mobile_user_branch_changed", mobile_user_id, destination)
+    return {
+        "message": "Branch updated. Generate a Re-pair QR for this user.",
+        "mobile_user_id": mobile_user_id,
+        "brand_name": brand,
+        "dealer_name": dealer,
+        "branch": branch,
+        "re_pair_required": True,
+        "code": ERR_BRANCH_TRANSFERRED,
+    }
 
 
 # ==================== PAIRING (WEB generates code, MOBILE consumes it) ====================
@@ -750,12 +1062,15 @@ async def generate_pairing_code(request: Request, payload: PairingGenerateReques
 
     mobile_user = None
     if pairing_type == "REPAIR":
-        if not payload.mobile_user_id:
+        uid = (payload.mobile_user_id or "").strip()
+        if not uid:
             raise HTTPException(400, "Mobile User ID is required for Re-pair")
-        mobile_user = await db.mobile_users.find_one({"mobile_user_id": payload.mobile_user_id.strip().upper()}, {"_id": 0})
+        mobile_user = await db.mobile_users.find_one({"mobile_user_id": uid}, {"_id": 0})
+        if not mobile_user:
+            mobile_user = await db.mobile_users.find_one({"mobile_user_id": _scope_ci(uid)}, {"_id": 0})
         if not mobile_user:
             raise HTTPException(404, "Mobile user not found")
-        if mobile_user.get("status") != "active":
+        if str(mobile_user.get("status") or "").strip().lower() != "active":
             raise HTTPException(400, "Mobile user is inactive")
 
     if current_user.role == "master":
@@ -767,7 +1082,7 @@ async def generate_pairing_code(request: Request, payload: PairingGenerateReques
         branch = payload.branch or (mobile_user or {}).get("branch")
     else:
         brand, dealer, branch = current_user.brand, current_user.group, current_user.location
-        if pairing_type == "REPAIR" and mobile_user.get("branch") != branch:
+        if pairing_type == "REPAIR" and not _same_mobile_scope(mobile_user, {"brand_name": brand, "dealer_name": dealer, "branch": branch}):
             raise HTTPException(403, "Mobile user is outside your assigned Branch")
     _require_scope_selected(brand, dealer, branch)
     brand, dealer, branch = await _resolve_canonical_pairing_scope(brand, dealer, branch)
@@ -947,6 +1262,11 @@ async def verify_pairing_and_register_device(payload: PairingVerifyRequest, requ
                 "created_at": now.isoformat(), "updated_at": now.isoformat(), "paired_device_count": 0, "active_device_count": 0, "last_active_at": None,
             }
             try:
+                import testing_runtime
+                mobile_user = testing_runtime.stamp_testing_origin(mobile_user)
+            except Exception:
+                pass
+            try:
                 await db.mobile_users.insert_one(dict(mobile_user))
             except DuplicateKeyError:
                 existing = await db.mobile_users.find_one(
@@ -989,6 +1309,11 @@ async def verify_pairing_and_register_device(payload: PairingVerifyRequest, requ
             "branch": pairing_doc["branch"],
             "session_token_hash": _hash_token(raw_session_token),
         }
+        try:
+            import testing_runtime
+            device_doc = testing_runtime.stamp_testing_origin(device_doc)
+        except Exception:
+            pass
         await db.mobile_devices.insert_one(dict(device_doc))
         await db.mobile_sessions.insert_one({"session_token_hash": device_doc["session_token_hash"], "device_id": device_id, "mobile_user_id": mobile_user["mobile_user_id"], "created_at": now.isoformat()})
         await db.mobile_users.update_one({"mobile_user_id": mobile_user["mobile_user_id"]}, {"$inc": {"paired_device_count": 1}, "$set": {"active_device_count": 1, "last_active_at": now.isoformat(), "updated_at": now.isoformat()}})
@@ -1096,11 +1421,13 @@ async def list_devices(
 
 @router.put("/devices/{device_id}/status")
 async def set_device_status(device_id: str, payload: DeviceStatusUpdate, current_user: UserResponse = Depends(_web_current_user)):
+    _require_master_or_admin(current_user, "change device status")
     if payload.status not in ("active", "inactive", "removed"):
         raise HTTPException(400, "Invalid status")
     device = await db.mobile_devices.find_one({"device_id": device_id})
     if not device:
         raise HTTPException(404, "Device not found")
+    await _assert_mobile_user_access(current_user, device.get("mobile_user_id"))
 
     was_active = device.get("status") == "active"
     await db.mobile_devices.update_one({"device_id": device_id}, {"$set": {"status": payload.status}})
@@ -1281,9 +1608,9 @@ async def generate_auto_perpetual(
         raise HTTPException(403, "Dealer outside scope")
     if q.get("branch") and q["branch"] != branch:
         raise HTTPException(403, "Branch outside scope")
-    from auto_perpetual import generate_auto_perpetual_for_branch, ist_date_key, resolve_branch_inventory_date_key
+    from auto_perpetual import generate_auto_perpetual_for_branch, require_todays_branch_stock
 
-    active_date_key = await resolve_branch_inventory_date_key(
+    active_date_key = await require_todays_branch_stock(
         db, brand_name=brand_name, dealer_name=dealer_name, branch=branch
     )
     result = await generate_auto_perpetual_for_branch(
@@ -1306,11 +1633,62 @@ async def list_auto_suggestions(
     limit: int = 20,
     current_user: UserResponse = Depends(_web_current_user),
 ):
+    _require_branch_scope(current_user, brand_name, dealer_name, branch)
     rows = await db.auto_perpetual_suggestions.find(
         {"brand_name": brand_name, "dealer_name": dealer_name, "branch": branch},
         {"_id": 0, "items": 0},
     ).sort("created_at", -1).limit(min(limit, 50)).to_list(50)
-    return rows
+    from auto_perpetual_suggestions import _mobile_user_name_map
+
+    suggestion_ids = [r.get("id") for r in rows if r.get("id")]
+    numbers = [r.get("suggestion_number") for r in rows if r.get("suggestion_number")]
+    assigns = []
+    or_filters = []
+    if suggestion_ids:
+        or_filters.append({"suggestion_id": {"$in": suggestion_ids}})
+    if numbers:
+        or_filters.append({"suggestion_number": {"$in": numbers}})
+    if or_filters:
+        assigns = await db.auto_perpetual_assignments.find(
+            {"$or": or_filters} if len(or_filters) > 1 else or_filters[0],
+            {"_id": 0, "suggestion_id": 1, "suggestion_number": 1, "mobile_user_id": 1, "status": 1},
+        ).to_list(20000)
+    names = await _mobile_user_name_map(db, [a.get("mobile_user_id") for a in assigns])
+    stats: Dict[str, dict] = {}
+    for a in assigns:
+        key = a.get("suggestion_id") or a.get("suggestion_number")
+        bucket = stats.setdefault(key, {"assigned": 0, "completed": 0, "users": {}})
+        bucket["assigned"] += 1
+        if (a.get("status") or "") == "completed":
+            bucket["completed"] += 1
+        mu = a.get("mobile_user_id")
+        if mu:
+            bucket["users"][mu] = names.get(mu) or mu
+    enriched = []
+    for row in rows:
+        bucket = stats.get(row.get("id")) or stats.get(row.get("suggestion_number")) or {}
+        assigned = int(bucket.get("assigned") or row.get("assignments_created") or row.get("total_items") or 0)
+        completed = int(bucket.get("completed") or 0)
+        user_map = bucket.get("users") or {}
+        if not user_map:
+            for mu in row.get("active_user_ids") or []:
+                user_map[mu] = mu
+            if user_map:
+                extra_names = await _mobile_user_name_map(db, list(user_map.keys()))
+                user_map = {k: extra_names.get(k) or k for k in user_map}
+        status = row.get("status") or "DRAFT"
+        enriched.append({
+            **row,
+            "audit_id": row.get("suggestion_number"),
+            "assigned_count": assigned,
+            "completed_count": completed,
+            "pending_count": max(0, assigned - completed),
+            "user_count": len(user_map),
+            "user_names": [user_map[k] for k in user_map],
+            "users_label": ", ".join(user_map.values()) if user_map else "-",
+            "status": status,
+        })
+    return enriched
 
 
 @router.get("/auto-perpetual/suggestions/{suggestion_id}")
@@ -1318,15 +1696,10 @@ async def get_auto_suggestion_detail(
     suggestion_id: str,
     current_user: UserResponse = Depends(_web_current_user),
 ):
-    row = await db.auto_perpetual_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
-    if not row:
-        raise HTTPException(404, "Suggestion not found")
-    items = sorted(
-        row.get("items") or [],
-        key=lambda r: (r.get("system_location") or "").upper(),
-    )
-    row["items"] = items
-    return row
+    from auto_perpetual_suggestions import suggestion_with_line_items
+
+    await _load_scoped_suggestion(current_user, suggestion_id)
+    return await suggestion_with_line_items(db, suggestion_id)
 
 
 @router.post("/auto-perpetual/suggestions/{suggestion_id}/send")
@@ -1336,6 +1709,8 @@ async def send_auto_suggestion(
 ):
     from auto_perpetual_suggestions import send_suggestion_to_mobile
     from mobile_push import notify_auto_perpetual_assignments
+
+    await _load_scoped_suggestion(current_user, suggestion_id)
 
     async def _notify(**kwargs):
         await notify_auto_perpetual_assignments(db, **kwargs)
@@ -1356,9 +1731,7 @@ async def auto_perpetual_user_performance(
     month: Optional[str] = None,
     current_user: UserResponse = Depends(_web_current_user),
 ):
-    q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
-    if q.get("brand_name") and q["brand_name"] != brand_name:
-        raise HTTPException(403, "Brand outside scope")
+    _require_branch_scope(current_user, brand_name, dealer_name, branch)
     from auto_perpetual import user_performance_summary
 
     return await user_performance_summary(db, brand_name=brand_name, dealer_name=dealer_name, branch=branch, month=month)
@@ -1371,9 +1744,7 @@ async def auto_perpetual_summary(
     branch: str,
     current_user: UserResponse = Depends(_web_current_user),
 ):
-    q = _scoped_query_for_user(current_user, brand_name, dealer_name, branch)
-    if q.get("brand_name") and q["brand_name"] != brand_name:
-        raise HTTPException(403, "Brand outside scope")
+    _require_branch_scope(current_user, brand_name, dealer_name, branch)
     from auto_perpetual import branch_monthly_summary
 
     return await branch_monthly_summary(db, brand_name=brand_name, dealer_name=dealer_name, branch=branch)
@@ -1388,6 +1759,7 @@ async def auto_perpetual_assignments_today(
 ):
     from auto_perpetual import ist_date_key
 
+    _require_branch_scope(current_user, brand_name, dealer_name, branch)
     rows = await db.auto_perpetual_assignments.find(
         {
             "allocation_date": ist_date_key(),
@@ -1400,66 +1772,266 @@ async def auto_perpetual_assignments_today(
     return rows
 
 
-@router.get("/auto-perpetual/tasks")
-async def auto_perpetual_tasks_device(session=Depends(get_device_session)):
-    from auto_perpetual import get_or_create_auto_daily_session, ist_date_key
-
-    mu = session["mobile_user"]["mobile_user_id"]
-    allocation_date = ist_date_key()
-    # Always use the authoritative daily get-or-create session. Do not trust
-    # per-assignment session_id stamps — those can diverge across parts.
-    session_id = await get_or_create_auto_daily_session(
-        db,
-        mobile_user_id=mu,
-        brand_name=session["brand_name"],
-        dealer_name=session["dealer_name"],
-        branch=session["branch"],
-        device_id=session["device"]["device_id"],
-    )
+async def _pending_auto_assignment_rows(scope_q: dict, brand_name: str, dealer_name: str, branch: str):
     rows = await db.auto_perpetual_assignments.find(
-        {
-            "allocation_date": allocation_date,
-            "mobile_user_id": mu,
-            "status": "pending",
-        },
+        {**scope_q, "status": "pending"},
         {"_id": 0},
     ).to_list(500)
-    rows.sort(key=lambda r: (r.get("loc") or r.get("part_number") or "").upper())
-    # Normalize assignment stamps to today's single session for consistency.
     if rows:
-        await db.auto_perpetual_assignments.update_many(
-            {
-                "allocation_date": allocation_date,
-                "mobile_user_id": mu,
-            },
-            {"$set": {"session_id": session_id}},
-        )
-    assigned = await db.auto_perpetual_assignments.count_documents(
-        {"allocation_date": allocation_date, "mobile_user_id": mu}
+        return rows, scope_q
+    loose_q = {
+        "allocation_date": scope_q.get("allocation_date"),
+        "mobile_user_id": scope_q.get("mobile_user_id"),
+        "status": "pending",
+        "brand_name": {"$regex": f"^{re.escape(str(brand_name or ''))}$", "$options": "i"},
+        "dealer_name": {"$regex": f"^{re.escape(str(dealer_name or ''))}$", "$options": "i"},
+        "branch": {"$regex": f"^{re.escape(str(branch or ''))}$", "$options": "i"},
+    }
+    rows = await db.auto_perpetual_assignments.find(loose_q, {"_id": 0}).to_list(500)
+    if not rows:
+        return [], scope_q
+    matched = {
+        "allocation_date": scope_q.get("allocation_date"),
+        "mobile_user_id": scope_q.get("mobile_user_id"),
+        "brand_name": rows[0].get("brand_name"),
+        "dealer_name": rows[0].get("dealer_name"),
+        "branch": rows[0].get("branch"),
+    }
+    return rows, matched
+
+
+async def _auto_assignment_rows(
+    scope_q: dict,
+    brand_name: str,
+    dealer_name: str,
+    branch: str,
+    *,
+    pending_only: bool = False,
+    limit: int = 2000,
+):
+    query = dict(scope_q)
+    if pending_only:
+        query["status"] = "pending"
+    rows = await db.auto_perpetual_assignments.find(query, {"_id": 0}).to_list(limit)
+    if rows:
+        return rows, query
+    loose_q = {
+        "mobile_user_id": scope_q.get("mobile_user_id"),
+        "brand_name": {"$regex": f"^{re.escape(str(brand_name or ''))}$", "$options": "i"},
+        "dealer_name": {"$regex": f"^{re.escape(str(dealer_name or ''))}$", "$options": "i"},
+        "branch": {"$regex": f"^{re.escape(str(branch or ''))}$", "$options": "i"},
+    }
+    if scope_q.get("allocation_date"):
+        loose_q["allocation_date"] = scope_q.get("allocation_date")
+    if scope_q.get("session_id"):
+        loose_q["session_id"] = scope_q.get("session_id")
+    if pending_only:
+        loose_q["status"] = "pending"
+    rows = await db.auto_perpetual_assignments.find(loose_q, {"_id": 0}).to_list(limit)
+    if not rows:
+        return [], query
+    matched = {
+        "mobile_user_id": scope_q.get("mobile_user_id"),
+        "brand_name": rows[0].get("brand_name"),
+        "dealer_name": rows[0].get("dealer_name"),
+        "branch": rows[0].get("branch"),
+    }
+    if scope_q.get("allocation_date"):
+        matched["allocation_date"] = scope_q.get("allocation_date")
+    if scope_q.get("session_id"):
+        matched["session_id"] = scope_q.get("session_id")
+    return rows, matched
+
+
+async def _auto_history_by_part(mobile_user_id: str, branch: str, part_keys, session_id: Optional[str] = None):
+    keys = [key for key in part_keys if key]
+    if not keys:
+        return {}
+    query = {
+        "verification_type": {"$in": ["auto", "recheck"]},
+        "mobile_user_id": mobile_user_id,
+        "branch": branch,
+        "part_number": {"$in": keys},
+    }
+    if session_id:
+        query["session_id"] = session_id
+    hist_rows = await db.stock_verification_history.find(query, {"_id": 0}).to_list(max(len(keys) * 3, 50))
+    hist_by_part = {}
+    for hist in hist_rows:
+        key = _normalize_part_number(hist.get("part_number", ""))
+        previous = hist_by_part.get(key)
+        if not previous or str(hist.get("verified_at") or hist.get("updated_at") or "") >= str(
+            previous.get("verified_at") or previous.get("updated_at") or ""
+        ):
+            hist_by_part[key] = hist
+    return hist_by_part
+
+
+async def _enrich_auto_tasks(rows, *, session_id, brand_name, dealer_name, branch, mobile_user_id):
+    products_by_part = await _scoped_products_by_part(
+        [row.get("part_number") for row in rows], brand_name, dealer_name, branch
     )
-    completed = await db.auto_perpetual_assignments.count_documents(
-        {"allocation_date": allocation_date, "mobile_user_id": mu, "status": "completed"}
-    )
+    part_keys = [_normalize_part_number(row.get("part_number", "")) for row in rows]
+    hist_by_part = await _auto_history_by_part(mobile_user_id, branch, part_keys, session_id=session_id)
+    live_qty_by_part = {}
     enriched = []
     for row in rows:
-        product, _ = await find_scoped_product(row.get("part_number", ""), session["brand_name"], session["dealer_name"], session["branch"])
+        part_key = _normalize_part_number(row.get("part_number", ""))
+        product = products_by_part.get(part_key)
+        loc = row.get("loc")
+        if loc is None or loc == "":
+            loc = _product_pin_location(product or {})
+        live_qty = _mobile_stock_qty(product)
+        live_qty_by_part[part_key] = live_qty
+        # Live qty (including zero) is used after first Save. Pre-Save public_auto_task omits it.
         enriched.append(
-            {
-                **row,
-                "session_id": session_id,
-                "part_name": resolve_product_part_name(product or {}),
-                "system_qty": _mobile_stock_qty(product),
-                "system_location": row.get("loc") or _product_pin_location(product or {}),
-                "loc": row.get("loc") or _product_pin_location(product or {}),
-            }
+            public_auto_task(
+                row,
+                loc=loc,
+                session_id=session_id or row.get("session_id"),
+                part_name=resolve_product_part_name(product or {}),
+                system_qty=live_qty,
+                history=hist_by_part.get(part_key),
+            )
         )
+    return enriched, live_qty_by_part
+
+
+def _empty_today_tasks(today: str) -> dict:
+    return {
+        "tasks": [],
+        "count": 0,
+        "session_id": None,
+        "allocation_date": today,
+        "today": today,
+        "today_created": False,
+        "is_today": True,
+        "editable": False,
+        "read_only": True,
+        "reaudit": False,
+        "mode": "view",
+        "assigned_count": 0,
+        "completed_count": 0,
+        "message": TODAY_SESSION_NOT_CREATED,
+    }
+
+
+@router.get("/auto-perpetual/tasks")
+async def auto_perpetual_tasks_device(
+    session=Depends(get_device_session),
+    session_id: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+):
+    """Return Auto Perpetual parts for one session.
+
+    Default (no session_id): IST-today pending tasks only. Never falls back to
+    yesterday's pending allocation. Extra fields are additive for old APKs.
+    mode=view: all parts for the session (read-only when not today).
+    mode=reaudit: pending parts only, editable, linked to the original session.
+    """
+    from auto_perpetual import ist_date_key
+
+    mu = session["mobile_user"]["mobile_user_id"]
+    brand_name = session["brand_name"]
+    dealer_name = session["dealer_name"]
+    branch = session["branch"]
+    today = ist_date_key()
+    wanted_mode = str(mode or "view").strip().lower()
+    if wanted_mode not in ("view", "reaudit"):
+        wanted_mode = "view"
+    requested_session = str(session_id or "").strip() or None
+
+    scope_q = {
+        "mobile_user_id": mu,
+        "brand_name": brand_name,
+        "dealer_name": dealer_name,
+        "branch": branch,
+    }
+    if requested_session:
+        scope_q["session_id"] = requested_session
+    else:
+        scope_q["allocation_date"] = today
+
+    pending_only = (not requested_session) or wanted_mode == "reaudit"
+    rows, matched_q = await _auto_assignment_rows(
+        scope_q, brand_name, dealer_name, branch, pending_only=False
+    )
+    if not rows:
+        payload = _empty_today_tasks(today)
+        if requested_session:
+            payload.update({
+                "session_id": requested_session,
+                "today_created": False,
+                "is_today": False,
+                "message": "Session not found",
+            })
+        return payload
+
+    allocation_date = next((str(r.get("allocation_date") or "") for r in rows if r.get("allocation_date")), today)
+    resolved_session = requested_session or next((r.get("session_id") for r in rows if r.get("session_id")), None)
+    flags = session_task_flags(allocation_date=allocation_date, mode=wanted_mode, today=today)
+    if not requested_session:
+        flags = session_task_flags(allocation_date=today, mode="view", today=today)
+        allocation_date = today
+        rows = [r for r in rows if str(r.get("allocation_date") or "") == today]
+        if not rows:
+            return _empty_today_tasks(today)
+        pending_only = True
+
+    live_qty_by_part = {}
+    products_preview = await _scoped_products_by_part(
+        [row.get("part_number") for row in rows], brand_name, dealer_name, branch
+    )
+    for row in rows:
+        key = _normalize_part_number(row.get("part_number", ""))
+        live_qty_by_part[key] = _mobile_stock_qty(products_preview.get(key))
+
+    selected = filter_session_tasks(
+        rows,
+        mode="reaudit" if flags["reaudit"] or pending_only else "view",
+        include_zero_live=True,
+        live_qty_by_part=live_qty_by_part,
+    )
+    if pending_only and not flags["reaudit"]:
+        selected = [row for row in selected if str(row.get("status") or "").lower() not in ("completed", "verified")]
+    selected.sort(key=lambda r: str(r.get("loc") or r.get("part_number") or "").upper())
+
+    assigned = await db.auto_perpetual_assignments.count_documents(matched_q if requested_session else {**matched_q, "allocation_date": today})
+    completed = await db.auto_perpetual_assignments.count_documents(
+        {**(matched_q if requested_session else {**matched_q, "allocation_date": today}), "status": "completed"}
+    )
+    enriched, _ = await _enrich_auto_tasks(
+        selected,
+        session_id=resolved_session,
+        brand_name=brand_name,
+        dealer_name=dealer_name,
+        branch=branch,
+        mobile_user_id=mu,
+    )
+    for task in enriched:
+        task["editable"] = flags["editable"]
+        task["read_only"] = flags["read_only"]
+        task["reaudit"] = flags["reaudit"]
+        # Double-check restricted fields stay omitted until first Save.
+        if not task.get("count_saved"):
+            for key in ("system_qty", "difference", "quantity_status", "shortage_qty", "excess_qty"):
+                task.pop(key, None)
+
     return {
         "tasks": enriched,
         "count": len(enriched),
-        "session_id": session_id,
+        "session_id": resolved_session,
         "allocation_date": allocation_date,
+        "today": today,
+        "today_created": allocation_date == today,
+        "is_today": flags["is_today"],
+        "editable": flags["editable"],
+        "read_only": flags["read_only"],
+        "reaudit": flags["reaudit"],
+        "mode": flags["mode"],
         "assigned_count": assigned,
         "completed_count": completed,
+        "message": None if (allocation_date == today or requested_session) else TODAY_SESSION_NOT_CREATED,
     }
 
 
@@ -1478,18 +2050,72 @@ async def finish_auto_perpetual_session(session=Depends(get_device_session)):
 
 @router.get("/auto-perpetual/session/today")
 async def auto_perpetual_session_today(session=Depends(get_device_session)):
-    from auto_perpetual import get_or_create_auto_daily_session, ist_date_key
+    """IST-today session only. Never returns yesterday's pending allocation as today.
+
+    Additive fields keep old APKs working when session_id is null.
+    """
+    from auto_perpetual import ist_date_key
 
     mu = session["mobile_user"]["mobile_user_id"]
-    session_id = await get_or_create_auto_daily_session(
-        db,
-        mobile_user_id=mu,
-        brand_name=session["brand_name"],
-        dealer_name=session["dealer_name"],
-        branch=session["branch"],
-        device_id=session["device"]["device_id"],
+    brand_name = session["brand_name"]
+    dealer_name = session["dealer_name"]
+    branch = session["branch"]
+    today = ist_date_key()
+    rows, matched = await _auto_assignment_rows(
+        {
+            "allocation_date": today,
+            "mobile_user_id": mu,
+            "brand_name": brand_name,
+            "dealer_name": dealer_name,
+            "branch": branch,
+        },
+        brand_name,
+        dealer_name,
+        branch,
+        pending_only=False,
     )
-    return {"session_id": session_id, "allocation_date": ist_date_key()}
+    assigned = len(rows)
+    completed = sum(1 for row in rows if str(row.get("status") or "").lower() in ("completed", "verified"))
+    pending = assigned - completed
+    session_id = next((row.get("session_id") for row in rows if row.get("session_id")), None)
+    created = bool(rows)
+    return {
+        "session_id": session_id,
+        "allocation_date": today,
+        "today": today,
+        "today_created": created,
+        "assigned_count": assigned,
+        "completed_count": completed,
+        "pending_count": pending,
+        "message": None if created else TODAY_SESSION_NOT_CREATED,
+    }
+
+
+@router.get("/auto-perpetual/sessions")
+async def auto_perpetual_sessions(session=Depends(get_device_session)):
+    """Collapsed session cards: today (if created) plus previous sessions."""
+    from auto_perpetual import ist_date_key
+
+    mu = session["mobile_user"]["mobile_user_id"]
+    brand_name = session["brand_name"]
+    dealer_name = session["dealer_name"]
+    branch = session["branch"]
+    today = ist_date_key()
+    rows, _matched = await _auto_assignment_rows(
+        {
+            "mobile_user_id": mu,
+            "brand_name": brand_name,
+            "dealer_name": dealer_name,
+            "branch": branch,
+        },
+        brand_name,
+        dealer_name,
+        branch,
+        pending_only=False,
+        limit=5000,
+    )
+    summary = summarize_auto_sessions(rows, today=today)
+    return summary
 
 
 # ==================== NOTIFICATIONS (BRANCH-SCOPED, MOBILE SIDE) ====================
@@ -1595,11 +2221,15 @@ def _lock_owner_name(lock) -> Optional[str]:
 
 
 def _already_picked_detail(lock) -> dict:
-    return {
-        "code": ERR_ALREADY_PICKED,
-        "message": "Already picked by another device",
-        "picked_by_name": _lock_owner_name(lock) or "another user",
-    }
+    try:
+        from mobile_request_claim import already_picked_detail as _apd
+        return _apd(lock)
+    except Exception:
+        return {
+            "code": ERR_ALREADY_PICKED,
+            "message": ALREADY_PICKED_DEALER_MESSAGE,
+            "picked_by_name": _lock_owner_name(lock) or "another dealer",
+        }
 
 
 def _error_detail(code: str, message: str, **extra) -> dict:
@@ -1732,7 +2362,11 @@ def _rejection_reason(lines, lock) -> Optional[str]:
 
 
 def _group_line_filter(request_group_key: str) -> dict:
-    return {"$or": [{"request_group_id": request_group_key}, {"request_number": request_group_key}]}
+    return {"$or": [
+        {"request_group_id": request_group_key},
+        {"request_attempt_id": request_group_key},
+        {"request_number": request_group_key},
+    ]}
 
 
 def _request_line_loc(line: dict) -> str:
@@ -1792,13 +2426,34 @@ async def _scope_group_lines(request_group_key: str, session, statuses=None):
     return await db.order_requests.find({"$and": clauses}, {"_id": 0}).to_list(2000)
 
 
+async def _brand_group_lines(request_group_key: str, session, statuses=None):
+    """Brand-wide group lines (no supplying dealer/branch filter) for Pick race."""
+    clauses = [_group_line_filter(request_group_key)]
+    brand_clause = _supplying_brand_clause(session)
+    if brand_clause:
+        clauses.append(brand_clause)
+    if statuses:
+        clauses.append({"status": {"$in": list(statuses)}})
+    return await db.order_requests.find({"$and": clauses}, {"_id": 0}).to_list(2000)
+
+
 async def _header_for_request_number(request_number: str) -> dict:
+    """Resolve header by official RQ, attempt_id, or group id."""
     if not request_number:
         return {}
+    projection = {
+        "_id": 0, "id": 1, "request_number": 1, "attempt_id": 1,
+        "response_deadline": 1, "response_status": 1,
+        "request_sent_at": 1, "timeout_cancelled": 1, "mobile_expiry_status": 1,
+        "official_confirmed": 1, "sourcing_attempt": 1,
+    }
     return await db.request_headers.find_one(
-        {"request_number": request_number},
-        {"_id": 0, "request_number": 1, "response_deadline": 1, "response_status": 1,
-         "request_sent_at": 1, "timeout_cancelled": 1, "mobile_expiry_status": 1},
+        {"$or": [
+            {"request_number": request_number},
+            {"attempt_id": request_number},
+            {"id": request_number},
+        ]},
+        projection,
     ) or {}
 
 
@@ -1828,6 +2483,49 @@ def _is_same_owner(lock, session) -> bool:
 def _line_response_map(lock) -> dict:
     raw = (lock or {}).get("line_responses") or {}
     return raw if isinstance(raw, dict) else {}
+
+
+@router.get("/stock/today-upload-status")
+async def today_upload_status(session=Depends(get_device_session)):
+    """Read-only IST-today stock upload gate for mobile stock screens.
+
+    Returns uploaded=true only when Published Product Hub rows exist for the
+    paired Brand/Dealer/Branch on today's IST inventory date key.
+    """
+    from auto_perpetual import TODAY_STOCK_MISSING_MESSAGE, ist_date_key, todays_branch_stock_date_key
+
+    brand = session["brand_name"]
+    dealer = session["dealer_name"]
+    branch = session["branch"]
+    today = ist_date_key()
+    try:
+        date_key = await todays_branch_stock_date_key(
+            db, brand_name=brand, dealer_name=dealer, branch=branch
+        )
+    except Exception as exc:
+        logger.warning("today-upload-status failed: %s", exc)
+        return {
+            "uploaded": False,
+            "error": True,
+            "retry": True,
+            "today": today,
+            "brand_name": brand,
+            "dealer_name": dealer,
+            "branch": branch,
+            "message": "Unable to verify today's stock upload. Please retry.",
+        }
+    uploaded = bool(date_key)
+    return {
+        "uploaded": uploaded,
+        "error": False,
+        "retry": not uploaded,
+        "today": today,
+        "active_date_key": date_key,
+        "brand_name": brand,
+        "dealer_name": dealer,
+        "branch": branch,
+        "message": None if uploaded else TODAY_STOCK_MISSING_MESSAGE,
+    }
 
 
 @router.get("/notifications")
@@ -1894,6 +2592,8 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             "request_group_key": key,
             "request_group_id": line.get("request_group_id") or key,
             "request_number": line.get("request_number"),
+            "attempt_id": line.get("request_attempt_id"),
+            "display_number": line.get("request_number") or line.get("request_attempt_id") or key,
             "requesting_dealer": line.get("requesting_dealer"),
             "requesting_branch": line.get("requesting_branch"),
             "supplying_dealer": line.get("supplying_dealer"),
@@ -1960,18 +2660,51 @@ async def list_branch_notifications(session=Depends(get_device_session)):
     ).to_list(2000)
     action_by_key = {a["request_id"]: a for a in actions}
 
-    request_numbers = [g.get("request_number") for g in groups.values() if g.get("request_number")]
+    # Dealer-level Reject opt-outs (any user at this dealer).
+    dealer_reject_keys = list(dict.fromkeys(group_keys + [
+        alias for key, group in groups.items()
+        for alias in _group_aliases(key, group, *(group_lines.get(key) or []))
+    ]))
+    dealer_rejects = await db.mobile_notification_actions.find(
+        {
+            "request_id": {"$in": dealer_reject_keys},
+            "action": "reject",
+            "dealer_name": _scope_ci(dealer),
+        },
+        {"_id": 0},
+    ).to_list(2000) if dealer_reject_keys else []
+    dealer_reject_by_key = {a["request_id"]: a for a in dealer_rejects if a.get("request_id")}
+
+    header_keys = []
+    for g in groups.values():
+        for key_name in ("request_number", "attempt_id", "request_group_id", "request_group_key"):
+            if g.get(key_name):
+                header_keys.append(g.get(key_name))
+    header_keys = list(dict.fromkeys(header_keys))
     header_by_number = {}
-    if request_numbers:
+    if header_keys:
         async for header in db.request_headers.find(
-            {"request_number": {"$in": request_numbers}},
-            {"_id": 0, "request_number": 1, "response_deadline": 1, "response_status": 1,
+            {"$or": [
+                {"request_number": {"$in": header_keys}},
+                {"attempt_id": {"$in": header_keys}},
+                {"id": {"$in": header_keys}},
+            ]},
+            {"_id": 0, "id": 1, "request_number": 1, "attempt_id": 1,
+             "response_deadline": 1, "response_status": 1,
              "request_sent_at": 1, "timeout_cancelled": 1, "mobile_expiry_status": 1},
         ):
-            header_by_number[header.get("request_number")] = header
+            for key_name in ("request_number", "attempt_id", "id"):
+                if header.get(key_name):
+                    header_by_number[header.get(key_name)] = header
+
+    from mobile_request_claim import (
+        CONFIRM_WINDOW_SECONDS,
+        is_confirm_expired,
+        release_expired_claim,
+    )
 
     results = []
-    for key, group in groups.items():
+    for key, group in groups.items():  # noqa: C901 — existing grouping loop
         lines_for_group = group_lines.get(key) or []
         lock = _lock_for_group(lock_by_key, {**group, "request_group_key": key}, lines_for_group)
         action = action_by_key.get(key, {})
@@ -1980,13 +2713,60 @@ async def list_branch_notifications(session=Depends(get_device_session)):
                 action = action_by_key.get(alias) or {}
                 if action:
                     break
-        header = header_by_number.get(group.get("request_number")) or {}
+        dealer_reject = dealer_reject_by_key.get(key) or {}
+        if not dealer_reject:
+            for alias in _group_aliases(key, group, *lines_for_group):
+                dealer_reject = dealer_reject_by_key.get(alias) or {}
+                if dealer_reject:
+                    break
+        dealer_dismissed = bool(dealer_reject)
+        header = (
+            header_by_number.get(group.get("request_number"))
+            or header_by_number.get(group.get("attempt_id"))
+            or header_by_number.get(group.get("request_group_id"))
+            or header_by_number.get(key)
+            or {}
+        )
+        if header.get("attempt_id") and not group.get("attempt_id"):
+            group["attempt_id"] = header.get("attempt_id")
+        if header.get("request_number"):
+            group["request_number"] = header.get("request_number")
+        group["display_number"] = group.get("request_number") or group.get("attempt_id") or key
+
+        if lock and is_confirm_expired(lock):
+            try:
+                released = await release_expired_claim(db, lock)
+                if released:
+                    try:
+                        import mobile_push
+                        await mobile_push.renotify_after_confirm_timeout(
+                            db,
+                            {
+                                **group,
+                                "id": key,
+                                "supplying_brand": session.get("brand_name"),
+                                "supplying_dealer": group.get("supplying_dealer") or dealer,
+                                "supplying_branch": group.get("supplying_branch") or branch,
+                                "total_items": group.get("total_items"),
+                                "total_qty": group.get("total_quantity"),
+                            },
+                            exclude_device_id=lock.get("device_id") or "",
+                        )
+                    except Exception as exc:
+                        logger.warning("renotify after confirm timeout (list) failed: %s", exc)
+                    lock_by_key.pop(lock.get("request_group_key"), None)
+                    lock = None
+            except Exception as exc:
+                logger.warning("release_expired_claim (list) failed: %s", exc)
+
         status = _ownership_status(lines_for_group, lock, header, now)
         owner_name = _lock_owner_name(lock)
         owned_by_me = bool(lock) and lock.get("device_id") == device_id
         skip_count = action.get("skip_count", 0)
-        skip_allowed = status == "pending" and skip_count < SKIP_LIMIT
+        skip_allowed = False
         rejection_reason = _rejection_reason(lines_for_group, lock) if status == "rejected" else None
+        if dealer_dismissed:
+            rejection_reason = (dealer_reject.get("rejection_reason") or "").strip() or rejection_reason
         responses = _line_response_map(lock)
         if responses:
             for part in group["parts"]:
@@ -1999,7 +2779,9 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             (part.get("order_request_id") in responses) for part in group["parts"]
         )
         can_edit = owned_by_me and status == "picked"
-        results.append({
+        can_pick = status == "pending" and not dealer_dismissed
+        can_reject = status == "pending" and not dealer_dismissed
+        row = {
             **group,
             "status": status,
             "status_label": OWNERSHIP_STATUS_LABELS.get(status, status),
@@ -2015,8 +2797,10 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             "accepted_by_device_name": lock.get("device_name") if lock else None,
             "accepted_by_another": bool(lock) and not owned_by_me,
             "accepted_by_me": owned_by_me,
-            "can_pick": status == "pending",
-            "can_snooze": skip_allowed,
+            "can_pick": can_pick,
+            "can_snooze": False,
+            "can_reject": can_reject,
+            "dealer_dismissed": dealer_dismissed,
             "can_edit": can_edit,
             "can_complete": can_edit and all_answered,
             "can_transfer": can_edit,
@@ -2027,24 +2811,36 @@ async def list_branch_notifications(session=Depends(get_device_session)):
             "response_deadline": header.get("response_deadline"),
             "response_status": header.get("response_status"),
             "request_sent_at": header.get("request_sent_at") or group.get("requested_at"),
-        })
+        }
+        if lock:
+            row["confirm_deadline_at"] = lock.get("confirm_deadline_at")
+            row["confirm_window_seconds"] = (
+                lock.get("confirm_window_seconds") or CONFIRM_WINDOW_SECONDS
+            )
+        results.append(row)
     results.sort(key=lambda r: r["requested_at"] or "", reverse=True)
     return results
 
 
 @router.post("/notifications/accept")
 async def accept_notification(payload: NotificationActionRequest, session=Depends(get_device_session)):
+    from mobile_request_claim import (
+        confirm_deadline_iso,
+        is_confirm_expired,
+        release_expired_claim,
+        resolve_confirm_window_seconds,
+    )
+
     mobile_user_id = session["mobile_user"]["mobile_user_id"]
     device_id = session["device"]["device_id"]
     device_user_name = session["device"].get("device_user_name") or session["mobile_user"]["name"]
     device_user_mobile = session["device"].get("device_user_mobile") or session["mobile_user"].get("mobile_number", "")
     branch = session["branch"]
     dealer = session["dealer_name"]
+    confirm_window_seconds = await resolve_confirm_window_seconds(db)
 
-    # Confirm at least one live "Requested" line still exists in this
-    # group, in this device's scope, before claiming the lock — prevents
-    # locking a stale/foreign group_key the client might send.
-    live_lines = await _scope_group_lines(payload.request_group_key, session, statuses=("Requested",))
+    # Brand-wide live lines so any dealer under the brand can race Pick.
+    live_lines = await _brand_group_lines(payload.request_group_key, session, statuses=("Requested",))
     if not live_lines:
         raise HTTPException(400, "Request is not available to accept")
     header = await _header_for_request_number(live_lines[0].get("request_number"))
@@ -2054,6 +2850,26 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
     canonical_key = _group_key_for(live_lines[0]) or payload.request_group_key
     aliases = _group_aliases(payload.request_group_key, canonical_key, live_lines[0])
     existing = await db.mobile_request_group_locks.find_one({"request_group_key": {"$in": aliases}}, {"_id": 0})
+    if existing and is_confirm_expired(existing):
+        await release_expired_claim(db, existing)
+        try:
+            import mobile_push
+            await mobile_push.renotify_after_confirm_timeout(db, {
+                **(header or {}),
+                "id": canonical_key,
+                "request_number": live_lines[0].get("request_number") or (header or {}).get("request_number"),
+                "supplying_brand": session["brand_name"],
+                "supplying_dealer": dealer,
+                "supplying_branch": branch,
+                "requesting_brand": live_lines[0].get("requesting_brand"),
+                "requesting_dealer": live_lines[0].get("requesting_dealer"),
+                "requesting_branch": live_lines[0].get("requesting_branch"),
+                "total_items": len(live_lines),
+                "total_qty": sum(float(x.get("requested_qty") or 0) for x in live_lines),
+            }, exclude_device_id=existing.get("device_id"))
+        except Exception as exc:
+            logger.warning("renotify after confirm timeout failed: %s", exc)
+        existing = None
     if existing:
         if existing.get("device_id") == device_id:
             return {
@@ -2065,10 +2881,22 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
                 "accepted_by_me": True,
                 "can_edit": True,
                 "can_pick": False,
+                "confirm_deadline_at": existing.get("confirm_deadline_at"),
+                "confirm_window_seconds": existing.get("confirm_window_seconds") or confirm_window_seconds,
             }
         raise HTTPException(status_code=409, detail=_already_picked_detail(existing))
 
+    # Dealer that already Rejected cannot Pick.
+    prior_reject = await db.mobile_notification_actions.find_one({
+        "request_id": {"$in": aliases},
+        "action": "reject",
+        "dealer_name": {"$regex": f"^{re.escape(dealer)}$", "$options": "i"},
+    })
+    if prior_reject:
+        raise HTTPException(400, "This dealer already rejected this request")
+
     now_iso = _now_iso()
+    deadline = confirm_deadline_iso(window_seconds=confirm_window_seconds)
     lock_doc = {
         "request_group_key": canonical_key,
         "mobile_user_id": mobile_user_id,
@@ -2081,6 +2909,8 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         "branch": branch,
         "lock_status": "picked",
         "picked_at": now_iso,
+        "confirm_deadline_at": deadline,
+        "confirm_window_seconds": confirm_window_seconds,
         "owner_last_seen_at": now_iso,
         "line_responses": {},
     }
@@ -2112,10 +2942,13 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         header_doc = {
             **header_doc,
             "request_number": live_lines[0].get("request_number") or header_doc.get("request_number"),
-            "id": payload.request_group_key,
+            "id": canonical_key,
             "supplying_brand": session["brand_name"],
             "supplying_dealer": dealer,
             "supplying_branch": branch,
+            "requesting_brand": live_lines[0].get("requesting_brand") or header_doc.get("requesting_brand"),
+            "requesting_dealer": live_lines[0].get("requesting_dealer") or header_doc.get("requesting_dealer"),
+            "requesting_branch": live_lines[0].get("requesting_branch") or header_doc.get("requesting_branch"),
         }
         await mobile_push.notify_request_picked_push(
             db, header_doc, picked_by_name=device_user_name, exclude_device_id=device_id,
@@ -2130,37 +2963,21 @@ async def accept_notification(payload: NotificationActionRequest, session=Depend
         "accepted_by_me": True,
         "can_edit": True,
         "can_pick": False,
+        "confirm_deadline_at": deadline,
+        "confirm_window_seconds": confirm_window_seconds,
     }
 
 
 @router.post("/notifications/skip")
 async def skip_notification(payload: NotificationActionRequest, session=Depends(get_device_session)):
-    mobile_user_id = session["mobile_user"]["mobile_user_id"]
-    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key}, {"_id": 0})
-    if lock:
-        raise HTTPException(status_code=409, detail=_already_picked_detail(lock))
-    action = await db.mobile_notification_actions.find_one(
-        {"request_id": payload.request_group_key, "mobile_user_id": mobile_user_id}
-    )
-    current_skips = action.get("skip_count", 0) if action else 0
-    if current_skips >= SKIP_LIMIT:
-        raise HTTPException(400, "Skip limit reached — you must pick or reject this request")
-
-    await db.mobile_notification_actions.update_one(
-        {"request_id": payload.request_group_key, "mobile_user_id": mobile_user_id},
-        {
-            "$set": {"last_skipped_at": _now_iso(), "branch": session["branch"]},
-            "$inc": {"skip_count": 1},
+    """Snooze removed — Pick and Reject only."""
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "SNOOZE_REMOVED",
+            "message": "Snooze is no longer available. Use Pick or Reject.",
         },
-        upsert=True,
     )
-    remaining = max(0, SKIP_LIMIT - (current_skips + 1))
-    return {
-        "message": "Skipped",
-        "skip_count": current_skips + 1,
-        "skip_allowed_remaining": remaining,
-        "skip_allowed": remaining > 0,
-    }
 
 
 @router.post("/notifications/respond")
@@ -2223,61 +3040,101 @@ async def submit_part_response(payload: RequestPartResponse, session=Depends(get
 
 @router.post("/notifications/reject")
 async def reject_notification(payload: NotificationRejectRequest, session=Depends(get_device_session)):
+    """Dealer-level Reject: mandatory reason, dismiss this dealer only (others may still Pick)."""
     reason = (payload.reason or "").strip()
     if not reason:
         raise HTTPException(400, "Rejection reason is required")
 
     mobile_user = session["mobile_user"]
     mobile_user_id = mobile_user["mobile_user_id"]
-    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
-    _raise_if_not_owner(lock, session)
-    if str(lock.get("lock_status") or "").lower() in ("rejected", "accepted"):
-        raise HTTPException(400, "This request has already been decided")
+    dealer = session["dealer_name"]
+    branch = session["branch"]
+    device_id = session["device"]["device_id"]
+
+    lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key}, {"_id": 0})
+    if lock and str(lock.get("lock_status") or "").lower() in ("picking_completed", "accepted"):
+        raise HTTPException(status_code=409, detail=_already_picked_detail(lock))
+    if lock and lock.get("device_id") and lock.get("device_id") != device_id:
+        raise HTTPException(status_code=409, detail=_already_picked_detail(lock))
 
     live_lines = await _scope_group_lines(payload.request_group_key, session, statuses=("Requested",))
+    # Brand-wide broadcast: allow reject even when line scope is another branch of same brand.
+    if not live_lines:
+        live_lines = await db.order_requests.find(
+            {**_group_line_filter(payload.request_group_key), "status": "Requested"},
+            {"_id": 0},
+        ).to_list(200)
     header = await _header_for_request_number((live_lines[0].get("request_number") if live_lines else None) or payload.request_group_key)
-    all_lines = await _scope_group_lines(payload.request_group_key, session)
-    if _is_expired_group(all_lines or live_lines, header):
-        raise HTTPException(status_code=409, detail={"message": MOBILE_EXPIRED_LABEL, "status": "expired", "picked_by_name": _lock_owner_name(lock)})
+    if _is_expired_group(live_lines, header):
+        raise HTTPException(status_code=409, detail={"message": MOBILE_EXPIRED_LABEL, "status": "expired"})
     if not live_lines:
         raise HTTPException(400, "Request is not available to reject")
 
-    acting_user = _MobileActingUser(
-        mobile_user_id,
-        session["device"].get("device_user_name") or mobile_user["name"],
-        session["dealer_name"],
-        session["brand_name"],
+    canonical_key = _group_key_for(live_lines[0]) or payload.request_group_key
+    owner_name = session["device"].get("device_user_name") or mobile_user["name"]
+    now_iso = _now_iso()
+    await db.mobile_notification_actions.update_one(
+        {
+            "request_id": canonical_key,
+            "mobile_user_id": mobile_user_id,
+            "action": "reject",
+        },
+        {
+            "$set": {
+                "request_id": canonical_key,
+                "mobile_user_id": mobile_user_id,
+                "device_id": device_id,
+                "dealer_name": dealer,
+                "branch": branch,
+                "brand_name": session["brand_name"],
+                "action": "reject",
+                "rejection_reason": reason,
+                "rejected_by_name": owner_name,
+                "rejected_at": now_iso,
+            }
+        },
+        upsert=True,
     )
-    acting_user.phone = session["device"].get("device_user_mobile") or mobile_user.get("mobile_number", "")
-
-    results = []
-    for line in live_lines:
-        updated, _changed = await request_center_transition(line["id"], "Rejected", reason, acting_user, accepted_qty=0)
-        results.append({
-            "order_request_id": line["id"],
-            "part_number": line.get("part_number"),
-            "status": updated.get("status"),
+    # If this device currently owns the Pick claim, release it so others can compete.
+    if lock and lock.get("device_id") == device_id and str(lock.get("lock_status") or "") == "picked":
+        await db.mobile_request_group_locks.delete_one({
+            "request_group_key": canonical_key,
+            "device_id": device_id,
+            "lock_status": "picked",
         })
 
-    owner_name = session["device"].get("device_user_name") or mobile_user["name"]
-    await db.mobile_request_group_locks.update_one(
-        {"request_group_key": payload.request_group_key},
-        {"$set": {
-            "lock_status": "rejected",
-            "rejected_at": _now_iso(),
-            "rejection_reason": reason,
-            "rejected_by_name": owner_name,
-        }},
-    )
+    try:
+        from mobile_request_cycle import add_rejected_dealer
+        await add_rejected_dealer(db, canonical_key, dealer)
+    except Exception as exc:
+        logger.warning("add_rejected_dealer failed: %s", exc)
+
+    try:
+        from mobile_request_cycle_scheduler import process_all_rejected_if_needed
+        group_doc = {
+            **(header or {}),
+            "id": canonical_key,
+            "request_number": (live_lines[0].get("request_number") if live_lines else None) or (header or {}).get("request_number"),
+            "supplying_brand": session["brand_name"],
+            "requesting_brand": (live_lines[0].get("requesting_brand") if live_lines else None) or (header or {}).get("requesting_brand") or session["brand_name"],
+            "requesting_dealer": (live_lines[0].get("requesting_dealer") if live_lines else None) or (header or {}).get("requesting_dealer"),
+            "requesting_branch": (live_lines[0].get("requesting_branch") if live_lines else None) or (header or {}).get("requesting_branch"),
+        }
+        await process_all_rejected_if_needed(
+            db, canonical_key, group_doc, brand=session["brand_name"],
+        )
+    except Exception as exc:
+        logger.warning("all-rejected check failed: %s", exc)
+
     await _audit(None, "mobile_reject_request", mobile_user_id, {
-        "request_group_key": payload.request_group_key, "reason": reason, "results": results,
+        "request_group_key": canonical_key, "reason": reason, "dealer_level": True,
     })
     return {
         "message": "Request rejected",
-        "request_group_key": payload.request_group_key,
+        "request_group_key": canonical_key,
         "rejected_by_name": owner_name,
         "rejection_reason": reason,
-        "results": results,
+        "dealer_dismissed": True,
     }
 
 
@@ -2327,6 +3184,8 @@ async def _mark_accepted_lines_picking_finished(lines, acting_user, now_iso: str
 @router.post("/notifications/complete")
 async def complete_picking(payload: NotificationCompleteRequest, session=Depends(get_device_session)):
     """Commit saved mobile drafts through request_center_transition, then mark picking finished."""
+    from mobile_request_claim import is_confirm_expired, release_expired_claim
+
     lock = await db.mobile_request_group_locks.find_one({"request_group_key": payload.request_group_key})
     if lock and str(lock.get("lock_status") or "").lower() == "picking_completed":
         if _is_same_owner(lock, session):
@@ -2339,6 +3198,16 @@ async def complete_picking(payload: NotificationCompleteRequest, session=Depends
             ERR_NOT_OWNER, "This request is already picked by another device",
             picked_by_name=_lock_owner_name(lock) or "another user",
         ))
+    if lock and is_confirm_expired(lock):
+        await release_expired_claim(db, lock)
+        raise HTTPException(
+            status_code=409,
+            detail=_error_detail(
+                ERR_INVALID_STATE,
+                "Confirmation window expired. The request was released for other dealers.",
+                status="confirm_expired",
+            ),
+        )
     _raise_if_not_writable(lock, session)
 
     all_lines = await _scope_group_lines(payload.request_group_key, session)
@@ -2390,6 +3259,12 @@ async def complete_picking(payload: NotificationCompleteRequest, session=Depends
         if existing and str(existing.get("lock_status") or "") == "picking_completed" and _is_same_owner(existing, session):
             return {"message": "Picking already completed", "request_group_key": payload.request_group_key, "status": "picking_completed"}
         raise HTTPException(status_code=409, detail=_error_detail(ERR_INVALID_STATE, "This request can no longer be changed"))
+
+    try:
+        from mobile_request_cycle import mark_cycle_completed
+        await mark_cycle_completed(db, payload.request_group_key)
+    except Exception as exc:
+        logger.warning("mark_cycle_completed failed: %s", exc)
 
     await _audit(None, "mobile_picking_completed", session["mobile_user"]["mobile_user_id"], {
         "request_group_key": payload.request_group_key, "results": results,
@@ -2783,6 +3658,47 @@ def _product_pin_location(product: dict) -> str:
     ).strip()
 
 
+async def _scoped_products_by_part(part_numbers, brand_name: str, dealer_name: str, branch: str) -> dict:
+    """One Product Hub lookup for many Auto Perpetual parts (avoids per-row overlay scans)."""
+    from auto_perpetual import inventory_date_key
+
+    cleaned = []
+    seen = set()
+    for part in part_numbers:
+        key = _normalize_part_number(part)
+        if key and key not in seen:
+            seen.add(key)
+            cleaned.append(key)
+    if not cleaned:
+        return {}
+    query = {
+        "brand_name": brand_name,
+        "dealer_name": dealer_name,
+        "branch": branch,
+        "publish_status": "Published",
+        "is_active_today": True,
+        "active_date_key": inventory_date_key(),
+        "part_number": {"$in": cleaned},
+    }
+    rows = await db.products.find(query, {"_id": 0}).to_list(max(len(cleaned) * 3, 50))
+    found = {}
+    for product in rows:
+        key = _normalize_part_number(product.get("part_number"))
+        if key and key not in found:
+            found[key] = product
+    missing = [key for key in cleaned if key not in found]
+    if missing:
+        query["part_number"] = {
+            "$in": list({*missing, *[k.lower() for k in missing], *[k.upper() for k in missing]})
+        }
+        extra = await db.products.find(query, {"_id": 0}).to_list(max(len(missing) * 3, 50))
+        for product in extra:
+            key = _normalize_part_number(product.get("part_number"))
+            if key and key not in found:
+                found[key] = product
+    return found
+
+
 async def find_scoped_product(part_number: str, brand_name: str, dealer_name: str, branch: str):
     """Lookup current Product Hub stock for verification (same day-scope as Product Hub)."""
     from auto_perpetual import inventory_date_key
@@ -3007,6 +3923,55 @@ async def _mirror_mobile_verification_to_web(doc: dict):
         )
 
 
+def _auto_submit_response(doc: dict, *, message: str, duplicate: bool = False, edited: bool = False) -> dict:
+    return {
+        "success": True,
+        "message": message,
+        "id": doc.get("id"),
+        "verification_id": doc.get("id"),
+        "duplicate": duplicate,
+        "edited": edited,
+        "session_id": doc.get("session_id"),
+        "system_qty": doc.get("system_quantity", 0),
+        "physical_qty": doc.get("physical_quantity", 0),
+        "difference_qty": doc.get("difference", 0),
+        "verification_status": doc.get("verification_status") or doc.get("quantity_status"),
+        "part_found_in_system": doc.get("part_found_in_system", False),
+        "count_saved": True,
+        "quantity_finalized": bool(doc.get("quantity_finalized")),
+        "original_physical_quantity": doc.get("original_physical_quantity"),
+        "edit_count": int(doc.get("edit_count") or 0),
+        "edit_status_label": compact_edit_status(doc.get("quantity_edit_history")),
+        "quantity_edit_history": list(doc.get("quantity_edit_history") or []),
+    }
+
+
+async def _complete_auto_assignment(assignment, *, mobile_user_id: str, part_key: str, branch: str, session_id: str, now) -> None:
+    assign_q = {"mobile_user_id": mobile_user_id, "part_number": part_key, "branch": branch}
+    if assignment and assignment.get("id"):
+        assign_q = {"id": assignment["id"]}
+    await db.auto_perpetual_assignments.update_many(
+        assign_q,
+        {
+            "$set": {
+                "status": "completed",
+                "completed_at": now,
+                "verified_by_mobile_user_id": mobile_user_id,
+                "quantity_finalized": True,
+            }
+        },
+    )
+    sid = (assignment or {}).get("suggestion_id")
+    if sid:
+        from auto_perpetual_suggestions import refresh_suggestion_status
+
+        await refresh_suggestion_status(db, sid)
+    await db.stock_verification_sessions.update_one(
+        {"session_id": session_id, "status": {"$nin": ["CLOSED", "COMPLETED"]}},
+        {"$set": {"status": "IN_PROGRESS", "updated_at": now}},
+    )
+
+
 async def _process_stock_verification_submit(payload: StockVerificationSubmit, session: dict) -> dict:
     """Core stock-verification save used by single + batch endpoints.
 
@@ -3056,15 +4021,6 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
                 "part_found_in_system": existing.get("part_found_in_system", False),
             }
 
-    session_id = await _get_or_create_mobile_daily_verification_session(
-        mobile_user_id,
-        device_id,
-        session["brand_name"],
-        session["dealer_name"],
-        session["branch"],
-        verification_type=payload.verification_type or "physical",
-    )
-
     try:
         damage_qty = max(0.0, float(payload.damage_qty or 0))
     except (TypeError, ValueError):
@@ -3081,20 +4037,49 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
 
     assignment = None
     coverage_kind = "monthly"
+    part_key = str(clean_part).strip().upper()
+    requested_session_id = str(getattr(payload, "verification_session_id", None) or "").strip() or None
+    reaudit_save = False
     if vtype == "auto":
-        from auto_perpetual import ist_date_key
-
+        assign_filter = {
+            "mobile_user_id": mobile_user_id,
+            "part_number": part_key,
+            "branch": session["branch"],
+        }
+        if requested_session_id:
+            assign_filter["session_id"] = requested_session_id
         assignment = await db.auto_perpetual_assignments.find_one(
-            {
-                "allocation_date": ist_date_key(),
-                "mobile_user_id": mobile_user_id,
-                "part_number": str(clean_part).strip().upper(),
-                "status": "pending",
-            },
+            {**assign_filter, "status": "pending"},
             {"_id": 0},
+            sort=[("allocation_date", -1)],
         )
+        if not assignment:
+            assignment = await db.auto_perpetual_assignments.find_one(
+                assign_filter,
+                {"_id": 0},
+                sort=[("allocation_date", -1)],
+            )
         if assignment:
             coverage_kind = assignment.get("coverage_kind") or "monthly"
+            from auto_perpetual import ist_date_key as _ist_today
+            if assignment.get("allocation_date") and str(assignment.get("allocation_date")) != _ist_today():
+                reaudit_save = True
+            if assignment.get("session_id"):
+                requested_session_id = assignment["session_id"]
+
+    if requested_session_id:
+        session_id = requested_session_id
+    else:
+        session_id = await _get_or_create_mobile_daily_verification_session(
+            mobile_user_id,
+            device_id,
+            session["brand_name"],
+            session["dealer_name"],
+            session["branch"],
+            verification_type=payload.verification_type or "physical",
+        )
+    count_phase = auto_count_phase(getattr(payload, "auto_count_phase", None)) if vtype == "auto" else "finalize"
+    finalize_requested = count_phase == "finalize"
     system_qty = _mobile_stock_qty(system_record)
     difference = physical_qty - system_qty
     part_found = bool(system_record)
@@ -3118,6 +4103,120 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
         mav = 0.0
     shortage_qty = abs(difference) if difference < 0 else 0.0
     excess_qty = difference if difference > 0 else 0.0
+
+    if vtype == "auto":
+        hist_q = {
+            "verification_type": "auto",
+            "mobile_user_id": mobile_user_id,
+            "part_number": part_key,
+            "branch": session["branch"],
+        }
+        if session_id:
+            hist_q["session_id"] = session_id
+        existing_auto = await db.stock_verification_history.find_one(
+            hist_q,
+            {"_id": 0},
+            sort=[("verified_at", -1)],
+        )
+        if existing_auto:
+            locked = is_quantity_finalized(assignment, existing_auto)
+            latest_qty = float(existing_auto.get("physical_quantity") or 0)
+            if locked:
+                if finalize_requested:
+                    await _mirror_mobile_verification_to_web(existing_auto)
+                    return _auto_submit_response(
+                        {**existing_auto, "session_id": existing_auto.get("session_id") or session_id},
+                        message="Already submitted",
+                        duplicate=True,
+                    )
+                raise HTTPException(400, "Quantity editing is locked after Final Submit")
+            if finalize_requested:
+                if not quantities_equal(latest_qty, physical_qty):
+                    raise HTTPException(
+                        400,
+                        "Final quantity does not match the latest saved physical quantity",
+                    )
+                from auto_perpetual import month_key as _auto_month_key
+                final_update = {
+                    "quantity_finalized": True,
+                    "updated_at": now,
+                    "month_key": _auto_month_key(),
+                }
+                await db.stock_verification_history.update_one({"id": existing_auto["id"]}, {"$set": final_update})
+                finalized = {**existing_auto, **final_update}
+                await _complete_auto_assignment(
+                    assignment,
+                    mobile_user_id=mobile_user_id,
+                    part_key=part_key,
+                    branch=session["branch"],
+                    session_id=existing_auto.get("session_id") or session_id,
+                    now=now,
+                )
+                await _mirror_mobile_verification_to_web(finalized)
+                return _auto_submit_response(finalized, message="Verification submitted")
+            edit = apply_quantity_edit(
+                existing_auto,
+                new_qty=physical_qty,
+                correction_reason=str(payload.correction_reason or "").strip(),
+                user_name=session["mobile_user"]["name"],
+                mobile_user_id=mobile_user_id,
+                device_id=device_id,
+                edited_at=now,
+            )
+            if edit["same_value"]:
+                await _mirror_mobile_verification_to_web(existing_auto)
+                return _auto_submit_response(
+                    {**existing_auto, "session_id": existing_auto.get("session_id") or session_id},
+                    message="Verification recorded",
+                    duplicate=True,
+                )
+            reason = str(payload.correction_reason or "").strip()
+            if not reason:
+                raise HTTPException(400, "Correction reason is required to change physical quantity")
+            update = {
+                "physical_quantity": physical_qty,
+                "difference": difference,
+                "shortage_qty": shortage_qty,
+                "excess_qty": excess_qty,
+                "shortage_value": shortage_qty * mav,
+                "excess_value": excess_qty * mav,
+                "quantity_status": quantity_status,
+                "verification_status": verification_status,
+                "overall_status": overall_status,
+                "original_physical_quantity": edit["original_physical_quantity"],
+                "quantity_edit_history": edit["quantity_edit_history"],
+                "edit_count": edit["edit_count"],
+                "quantity_edit_status": edit["quantity_edit_status"],
+                "correction_reason": reason,
+                "quantity_finalized": False,
+                "updated_at": now,
+                "session_id": existing_auto.get("session_id") or session_id,
+            }
+            if reaudit_save:
+                update["system_quantity"] = system_qty
+                update["reaudit"] = True
+                update["reaudit_of_session_id"] = existing_auto.get("session_id") or session_id
+            await db.stock_verification_history.update_one({"id": existing_auto["id"]}, {"$set": update})
+            await db.auto_perpetual_assignments.update_one(
+                {"id": (assignment or {}).get("id")} if assignment and assignment.get("id") else {
+                    "mobile_user_id": mobile_user_id,
+                    "part_number": part_key,
+                    "branch": session["branch"],
+                },
+                {
+                    "$set": {
+                        "count_saved": True,
+                        "physical_quantity": physical_qty,
+                        "original_physical_quantity": edit["original_physical_quantity"],
+                        "quantity_edit_history": edit["quantity_edit_history"],
+                        "edit_count": edit["edit_count"],
+                        "updated_at": now,
+                    }
+                },
+            )
+            updated = {**existing_auto, **update}
+            await _mirror_mobile_verification_to_web(updated)
+            return _auto_submit_response(updated, message="Verification updated", edited=True)
 
     doc = {
         "id": str(uuid.uuid4()), "session_id": session_id, "client_id": payload.client_id,
@@ -3148,6 +4247,15 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
         "suggestion_number": (assignment or {}).get("suggestion_number"),
         "batch_no": (assignment or {}).get("batch_no"),
         "suggestion_type": (assignment or {}).get("suggestion_type"),
+        "task_id": (assignment or {}).get("task_id"),
+        "audit_id": (assignment or {}).get("audit_id") or (assignment or {}).get("suggestion_number"),
+        "original_physical_quantity": physical_qty,
+        "quantity_edit_history": [],
+        "edit_count": 0,
+        "quantity_edit_status": "",
+        "quantity_finalized": bool(vtype == "auto" and finalize_requested),
+        "reaudit": bool(vtype == "auto" and reaudit_save),
+        "reaudit_of_session_id": session_id if (vtype == "auto" and reaudit_save) else None,
         "qty_result": quantity_status.upper(),
         "location_result": "LOCATION MATCHED" if location_status == "matched" else "LOCATION MISMATCH",
         "final_result": overall_status.upper().replace("_", " "),
@@ -3176,7 +4284,10 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
     from auto_perpetual import month_key, ist_date_key
 
     part_key = str(doc["part_number"]).strip().upper()
-    if coverage_kind == "monthly" and vtype in ("auto", "physical"):
+    mark_pool = coverage_kind == "recheck" or (
+        coverage_kind == "monthly" and (vtype == "physical" or (vtype == "auto" and finalize_requested))
+    )
+    if mark_pool and coverage_kind == "monthly" and vtype in ("auto", "physical"):
         await db.auto_perpetual_pool.update_one(
             {
                 "month_key": month_key(),
@@ -3194,7 +4305,7 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
                 }
             },
         )
-    elif coverage_kind == "recheck":
+    elif mark_pool and coverage_kind == "recheck":
         await db.auto_perpetual_pool.update_one(
             {
                 "month_key": month_key(),
@@ -3213,35 +4324,118 @@ async def _process_stock_verification_submit(payload: StockVerificationSubmit, s
             },
         )
     if vtype == "auto":
-        await db.auto_perpetual_assignments.update_many(
-            {
-                "allocation_date": ist_date_key(),
-                "mobile_user_id": mobile_user_id,
-                "part_number": part_key,
-            },
-            {"$set": {"status": "completed", "completed_at": now, "verified_by_mobile_user_id": mobile_user_id}},
-        )
-        sid = (assignment or {}).get("suggestion_id")
-        if sid:
-            from auto_perpetual_suggestions import refresh_suggestion_status
-
-            await refresh_suggestion_status(db, sid)
-        # Mark work started, but get_or_create_auto_daily_session must still
-        # reuse this same session_id for every later part on the IST day.
-        await db.stock_verification_sessions.update_one(
-            {"session_id": session_id},
-            {"$set": {"status": "IN_PROGRESS", "updated_at": now}},
-        )
+        assign_q = {"mobile_user_id": mobile_user_id, "part_number": part_key, "branch": session["branch"]}
+        if assignment and assignment.get("id"):
+            assign_q = {"id": assignment["id"]}
+        if finalize_requested:
+            await _complete_auto_assignment(
+                assignment,
+                mobile_user_id=mobile_user_id,
+                part_key=part_key,
+                branch=session["branch"],
+                session_id=session_id,
+                now=now,
+            )
+        else:
+            await db.auto_perpetual_assignments.update_many(
+                assign_q,
+                {
+                    "$set": {
+                        "count_saved": True,
+                        "physical_quantity": physical_qty,
+                        "original_physical_quantity": physical_qty,
+                        "quantity_finalized": False,
+                        "updated_at": now,
+                    }
+                },
+            )
         await db.stock_verification_history.update_one(
             {"id": doc["id"]},
             {"$set": {"month_key": month_key()}},
         )
+        return _auto_submit_response(doc, message="Verification recorded")
     return {
         "success": True, "message": "Verification recorded", "id": doc["id"], "verification_id": doc["id"],
         "session_id": session_id,
         "duplicate": False, "system_qty": system_qty, "physical_qty": physical_qty,
         "difference_qty": difference, "verification_status": verification_status,
         "part_found_in_system": part_found,
+    }
+
+
+@router.post("/auto-perpetual/count")
+async def save_auto_perpetual_count(payload: AutoCountSaveRequest, session=Depends(get_device_session)):
+    """First Save / quantity edit for Auto Perpetual. Does not Final Submit."""
+    submit = StockVerificationSubmit(
+        part_number=payload.part_number,
+        physical_qty=payload.physical_qty,
+        location=payload.location,
+        remark=payload.remark,
+        damage_qty=payload.damage_qty,
+        correction_reason=payload.correction_reason,
+        client_id=payload.client_id,
+        entry_method=payload.entry_method or "MANUAL",
+        verification_type="auto",
+        auto_count_phase="save",
+        verification_session_id=payload.session_id,
+    )
+    return await _process_stock_verification_submit(submit, session)
+
+
+@router.post("/auto-perpetual/finalize")
+async def finalize_auto_perpetual_counts(payload: AutoFinalizeRequest, session=Depends(get_device_session)):
+    """Final Submit using the latest quantity already saved on the server."""
+    mobile_user_id = session["mobile_user"]["mobile_user_id"]
+    branch = session["branch"]
+    requested = [_normalize_part_number(part) for part in (payload.part_numbers or []) if str(part or "").strip()]
+    query = {
+        "verification_type": "auto",
+        "mobile_user_id": mobile_user_id,
+        "branch": branch,
+        "quantity_finalized": {"$ne": True},
+    }
+    if payload.session_id:
+        query["session_id"] = payload.session_id
+    if requested:
+        query["part_number"] = {"$in": requested}
+    rows = await db.stock_verification_history.find(query, {"_id": 0}).to_list(500)
+    # Include legacy saved rows that predate quantity_finalized.
+    if requested:
+        extra_q = {
+            "verification_type": "auto",
+            "mobile_user_id": mobile_user_id,
+            "branch": branch,
+            "part_number": {"$in": requested},
+        }
+        if payload.session_id:
+            extra_q["session_id"] = payload.session_id
+        extra = await db.stock_verification_history.find(extra_q, {"_id": 0}).to_list(500)
+        by_id = {row.get("id"): row for row in rows}
+        for row in extra:
+            by_id.setdefault(row.get("id"), row)
+        rows = list(by_id.values())
+    if requested and not rows:
+        raise HTTPException(400, "Save a physical count before Final Submit")
+    results = []
+    for row in rows:
+        latest = float(row.get("physical_quantity") or 0)
+        submit = StockVerificationSubmit(
+            part_number=row.get("part_number"),
+            physical_qty=latest,
+            location=row.get("physical_location") or row.get("location"),
+            remark=row.get("remark") or row.get("remarks"),
+            damage_qty=row.get("damage_qty") or 0,
+            client_id=payload.client_id,
+            entry_method=row.get("entry_method") or "MANUAL",
+            verification_type="auto",
+            auto_count_phase="finalize",
+            verification_session_id=payload.session_id or row.get("session_id"),
+        )
+        results.append(await _process_stock_verification_submit(submit, session))
+    return {
+        "success": True,
+        "count": len(results),
+        "results": results,
     }
 
 
@@ -3717,6 +4911,11 @@ async def _backfill_device_session_flags():
 # ==================== INDEXES ====================
 
 async def ensure_mobile_indexes():
+    try:
+        from mobile_request_cycle import ensure_cycle_indexes
+        await ensure_cycle_indexes(db)
+    except Exception as exc:
+        logger.warning("mobile_request_cycles indexes failed: %s", exc)
     from auto_perpetual import ensure_auto_perpetual_indexes
 
     await ensure_auto_perpetual_indexes(db)

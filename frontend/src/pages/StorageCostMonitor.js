@@ -4,6 +4,7 @@ import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
 import { HardDrive, RefreshCw, AlertTriangle, ExternalLink, ShieldCheck, Trash2, Download } from 'lucide-react';
 import { toast } from 'sonner';
+import { parseBlobError } from '@/utils/blobResponse';
 
 const COLORS = {
   primary: '#0F766E',
@@ -162,22 +163,27 @@ export function StorageCostMonitor() {
   const downloadArchive = async (archiveId) => {
     try {
       const res = await axios.get(`${API}/storage/archives/${archiveId}/download`, {
+        params: { redirect: false },
         responseType: 'blob',
-        maxRedirects: 5,
       });
-      const blob = new Blob([res.data]);
-      const url = window.URL.createObjectURL(blob);
+      const ctype = String(res.headers?.['content-type'] || '').toLowerCase();
       const a = document.createElement('a');
-      a.href = url;
-      a.download = `archive-${archiveId}.jsonl.gz`;
+      let objectUrl = '';
+      if (ctype.includes('application/json')) {
+        const { url } = JSON.parse(await res.data.text());
+        a.href = url;
+      } else {
+        objectUrl = window.URL.createObjectURL(new Blob([res.data]));
+        a.href = objectUrl;
+        a.download = `archive-${archiveId}.jsonl.gz`;
+      }
+      document.body.appendChild(a);
       a.click();
-      window.URL.revokeObjectURL(url);
+      a.remove();
+      if (objectUrl) window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 60000);
       toast.success('Download started');
     } catch (err) {
-      // Prefer opening API URL directly for S3 redirect
-      const token = localStorage.getItem('token');
-      window.open(`${API}/storage/archives/${archiveId}/download?token=${encodeURIComponent(token || '')}`, '_blank');
-      toast.message(err?.response?.data?.detail || 'Opening archive download…');
+      toast.error(await parseBlobError(err, 'Archive download failed'));
     }
   };
 

@@ -136,6 +136,9 @@ async def list_cleanup_archives(
     prune_on = bool(get_storage().status().get("archive_prune_enabled"))
     rows = await db.archive_manifests.find(q, {"_id": 0}).sort("created_at", -1).to_list(5000)
     out = []
+    # Several manifests (one per dataset/run) share an archive date.
+    count_cache: Dict[tuple, int] = {}
+    scope_cache: Dict[str, Dict[str, List[str]]] = {}
     for m in rows:
         date_iso = m.get("archive_date") or m.get("archive_month")
         date_key = ha.iso_to_date_key(date_iso or "") if m.get("archive_date") else ""
@@ -150,7 +153,9 @@ async def list_cleanup_archives(
             and not scope_dealers
             and not scope_branches
         ):
-            derived = await _scope_from_mongo(db, date_iso or "")
+            if (date_iso or "") not in scope_cache:
+                scope_cache[date_iso or ""] = await _scope_from_mongo(db, date_iso or "")
+            derived = scope_cache[date_iso or ""]
             scope_brands = derived["brands"] or scope_brands
             scope_dealers = derived["dealers"] or scope_dealers
             scope_branches = derived["branches"] or scope_branches
@@ -159,12 +164,15 @@ async def list_cleanup_archives(
 
         mongo_count = 0
         if m.get("module") == ha.MODULE_PRODUCT_HISTORY and date_key:
-            mongo_count = await db.products.count_documents(
-                {
-                    "publish_status": "Published",
-                    "active_date_key": {"$in": [date_key, date_iso]},
-                }
-            )
+            count_key = (date_key, date_iso)
+            if count_key not in count_cache:
+                count_cache[count_key] = await db.products.count_documents(
+                    {
+                        "publish_status": "Published",
+                        "active_date_key": {"$in": [date_key, date_iso]},
+                    }
+                )
+            mongo_count = count_cache[count_key]
         s3_count = int(m.get("record_count") or 0)
         live = av.head_s3_status(m)
         display = live.get("display_status") or av.classify_display_status(

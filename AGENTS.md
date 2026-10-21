@@ -34,7 +34,7 @@ run from the project venv (see below). Details: `.devcontainer/README.md`.
   `AWS_REGION` (optional `NMTS_STORAGE_ENV`). Keep `ARCHIVE_PRUNE_ENABLED=false`
   unless prune is explicitly authorized.
 - On startup the backend seeds a master admin if none exists. Default login:
-  `admin@sleepingstock.in` / `admin123`.
+  `<seeded master admin email>` / `<password from your secret store>`.
 - Known non-fatal startup log: a `Product Hub index creation failed ... E11000
   duplicate key` error on `request_headers` used to appear from a legacy full
   unique index on `(order_id, supplying_dealer, supplying_branch)` while

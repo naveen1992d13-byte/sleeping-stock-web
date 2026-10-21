@@ -54,10 +54,22 @@ class FakeLocks:
         doc = self.docs.get(query.get("request_group_key"))
         if not doc:
             return None
-        nin = ((query.get("lock_status") or {}).get("$nin") or [])
-        if doc.get("lock_status") in nin:
+        status_q = query.get("lock_status")
+        if isinstance(status_q, dict):
+            nin = status_q.get("$nin") or []
+            if doc.get("lock_status") in nin:
+                return None
+        elif status_q is not None and doc.get("lock_status") != status_q:
+            return None
+        if "confirm_deadline_at" in query and doc.get("confirm_deadline_at") != query.get("confirm_deadline_at"):
+            return None
+        if query.get("device_id") and doc.get("device_id") != query.get("device_id"):
             return None
         return self.docs.pop(doc["request_group_key"])
+
+    async def delete_one(self, query):
+        removed = await self.find_one_and_delete(query)
+        return type("R", (), {"deleted_count": 1 if removed else 0})()
 
 
 def test_lock_alias_matches_header_id_or_request_number():
@@ -75,6 +87,15 @@ def test_already_picked_code():
     detail = mobile_api._already_picked_detail({"device_user_name": "Ravi"})
     assert detail["code"] == "ALREADY_PICKED"
     assert detail["picked_by_name"] == "Ravi"
+    assert detail["message"] == "This request was already picked by another dealer."
+
+
+def test_already_picked_message_exact():
+    assert mobile_api.ALREADY_PICKED_DEALER_MESSAGE == (
+        "This request was already picked by another dealer."
+    )
+    detail = mobile_api._already_picked_detail({"device_user_name": "Other"})
+    assert detail["message"] == mobile_api.ALREADY_PICKED_DEALER_MESSAGE
 
 
 def test_ownership_status_stays_picked_after_responses():
@@ -90,10 +111,11 @@ def test_ownership_status_picking_completed():
 
 
 def test_skip_limit_is_two_with_no_timeout_constant():
-    assert mobile_api.SKIP_LIMIT == 2
+    assert mobile_api.SKIP_LIMIT == 0
     src = Path(BACKEND_DIR / "mobile_api.py").read_text()
     assert "auto-stop" not in src.lower()
     assert "ring_timeout" not in src
+    assert "Snooze removed" in src or "SNOOZE_REMOVED" in src
     sla_src = Path(BACKEND_DIR / "request_sla_scheduler.py").read_text()
     assert "request_is_no_longer_new" in sla_src
 
@@ -183,6 +205,7 @@ def _eligible_dev(device_id, token, uid, brand="Honda", dealer="D", branch="B", 
         "brand_name": brand,
         "dealer_name": dealer,
         "branch": branch,
+        "data_origin": "testing",
     }
     row.update(extra)
     return row
@@ -201,13 +224,30 @@ async def _test_request_picked_excludes_picker(monkeypatch):
                     ]
             return Cursor()
 
+    class FakeCycles:
+        async def find_one(self, query, proj=None):
+            return {"request_group_key": "G", "status": "ringing", "cycle_number": 1}
+
+        async def update_one(self, query, update, upsert=False):
+            return type("R", (), {"matched_count": 1})()
+
+    class EmptyActions:
+        def find(self, query, proj=None):
+            class Cursor:
+                async def to_list(self, n):
+                    return []
+            return Cursor()
+
     class FakeDB:
         mobile_devices = Devices()
+        mobile_notification_actions = EmptyActions()
+        mobile_request_cycles = FakeCycles()
 
     def capture(messages):
         sent.extend(messages)
-        return {"ok": True}
+        return {"ok": True, "sent": len(messages), "body": {}}
 
+    monkeypatch.setattr(mobile_push, "_post_expo_push_http", capture)
     monkeypatch.setattr(mobile_push, "send_expo_push_messages", capture)
     result = await mobile_push.notify_request_picked_push(
         FakeDB(),
@@ -215,9 +255,11 @@ async def _test_request_picked_excludes_picker(monkeypatch):
         picked_by_name="Ravi",
         exclude_device_id="winner",
     )
-    assert result["sent"] == 1
-    assert sent[0]["data"]["type"] == "request_picked"
-    assert sent[0]["to"] == "ExponentPushToken[o]"
+    # request_picked + request_closed to other devices
+    assert result["sent"] == 2
+    types = {m["data"]["type"] for m in sent}
+    assert types == {"request_picked", "request_closed"}
+    assert all(m["to"] == "ExponentPushToken[o]" for m in sent)
 
 
 def test_reminder_skips_picked_request():
@@ -350,15 +392,36 @@ async def _test_notify_skips_logged_out_wrong_brand_and_missing_scope(monkeypatc
         async def insert_one(self, doc):
             return None
 
+        async def update_many(self, query, update):
+            return type("R", (), {"modified_count": 0, "matched_count": 0})()
+
     class Logs:
         async def insert_one(self, doc):
             return None
 
+    class FakeCycles:
+        async def find_one(self, query, proj=None):
+            return None
+
+        async def update_one(self, query, update, upsert=False):
+            return type("R", (), {"matched_count": 1})()
+
+    class EmptyActions:
+        def find(self, query, proj=None):
+            class Cursor:
+                async def to_list(self, n):
+                    return []
+            return Cursor()
+
     class FakeDB:
         mobile_devices = Devices()
         mobile_push_delivery_logs = Logs()
+        mobile_request_cycles = FakeCycles()
+        mobile_notification_actions = EmptyActions()
 
-    monkeypatch.setattr(mobile_push, "send_expo_push_messages", lambda messages: sent.extend(messages) or {"ok": True})
+    capture = lambda messages: sent.extend(messages) or {"ok": True, "sent": len(messages), "body": {}}
+    monkeypatch.setattr(mobile_push, "_post_expo_push_http", capture)
+    monkeypatch.setattr(mobile_push, "send_expo_push_messages", capture)
     missing = await mobile_push.notify_branch_request_push(
         FakeDB(), {"id": "G", "request_number": "RQ1", "supplying_dealer": "D", "supplying_branch": "B"}, "new",
     )

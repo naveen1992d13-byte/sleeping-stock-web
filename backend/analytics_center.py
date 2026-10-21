@@ -1,6 +1,7 @@
 """NMTS Analytics APIs — scope-aware dashboards using published Product Hub history."""
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone, date
@@ -16,7 +17,13 @@ except ImportError:
     import reports_center as rc
     import part_category as pc
 
+try:
+    from . import analytics_rollup as rollup
+except ImportError:
+    import analytics_rollup as rollup
+
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
+logger = logging.getLogger("nmts.analytics")
 _security = HTTPBearer()
 _AUTH_DEP = None
 db = None
@@ -43,14 +50,30 @@ _query = rc._query
 _and = rc._and
 
 
+ANALYTICS_CHART_BUCKETS = list(ANALYTICS_AGING_BUCKETS)
+AGING_DAY_FILTERS = {
+    "all": None,
+    "0-90": "0–90 Days",
+    "91-180": "91–180 Days",
+    "181-270": "181–270 Days",
+    "271-361": "271–361 Days",
+    "above-361": ">361 Days",
+}
+
+
 def _analytics_bucket(days) -> str:
-    """Map aging days into the Analytics stacked-column buckets."""
-    if days is None or days == "":
-        return ANALYTICS_AGING_BUCKETS[0]
+    """Map aging days into the Analytics stacked-column buckets.
+
+    Missing/invalid aging is counted under Above 361 — there is no Unknown bucket.
+    """
     try:
+        if days is None or days == "":
+            return ANALYTICS_AGING_BUCKETS[4]
         d = float(days)
     except (TypeError, ValueError):
-        return ANALYTICS_AGING_BUCKETS[0]
+        return ANALYTICS_AGING_BUCKETS[4]
+    if d < 0:
+        return ANALYTICS_AGING_BUCKETS[4]
     if d <= 90:
         return ANALYTICS_AGING_BUCKETS[0]
     if d <= 180:
@@ -60,6 +83,28 @@ def _analytics_bucket(days) -> str:
     if d <= 361:
         return ANALYTICS_AGING_BUCKETS[3]
     return ANALYTICS_AGING_BUCKETS[4]
+
+
+def _normalize_aging_days_filter(value: Optional[str]) -> Optional[str]:
+    if value is None or str(value).strip() == "":
+        return None
+    key = str(value).strip().lower().replace("–", "-").replace(" ", "")
+    aliases = {
+        "all": "all",
+        "0-90": "0-90",
+        "0–90": "0-90",
+        "91-180": "91-180",
+        "181-270": "181-270",
+        "271-361": "271-361",
+        "above-361": "above-361",
+        "above361": "above-361",
+        ">361": "above-361",
+        ">361days": "above-361",
+    }
+    norm = aliases.get(key, key)
+    if norm not in AGING_DAY_FILTERS:
+        raise HTTPException(400, "aging_days must be All, 0-90, 91-180, 181-270, 271-361 or Above 361")
+    return None if norm == "all" else AGING_DAY_FILTERS[norm]
 
 
 async def _current_user(credentials: HTTPAuthorizationCredentials = Depends(_security)):
@@ -90,11 +135,11 @@ def _safe_pct(num: float, den: float) -> float:
 
 def _parse_period(from_date: str, to_date: str) -> Tuple[datetime, datetime, List[str]]:
     try:
-        start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=rc.IST)
     except Exception:
         raise HTTPException(400, "Invalid From Date (use YYYY-MM-DD)")
     try:
-        end_day = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_day = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=rc.IST)
     except Exception:
         raise HTTPException(400, "Invalid To Date (use YYYY-MM-DD)")
     end = end_day + timedelta(days=1)
@@ -142,10 +187,13 @@ def _row_category(row: dict) -> str:
 
 
 def _row_qty_unit(row: dict) -> Tuple[float, float]:
-    qty = _num(row.get("available_qty_number"), _num(row.get("quantity"), 0))
-    unit = _num(
+    qty = rc._num_alias(row.get("available_qty_number"), row.get("quantity"), row.get("available_qty"), row.get("qty"))
+    unit = rc._num_alias(
         row.get("unit_value_number"),
-        _num(row.get("mav_value"), _num(row.get("unit_value"), _num(row.get("price"), 0))),
+        row.get("mav_value"),
+        row.get("unit_value"),
+        row.get("price"),
+        row.get("cost"),
     )
     return qty, unit
 
@@ -167,8 +215,8 @@ async def _aggregate_latest_parts_for_date_keys(
 ) -> Dict[str, Dict[Tuple[str, str, str, str], dict]]:
     """Latest published part rows per date/branch, scoped and de-duplicated.
 
-    Uses `$top` (no separate `$sort`) so Atlas shared-tier 32MB sort limits are
-    avoided, and still processes one `active_date_key` at a time for safety.
+    DocumentDB rejects `$top` (code 306), so the latest row per part is picked
+    with `$sort` + `$first`, one `active_date_key` at a time.
     """
     if not date_keys:
         return {}
@@ -211,6 +259,7 @@ async def _aggregate_latest_parts_for_date_keys(
                     "last_sales_date": 1,
                 }
             },
+            {"$sort": {"published_at": -1, "updated_at": -1}},
             {
                 "$group": {
                     "_id": {
@@ -220,12 +269,7 @@ async def _aggregate_latest_parts_for_date_keys(
                         "branch": "$branch",
                         "part": "$part_number",
                     },
-                    "doc": {
-                        "$top": {
-                            "output": "$$ROOT",
-                            "sortBy": {"published_at": -1, "updated_at": -1},
-                        }
-                    },
+                    "doc": {"$first": "$$ROOT"},
                 }
             },
             {
@@ -308,7 +352,7 @@ def _compute_day_movement(
         curr = curr_map.get(pk, {"qty": 0.0, "unit": 0.0, "value": 0.0})
         p_qty = _num(prev.get("qty"))
         c_qty = _num(curr.get("qty"))
-        unit = _num(curr.get("unit"), _num(prev.get("unit")))
+        unit = _num(curr.get("unit")) if pk in curr_map else _num(prev.get("unit"))
         add_q = max(c_qty - p_qty, 0.0)
         red_q = max(p_qty - c_qty, 0.0)
         added_q += add_q
@@ -455,77 +499,81 @@ async def _snapshots_enabled() -> bool:
         return False
 
 
+async def _read_finalized_parts_for_dates(
+    date_keys: List[str],
+    scope: dict,
+    category: Optional[str],
+    aging_bucket: Optional[str] = None,
+) -> Dict[str, Dict[Tuple[str, str, str, str], dict]]:
+    """Screen-load path: finalized rollup rows only. Never touches live products."""
+    if not date_keys:
+        return {}
+    snap_keys = []
+    for dk in date_keys:
+        snap_keys.append(dk)
+        if len(dk) == 8:
+            snap_keys.append(f"{dk[0:4]}-{dk[4:6]}-{dk[6:8]}")
+        elif len(dk) == 10:
+            snap_keys.append(dk.replace("-", ""))
+    q = {"snapshot_date_ist": {"$in": list(set(snap_keys))}}
+    if scope.get("brand"):
+        q["brand_name"] = scope["brand"]
+    if scope.get("dealer"):
+        q["dealer_name"] = scope["dealer"]
+    if scope.get("branch"):
+        q["branch_name"] = scope["branch"]
+    rows = await db.analytics_stock_daily_snapshots.find(q, {"_id": 0}).to_list(500000)
+    by_date: Dict[str, Dict[Tuple[str, str, str, str], dict]] = defaultdict(dict)
+    for r in rows:
+        if category and not pc.is_all_part_type(category):
+            row_cat = pc.normalize_part_category(str(r.get("category") or r.get("part_category") or ""))
+            want = pc.normalize_part_category(str(category))
+            if row_cat != want:
+                continue
+        raw = _text(r.get("snapshot_date_ist")).replace("-", "")[:8]
+        pk = (
+            _text(r.get("brand_name")).casefold(),
+            _text(r.get("dealer_name")).casefold(),
+            _text(r.get("branch_name")).casefold(),
+            _text(r.get("part_number")).casefold(),
+        )
+        qty = _num(r.get("available_qty"))
+        unit = _num(r.get("unit_value"))
+        by_date[raw][pk] = {
+            "brand_name": r.get("brand_name"),
+            "dealer_name": r.get("dealer_name"),
+            "branch": r.get("branch_name"),
+            "part_number": r.get("part_number"),
+            "part_name": r.get("part_name"),
+            "part_category": r.get("category") or r.get("part_category"),
+            "category": r.get("category") or r.get("part_category"),
+            "qty": qty,
+            "unit": unit,
+            "value": _num(r.get("total_value"), qty * unit),
+            "purchase_aging_days": r.get("purchase_aging_days"),
+            "sales_aging_days": r.get("sales_aging_days"),
+            "last_receipt_date": r.get("last_receipt_date"),
+            "last_sales_date": r.get("last_sales_date"),
+        }
+    return by_date
+
+
 async def _aggregate_parts_for_dates(
     date_keys: List[str],
     scope: dict,
     category: Optional[str],
     use_snapshots: bool,
+    *,
+    allow_live_fallback: bool = False,
+    aging_bucket: Optional[str] = None,
 ) -> Dict[str, Dict[Tuple[str, str, str, str], dict]]:
     if not date_keys:
         return {}
-    if use_snapshots:
-        snap_keys = []
-        for dk in date_keys:
-            snap_keys.append(dk)
-            if len(dk) == 8:
-                snap_keys.append(f"{dk[0:4]}-{dk[4:6]}-{dk[6:8]}")
-        q = {"snapshot_date_ist": {"$in": list(set(snap_keys))}}
-        if scope.get("brand"):
-            q["brand_name"] = scope["brand"]
-        if scope.get("dealer"):
-            q["dealer_name"] = scope["dealer"]
-        if scope.get("branch"):
-            q["branch_name"] = scope["branch"]
-        rows = await db.analytics_stock_daily_snapshots.find(q, {"_id": 0}).to_list(500000)
-        if rows:
-            by_date: Dict[str, Dict[Tuple[str, str, str, str], dict]] = defaultdict(dict)
-            for r in rows:
-                # Part Type filter on snapshot path (was previously dropped).
-                if category and not pc.is_all_part_type(category):
-                    row_cat = pc.normalize_part_category(
-                        str(r.get("category") or r.get("part_category") or "")
-                    )
-                    want = pc.normalize_part_category(str(category))
-                    if row_cat != want:
-                        continue
-                raw = _text(r.get("snapshot_date_ist")).replace("-", "")[:8]
-                pk = (
-                    _text(r.get("brand_name")).casefold(),
-                    _text(r.get("dealer_name")).casefold(),
-                    _text(r.get("branch_name")).casefold(),
-                    _text(r.get("part_number")).casefold(),
-                )
-                qty = _num(r.get("available_qty"))
-                unit = _num(r.get("unit_value"))
-                by_date[raw][pk] = {
-                    "brand_name": r.get("brand_name"),
-                    "dealer_name": r.get("dealer_name"),
-                    "branch": r.get("branch_name"),
-                    "part_number": r.get("part_number"),
-                    "part_name": r.get("part_name"),
-                    "part_category": r.get("category") or r.get("part_category"),
-                    "category": r.get("category") or r.get("part_category"),
-                    "qty": qty,
-                    "unit": unit,
-                    "value": _num(r.get("total_value"), qty * unit),
-                    # Preserve aging for Purchase/Sales Aging Analytics filters.
-                    "purchase_aging_days": r.get("purchase_aging_days"),
-                    "sales_aging_days": r.get("sales_aging_days"),
-                }
-            # If snapshots exist globally but none matched this date/filter set,
-            # fall through to products only when snapshots for the requested dates
-            # are entirely missing — not when Part Type simply filtered to empty.
-            if by_date:
-                return by_date
-            # Snapshots queried but empty after scope — treat as no snapshot data
-            # for these dates (avoid silent wrong empty when dates missing).
-            have_dates = {
-                _text(r.get("snapshot_date_ist")).replace("-", "")[:8]
-                for r in rows
-            }
-            missing = [dk for dk in date_keys if _text(dk).replace("-", "")[:8] not in have_dates]
-            if not missing:
-                return by_date
+    if use_snapshots or not allow_live_fallback:
+        by_date = await _read_finalized_parts_for_dates(date_keys, scope, category, aging_bucket)
+        if by_date or not allow_live_fallback:
+            # Screen load: never calculate today's incomplete live data.
+            return by_date
     return await _aggregate_latest_parts_for_date_keys(date_keys, scope, category)
 
 
@@ -627,6 +675,79 @@ def _empty_daily_row(dk: str, status_info: dict) -> dict:
     }
 
 
+def _aging_field(aging_type: str) -> str:
+    return "aging_sales" if str(aging_type or "").lower() == "sales" else "aging_purchase"
+
+
+def _agg_metric_from_row(row: dict, aging_type: str, aging_bucket: Optional[str]) -> Tuple[float, float, float]:
+    """Return (qty, value, items) from one pre-aggregated daily row."""
+    if aging_bucket:
+        bucket = ((row.get(_aging_field(aging_type)) or {}).get(aging_bucket)) or {}
+        return _num(bucket.get("qty")), _num(bucket.get("value")), _num(bucket.get("items"))
+    return _num(row.get("stock_qty")), _num(row.get("stock_value")), _num(row.get("line_count"))
+
+
+def _aggs_to_branch_maps(
+    rows: List[dict],
+    aging_type: str,
+    aging_bucket: Optional[str] = None,
+) -> Dict[Tuple[str, str, str, str], dict]:
+    """Collapse daily-agg rows to a movement map keyed by brand/dealer/branch/category."""
+    out: Dict[Tuple[str, str, str, str], dict] = {}
+    for r in rows:
+        qty, value, items = _agg_metric_from_row(r, aging_type, aging_bucket)
+        key = (
+            _text(r.get("brand_name")).casefold(),
+            _text(r.get("dealer_name")).casefold(),
+            _text(r.get("branch_name")).casefold(),
+            _text(r.get("category")).casefold(),
+        )
+        cur = out.get(key)
+        if not cur:
+            out[key] = {
+                "brand_name": r.get("brand_name"),
+                "dealer_name": r.get("dealer_name"),
+                "branch": r.get("branch_name"),
+                "part_number": "",
+                "part_name": "",
+                "part_category": r.get("category"),
+                "category": r.get("category"),
+                "qty": qty,
+                "value": value,
+                "items": items,
+                "unit": (value / qty) if qty else 0.0,
+                "aging_purchase": r.get("aging_purchase") or {},
+                "aging_sales": r.get("aging_sales") or {},
+            }
+        else:
+            cur["qty"] += qty
+            cur["value"] += value
+            cur["items"] += items
+            cur["unit"] = (cur["value"] / cur["qty"]) if cur["qty"] else 0.0
+            # Merge aging bucket totals when no single-bucket filter is applied.
+            if not aging_bucket:
+                for side in ("aging_purchase", "aging_sales"):
+                    src = r.get(side) or {}
+                    dst = cur.setdefault(side, {})
+                    for bname, bvals in src.items():
+                        slot = dst.setdefault(bname, {"qty": 0.0, "value": 0.0, "items": 0.0})
+                        slot["qty"] = _num(slot.get("qty")) + _num((bvals or {}).get("qty"))
+                        slot["value"] = _num(slot.get("value")) + _num((bvals or {}).get("value"))
+                        slot["items"] = _num(slot.get("items")) + _num((bvals or {}).get("items"))
+    return out
+
+
+async def _successful_rollup_keys(date_keys: List[str]) -> set:
+    if not date_keys:
+        return set()
+    isos = sorted({rollup.date_key_to_iso(rollup.iso_to_date_key(dk)) for dk in date_keys})
+    rows = await db[rollup.STATUS_COLLECTION].find(
+        {"rollup_date_ist": {"$in": isos}, "status": rollup.STATUS_SUCCESS},
+        {"_id": 0, "rollup_date_ist": 1},
+    ).to_list(5000)
+    return {rollup.iso_to_date_key(r["rollup_date_ist"]) for r in rows if r.get("rollup_date_ist")}
+
+
 async def _build_daily_stock_series(
     scope: dict,
     date_keys: List[str],
@@ -634,29 +755,67 @@ async def _build_daily_stock_series(
     aging_type: str,
     metric_type: str,
     current_user,
+    *,
+    aging_bucket: Optional[str] = None,
+    updated_up_to: Optional[str] = None,
 ) -> dict:
+    """Screen path: pre-aggregated daily rollups only (never 100k+ part rows)."""
     expected_branches = await _expected_branch_names(scope, current_user)
     consolidated = not bool(scope.get("branch"))
-    uploaded_by_date, upload_meta = await _uploaded_branches_by_date(scope, date_keys)
-    use_snap = await _snapshots_enabled()
-    prior_key = await _find_last_upload_before(date_keys[0], scope, expected_branches, consolidated)
+    prior_key = None
+    if date_keys:
+        prior_iso = await rollup.last_successful_rollup_date(
+            db, on_or_before=rollup.date_key_to_iso(rollup.iso_to_date_key(_prev_date_key(date_keys[0])))
+        )
+        if prior_iso:
+            prior_key = rollup.iso_to_date_key(prior_iso)
     load_keys = list(date_keys)
     if prior_key and prior_key not in load_keys:
         load_keys.append(prior_key)
-    if prior_key and prior_key not in load_keys:
-        load_keys.append(prior_key)
-    by_date = await _aggregate_parts_for_dates(load_keys, scope, category, use_snap)
-    if prior_key:
-        up_prior, meta_prior = await _uploaded_branches_by_date(scope, [prior_key])
-        for dk, branches in up_prior.items():
-            uploaded_by_date[dk] = uploaded_by_date.get(dk, set()) | branches
-        for dk, m in meta_prior.items():
-            upload_meta[dk] = {**upload_meta.get(dk, {}), **m}
+
+    agg_rows = await rollup.query_daily_aggs(db, load_keys, scope, category)
+    success_keys = await _successful_rollup_keys(load_keys)
+
+    by_date_rows: Dict[str, List[dict]] = defaultdict(list)
+    for r in agg_rows:
+        dk = rollup.iso_to_date_key(_text(r.get("rollup_date_ist")))
+        if dk:
+            by_date_rows[dk].append(r)
+
+    by_date: Dict[str, Dict[Tuple[str, str, str, str], dict]] = {}
+    uploaded_by_date: Dict[str, set] = {}
+    upload_meta: Dict[str, Dict[str, dict]] = {}
+    for dk, rows in by_date_rows.items():
+        part_map = _aggs_to_branch_maps(rows, aging_type, aging_bucket)
+        by_date[dk] = part_map
+        branches = {_text(row.get("branch")).casefold() for row in part_map.values() if _text(row.get("branch"))}
+        uploaded_by_date[dk] = branches
+        upload_meta[dk] = {
+            b: {
+                "published_at": None,
+                "total_value": sum(
+                    r["value"] for r in part_map.values() if _text(r.get("branch")).casefold() == b
+                ),
+            }
+            for b in branches
+        }
+    # Finalized empty days (genuine zero stock) still count as present.
+    for dk in success_keys:
+        if dk not in by_date:
+            by_date[dk] = {}
+            uploaded_by_date.setdefault(dk, set())
+            upload_meta.setdefault(dk, {})
 
     last_avail_key: Optional[str] = prior_key
     if prior_key:
         prior_status = _day_upload_status(prior_key, uploaded_by_date, expected_branches, consolidated)
-        last_avail_map = _filter_map_branches(by_date.get(prior_key, {}), prior_status["allowed_branch_keys"])
+        if prior_key in success_keys and prior_key not in by_date_rows:
+            # Empty finalized prior day.
+            last_avail_map = {}
+        else:
+            last_avail_map = _filter_map_branches(by_date.get(prior_key, {}), prior_status["allowed_branch_keys"])
+            if prior_key in success_keys and not by_date.get(prior_key) and not prior_status["allowed_branch_keys"]:
+                last_avail_map = {}
     else:
         last_avail_map = {}
 
@@ -668,6 +827,30 @@ async def _build_daily_stock_series(
     period_added = period_reduced = 0.0
     for dk in date_keys:
         status_info = _day_upload_status(dk, uploaded_by_date, expected_branches, consolidated)
+        # Finalized-only: missing successful rollup => No Data; successful empty => 0.
+        if dk not in success_keys:
+            status_info = {
+                **status_info,
+                "data_status": "NO_UPLOAD",
+                "uploaded_branch_count": 0,
+                "missing_branch_count": status_info.get("expected_branch_count") or 0,
+                "coverage_percentage": 0.0,
+                "uploaded_branches": [],
+                "missing_branches": status_info.get("missing_branches") or expected_branches,
+                "allowed_branch_keys": set(),
+            }
+        elif not by_date_rows.get(dk):
+            # Rollup succeeded with zero source rows — show 0, not No Data.
+            status_info = {
+                **status_info,
+                "data_status": "AVAILABLE",
+                "uploaded_branch_count": status_info.get("uploaded_branch_count") or 0,
+                "missing_branch_count": 0,
+                "coverage_percentage": 100.0 if not expected_branches else status_info.get("coverage_percentage") or 100.0,
+                "allowed_branch_keys": set(uploaded_by_date.get(dk) or set()) or (
+                    {_text(b).casefold() for b in expected_branches} if expected_branches else set()
+                ),
+            }
         if status_info["data_status"] == "NO_UPLOAD":
             no_days += 1
             daily.append(_empty_daily_row(dk, status_info))
@@ -678,11 +861,13 @@ async def _build_daily_stock_series(
             full_days += 1
         uploaded_branch_days += status_info["uploaded_branch_count"]
         curr_map = _filter_map_branches(by_date.get(dk, {}), status_info["allowed_branch_keys"])
+        if dk in success_keys and not by_date_rows.get(dk):
+            curr_map = {}
         stock_v, stock_q = _sum_map(curr_map)
         row = _empty_daily_row(dk, status_info)
         row["stock_value"] = stock_v
         row["stock_quantity"] = stock_q
-        if last_avail_key and last_avail_map is not None:
+        if last_avail_key is not None and last_avail_map is not None:
             mv = _compute_day_movement(last_avail_map, curr_map, aging_type, metric_type)
             ctype = _comparison_type_for(last_avail_key, dk)
             row["comparison_date"] = _date_key_to_iso(last_avail_key)
@@ -747,20 +932,29 @@ async def _build_daily_stock_series(
         for k in ("uploaded_branch_count", "expected_branch_count", "missing_branch_count", "coverage_percentage"):
             summary[k] = last_row.get(k)
     if last_row and last_row.get("comparison_date") and last_row["stock_value"] is not None:
-        # previous available from comparison row
         comp_key = _iso_to_date_key(last_row["comparison_date"])
-        comp_map = _filter_map_branches(by_date.get(comp_key, {}), _day_upload_status(comp_key, uploaded_by_date, expected_branches, consolidated)["allowed_branch_keys"])
+        comp_map = _filter_map_branches(
+            by_date.get(comp_key, {}),
+            _day_upload_status(comp_key, uploaded_by_date, expected_branches, consolidated)["allowed_branch_keys"],
+        )
         summary["previous_available_stock_value"], _ = _sum_map(comp_map)
 
+    coverage = _coverage_payload(updated_up_to, coverage)
+    summary["data_updated_up_to"] = updated_up_to
     return {
         "daily": daily,
         "coverage": coverage,
         "summary": summary,
         "by_date_parts": by_date,
+        "by_date_aggs": dict(by_date_rows),
+        "success_keys": success_keys,
         "upload_meta": upload_meta,
         "uploaded_by_date": uploaded_by_date,
         "expected_branches": expected_branches,
         "consolidated": consolidated,
+        "data_updated_up_to": updated_up_to,
+        "aging_type": aging_type,
+        "aging_bucket": aging_bucket,
     }
 
 
@@ -799,14 +993,11 @@ async def _part_type_lookup(part_numbers: List[str], scope: Optional[dict] = Non
     for i in range(0, len(nums), 2000):
         chunk = nums[i : i + 2000]
         q = _and(_query(scope or {}), {"part_number": {"$in": chunk}})
-        rows = (
-            await db.products.find(
-                q,
-                {"_id": 0, "part_number": 1, "part_category": 1, "category": 1, "parts_type": 1, "active_date_key": 1},
-            )
-            .sort("active_date_key", -1)
-            .to_list(100000)
-        )
+        cursor = db.products.find(
+            q,
+            {"_id": 0, "part_number": 1, "part_category": 1, "category": 1, "parts_type": 1, "active_date_key": 1},
+        ).sort("active_date_key", -1)
+        rows = await cursor.to_list(None)
         for row in rows:
             pn = _text(row.get("part_number")).casefold()
             if not pn or pn in out:
@@ -830,36 +1021,127 @@ async def _filter_rows_by_part_type(rows: List[dict], category: Optional[str], s
 
 
 def _request_unit(row: dict) -> float:
-    return _num(
+    return rc._num_alias(
         row.get("value"),
-        _num(row.get("part_value"), _num(row.get("unit_value_at_request"), _num(row.get("unit_value"), 0))),
+        row.get("part_value"),
+        row.get("unit_value_at_request"),
+        row.get("unit_value"),
     )
 
 
 def _approved_qty(row: dict) -> float:
-    return _num(row.get("accepted_qty"), _num(row.get("approved_qty"), 0))
+    return rc._num_alias(row.get("accepted_qty"), row.get("approved_qty"))
 
 
 def _requested_qty(row: dict) -> float:
-    return _num(row.get("requested_qty"), _num(row.get("quantity"), 0))
+    return rc._num_alias(row.get("requested_qty"), row.get("quantity"), row.get("required_qty"))
 
 
 def _is_completed_request(row: dict) -> bool:
-    return _text(row.get("status")).lower() == "completed"
+    # The UI closes a transfer at "Received"; "Completed" is only reachable via the API.
+    return _text(row.get("status")).lower() in {"received", "completed"}
 
 
-def _nmts_sourced_qty_value(row: dict) -> Tuple[float, float]:
+LOST_REQUEST_STATUSES = {
+    "rejected",
+    "cancelled",
+    "timeout",
+    "expired",
+    "response time expired",
+    "cancelled – no response",
+    "cancelled - no response",
+    "no response",
+}
+
+
+def _accepted_arranged_qty(row: dict) -> float:
+    """Finally accepted/arranged quantity only."""
     if not _is_completed_request(row):
-        return 0.0, 0.0
+        return 0.0
+    qty = _num(row.get("completed_qty"), _approved_qty(row))
+    return qty if qty > 0 else 0.0
+
+
+def _saving_bucket(row: dict) -> Optional[str]:
+    """Classify a finally accepted transfer: own | same_dealer | other_dealer."""
+    qty = _accepted_arranged_qty(row)
+    if qty <= 0:
+        return None
     req_b = _text(row.get("requesting_branch")).casefold()
     sup_b = _text(row.get("supplying_branch")).casefold()
     if req_b and sup_b and req_b == sup_b:
-        return 0.0, 0.0
-    qty = _num(row.get("completed_qty"), _approved_qty(row))
+        return "own"
+    req_d = _text(row.get("requesting_dealer")).casefold()
+    sup_d = _text(row.get("supplying_dealer")).casefold()
+    if req_d and sup_d and req_d == sup_d:
+        return "same_dealer"
+    return "other_dealer"
+
+
+def _nmts_sourced_qty_value(row: dict) -> Tuple[float, float]:
+    """Total saved qty/value across own + same-dealer + other-dealer accepted transfers."""
+    qty = _accepted_arranged_qty(row)
     if qty <= 0:
         return 0.0, 0.0
-    unit = _request_unit(row)
-    return qty, qty * unit
+    return qty, qty * _request_unit(row)
+
+
+def _is_lost_request(row: dict) -> bool:
+    return _text(row.get("status")).lower() in LOST_REQUEST_STATUSES
+
+
+def _lost_qty_value(row: dict) -> Tuple[float, float]:
+    """Rejected/timed-out/closed unfulfilled only. Pending is never Lost."""
+    if not _is_lost_request(row):
+        return 0.0, 0.0
+    rq = _requested_qty(row)
+    fq = _num(row.get("completed_qty"), _approved_qty(row))
+    if fq < 0:
+        fq = 0.0
+    lost = max(0.0, rq - fq)
+    if lost <= 0:
+        return 0.0, 0.0
+    return lost, lost * _request_unit(row)
+
+
+
+async def _analytics_window(from_date: str, to_date: str) -> Tuple[str, str, List[str], Optional[str]]:
+    """Clamp Analytics to finalized historical dates only (never today)."""
+    last = await rollup.last_successful_rollup_date(db)
+    effective_to, updated_up_to = rollup.resolve_analytics_end_date(to_date, last_success=last)
+    if not updated_up_to:
+        return from_date, effective_to, [], None
+    start = datetime.strptime(from_date, "%Y-%m-%d").date()
+    end = datetime.strptime(effective_to, "%Y-%m-%d").date()
+    if end < start:
+        return from_date, effective_to, [], updated_up_to
+    keys = []
+    cur = start
+    while cur <= end:
+        keys.append(cur.strftime("%Y%m%d"))
+        cur += timedelta(days=1)
+    return from_date, effective_to, keys, updated_up_to
+
+
+def _filter_parts_by_aging_bucket(
+    part_map: Dict[Tuple[str, str, str, str], dict],
+    aging_type: str,
+    aging_bucket: Optional[str],
+) -> Dict[Tuple[str, str, str, str], dict]:
+    if not aging_bucket:
+        return part_map
+    out = {}
+    for pk, row in part_map.items():
+        if _analytics_bucket(_aging_days_row(row, aging_type)) == aging_bucket:
+            out[pk] = row
+    return out
+
+
+def _coverage_payload(updated_up_to: Optional[str], coverage: Optional[dict] = None) -> dict:
+    out = dict(coverage or {})
+    out["data_updated_up_to"] = updated_up_to
+    out["finalized_only"] = True
+    return out
 
 
 def _common_params(
@@ -986,13 +1268,22 @@ async def analytics_stock_trend(
     category: Optional[str] = None,
     aging_type: str = "purchase",
     metric_type: str = "value",
+    aging_days: Optional[str] = None,
     current_user=Depends(_current_user),
 ):
     scope = _resolve_scope_params(current_user, brand, dealer, branch, brand_id, dealer_id, branch_id)
-    _, _, date_keys, aging_type, metric_type, category = _common_params(
+    _, _, _, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
-    payload = await _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user)
+    _, effective_to, date_keys, updated_up_to = await _analytics_window(from_date, to_date)
+    aging_bucket = _normalize_aging_days_filter(aging_days)
+    payload = await _stock_trend_payload(
+        scope, date_keys, aging_type, metric_type, category, current_user,
+        aging_bucket=aging_bucket, updated_up_to=updated_up_to,
+    )
+    payload["from_date"] = from_date
+    payload["to_date"] = effective_to
+    payload["data_updated_up_to"] = updated_up_to
     return payload
 
 
@@ -1091,52 +1382,76 @@ async def analytics_aging_trend(
     category: Optional[str] = None,
     aging_type: str = "purchase",
     metric_type: str = "value",
+    aging_days: Optional[str] = None,
     current_user=Depends(_current_user),
 ):
     scope = _resolve_scope_params(current_user, brand, dealer, branch, brand_id, dealer_id, branch_id)
-    _, _, date_keys, aging_type, metric_type, category = _common_params(
+    _, _, _, aging_type, metric_type, category = _common_params(
         from_date, to_date, category=category, aging_type=aging_type, metric_type=metric_type
     )
+    _, effective_to, date_keys, updated_up_to = await _analytics_window(from_date, to_date)
+    aging_bucket = _normalize_aging_days_filter(aging_days)
     if not date_keys:
         return {
             "buckets": [],
-            "bucket_keys": list(ANALYTICS_AGING_BUCKETS),
+            "bucket_keys": list(ANALYTICS_CHART_BUCKETS),
             "stacked": [],
             "daily": [],
-            "data_coverage": {},
+            "data_coverage": _coverage_payload(updated_up_to),
+            "data_updated_up_to": updated_up_to,
+            "from_date": from_date,
+            "to_date": effective_to,
         }
-    ctx = await _build_daily_stock_series(scope, date_keys, category, aging_type, metric_type, current_user)
+    # Aging panel needs full bucket breakdown — do not pre-filter the series by aging_days.
+    ctx = await _build_daily_stock_series(
+        scope, date_keys, category, aging_type, metric_type, current_user,
+        aging_bucket=None, updated_up_to=updated_up_to,
+    )
     use_value = metric_type == "value"
     # Item Wise = distinct part-line count (quantity of line items), Value Wise = stock value.
     use_items = metric_type == "quantity"
+    aging_side = _aging_field(aging_type)
     last_row = ctx["daily"][-1]
-    bucket_totals = {b: {"value": None, "quantity": None, "items": None} for b in ANALYTICS_AGING_BUCKETS}
-    stacked = defaultdict(lambda: {b: None for b in ANALYTICS_AGING_BUCKETS})
+    bucket_totals = {b: {"value": None, "quantity": None, "items": None} for b in ANALYTICS_CHART_BUCKETS}
+    stacked = defaultdict(lambda: {b: None for b in ANALYTICS_CHART_BUCKETS})
     if last_row["data_status"] != "NO_UPLOAD":
         dk = _iso_to_date_key(last_row["date"])
         status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
         curr_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
-        bucket_totals = {b: {"value": 0.0, "quantity": 0.0, "items": 0.0} for b in ANALYTICS_AGING_BUCKETS}
-        stacked = defaultdict(lambda: {b: 0.0 for b in ANALYTICS_AGING_BUCKETS})
+        bucket_totals = {b: {"value": 0.0, "quantity": 0.0, "items": 0.0} for b in ANALYTICS_CHART_BUCKETS}
+        stacked = defaultdict(lambda: {b: 0.0 for b in ANALYTICS_CHART_BUCKETS})
         for row in curr_map.values():
-            days = _aging_days_row(row, aging_type)
-            b = _analytics_bucket(days)
-            bucket_totals[b]["value"] += row["value"]
-            bucket_totals[b]["quantity"] += row["qty"]
-            bucket_totals[b]["items"] += 1.0
             cat = _row_category(row)
-            metric = row["value"] if use_value else (1.0 if use_items else row["qty"])
-            stacked[cat][b] += metric
-        cat_total = sum(
-            (x["value"] if use_value else 1.0) for x in curr_map.values()
-        ) or 1.0
+            aging = row.get(aging_side) or {}
+            for b in ANALYTICS_CHART_BUCKETS:
+                if aging_bucket and b != aging_bucket:
+                    continue
+                slot = aging.get(b) or {}
+                bv = _num(slot.get("value"))
+                bq = _num(slot.get("qty"))
+                bi = _num(slot.get("items"))
+                bucket_totals[b]["value"] += bv
+                bucket_totals[b]["quantity"] += bq
+                bucket_totals[b]["items"] += bi
+                metric = bv if use_value else (bi if use_items else bq)
+                stacked[cat][b] = (stacked[cat][b] or 0.0) + metric
+        if aging_bucket:
+            cat_total = bucket_totals[aging_bucket]["value"] if use_value else bucket_totals[aging_bucket]["items"]
+            cat_total = cat_total or 1.0
+        else:
+            cat_total = sum(
+                (bucket_totals[b]["value"] if use_value else bucket_totals[b]["items"])
+                for b in ANALYTICS_CHART_BUCKETS
+            ) or 1.0
     else:
         cat_total = 1.0
     buckets_out = []
-    for b in ANALYTICS_AGING_BUCKETS:
+    for b in ANALYTICS_CHART_BUCKETS:
         v = bucket_totals[b]["value"]
         q = bucket_totals[b]["quantity"]
         items = bucket_totals[b]["items"]
+        if aging_bucket and b != aging_bucket and v is not None:
+            v = q = items = 0.0
         m = v if use_value else items
         buckets_out.append(
             {
@@ -1150,7 +1465,7 @@ async def analytics_aging_trend(
             }
         )
     stacked_out = [
-        {"category": c, **{b: stacked[c][b] for b in ANALYTICS_AGING_BUCKETS}}
+        {"category": c, **{b: stacked[c][b] for b in ANALYTICS_CHART_BUCKETS}}
         for c in sorted(stacked.keys())
     ]
     daily = []
@@ -1161,32 +1476,39 @@ async def analytics_aging_trend(
                     "date": pt["date"],
                     "data_status": "NO_UPLOAD",
                     "total": None,
-                    **{b: None for b in ANALYTICS_AGING_BUCKETS},
+                    **{b: None for b in ANALYTICS_CHART_BUCKETS},
                 }
             )
             continue
         dk = _iso_to_date_key(pt["date"])
         status = _day_upload_status(dk, ctx["uploaded_by_date"], ctx["expected_branches"], ctx["consolidated"])
         curr_map = _filter_map_branches(ctx["by_date_parts"].get(dk, {}), status["allowed_branch_keys"])
-        day_buckets = {b: 0.0 for b in ANALYTICS_AGING_BUCKETS}
+        day_buckets = {b: 0.0 for b in ANALYTICS_CHART_BUCKETS}
         for row in curr_map.values():
-            b = _analytics_bucket(_aging_days_row(row, aging_type))
-            day_buckets[b] += row["value"] if use_value else 1.0
+            aging = row.get(aging_side) or {}
+            for b in ANALYTICS_CHART_BUCKETS:
+                if aging_bucket and b != aging_bucket:
+                    continue
+                slot = aging.get(b) or {}
+                day_buckets[b] += _num(slot.get("value")) if use_value else _num(slot.get("items"))
         total = sum(day_buckets.values())
         daily.append(
             {
                 "date": pt["date"],
                 "data_status": pt["data_status"],
                 "total": total,
-                **{b: day_buckets[b] for b in ANALYTICS_AGING_BUCKETS},
+                **{b: day_buckets[b] for b in ANALYTICS_CHART_BUCKETS},
             }
         )
     return {
         "buckets": buckets_out,
-        "bucket_keys": list(ANALYTICS_AGING_BUCKETS),
+        "bucket_keys": list(ANALYTICS_CHART_BUCKETS),
         "stacked": stacked_out,
         "daily": daily,
         "data_coverage": ctx["coverage"],
+        "data_updated_up_to": updated_up_to,
+        "from_date": from_date,
+        "to_date": effective_to,
         "comparison_type": ctx["summary"].get("comparison_type"),
         "comparison_label": ctx["summary"].get("comparison_label"),
         "metric_type": metric_type,
@@ -1209,12 +1531,36 @@ async def analytics_order_saving(
 ):
     """Orders & Savings Analysis.
 
-    Final / Net Order = Original Order - Reduced / Cut (NMTS-sourced network supply).
+    Original Order, Own/Same/Other Dealer Saved, Total Saved, Balance Order, Saving %.
+    Counts only finally accepted/arranged quantities.
     """
     scope = _resolve_scope_params(current_user, brand, dealer, branch, brand_id, dealer_id, branch_id)
-    start, end, date_keys, _, metric_type, category = _common_params(
+    _, _, _, _, metric_type, category = _common_params(
         from_date, to_date, category=category, metric_type=metric_type
     )
+    from_date, effective_to, date_keys, updated_up_to = await _analytics_window(from_date, to_date)
+    if not updated_up_to or not date_keys:
+        return {
+            "summary": {
+                "total_order_count": 0,
+                "original_order_value": 0.0,
+                "own_branch_saved_value": 0.0,
+                "same_dealer_saved_value": 0.0,
+                "other_dealer_saved_value": 0.0,
+                "total_saved_value": 0.0,
+                "balance_order_value": 0.0,
+                "saving_pct": 0.0,
+                "reduction_pct": 0.0,
+            },
+            "series": [],
+            "metric_type": metric_type,
+            "scope": scope,
+            "data_updated_up_to": updated_up_to,
+            "from_date": from_date,
+            "to_date": effective_to,
+            "data_coverage": _coverage_payload(updated_up_to),
+        }
+    start, end, _, _, _, _ = _common_params(from_date, effective_to, category=category, metric_type=metric_type)
     orders = await _orders_query(scope, start, end)
     order_ids = {o.get("id") for o in orders if o.get("id")}
     reqs = await _requests_query(scope, start, end, "raised")
@@ -1236,29 +1582,53 @@ async def analytics_order_saving(
         orders = [o for o in orders if o.get("id") in keep_ids]
 
     if part_type_filter:
-        original_value = sum(_num(i.get("required_qty")) * _num(i.get("value"), _num(i.get("unit_value"))) for i in order_item_rows)
-        original_items = sum(_num(i.get("required_qty")) for i in order_item_rows)
+        original_value = sum(_num(i.get("required_qty")) * rc._num_alias(i.get("value"), i.get("unit_value")) for i in order_item_rows)
+        original_qty = sum(_num(i.get("required_qty")) for i in order_item_rows)
+        line_item_count = len(order_item_rows)
     else:
         original_value = sum(_num(o.get("total_order_value")) for o in orders)
-        original_items = sum(_num(o.get("item_count"), _num(o.get("total_required_qty"), 0)) for o in orders)
-    reduced_value = 0.0
-    reduced_items = 0.0
+        original_qty = sum(_num(o.get("total_required_qty")) for o in orders)
+        line_item_count = sum(_num(o.get("item_count")) for o in orders)
+    own_v = same_v = other_v = 0.0
+    own_q = same_q = other_q = 0.0
     for r in linked:
+        bucket = _saving_bucket(r)
+        if not bucket:
+            continue
         sq, sv = _nmts_sourced_qty_value(r)
-        reduced_value += sv
-        reduced_items += sq
-    # Cap reduced so Final never goes negative from noisy source rows.
-    reduced_value = min(reduced_value, original_value) if original_value > 0 else reduced_value
-    reduced_items = min(reduced_items, original_items) if original_items > 0 else reduced_items
-    final_value = max(0.0, original_value - reduced_value)
-    final_items = max(0.0, original_items - reduced_items)
+        if bucket == "own":
+            own_v += sv; own_q += sq
+        elif bucket == "same_dealer":
+            same_v += sv; same_q += sq
+        else:
+            other_v += sv; other_q += sq
+    reduced_value = own_v + same_v + other_v
+    reduced_qty = own_q + same_q + other_q
+    recon_failed = False
+    if original_value > 0 and reduced_value > original_value + 1e-6:
+        recon_failed = True
+        logger.warning("order-saving value reconciliation failed: reduced exceeds original")
+    if original_qty > 0 and reduced_qty > original_qty + 1e-6:
+        recon_failed = True
+        logger.warning("order-saving quantity reconciliation failed: reduced exceeds original")
+    original_items = original_qty
+    reduced_items = reduced_qty
+    final_value = original_value - reduced_value
+    final_items = original_qty - reduced_qty
 
     series_map = defaultdict(
         lambda: {
             "original_value": 0.0,
-            "original_items": 0.0,
+            "original_qty": 0.0,
+            "line_item_count": 0.0,
             "reduced_value": 0.0,
-            "reduced_items": 0.0,
+            "reduced_qty": 0.0,
+            "own_value": 0.0,
+            "own_qty": 0.0,
+            "same_dealer_value": 0.0,
+            "same_dealer_qty": 0.0,
+            "other_dealer_value": 0.0,
+            "other_dealer_qty": 0.0,
             "order_count": 0,
         }
     )
@@ -1273,72 +1643,121 @@ async def analytics_order_saving(
             if oid and oid not in counted_orders:
                 series_map[d]["order_count"] += 1
                 counted_orders.add(oid)
-            series_map[d]["original_value"] += _num(i.get("required_qty")) * _num(i.get("value"), _num(i.get("unit_value")))
-            series_map[d]["original_items"] += _num(i.get("required_qty"))
+            series_map[d]["original_value"] += _num(i.get("required_qty")) * rc._num_alias(i.get("value"), i.get("unit_value"))
+            series_map[d]["original_qty"] += _num(i.get("required_qty"))
+            series_map[d]["line_item_count"] += 1
     else:
         for o in orders:
             d = (_dt(o.get("created_at")) or start).date().isoformat()
             series_map[d]["order_count"] += 1
             series_map[d]["original_value"] += _num(o.get("total_order_value"))
-            series_map[d]["original_items"] += _num(o.get("item_count"), _num(o.get("total_required_qty"), 0))
+            series_map[d]["original_qty"] += _num(o.get("total_required_qty"))
+            series_map[d]["line_item_count"] += _num(o.get("item_count"))
     for r in linked:
         d = (_dt(r.get("requested_at") or r.get("created_at")) or start).date().isoformat()
+        bucket = _saving_bucket(r)
+        if not bucket:
+            continue
         sq, sv = _nmts_sourced_qty_value(r)
         series_map[d]["reduced_value"] += sv
-        series_map[d]["reduced_items"] += sq
+        series_map[d]["reduced_qty"] += sq
+        if bucket == "own":
+            series_map[d]["own_value"] += sv; series_map[d]["own_qty"] += sq
+        elif bucket == "same_dealer":
+            series_map[d]["same_dealer_value"] += sv; series_map[d]["same_dealer_qty"] += sq
+        else:
+            series_map[d]["other_dealer_value"] += sv; series_map[d]["other_dealer_qty"] += sq
 
     series = []
     for d in sorted(series_map.keys()):
         v = series_map[d]
         ov = v["original_value"]
-        rv = min(v["reduced_value"], ov) if ov > 0 else v["reduced_value"]
-        oi = v["original_items"]
-        ri = min(v["reduced_items"], oi) if oi > 0 else v["reduced_items"]
-        fv = max(0.0, ov - rv)
-        fi = max(0.0, oi - ri)
+        rv = v["reduced_value"]
+        oq = v["original_qty"]
+        rq = v["reduced_qty"]
+        fv = ov - rv
+        fq = oq - rq
+        own_v_d = v["own_value"]; same_v_d = v["same_dealer_value"]; other_v_d = v["other_dealer_value"]
+        own_q_d = v["own_qty"]; same_q_d = v["same_dealer_qty"]; other_q_d = v["other_dealer_qty"]
         series.append(
             {
                 "date": d,
                 "order_count": v["order_count"],
+                "line_item_count": v["line_item_count"],
                 "original_order_value": ov,
+                "own_branch_saved_value": own_v_d,
+                "same_dealer_saved_value": same_v_d,
+                "other_dealer_saved_value": other_v_d,
+                "total_saved_value": rv,
                 "reduced_value": rv,
+                "balance_order_value": fv,
                 "final_order_value": fv,
-                "reduction_pct": _safe_pct(rv, ov),
-                "original_order_items": oi,
-                "reduced_items": ri,
-                "final_order_items": fi,
-                # Backward-compatible aliases used by older UI fragments.
+                "reduction_pct": _safe_pct(rv, ov) if ov > 0 else 0.0,
+                "saving_pct": _safe_pct(rv, ov) if ov > 0 else 0.0,
+                "original_order_qty": oq,
+                "own_branch_saved_qty": own_q_d,
+                "same_dealer_saved_qty": same_q_d,
+                "other_dealer_saved_qty": other_q_d,
+                "total_saved_qty": rq,
+                "reduced_qty": rq,
+                "balance_order_qty": fq,
+                "final_order_qty": fq,
+                "original_order_items": oq,
+                "reduced_items": rq,
+                "final_order_items": fq,
                 "order_value": ov,
                 "sourced_value": rv,
                 "external_avoided_value": rv,
                 "unfulfilled_value": fv,
-                "saving_pct": _safe_pct(rv, ov),
-                "original": ov if metric_type == "value" else oi,
-                "reduced": rv if metric_type == "value" else ri,
-                "final": fv if metric_type == "value" else fi,
+                "original": ov if metric_type == "value" else oq,
+                "own_branch_saved": own_v_d if metric_type == "value" else own_q_d,
+                "same_dealer_saved": same_v_d if metric_type == "value" else same_q_d,
+                "other_dealer_saved": other_v_d if metric_type == "value" else other_q_d,
+                "total_saved": rv if metric_type == "value" else rq,
+                "reduced": rv if metric_type == "value" else rq,
+                "balance_order": fv if metric_type == "value" else fq,
+                "final": fv if metric_type == "value" else fq,
             }
         )
 
     return {
         "summary": {
             "total_order_count": len(orders),
+            "line_item_count": line_item_count,
             "original_order_value": original_value,
+            "own_branch_saved_value": own_v,
+            "same_dealer_saved_value": same_v,
+            "other_dealer_saved_value": other_v,
+            "total_saved_value": reduced_value,
             "reduced_value": reduced_value,
+            "balance_order_value": final_value,
             "final_order_value": final_value,
-            "reduction_pct": _safe_pct(reduced_value, original_value),
-            "original_order_items": original_items,
-            "reduced_items": reduced_items,
-            "final_order_items": final_items,
-            # Aliases
+            "reduction_pct": _safe_pct(reduced_value, original_value) if original_value else 0.0,
+            "saving_pct": _safe_pct(reduced_value, original_value) if original_value else 0.0,
+            "original_order_qty": original_qty,
+            "own_branch_saved_qty": own_q,
+            "same_dealer_saved_qty": same_q,
+            "other_dealer_saved_qty": other_q,
+            "total_saved_qty": reduced_qty,
+            "reduced_qty": reduced_qty,
+            "balance_order_qty": original_qty - reduced_qty,
+            "final_order_qty": original_qty - reduced_qty,
+            "original_order_items": original_qty,
+            "reduced_items": reduced_qty,
+            "final_order_items": original_qty - reduced_qty,
+            "reconciliation_failed": recon_failed,
             "total_order_value": original_value,
             "nmts_sourced_value": reduced_value,
             "external_purchase_avoided_value": reduced_value,
             "unfulfilled_value": final_value,
-            "saving_pct": _safe_pct(reduced_value, original_value),
         },
         "series": series,
         "metric_type": metric_type,
         "scope": scope,
+        "data_updated_up_to": updated_up_to,
+        "from_date": from_date,
+        "to_date": effective_to,
+        "data_coverage": _coverage_payload(updated_up_to),
     }
 
 
@@ -1377,22 +1796,43 @@ async def analytics_request_acceptance(
 ):
     """Request Fulfillment Analysis for requests received by the selected scope.
 
-    Total Request = Fulfilled + Not Fulfilled
-    Fulfilled = Given to Branches + Given to Dealers / Co-Dealers
+    Request Received, Given to Branches/Dealers, Total Fulfilled, Lost Opportunity,
+    Fulfillment %. Pending is never Lost — only rejected/timed-out/closed unfulfilled.
     """
     scope = _resolve_scope_params(current_user, brand, dealer, branch, brand_id, dealer_id, branch_id)
-    start, end, _, _, metric_type, category = _common_params(
+    _, _, _, _, metric_type, category = _common_params(
         from_date, to_date, category=category, metric_type=metric_type
     )
+    from_date, effective_to, date_keys, updated_up_to = await _analytics_window(from_date, to_date)
     direction = (request_direction or "received").lower()
     if direction not in {"raised", "received"}:
         raise HTTPException(400, "request_direction must be raised or received")
-    # Fulfillment view defaults to requests received by the selected supplying scope.
+    if not updated_up_to or not date_keys:
+        return {
+            "summary": {
+                "total_request_count": 0,
+                "request_received_value": 0.0,
+                "total_fulfilled_value": 0.0,
+                "lost_opportunity_value": 0.0,
+                "given_to_branches_value": 0.0,
+                "given_to_dealers_value": 0.0,
+                "fulfillment_pct": 0.0,
+            },
+            "series": [],
+            "metric_type": metric_type,
+            "request_direction": direction,
+            "scope": scope,
+            "data_updated_up_to": updated_up_to,
+            "from_date": from_date,
+            "to_date": effective_to,
+            "data_coverage": _coverage_payload(updated_up_to),
+        }
+    start, end, _, _, _, _ = _common_params(from_date, effective_to, category=category, metric_type=metric_type)
     reqs = await _requests_query(scope, start, end, direction)
     reqs = await _filter_rows_by_part_type(reqs, category, scope)
 
-    received_v = fulfilled_v = branch_v = dealer_v = 0.0
-    received_i = fulfilled_i = branch_i = dealer_i = 0.0
+    received_v = fulfilled_v = branch_v = dealer_v = lost_v = 0.0
+    received_i = fulfilled_i = branch_i = dealer_i = lost_i = 0.0
     groups = defaultdict(list)
     for r in reqs:
         groups[_text(r.get("request_number"), r.get("id"))].append(r)
@@ -1400,8 +1840,9 @@ async def analytics_request_acceptance(
         ru = _request_unit(r)
         received_v += ru * rq
         received_i += rq
-        fq, fv = _fulfilled_qty_value(r)
-        # Cap fulfillment to requested on the line.
+        # Fulfilled counts only finally accepted/arranged quantities.
+        fq = _accepted_arranged_qty(r)
+        fv = fq * ru
         if fq > rq > 0:
             fv = ru * rq
             fq = rq
@@ -1414,9 +1855,9 @@ async def analytics_request_acceptance(
             else:
                 dealer_v += fv
                 dealer_i += fq
-
-    not_fulfilled_v = max(0.0, received_v - fulfilled_v)
-    not_fulfilled_i = max(0.0, received_i - fulfilled_i)
+        lq, lv = _lost_qty_value(r)
+        lost_v += lv
+        lost_i += lq
 
     daily = defaultdict(
         lambda: {
@@ -1424,10 +1865,12 @@ async def analytics_request_acceptance(
             "fulfilled_value": 0.0,
             "branch_value": 0.0,
             "dealer_value": 0.0,
+            "lost_value": 0.0,
             "request_received_items": 0.0,
             "fulfilled_items": 0.0,
             "branch_items": 0.0,
             "dealer_items": 0.0,
+            "lost_items": 0.0,
         }
     )
     for r in reqs:
@@ -1436,7 +1879,8 @@ async def analytics_request_acceptance(
         ru = _request_unit(r)
         daily[d]["request_received_value"] += ru * rq
         daily[d]["request_received_items"] += rq
-        fq, fv = _fulfilled_qty_value(r)
+        fq = _accepted_arranged_qty(r)
+        fv = fq * ru
         if fq > rq > 0:
             fv = ru * rq
             fq = rq
@@ -1449,14 +1893,19 @@ async def analytics_request_acceptance(
             else:
                 daily[d]["dealer_value"] += fv
                 daily[d]["dealer_items"] += fq
+        lq, lv = _lost_qty_value(r)
+        daily[d]["lost_value"] += lv
+        daily[d]["lost_items"] += lq
 
     series = []
     for d in sorted(daily.keys()):
         v = daily[d]
         rv = v["request_received_value"]
         fv = v["fulfilled_value"]
+        lv = v["lost_value"]
         ri = v["request_received_items"]
         fi = v["fulfilled_items"]
+        li = v["lost_items"]
         series.append(
             {
                 "date": d,
@@ -1464,20 +1913,21 @@ async def analytics_request_acceptance(
                 "given_to_branches_value": v["branch_value"],
                 "given_to_dealers_value": v["dealer_value"],
                 "total_fulfilled_value": fv,
-                "not_fulfilled_value": max(0.0, rv - fv),
+                "lost_opportunity_value": lv,
+                "not_fulfilled_value": lv,  # compatibility alias = Lost only
                 "fulfillment_pct": _safe_pct(fv, rv),
                 "request_received_items": ri,
                 "given_to_branches_items": v["branch_items"],
                 "given_to_dealers_items": v["dealer_items"],
                 "total_fulfilled_items": fi,
-                "not_fulfilled_items": max(0.0, ri - fi),
-                # Metric-selected convenience fields for charts
+                "lost_opportunity_items": li,
+                "not_fulfilled_items": li,
                 "request_received": rv if metric_type == "value" else ri,
                 "given_to_branches": v["branch_value"] if metric_type == "value" else v["branch_items"],
                 "given_to_dealers": v["dealer_value"] if metric_type == "value" else v["dealer_items"],
                 "total_fulfilled": fv if metric_type == "value" else fi,
-                "not_fulfilled": (max(0.0, rv - fv) if metric_type == "value" else max(0.0, ri - fi)),
-                # Legacy aliases
+                "lost_opportunity": lv if metric_type == "value" else li,
+                "not_fulfilled": lv if metric_type == "value" else li,
                 "requested": rv,
                 "accepted": fv,
             }
@@ -1488,33 +1938,41 @@ async def analytics_request_acceptance(
             "total_request_count": len(groups),
             "request_received_value": received_v,
             "total_fulfilled_value": fulfilled_v,
-            "not_fulfilled_value": not_fulfilled_v,
+            "lost_opportunity_value": lost_v,
+            "not_fulfilled_value": lost_v,
             "given_to_branches_value": branch_v,
             "given_to_dealers_value": dealer_v,
             "fulfillment_pct": _safe_pct(fulfilled_v, received_v),
             "request_received_items": received_i,
             "total_fulfilled_items": fulfilled_i,
-            "not_fulfilled_items": not_fulfilled_i,
+            "lost_opportunity_items": lost_i,
+            "not_fulfilled_items": lost_i,
             "given_to_branches_items": branch_i,
             "given_to_dealers_items": dealer_i,
-            # Legacy aliases for older cards
             "total_requested_value": received_v,
-            "accepted_request_count": sum(1 for g in groups.values() if sum(_approved_qty(i) for i in g) > 0),
+            "accepted_request_count": sum(1 for g in groups.values() if sum(_accepted_arranged_qty(i) for i in g) > 0),
             "fully_accepted_value": fulfilled_v,
             "partial_accepted_value": 0.0,
-            "rejected_value": 0.0,
-            "pending_value": not_fulfilled_v,
+            "rejected_value": lost_v,
+            "pending_value": max(0.0, received_v - fulfilled_v - lost_v),
             "acceptance_pct": _safe_pct(fulfilled_v, received_v),
         },
         "series": series,
         "metric_type": metric_type,
         "request_direction": direction,
         "scope": scope,
+        "data_updated_up_to": updated_up_to,
+        "from_date": from_date,
+        "to_date": effective_to,
+        "data_coverage": _coverage_payload(updated_up_to),
     }
 
 
-async def _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user):
-    ctx = await _build_daily_stock_series(scope, date_keys, category, aging_type, metric_type, current_user)
+async def _stock_trend_payload(scope, date_keys, aging_type, metric_type, category, current_user, aging_bucket=None, updated_up_to=None):
+    ctx = await _build_daily_stock_series(
+        scope, date_keys, category, aging_type, metric_type, current_user,
+        aging_bucket=aging_bucket, updated_up_to=updated_up_to,
+    )
     use_value = metric_type == "value"
     series = []
     for pt in ctx["daily"]:
@@ -1542,6 +2000,7 @@ async def _stock_trend_payload(scope, date_keys, aging_type, metric_type, catego
     stk = ctx["summary"]
     return {
         "data_coverage": ctx["coverage"],
+        "data_updated_up_to": ctx.get("data_updated_up_to") or updated_up_to,
         "summary": {
             "data_status": stk.get("data_status"),
             "current_total": stk.get("current_stock_value") if use_value else stk.get("current_stock_quantity"),
@@ -1794,8 +2253,39 @@ async def analytics_drilldown(
 async def ensure_analytics_indexes():
     await db.products.create_index([("active_date_key", 1), ("brand_name", 1), ("dealer_name", 1), ("branch", 1)])
     await db.order_headers.create_index([("created_at", -1), ("brand_name", 1), ("dealer_name", 1), ("branch", 1)])
-    await db.analytics_stock_daily_snapshots.create_index(
-        [("snapshot_date_ist", 1), ("brand_id", 1), ("dealer_id", 1), ("branch_id", 1), ("part_number", 1)],
-        unique=True,
-        name="uq_analytics_daily_snapshot",
-    )
+    await rollup.ensure_rollup_indexes(db)
+
+
+@router.get("/rollup/status")
+async def analytics_rollup_status(
+    date: Optional[str] = None,
+    current_user=Depends(_current_user),
+):
+    """Master-only: last/selected finalized Analytics rollup status."""
+    if getattr(current_user, "role", None) != "master":
+        raise HTTPException(403, "Master only")
+    last = await rollup.last_successful_rollup_date(db, on_or_before=date)
+    selected = await rollup.get_rollup_status(db, date) if date else None
+    latest = await rollup.get_rollup_status(db, last) if last else None
+    return {
+        "data_updated_up_to": last,
+        "yesterday_ist": rollup.yesterday_ist_iso(),
+        "selected": selected,
+        "latest_success": latest,
+    }
+
+
+@router.post("/rollup/finalize")
+async def analytics_rollup_finalize(
+    date: Optional[str] = None,
+    force: bool = False,
+    current_user=Depends(_current_user),
+):
+    """Master-only: run the idempotent daily Analytics finalizer for one IST date.
+
+    Used on Testing to backfill durable DB snapshots without waiting for 11:00 PM IST.
+    """
+    if getattr(current_user, "role", None) != "master":
+        raise HTTPException(403, "Master only")
+    target = date or rollup.yesterday_ist_iso()
+    return await rollup.finalize_analytics_rollup_for_date(db, target, force=force)

@@ -1,11 +1,15 @@
 .nmts-login-page {
+  --nmts-banner-h: 22px;
   position: relative;
-  min-height: 100vh;
+  /* Banner is a sticky sibling above this page — do not add another full 100vh. */
+  min-height: calc(100vh - var(--nmts-banner-h));
+  height: calc(100vh - var(--nmts-banner-h));
   width: 100%;
   overflow: hidden;
   display: grid;
   place-items: center;
-  padding: 28px 18px;
+  padding: 12px 16px;
+  box-sizing: border-box;
   background-image: url('../assets/nmts-login-background.jpg');
   background-size: cover;
   background-position: center;
@@ -33,12 +37,32 @@
   display: flex;
   justify-content: center;
   align-items: center;
+  max-height: calc(100vh - var(--nmts-banner-h) - 24px);
+}
+
+/* Stage A4: card height ~64vh; promo is 6:5 so width = height×1.2 + form column. Cap width ≤64vw. */
+.nmts-login-zoom {
+  --nmts-card-h: min(64vh, 32vw, calc(100vh - var(--nmts-banner-h) - 48px));
+  height: var(--nmts-card-h);
+  width: min(64vw, calc(var(--nmts-card-h) * 2));
+  max-width: 64vw;
+  max-height: calc(100vh - var(--nmts-banner-h) - 24px);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.nmts-login-zoom-inner {
+  width: 100%;
+  height: 100%;
+  max-height: inherit;
 }
 
 .nmts-login-panel {
   position: relative;
-  width: min(430px, 92vw);
-  border-radius: 28px;
+  width: 100%;
+  height: 100%;
+  border-radius: 22px;
   background: transparent;
   box-shadow:
     0 28px 70px rgba(0, 0, 0, 0.58),
@@ -47,7 +71,10 @@
 }
 
 .nmts-login-panel--split {
-  width: min(1180px, 96vw);
+  width: 100%;
+  height: 100%;
+  max-height: inherit;
+  aspect-ratio: auto;
 }
 
 .nmts-login-panel-run {
@@ -113,24 +140,6 @@
     inset 0 -28px 46px rgba(0, 0, 0, 0.20);
 }
 
-.nmts-login-panel-blur {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  overflow: hidden;
-  pointer-events: none;
-}
-
-.nmts-login-panel-blur img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  object-position: center;
-  transform: scale(1.14);
-  filter: blur(32px);
-  opacity: 0.42;
-}
-
 .nmts-login-panel-face::after {
   content: "";
   position: absolute;
@@ -142,7 +151,8 @@
 }
 
 .nmts-login-panel--split .nmts-login-panel-face {
-  min-height: 690px;
+  min-height: 0;
+  height: 100%;
 }
 
 .nmts-login-panel-face::before {
@@ -159,37 +169,50 @@
 
 .nmts-login-promo {
   position: relative;
-  z-index: 2;
-  flex: 0 0 58%;
-  width: 58%;
+  z-index: 3;
+  flex: 0 0 auto;
+  height: 100%;
+  width: auto;
+  aspect-ratio: 6 / 5;
   min-width: 0;
+  overflow: hidden;
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: center;
+  background: #0b0f12;
+  align-self: stretch;
+}
+
+.nmts-login-promo-bg {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: #0b0f12;
+  pointer-events: none;
 }
 
 .nmts-login-promo-media {
   position: relative;
+  z-index: 1;
   width: 100%;
   height: 100%;
-  max-height: 100%;
-  aspect-ratio: 684 / 690;
-  -webkit-mask-image:
-    linear-gradient(to right, transparent 0%, #000 2%, #000 98%, transparent 100%),
-    linear-gradient(to bottom, transparent 0%, #000 2.5%, #000 97.5%, transparent 100%);
-  -webkit-mask-composite: source-in;
-  mask-image:
-    linear-gradient(to right, transparent 0%, #000 2%, #000 98%, transparent 100%),
-    linear-gradient(to bottom, transparent 0%, #000 2.5%, #000 97.5%, transparent 100%);
-  mask-composite: intersect;
+  min-height: 0;
+  overflow: hidden;
+  background: #0b0f12;
 }
 
-.nmts-login-promo-media img {
+.nmts-login-promo-media img,
+.nmts-login-promo-media video {
   display: block;
   width: 100%;
   height: 100%;
   object-fit: contain;
-  object-position: center;
+  object-position: center center;
+  background: #0b0f12;
+}
+
+.nmts-login-promo-media video::-webkit-media-controls {
+  display: none !important;
 }
 
 .nmts-login-promo::after {
@@ -206,20 +229,27 @@
 
 .nmts-login-card {
   position: relative;
-  z-index: 2;
+  z-index: 3;
   flex: 1 1 auto;
-  width: 100%;
-  min-height: 690px;
+  width: auto;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
   border: 0;
   border-radius: 0;
   background: transparent;
   box-shadow: none;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: stretch;
+  align-self: stretch;
 }
 
 .nmts-login-panel--split .nmts-login-card {
-  flex: 0 0 42%;
-  width: 42%;
+  flex: 1 1 auto;
+  width: auto;
+  height: 100%;
 }
 
 .nmts-login-card-glow {
@@ -238,14 +268,22 @@
 .nmts-login-content {
   position: relative;
   z-index: 1;
-  min-height: 690px;
-  padding: 34px 45px 30px;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  padding: 14px 22px 12px;
   display: flex;
   flex-direction: column;
+  justify-content: flex-start;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .nmts-login-brand {
-  height: 260px;
+  flex: 1 1 46%;
+  height: 46%;
+  max-height: 50%;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -253,28 +291,31 @@
 }
 
 .nmts-login-logo {
-  width: 250px;
+  display: block;
+  width: auto;
+  height: 100%;
   max-width: 100%;
-  height: auto;
+  max-height: 100%;
   object-fit: contain;
-  filter: drop-shadow(0 14px 20px rgba(0, 0, 0, 0.55));
-  transform: scale(1.18);
+  object-position: center;
 }
 
 .nmts-login-header {
   text-align: center;
-  margin-top: -10px;
-  margin-bottom: 26px;
+  margin-top: 2px;
+  margin-bottom: 0;
+  flex-shrink: 0;
 }
 
 .nmts-login-header h1 {
   margin: 0;
   color: #f7f8f7;
-  font-size: clamp(27px, 3vw, 34px);
+  font-size: clamp(16px, 1.6vw, 20px);
   line-height: 1.15;
   font-weight: 600;
-  letter-spacing: -0.7px;
+  letter-spacing: -0.5px;
   text-shadow: 0 3px 18px rgba(0, 0, 0, 0.45);
+  white-space: nowrap;
 }
 
 .nmts-login-header h1 span {
@@ -283,38 +324,47 @@
 }
 
 .nmts-login-header p {
-  margin: 8px 0 0;
+  margin: 5px 0 0;
   color: rgba(239, 242, 239, 0.82);
-  font-size: 16px;
+  font-size: 12px;
   font-weight: 400;
-  letter-spacing: 0.05px;
+  white-space: nowrap;
 }
 
 .nmts-title-accent {
-  width: 54px;
+  width: 48px;
   height: 2px;
-  margin: 14px auto 0;
+  margin: 6px auto 0;
   background: linear-gradient(90deg, transparent, #77c63d, transparent);
   box-shadow: 0 0 12px rgba(117, 201, 57, 0.45);
+}
+
+.nmts-login-bottom {
+  margin-top: auto;
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
 }
 
 .nmts-login-form {
   display: flex;
   flex-direction: column;
-  gap: 17px;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
 .nmts-login-field {
-  height: 58px;
+  height: 40px;
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 0 17px;
+  gap: 8px;
+  padding: 0 12px;
   border-radius: 9px;
   border: 1px solid rgba(181, 189, 184, 0.35);
   background: linear-gradient(180deg, rgba(13, 16, 16, 0.76), rgba(22, 25, 24, 0.82));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
   transition: border-color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
+  min-width: 0;
 }
 
 .nmts-login-field:focus-within {
@@ -324,8 +374,8 @@
 }
 
 .nmts-field-icon {
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   flex: 0 0 auto;
   color: rgba(250, 252, 250, 0.92);
   stroke-width: 1.7;
@@ -339,9 +389,10 @@
   outline: 0;
   background: transparent !important;
   color: #f0f4f0;
-  font-size: 16px;
+  font-size: 12px;
   font-weight: 400;
-  padding-left: 12px;
+  padding-left: 6px;
+  text-overflow: clip;
 }
 
 .nmts-login-field input::placeholder {
@@ -349,7 +400,7 @@
 }
 
 .nmts-login-field--password {
-  padding-right: 8px;
+  padding-right: 4px;
 }
 
 .nmts-password-toggle {
@@ -357,14 +408,13 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 40px;
-  height: 40px;
+  width: 34px;
+  height: 34px;
   border: 0;
   border-radius: 8px;
   background: transparent;
   cursor: pointer;
   color: #78c841;
-  transition: background 0.15s ease;
 }
 
 .nmts-password-toggle:hover {
@@ -372,35 +422,30 @@
 }
 
 .nmts-password-toggle-icon {
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   stroke-width: 1.7;
 }
 
 .nmts-login-button {
   position: relative;
   width: 100% !important;
-  height: 60px !important;
-  margin-top: 8px;
-  border: 1px solid rgba(153, 226, 89, 0.42) !important;
+  height: 40px !important;
+  margin-top: 2px;
+  border: 0 !important;
   border-radius: 9px !important;
-  background: linear-gradient(110deg, #73c637 0%, #55aa23 52%, #4a991e 100%) !important;
-  color: white !important;
-  font-size: 20px !important;
-  font-weight: 600 !important;
-  letter-spacing: 0.1px;
-  box-shadow: 0 13px 30px rgba(55, 127, 14, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
-  transition: transform 180ms ease, filter 180ms ease, box-shadow 180ms ease !important;
+  background: #85c808 !important;
+  color: #14240c !important;
+  font-size: 15px !important;
+  font-weight: 700 !important;
+  box-shadow: none !important;
+  transition: filter 180ms ease !important;
+  flex-shrink: 0;
 }
 
 .nmts-login-button:hover:not(:disabled) {
-  transform: translateY(-2px);
+  transform: translateY(-1px);
   filter: brightness(1.08);
-  box-shadow: 0 17px 36px rgba(55, 127, 14, 0.36), inset 0 1px 0 rgba(255, 255, 255, 0.28) !important;
-}
-
-.nmts-login-button:active:not(:disabled) {
-  transform: translateY(0);
 }
 
 .nmts-login-button:disabled {
@@ -410,119 +455,62 @@
 
 .nmts-login-arrow {
   position: absolute;
-  right: 18px;
-  width: 21px;
-  height: 21px;
-  stroke-width: 1.8;
+  right: 14px;
+  width: 18px;
+  height: 18px;
+  stroke-width: 2.2;
+  color: #14240c;
 }
 
 .nmts-login-footer {
-  margin-top: auto;
-  padding-top: 30px;
+  margin-top: 10px;
+  padding-top: 8px;
   text-align: center;
   color: rgba(211, 216, 212, 0.56);
-  font-size: 13px;
-  letter-spacing: 0.05px;
+  font-size: 11px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 @media (max-width: 900px) {
-  .nmts-login-panel {
-    border-radius: 24px;
+  .nmts-login-zoom {
+    --nmts-card-h: auto;
+    height: auto;
+    width: min(92vw, 480px);
+    max-width: 92vw;
+    max-height: none;
   }
 
-  .nmts-login-panel--split {
-    width: min(430px, 94vw);
+  .nmts-login-zoom-inner,
+  .nmts-login-panel,
+  .nmts-login-panel--split,
+  .nmts-login-panel--split .nmts-login-panel-face {
+    height: auto;
   }
 
   .nmts-login-panel--split .nmts-login-panel-face {
     flex-direction: column;
-    min-height: 0;
   }
 
   .nmts-login-promo,
   .nmts-login-panel--split .nmts-login-card {
     width: 100%;
     flex: none;
+    height: auto;
   }
 
   .nmts-login-promo {
+    aspect-ratio: 6 / 5;
+    width: 100%;
     height: auto;
-    max-height: 38vh;
+    max-height: 36vh;
   }
 
-  .nmts-login-promo-media {
-    width: min(100%, calc(38vh * 684 / 690));
-    height: auto;
-    max-height: 38vh;
+  .nmts-login-content {
+    min-height: 0;
   }
 
   .nmts-login-promo::after {
     display: none;
   }
-
-  .nmts-login-panel--split .nmts-login-card,
-  .nmts-login-panel--split .nmts-login-content {
-    min-height: 0;
-  }
-}
-
-@media (max-width: 700px) {
-  .nmts-login-page {
-    padding: 18px 14px;
-    background-position: center;
-  }
-
-  .nmts-login-card,
-  .nmts-login-content {
-    min-height: 640px;
-  }
-
-  .nmts-login-panel--split .nmts-login-card,
-  .nmts-login-panel--split .nmts-login-content {
-    min-height: 0;
-  }
-
-  .nmts-login-content {
-    padding: 28px 26px 24px;
-  }
-
-  .nmts-login-brand {
-    height: 225px;
-  }
-
-  .nmts-login-logo {
-    width: 260px;
-  }
-
-  .nmts-login-header {
-    margin-bottom: 23px;
-  }
-}
-
-@media (max-height: 760px) and (min-width: 901px) {
-  .nmts-login-page {
-    padding: 16px;
-  }
-
-  .nmts-login-card,
-  .nmts-login-content {
-    min-height: 620px;
-  }
-
-  .nmts-login-content {
-    padding-top: 22px;
-  }
-
-  .nmts-login-brand {
-    height: 215px;
-  }
-
-  .nmts-login-logo {
-    width: 255px;
-  }
-
-  .nmts-login-header {
-    margin-bottom: 20px;
-  }
-
 }

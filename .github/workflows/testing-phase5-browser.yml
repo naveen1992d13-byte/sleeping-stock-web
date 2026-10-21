@@ -1,0 +1,167 @@
+name: Testing Phase 5 Browser QA
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: build-artifact | stage-a-browser
+        required: true
+        default: build-artifact
+        type: choice
+        options:
+          - build-artifact
+          - stage-a-browser
+          - stage-a2-browser
+          - stage-a3-browser
+          - stage-a4-browser
+          - stage-b-browser
+          - login-smoke
+jobs:
+  login-smoke:
+    if: ${{ github.event.inputs.mode == 'login-smoke' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Testing Master login + /auth/me
+        env:
+          NMTS_E2E_EMAIL: ${{ secrets.TESTING_MASTER_EMAIL }}
+          NMTS_E2E_PASSWORD: ${{ secrets.TESTING_MASTER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "${NMTS_E2E_EMAIL}"
+          test -n "${NMTS_E2E_PASSWORD}"
+          CODE=$(curl -sS -o /tmp/login.json -w '%{http_code}' -X POST \
+            'https://testing.sleepingstock.in/api/auth/login' \
+            -H 'Content-Type: application/json' \
+            --data-binary @- <<EOF
+          {"email":"${NMTS_E2E_EMAIL}","password":"${NMTS_E2E_PASSWORD}"}
+          EOF
+          )
+          echo "login_status=${CODE}"
+          test "${CODE}" = "200"
+          TOKEN=$(python3 -c 'import json; print(json.load(open("/tmp/login.json"))["access_token"])')
+          ME=$(curl -sS -o /tmp/me.json -w '%{http_code}' \
+            'https://testing.sleepingstock.in/api/auth/me' \
+            -H "Authorization: Bearer ${TOKEN}")
+          echo "me_status=${ME}"
+          test "${ME}" = "200"
+          python3 -c 'import json; u=json.load(open("/tmp/me.json")); assert u.get("role")=="master"; print("role=master username_set=", bool(u.get("username")))'
+
+  build-artifact:
+    if: ${{ github.event.inputs.mode == 'build-artifact' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install and build Testing frontend
+        working-directory: frontend
+        env:
+          REACT_APP_BACKEND_URL: https://testing.sleepingstock.in
+          REACT_APP_APP_ENV: testing
+          REACT_APP_TESTING_PR: ""
+          REACT_APP_TESTING_BRANCH: ${{ github.ref_name }}
+          REACT_APP_TESTING_COMMIT: ${{ github.sha }}
+          GENERATE_SOURCEMAP: "false"
+          CI: "false"
+          NODE_OPTIONS: --max-old-space-size=2048
+        run: |
+          SHORT="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          IST="$(TZ=Asia/Kolkata date +'%Y-%m-%d %H:%M:%S IST')"
+          UTC="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          export REACT_APP_TESTING_COMMIT="$SHORT"
+          export REACT_APP_TESTING_DEPLOYED_AT="$IST"
+          npm ci --ignore-scripts || npm install --ignore-scripts
+          npm run build
+          python3 - <<PY
+          import json, os
+          from pathlib import Path
+          sha = os.environ["GITHUB_SHA"]
+          short = sha[:7]
+          Path("build/deployment.json").write_text(json.dumps({
+            "environment": "testing",
+            "app_env": "testing",
+            "pr_number": None,
+            "git_branch": os.environ.get("GITHUB_REF_NAME") or "testing-six-fixes",
+            "commit": sha,
+            "commit_short": short,
+            "deployed_at": os.environ.get("UTC") or "",
+            "deployed_at_ist": os.environ.get("IST") or "",
+            "backend_port": 8001,
+            "service": "nmts-backend-testing",
+            "built_on": "github-actions",
+          }, indent=2) + "\n")
+          PY
+          # inject times into python via env
+          UTC="$UTC" IST="$IST" GITHUB_SHA="$GITHUB_SHA" GITHUB_REF_NAME="${GITHUB_REF_NAME}" python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          sha = os.environ["GITHUB_SHA"]
+          Path("build/deployment.json").write_text(json.dumps({
+            "environment": "testing",
+            "app_env": "testing",
+            "pr_number": None,
+            "git_branch": os.environ.get("GITHUB_REF_NAME") or "testing-six-fixes",
+            "commit": sha,
+            "commit_short": sha[:7],
+            "deployed_at": os.environ["UTC"],
+            "deployed_at_ist": os.environ["IST"],
+            "backend_port": 8001,
+            "service": "nmts-backend-testing",
+            "built_on": "github-actions",
+          }, indent=2) + "\n")
+          PY
+          cp -f ../deploy/testing/robots.txt build/robots.txt
+          echo "Built short=$SHORT"
+          cat build/deployment.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: testing-frontend
+          path: frontend/build/
+          retention-days: 2
+
+  stage-a-browser:
+    if: ${{ github.event.inputs.mode == 'stage-a-browser' || github.event.inputs.mode == 'stage-a2-browser' || github.event.inputs.mode == 'stage-a3-browser' || github.event.inputs.mode == 'stage-a4-browser' || github.event.inputs.mode == 'stage-b-browser' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Playwright
+        working-directory: frontend
+        run: |
+          npm ci --ignore-scripts || npm install --ignore-scripts
+          npm install --no-save @playwright/test@1.48.2
+          npx playwright install --with-deps chromium
+      - name: Stage A remote UI checks
+        working-directory: frontend
+        env:
+          NMTS_E2E_BASE_URL: https://testing.sleepingstock.in
+          NMTS_E2E_EMAIL: ${{ secrets.TESTING_MASTER_EMAIL }}
+          NMTS_E2E_PASSWORD: ${{ secrets.TESTING_MASTER_PASSWORD }}
+        run: | 
+          if [ "${{ github.event.inputs.mode }}" = "stage-b-browser" ]; then
+            npx playwright test e2e/testing-stage-b.spec.js --project=chromium
+          elif [ "${{ github.event.inputs.mode }}" = "stage-a4-browser" ]; then
+            npx playwright test e2e/testing-stage-a4.spec.js --project=chromium
+          elif [ "${{ github.event.inputs.mode }}" = "stage-a3-browser" ]; then
+            npx playwright test e2e/testing-stage-a3.spec.js --project=chromium
+          elif [ "${{ github.event.inputs.mode }}" = "stage-a2-browser" ]; then
+            npx playwright test e2e/testing-stage-a2.spec.js --project=chromium
+          else
+            npx playwright test e2e/testing-stage-a.spec.js --project=chromium
+          fi
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-a-screenshots
+          # includes stage-a2-*
+          path: |
+            frontend/test-results/
+            frontend/e2e/test-results/
+          if-no-files-found: ignore
+          retention-days: 5

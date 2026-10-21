@@ -2,10 +2,12 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import * as XLSX from 'xlsx';
 import { API, useAuth } from '@/App';
-import { useLocation, useOutletContext } from 'react-router-dom';
+import { useLocation } from 'react-router-dom';
+import { useWorkspaceScope } from '../workspaceScope';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { openOrderDeskPrint } from '@/utils/orderDeskPrint';
+import { fetchFeatureFlags } from '@/featureFlags';
 import { FileSpreadsheet, ClipboardPaste, Search, Send, ChevronDown, ChevronUp, Printer, Eraser, Plus, Lock, Download } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -203,7 +205,7 @@ function compactRequestedFrom(item, selectedAllocations = []) {
     } else parts.push(`${row.branch_name || row.source_name || '-'} - ${qty}`);
   });
   (selectedAllocations || []).forEach((alloc) => {
-    if (alloc.request_no || alloc.request_number) return;
+    if (alloc.request_no || alloc.request_number || alloc.request_attempt_id || alloc.locked) return;
     if (/rejected|cancelled/i.test(String(alloc.status || alloc.request_status || ''))) return;
     const qty = Number(alloc.request_qty || 0); if (!qty) return;
     const level = String(alloc.level || alloc.source_type || '').toLowerCase();
@@ -213,11 +215,17 @@ function compactRequestedFrom(item, selectedAllocations = []) {
   return parts.join(' | ') || '—';
 }
 
-export function Orders() {
+export function Orders({ scopeOverride } = {}) {
   const { user } = useAuth();
-  const canSaveSystemOrder = ['master', 'admin'].includes(String(user?.role || '').toLowerCase());
+  const canSaveSystemOrder = ['master', 'admin', 'user'].includes(String(user?.role || '').toLowerCase());
+  const canApproveCancellation = ['master', 'admin'].includes(String(user?.role || '').toLowerCase());
   const isMaster = String(user?.role || '').toLowerCase() === 'master';
-  const { scopeBrand = 'All Brands', scopeDealer = 'All Dealers', scopeBranch = 'All Branches' } = useOutletContext() || {};
+  const outletScope = useWorkspaceScope();
+  const {
+    scopeBrand = 'All Brands',
+    scopeDealer = 'All Dealers',
+    scopeBranch = 'All Branches',
+  } = scopeOverride || outletScope;
   const isAllScope = value => !value || String(value).startsWith('All ') || value === 'N/A';
   const scopeReady = !isAllScope(scopeBrand) && !isAllScope(scopeDealer) && !isAllScope(scopeBranch);
   const fileRef = useRef(null);
@@ -242,6 +250,7 @@ export function Orders() {
   const [partSearch, setPartSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('All');
   const [stageFilter, setStageFilter] = useState('All');
+  const [orderNumberInput, setOrderNumberInput] = useState('');
 
   const [pasteOpen, setPasteOpen] = useState(false);
   const [pasteText, setPasteText] = useState('');
@@ -256,6 +265,17 @@ export function Orders() {
   const [sendRequestResult, setSendRequestResult] = useState(null);
   const [resendingNumber, setResendingNumber] = useState('');
   const [autoSuggestLoading, setAutoSuggestLoading] = useState('');
+  const [autoSourceLoading, setAutoSourceLoading] = useState(false);
+  const [factoryDecisionLoading, setFactoryDecisionLoading] = useState('');
+  // Fail closed: hidden until the backend confirms the flag is on.
+  const [sequentialAutoSourcing, setSequentialAutoSourcing] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    fetchFeatureFlags(API).then((flags) => {
+      if (!cancelled) setSequentialAutoSourcing(flags.sequential_auto_sourcing === true);
+    });
+    return () => { cancelled = true; };
+  }, []);
   const [nowMs, setNowMs] = useState(Date.now());
   const [factoryDrafts, setFactoryDrafts] = useState({});
   const [factorySaving, setFactorySaving] = useState('');
@@ -455,6 +475,44 @@ export function Orders() {
     });
   };
 
+  const startAutoSourcing = async () => {
+    if (!currentOrder?.id || autoSourceLoading || orderFinished) return toast.error('Upload or open an order first');
+    if (!currentOrder?.availability_checked) return toast.error('Run Check Availability first');
+    setAutoSourceLoading(true);
+    try {
+      const res = await axios.post(`${API}/order-desk/orders/${currentOrder.id}/auto-source/start`, {
+        aging_type: branchAgingType,
+        min_aging_days: Number(branchAgingMin || 0),
+      });
+      const state = res.data?.state || res.data?.order?.auto_sourcing_state;
+      const banner = res.data?.message_banner || res.data?.order?.auto_sourcing_message;
+      if (banner) toast(banner);
+      else if (state === 'waiting_response' || state === 'last_chance') {
+        toast.success(`Auto Sourcing routed${res.data?.result?.request_number ? `: ${res.data.result.request_number}` : (res.data?.result?.attempt_id ? `: ${res.data.result.attempt_id}` : '')}`);
+      } else toast.success(res.data?.message || 'Auto Sourcing started');
+      await loadOrder(currentOrder.id, { silent: true });
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Auto Sourcing failed');
+    } finally {
+      setAutoSourceLoading(false);
+    }
+  };
+
+  const submitFactoryDecision = async (action) => {
+    if (!currentOrder?.id || factoryDecisionLoading || orderFinished) return;
+    setFactoryDecisionLoading(action);
+    try {
+      const res = await axios.post(`${API}/order-desk/orders/${currentOrder.id}/factory-decision`, { action });
+      toast.success(res.data?.message || 'Decision saved');
+      await loadOrder(currentOrder.id, { silent: true });
+      if (action === 'move_to_factory') setActiveStage('factory');
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Unable to save factory decision');
+    } finally {
+      setFactoryDecisionLoading('');
+    }
+  };
+
   const runAutoSuggest = async (level) => {
     if (!currentOrder?.id) return toast.error('Upload or open an order first');
     if (!currentOrder?.availability_checked) return toast.error('Run Check Availability first');
@@ -488,13 +546,15 @@ export function Orders() {
         requestNumbers: data.request_numbers || [],
         emailSent: !!data.email_sent,
         emailError: data.email_error || null,
+        emailDeferred: !!data.email_deferred_until_acceptance,
         duplicate: !!data.duplicate,
         message: data.message || 'Requests sent',
         level,
       });
       dirtyAllocRef.current = false;
       if (data.email_sent) toast.success('Request created and emailed.');
-      else toast.success('Request created. Email pending/failed — use Retry Email if needed.');
+      else if (data.email_deferred_until_acceptance) toast.success('Sourcing attempt created. Email and PDF will be created after supplier acceptance.');
+      else toast.success('Request created. Email failed — use Retry Email if needed.');
       await loadOrder(currentOrder.id, false, { preserveStage: true });
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Unable to send requests');
@@ -543,6 +603,18 @@ export function Orders() {
     } finally { setLoading(false); }
   };
 
+  const decideCancellation = async (item, decision) => {
+    if (!currentOrder?.id || !item?.cancellation_request_id) return;
+    setLoading(true);
+    try {
+      const res = await axios.post(`${API}/order-desk/cancellations/${item.cancellation_request_id}/decide`, { decision });
+      toast.success(res.data.message || 'Cancellation updated');
+      await loadOrder(currentOrder.id, false);
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Unable to update cancellation');
+    } finally { setLoading(false); }
+  };
+
   const updateAllocation = (item, source, value, level) => {
     if (item.qty_locked && Number(item.remaining_qty || 0) <= 0) {
       return toast.error(item.lock_reason || 'Quantity is locked');
@@ -558,8 +630,8 @@ export function Orders() {
     const current = allocations[item.id] || [];
     const key = `${source.dealer_name}__${source.branch}`;
     // Preserve locked/sent allocations
-    const preserved = current.filter(x => x.request_no || x.request_number || x.locked);
-    const drafts = current.filter(x => !(x.request_no || x.request_number || x.locked) && `${x.dealer_name}__${x.branch}` !== key);
+    const preserved = current.filter(x => x.request_no || x.request_number || x.request_attempt_id || x.locked);
+    const drafts = current.filter(x => !(x.request_no || x.request_number || x.request_attempt_id || x.locked) && `${x.dealer_name}__${x.branch}` !== key);
     const nextDraft = requestQty > 0
       ? [...drafts, { ...source, request_qty: Math.min(requestQty, available || Number(source.available_qty || 0)), level, source_type: level }]
       : drafts;
@@ -713,9 +785,15 @@ export function Orders() {
     });
   };
 
+  const openByOrderNumber = () => {
+    const number = String(orderNumberInput || '').trim();
+    if (!number) return toast.error('Enter an Order Number');
+    loadOrder(number, true);
+  };
+
   return (
-    <div className="space-y-3" data-testid="orders-page">
-      <div className="rounded-xl border bg-white p-3 shadow-sm">
+    <div className="space-y-2" data-testid="orders-page">
+      <div className="rounded-xl border bg-white p-2.5 shadow-sm">
         <div className="flex flex-wrap items-center gap-2">
           <input ref={fileRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={handleUpload} />
           <Button onClick={() => fileRef.current?.click()} disabled={loading || orderFinished}><FileSpreadsheet className="mr-2 h-4 w-4" />Upload Excel</Button>
@@ -723,10 +801,18 @@ export function Orders() {
           <Button variant="outline" onClick={exportTemplate}>Download Template</Button>
           <Button variant="outline" onClick={downloadCurrentOrder} disabled={!currentOrder || loading}><Download className="mr-2 h-4 w-4" />Download Excel</Button>
           <Button variant="outline" onClick={() => setAddItemsOpen(true)} disabled={!currentOrder || loading || orderFinished}><Plus className="mr-2 h-4 w-4" />Add Items</Button>
-          <div className="ml-auto text-sm">
-            <span className="text-slate-500">Order Number: </span>
-            <span className="font-bold text-emerald-700">{currentOrder?.order_number || 'Created after upload'}</span>
-          </div>
+          <label className="ml-auto flex items-center gap-2 text-sm">
+            <span className="text-slate-500 whitespace-nowrap">Order Number</span>
+            <input
+              value={orderNumberInput}
+              onChange={(e) => setOrderNumberInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); openByOrderNumber(); } }}
+              placeholder={currentOrder?.order_number || 'Paste or type'}
+              className="h-9 w-48 rounded-md border px-2 text-sm font-semibold text-emerald-800"
+              data-testid="order-desk-order-number"
+            />
+            <Button type="button" variant="outline" onClick={openByOrderNumber} disabled={loading}>Open</Button>
+          </label>
         </div>
       </div>
 
@@ -767,12 +853,70 @@ export function Orders() {
       {sendRequestResult && (
         <div className={`rounded-xl border p-4 ${sendRequestResult.emailSent ? 'bg-emerald-50 border-emerald-200' : 'bg-amber-50 border-amber-200'}`}>
           <div className="text-sm font-semibold">{sendRequestResult.requestNumbers.length ? `Request: ${sendRequestResult.requestNumbers.join(', ')}` : sendRequestResult.message}</div>
-          <div className="mt-1 text-xs">{sendRequestResult.emailSent ? 'Email Sent' : `Email Failed${sendRequestResult.emailError ? `: ${sendRequestResult.emailError}` : ''}. Request remains valid.`}</div>
-          {!sendRequestResult.emailSent && sendRequestResult.requestNumbers.map(rn => (
+          <div className="mt-1 text-xs">
+            {sendRequestResult.emailSent
+              ? 'Email Sent'
+              : sendRequestResult.emailDeferred
+                ? 'Email and PDF pending — they will be created after supplier acceptance.'
+                : `Email Failed${sendRequestResult.emailError ? `: ${sendRequestResult.emailError}` : ''}. Request remains valid.`}
+          </div>
+          {!sendRequestResult.emailSent && !sendRequestResult.emailDeferred && sendRequestResult.requestNumbers.map(rn => (
             <Button key={rn} size="sm" variant="outline" className="mt-2 mr-2" disabled={resendingNumber === rn} onClick={() => resendRequestEmail(rn)}>
               {resendingNumber === rn ? 'Retrying…' : `Retry Email (${rn})`}
             </Button>
           ))}
+        </div>
+      )}
+
+      {sequentialAutoSourcing && currentOrder && (
+        <div className="rounded-xl border bg-white p-4 flex flex-wrap items-center gap-3">
+          <div className="flex-1 min-w-[220px]">
+            <div className="text-sm font-semibold text-slate-800">Sequential Auto Sourcing</div>
+            <div className="text-xs text-slate-500 mt-1">
+              Own Branch first → best supplier (full coverage, fewer pickups, same dealer, higher aging) → Last Chance → Factory Decision.
+              Response window: 15 minutes per 5 part lines.
+            </div>
+            {currentOrder.auto_sourcing_state && (
+              <div className="text-xs mt-1 text-slate-600">
+                State: <span className="font-medium">{currentOrder.auto_sourcing_state}</span>
+                {currentOrder.auto_sourcing_current_request ? ` · Active: ${currentOrder.auto_sourcing_current_request}` : ''}
+              </div>
+            )}
+          </div>
+          <Button
+            onClick={startAutoSourcing}
+            disabled={!currentOrder?.availability_checked || loading || autoSourceLoading || orderFinished || currentOrder.auto_sourcing_active}
+          >
+            {autoSourceLoading ? 'Starting…' : currentOrder.auto_sourcing_active ? 'Auto Sourcing Active…' : 'Start Auto Sourcing'}
+          </Button>
+        </div>
+      )}
+
+      {sequentialAutoSourcing && (currentOrder?.factory_decision_required || currentOrder?.auto_sourcing_message) && (
+        <div className="rounded-xl border border-slate-300 bg-slate-50 p-4 space-y-3">
+          <div className="text-sm font-semibold text-slate-900">
+            {currentOrder.auto_sourcing_message || 'Auto Sourcing Completed – Factory Decision Required'}
+          </div>
+          <div className="text-xs text-slate-600">
+            Selecting either option stops the response timer and closes remaining Auto Sourcing.
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              disabled={!!factoryDecisionLoading || orderFinished}
+              onClick={() => submitFactoryDecision('move_to_factory')}
+            >
+              {factoryDecisionLoading === 'move_to_factory' ? 'Saving…' : 'Move Balance to Factory'}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!!factoryDecisionLoading || orderFinished}
+              onClick={() => submitFactoryDecision('cancel_remaining')}
+            >
+              {factoryDecisionLoading === 'cancel_remaining' ? 'Saving…' : 'Cancel Remaining Requirement'}
+            </Button>
+          </div>
         </div>
       )}
 
@@ -891,7 +1035,7 @@ export function Orders() {
             <div className="text-sm text-slate-600">
               Factory Order entry stays locked until Branch and Dealer stages are exhausted. Apply one Factory Order No to multiple selected parts.
             </div>
-            {factoryUnlocked && (
+            {factoryUnlocked && canSaveSystemOrder && (
               <div className="flex flex-wrap items-end gap-2">
                 <label className="text-xs text-slate-600">
                   <input
@@ -914,12 +1058,17 @@ export function Orders() {
                     placeholder="Apply to selected parts"
                   />
                 </label>
-                <Button size="sm" disabled={!canSaveSystemOrder || factorySaving === 'bulk' || orderFinished} onClick={applyFactoryBulk}>
+                <Button size="sm" disabled={factorySaving === 'bulk' || orderFinished} onClick={applyFactoryBulk}>
                   {factorySaving === 'bulk' ? 'Applying…' : 'Apply to Selected'}
                 </Button>
               </div>
             )}
-            {!factoryUnlocked && <div className="text-xs text-slate-500">Factory Order entry is locked until the existing workflow opens this stage.</div>}
+            {factoryUnlocked && !canSaveSystemOrder && (
+              <div className="text-xs text-amber-700" data-testid="factory-waiting-admin-msg">
+                Waiting for the order creator, Admin, or Master to enter the Factory Order No
+              </div>
+            )}
+            {!factoryUnlocked && <div className="text-xs text-slate-500">Factory Order entry is locked until Branch and Dealer stages are exhausted and no Branch/Dealer request is open.</div>}
           </div>
         )}
 
@@ -932,7 +1081,7 @@ export function Orders() {
               {finishing ? 'Finishing…' : 'Finish Order'}
             </Button>
             {!finishReadiness.can_finish && (
-              <div className="text-xs text-amber-700">
+              <div className="text-xs text-amber-700" data-testid="finish-blocked-reason">
                 {(finishReadiness.unresolved_requests || []).length ? 'Unresolved request still open. ' : ''}
                 {(finishReadiness.remaining_open_items || []).length ? 'Remaining qty is still open. ' : ''}
                 {(finishReadiness.missing_factory_order_no || []).length ? 'Factory Order No missing on a factory row.' : ''}
@@ -1000,6 +1149,12 @@ export function Orders() {
                         {!item.qty_locked && !orderFinished && !['Cancelled', 'Cancellation Requested', 'Accepted', 'Completed'].includes(item.request_status) && (
                           <Button size="sm" variant="outline" className="text-amber-800" onClick={() => { setCancelItem(item); setCancelOpen(true); setCancelReason(''); setCancelRemarks(''); }}>Request Cancellation</Button>
                         )}
+                        {canApproveCancellation && !orderFinished && item.cancellation_status === 'pending' && item.cancellation_request_id && (
+                          <div className="flex gap-1">
+                            <Button size="sm" variant="outline" className="text-emerald-800" disabled={loading} onClick={() => decideCancellation(item, 'approve')}>Approve Cancel</Button>
+                            <Button size="sm" variant="outline" className="text-red-700" disabled={loading} onClick={() => decideCancellation(item, 'reject')}>Reject Cancel</Button>
+                          </div>
+                        )}
                       </td>
                     </tr>
                     {expanded && (
@@ -1065,7 +1220,7 @@ export function Orders() {
                                       ? 'Factory Order Number is locked while a branch availability request is still active.'
                                       : canSaveSystemOrder
                                       ? 'Enter System Order Number to fulfill remaining Factory quantity.'
-                                      : 'View only — Admin / Master Admin enter the System Order Number.'}
+                                      : 'Waiting for the order creator, Admin, or Master to enter the Factory Order No'}
                                   </div>
                                 )
                               )}
@@ -1076,7 +1231,7 @@ export function Orders() {
                               <div className="grid gap-2">
                                 {sources.map(source => {
                                   const key = `${source.dealer_name}__${source.branch}`;
-                                  const value = (selected.find(x => `${x.dealer_name}__${x.branch}` === key && !(x.request_no || x.request_number))?.request_qty) || '';
+                                  const value = (selected.find(x => `${x.dealer_name}__${x.branch}` === key && !(x.request_no || x.request_number || x.request_attempt_id || x.locked))?.request_qty) || '';
                                   const frozen = source.source_frozen_today || source.rejected_today;
                                   return (
                                     <div key={key} className={`grid grid-cols-2 md:grid-cols-7 gap-2 items-center rounded-lg border p-3 ${frozen ? 'bg-rose-50 opacity-80' : 'bg-white'}`}>

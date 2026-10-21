@@ -499,6 +499,121 @@
   min-height: 2.5em;
 }
 
+/* Compact top-left Menu dropdown (replaces sidebar drawer navigation). */
+.nmts-app-shell--menu-dropdown .nmts-main-column {
+  width: 100%;
+}
+
+.nmts-app-menu-dropdown {
+  z-index: 80 !important;
+  min-width: 14.5rem;
+  max-width: min(20rem, calc(100vw - 1.5rem));
+  max-height: min(70vh, var(--radix-dropdown-menu-content-available-height, 70vh));
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0.35rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(133, 200, 8, 0.28);
+  background:
+    linear-gradient(165deg, rgba(28, 32, 30, 0.98) 0%, rgba(10, 12, 11, 0.98) 55%, rgba(6, 8, 7, 0.99) 100%);
+  box-shadow:
+    0 16px 40px rgba(0, 0, 0, 0.55),
+    0 0 24px rgba(86, 176, 48, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  color: #f3f6f2;
+}
+
+.nmts-app-menu-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.55rem 0.7rem 0.65rem;
+  margin: 0 0 0.25rem;
+  border-bottom: 1px solid rgba(133, 200, 8, 0.22);
+}
+
+.nmts-app-menu-brand-logo {
+  width: 34px;
+  height: 34px;
+  object-fit: contain;
+  flex-shrink: 0;
+  filter: drop-shadow(0 0 8px rgba(133, 200, 8, 0.35));
+}
+
+.nmts-app-menu-brand-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.15;
+  min-width: 0;
+}
+
+.nmts-app-menu-brand-wordmark {
+  font-size: 0.92rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.nmts-app-menu-brand-wordmark .nmts-word-sleeping {
+  color: #ffffff;
+}
+
+.nmts-app-menu-brand-wordmark .nmts-word-stock {
+  color: #85c808;
+  margin-left: 0.25em;
+}
+
+.nmts-app-menu-brand-nmts {
+  margin-top: 2px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  color: rgba(232, 255, 176, 0.85);
+}
+
+.nmts-app-menu-item {
+  display: flex !important;
+  align-items: center;
+  gap: 0.65rem;
+  width: 100%;
+  cursor: pointer;
+  border-radius: 0.55rem !important;
+  padding: 0.55rem 0.7rem !important;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: #edf2ea !important;
+}
+
+.nmts-app-menu-item svg {
+  width: 1.1rem;
+  height: 1.1rem;
+  flex-shrink: 0;
+  color: #85c808;
+}
+
+.nmts-app-menu-item:focus,
+.nmts-app-menu-item[data-highlighted] {
+  background: rgba(133, 200, 8, 0.14) !important;
+  color: #f7ffe8 !important;
+}
+
+.nmts-app-menu-item--active {
+  background: rgba(133, 200, 8, 0.22) !important;
+  color: #f7ffe8 !important;
+  font-weight: 600;
+}
+
+.nmts-app-menu-item--active svg {
+  color: #b6f03a;
+}
+
+@media (max-width: 640px) {
+  .nmts-app-menu-dropdown {
+    min-width: min(16rem, calc(100vw - 1rem));
+    max-height: min(65vh, var(--radix-dropdown-menu-content-available-height, 65vh));
+  }
+}
+
 .nmts-menu-toggle {
   display: inline-flex;
   align-items: center;

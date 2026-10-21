@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth, API, canAccessPermission, canAccessMenuItem } from '../App';
 import axios from 'axios';
@@ -23,8 +23,64 @@ import {
   DropdownMenuTrigger,
 } from '../components/ui/dropdown-menu';
 import { toast } from 'sonner';
-import { clearAuthStorage } from '../utils/sessionActivity';
+import { clearAuthStorage, readAuthItem, removeAuthItem, writeAuthItem } from '../utils/sessionActivity';
 import { NoticeLoginPopup } from '../components/NoticeLoginPopup';
+import {
+  WorkspaceScopeProvider,
+  buildScopeKey,
+} from '../workspaceScope';
+
+import { Analytics } from './Analytics';
+import { Products } from './Products';
+import { ProductHubHistory } from './ProductHubHistory';
+import { Orders } from './Orders';
+import { OrderHistory } from './OrderHistory';
+import UploadCenter from './Upload';
+import UsersPage from './Users';
+import { Requests } from './Requests';
+import { Reports } from './Reports';
+import NoticeBoard from './NoticeBoard';
+import { QueryDesk } from './QueryDesk';
+import StockAudit from './StockAudit';
+import { StorageCostMonitor } from './StorageCostMonitor';
+import { LoginScreenManager } from './LoginScreenManager';
+import { Notifications } from './Notifications';
+import { Profile } from './Profile';
+
+/**
+ * Modules kept mounted while their tab is open (hidden via display:none when
+ * inactive). Unmount only on tab close. Remount when scopeKey changes
+ * (brand/dealer/branch/session).
+ */
+const KEEP_ALIVE_COMPONENTS = {
+  analytics: Analytics,
+  products: Products,
+  'product-history': ProductHubHistory,
+  orders: Orders,
+  'order-history': OrderHistory,
+  upload: UploadCenter,
+  users: UsersPage,
+  requests: Requests,
+  reports: Reports,
+  // menu id "dashboard" is Notice Board
+  dashboard: NoticeBoard,
+  query: QueryDesk,
+  'stock-audit': StockAudit,
+  'storage-cost-monitor': StorageCostMonitor,
+  'login-screen-manager': LoginScreenManager,
+  notifications: Notifications,
+  profile: Profile,
+};
+
+const KEEP_ALIVE_PATHS = new Set(
+  Object.keys(KEEP_ALIVE_COMPONENTS).flatMap((id) => {
+    const item = APPLICATION_MENU_ITEMS.find((m) => m.id === id);
+    const paths = [];
+    if (item?.path) paths.push(item.path);
+    if (id === 'analytics') paths.push('/dashboard', '/');
+    return paths;
+  })
+);
 
 export function DashboardLayout() {
   const { user, logout } = useAuth();
@@ -34,18 +90,12 @@ export function DashboardLayout() {
   const [unreadCount, setUnreadCount] = useState(0);
   const [bellOpen, setBellOpen] = useState(false);
   const [alerts, setAlerts] = useState([]);
-  const [sidebarOpen, setSidebarOpen] = useState(() => {
-    try {
-      const stored = localStorage.getItem('nmtsSidebarOpen');
-      if (stored === 'false') return false;
-      if (stored === 'true') return true;
-    } catch {
-      /* ignore */
-    }
-    return typeof window !== 'undefined' ? window.innerWidth >= 1024 : true;
-  });
+  // Compact top-left Menu dropdown (sidebar drawer retired for navigation).
+  const [menuOpen, setMenuOpen] = useState(false);
   const [tabs, setTabs] = useState([]);
   const [activeTabId, setActiveTabId] = useState(null);
+  // Bumped on logout so keep-alive modules remount with a fresh session key.
+  const [sessionEpoch, setSessionEpoch] = useState(0);
 
   const [brandOptions, setBrandOptions] = useState([]);
   const [dealerOptions, setDealerOptions] = useState([]);
@@ -75,7 +125,49 @@ export function DashboardLayout() {
 
   const navItems = APPLICATION_MENU_ITEMS;
 
-  const filteredNavItems = navItems.filter((item) => canAccessMenuItem(user, item));
+  const filteredNavItems = navItems.filter((item) => !item.sidebarHidden && canAccessMenuItem(user, item));
+
+  const scopeKey = useMemo(
+    () =>
+      buildScopeKey({
+        scopeBrand,
+        scopeDealer,
+        scopeBranch,
+        userId: user?.id || user?.email || user?.username,
+        sessionEpoch,
+      }),
+    [scopeBrand, scopeDealer, scopeBranch, user?.id, user?.email, user?.username, sessionEpoch]
+  );
+
+  const outletContext = useMemo(
+    () => ({
+      scopeBrand,
+      scopeDealer,
+      scopeBranch,
+      setScopeBrand,
+      setScopeDealer,
+      setScopeBranch,
+      brandOptions,
+      dealerOptions,
+      branchOptions,
+      isMaster,
+      isAdmin,
+      scopeKey,
+      sessionEpoch,
+    }),
+    [
+      scopeBrand,
+      scopeDealer,
+      scopeBranch,
+      brandOptions,
+      dealerOptions,
+      branchOptions,
+      isMaster,
+      isAdmin,
+      scopeKey,
+      sessionEpoch,
+    ]
+  );
 
   useEffect(() => {
     if (!user) return;
@@ -206,39 +298,39 @@ export function DashboardLayout() {
   }, [isAdmin, scopeMasters, user?.group, user?.dealer, user?.location, user?.branch]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem('nmtsSidebarOpen', sidebarOpen ? 'true' : 'false');
-    } catch {
-      /* ignore */
-    }
-  }, [sidebarOpen]);
-
-  const toggleSidebar = () => {
-    setSidebarOpen((prev) => !prev);
-  };
-
-  useEffect(() => {
     fetchUnreadCount();
     const interval = setInterval(fetchUnreadCount, 30000);
 
-    const savedTabs = localStorage.getItem('openTabs');
-    const savedActiveTab = localStorage.getItem('activeTab');
+    const savedTabs = readAuthItem('openTabs');
+    const savedActiveTab = readAuthItem('activeTab');
 
     if (savedTabs) {
       try {
         const parsedTabs = JSON.parse(savedTabs);
-        const allowedTabs = Array.isArray(parsedTabs)
-          ? parsedTabs.filter(
-              (tab) =>
-                canAccessPermission(user, tab.permission || tab.label) || tab.label === 'My Profile'
-            )
+        const remapped = Array.isArray(parsedTabs)
+          ? parsedTabs.map((tab) => {
+              if (tab?.id === 'sleeping-stock-mobile' || tab?.path === '/sleeping-stock-mobile') {
+                return { id: 'users', label: 'User Hub', path: '/users', permission: 'User Hub' };
+              }
+              return tab;
+            })
           : [];
+        const seen = new Set();
+        const allowedTabs = remapped.filter((tab) => {
+          if (!tab || seen.has(tab.id)) return false;
+          const ok =
+            canAccessPermission(user, tab.permission || tab.label) || tab.label === 'My Profile';
+          if (ok) seen.add(tab.id);
+          return ok;
+        });
         setTabs(allowedTabs);
       } catch {
         setTabs([]);
       }
 
-      if (savedActiveTab) {
+      if (savedActiveTab === 'sleeping-stock-mobile') {
+        setActiveTabId('users');
+      } else if (savedActiveTab) {
         setActiveTabId(savedActiveTab);
       }
     }
@@ -249,13 +341,13 @@ export function DashboardLayout() {
 
   useEffect(() => {
     if (tabs.length > 0) {
-      localStorage.setItem('openTabs', JSON.stringify(tabs));
+      writeAuthItem('openTabs', JSON.stringify(tabs));
       if (activeTabId) {
-        localStorage.setItem('activeTab', activeTabId);
+        writeAuthItem('activeTab', activeTabId);
       }
     } else {
-      localStorage.removeItem('openTabs');
-      localStorage.removeItem('activeTab');
+      removeAuthItem('openTabs');
+      removeAuthItem('activeTab');
     }
   }, [tabs, activeTabId]);
 
@@ -271,8 +363,44 @@ export function DashboardLayout() {
   useEffect(() => {
     const path = location.pathname;
     if (!path || path === '/' || path === '/login') return;
+    // /dashboard is Analytics home alias
+    if (path === '/dashboard') {
+      const analyticsItem = navItems.find((item) => item.id === 'analytics');
+      if (analyticsItem && canAccessMenuItem(user, analyticsItem)) {
+        setTabs((prev) => {
+          if (prev.some((t) => t.id === 'analytics')) return prev;
+          return [
+            ...prev,
+            {
+              id: 'analytics',
+              label: analyticsItem.label,
+              path: analyticsItem.path,
+              permission: analyticsItem.permissionLabel || analyticsItem.label,
+            },
+          ];
+        });
+        setActiveTabId('analytics');
+      }
+      return;
+    }
+    if (path.startsWith('/profile')) {
+      setTabs((prev) => {
+        if (prev.some((t) => t.id === 'profile')) return prev;
+        return [...prev, { id: 'profile', label: 'My Profile', path: '/profile', permission: 'My Profile' }];
+      });
+      setActiveTabId('profile');
+      return;
+    }
+    if (path === '/notifications') {
+      setTabs((prev) => {
+        if (prev.some((t) => t.id === 'notifications')) return prev;
+        return [...prev, { id: 'notifications', label: 'Notifications', path: '/notifications', permission: 'Notifications' }];
+      });
+      setActiveTabId('notifications');
+      return;
+    }
     const menuItem = navItems.find((item) => item.path === path);
-    if (!menuItem) return;
+    if (!menuItem || menuItem.sidebarHidden) return;
     if (!canAccessMenuItem(user, menuItem) && menuItem.id !== 'profile') return;
     setTabs((prev) => {
       if (prev.some((t) => t.id === menuItem.id)) return prev;
@@ -309,7 +437,16 @@ export function DashboardLayout() {
     }
   };
 
+  const clearWorkspaceCache = () => {
+    setTabs([]);
+    setActiveTabId(null);
+    removeAuthItem('openTabs');
+    removeAuthItem('activeTab');
+    setSessionEpoch((n) => n + 1);
+  };
+
   const handleLogout = () => {
+    clearWorkspaceCache();
     logout();
     clearAuthStorage();
     navigate('/login');
@@ -432,71 +569,75 @@ export function DashboardLayout() {
     }
   };
 
+  // Deep-link fallback only when the active screen is not keep-alive mounted.
+  const activeIsKeepAlive = Boolean(activeTabId && KEEP_ALIVE_COMPONENTS[activeTabId]);
+  const showOutlet = !activeIsKeepAlive && (
+    location.pathname.startsWith('/profile') || location.pathname === '/notifications'
+  );
+
   return (
-    <div className="nmts-app-shell" data-testid="dashboard-layout">
-      {!sidebarOpen ? null : (
-        <button
-          type="button"
-          className="nmts-sidebar-backdrop lg:hidden"
-          aria-label="Close navigation menu"
-          onClick={() => setSidebarOpen(false)}
-        />
-      )}
-
-      <aside
-        className={`nmts-sidebar${sidebarOpen ? '' : ' nmts-sidebar--collapsed'}`}
-        aria-hidden={!sidebarOpen}
-      >
-        <div className="nmts-sidebar-brand">
-          <img src="/sleeping-stock-logo.png" alt="Sleeping Stock" />
-          <div className="nmts-sidebar-brand-title">
-            Sleeping <span>Stock</span>
-          </div>
-          <div className="nmts-sidebar-brand-sub">Non Moving Tracking System</div>
-        </div>
-
-        <nav className="nmts-sidebar-nav" aria-label="Main navigation">
-          {filteredNavItems.map((item) => {
-            const Icon = item.icon;
-            const isActive =
-              location.pathname === item.path ||
-              (item.path === '/analytics' &&
-                (location.pathname === '/' || location.pathname === '/dashboard'));
-
-            return (
-              <button
-                key={item.id}
-                type="button"
-                className={`nmts-sidebar-link${isActive ? ' nmts-sidebar-link--active' : ''}`}
-                onClick={() => {
-                  openTab(item.id, item.label, item.path, item.permissionLabel);
-                  setSidebarOpen(false);
-                }}
-              >
-                <Icon aria-hidden="true" />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
-        </nav>
-
-        <div className="nmts-sidebar-footer">© 2026 NMTS. All rights reserved.</div>
-      </aside>
-
+    <div className="nmts-app-shell nmts-app-shell--menu-dropdown" data-testid="dashboard-layout">
       <div className="nmts-main-column">
         <header className="nmts-topbar">
           <div className="nmts-topbar-inner">
             <div className="nmts-topbar-left">
-              <button
-                type="button"
-                className="nmts-menu-toggle"
-                data-testid="sidebar-menu-toggle"
-                aria-expanded={sidebarOpen}
-                aria-label={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
-                onClick={toggleSidebar}
-              >
-                <Menu className="h-5 w-5" />
-              </button>
+              <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="nmts-menu-toggle"
+                    data-testid="sidebar-menu-toggle"
+                    aria-expanded={menuOpen}
+                    aria-haspopup="menu"
+                    aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+                  >
+                    <Menu className="h-5 w-5" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="start"
+                  side="bottom"
+                  sideOffset={8}
+                  className="nmts-app-menu-dropdown"
+                  aria-label="Main navigation"
+                  onCloseAutoFocus={(e) => e.preventDefault()}
+                >
+                  <div className="nmts-app-menu-brand" data-testid="app-menu-brand-header">
+                    <img
+                      src="/sleeping-stock-logo-transparent.png"
+                      alt=""
+                      className="nmts-app-menu-brand-logo"
+                    />
+                    <div className="nmts-app-menu-brand-text">
+                      <div className="nmts-app-menu-brand-wordmark">
+                        <span className="nmts-word-sleeping">Sleeping</span>
+                        <span className="nmts-word-stock">Stock</span>
+                      </div>
+                      <div className="nmts-app-menu-brand-nmts">NMTS</div>
+                    </div>
+                  </div>
+                  {filteredNavItems.map((item) => {
+                    const Icon = item.icon;
+                    const isActive =
+                      location.pathname === item.path ||
+                      (item.path === '/analytics' &&
+                        (location.pathname === '/' || location.pathname === '/dashboard'));
+                    return (
+                      <DropdownMenuItem
+                        key={item.id}
+                        className={`nmts-app-menu-item${isActive ? ' nmts-app-menu-item--active' : ''}`}
+                        onSelect={() => {
+                          openTab(item.id, item.label, item.path, item.permissionLabel);
+                          setMenuOpen(false);
+                        }}
+                      >
+                        <Icon aria-hidden="true" />
+                        <span>{item.label}</span>
+                      </DropdownMenuItem>
+                    );
+                  })}
+                </DropdownMenuContent>
+              </DropdownMenu>
 
               <Button variant="ghost" size="sm" className="p-1 hidden sm:flex" onClick={goHome} title="Home">
                 <Home className="h-5 w-5" style={{ color: '#059669' }} />
@@ -646,9 +787,9 @@ export function DashboardLayout() {
 
                   <div className="nmts-user-dropdown-body">
                     <InfoRow icon={Shield} label="Role" value={user?.role || 'N/A'} />
-                    <InfoRow icon={Building} label="Brand" value={scopeBrand} />
-                    <InfoRow icon={Users} label="Dealer" value={scopeDealer} />
-                    <InfoRow icon={MapPin} label="Branch" value={scopeBranch} />
+                    <InfoRow icon={Building} label="Brand" value={scopeBrand || 'All Brands'} />
+                    <InfoRow icon={Users} label="Dealer" value={scopeDealer || 'All Dealers'} />
+                    <InfoRow icon={MapPin} label="Branch" value={scopeBranch || 'All Branches'} />
                   </div>
 
                   <div className="p-2">
@@ -685,21 +826,29 @@ export function DashboardLayout() {
               />
             </div>
           ) : (
-            <Outlet
-              context={{
-                scopeBrand,
-                scopeDealer,
-                scopeBranch,
-                setScopeBrand,
-                setScopeDealer,
-                setScopeBranch,
-                brandOptions,
-                dealerOptions,
-                branchOptions,
-                isMaster,
-                isAdmin,
-              }}
-            />
+            <WorkspaceScopeProvider value={outletContext}>
+              {tabs.map((tab) => {
+                const Comp = KEEP_ALIVE_COMPONENTS[tab.id];
+                if (!Comp) return null;
+                const active = activeTabId === tab.id;
+                return (
+                  <div
+                    key={`${tab.id}::${scopeKey}`}
+                    style={{ display: active ? 'block' : 'none' }}
+                    aria-hidden={!active}
+                    data-testid={`keepalive-${tab.id}`}
+                    data-scope-key={scopeKey}
+                  >
+                    <Comp />
+                  </div>
+                );
+              })}
+              {showOutlet ? (
+                <div data-testid="outlet-fallback">
+                  <Outlet context={outletContext} />
+                </div>
+              ) : null}
+            </WorkspaceScopeProvider>
           )}
         </main>
       </div>

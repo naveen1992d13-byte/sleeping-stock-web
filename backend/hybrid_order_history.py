@@ -94,6 +94,8 @@ async def list_archived_order_headers(
     brand: Optional[str] = None,
     dealer: Optional[str] = None,
     branch: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     limit: int = 1000,
 ) -> List[Dict[str, Any]]:
     """Return archived order headers not already present in Mongo (id set)."""
@@ -113,6 +115,11 @@ async def list_archived_order_headers(
         packed = await read_order_package(db, eid)
         header = (packed or {}).get("order") or {}
         if not header:
+            continue
+        created = str(header.get("created_at") or "")
+        if date_from and created and created < str(date_from):
+            continue
+        if date_to and created and created >= str(date_to):
             continue
         header = dict(header)
         header["archive_source"] = "s3"

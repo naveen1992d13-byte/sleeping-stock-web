@@ -1,18 +1,32 @@
-import React, { useEffect, useState } from 'react';
-import { useNavigate, useOutletContext } from 'react-router-dom';
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useWorkspaceScope } from '../workspaceScope';
 import axios from 'axios';
 import { API } from '../App';
 import { Button } from '../components/ui/button';
-import { ChevronDown, ChevronRight, RefreshCw, FileSpreadsheet, Mail } from 'lucide-react';
+import { ChevronDown, ChevronRight, FileSpreadsheet, Mail } from 'lucide-react';
 import { toast } from 'sonner';
+import { parseBlobError } from '../utils/blobResponse';
 
 const formatNumber = (v) => Number(v || 0).toLocaleString('en-IN');
 const dtfmt = (v) => (v ? String(v).slice(0, 16).replace('T', ' ') : '-');
+const todayIst = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+const ORDER_HISTORY_STATUSES = [
+  'All',
+  'Order Created',
+  'Availability Checked',
+  'Source Selected',
+  'Requested',
+  'Accepted',
+  'Partially Accepted',
+  'Completed',
+  'Finished',
+];
 
 export function OrderHistory() {
   const navigate = useNavigate();
   const { scopeBrand = 'All Brands', scopeDealer = 'All Dealers', scopeBranch = 'All Branches' } =
-    useOutletContext() || {};
+    useWorkspaceScope();
   const isAllScope = (value) => !value || String(value).startsWith('All ') || value === 'N/A';
   const [orders, setOrders] = useState([]);
   const [expanded, setExpanded] = useState({});
@@ -20,14 +34,21 @@ export function OrderHistory() {
   const [emailOrderId, setEmailOrderId] = useState('');
   const [emailTo, setEmailTo] = useState('');
   const [emailing, setEmailing] = useState(false);
+  const [draft, setDraft] = useState({ date_from: todayIst(), date_to: todayIst(), status: 'All' });
+  const [applied, setApplied] = useState(null);
 
   const loadHistory = async () => {
     setLoading(true);
     try {
+      const next = { ...draft };
+      setApplied(next);
       const params = new URLSearchParams();
       if (!isAllScope(scopeBrand)) params.set('brand', scopeBrand);
       if (!isAllScope(scopeDealer)) params.set('dealer', scopeDealer);
       if (!isAllScope(scopeBranch)) params.set('branch', scopeBranch);
+      if (next.date_from) params.set('date_from', next.date_from);
+      if (next.date_to) params.set('date_to', next.date_to);
+      if (next.status && next.status !== 'All') params.set('status', next.status);
       const res = await axios.get(`${API}/order-desk/orders?${params.toString()}`, { timeout: 120000 });
       setOrders(res.data || []);
     } catch (error) {
@@ -36,11 +57,6 @@ export function OrderHistory() {
       setLoading(false);
     }
   };
-
-  useEffect(() => {
-    loadHistory();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scopeBrand, scopeDealer, scopeBranch]);
 
   const openOrder = (orderId) => {
     navigate('/orders', { state: { openOrderId: orderId } });
@@ -58,7 +74,7 @@ export function OrderHistory() {
       link.remove();
       window.URL.revokeObjectURL(url);
     } catch (error) {
-      toast.error(error.response?.data?.detail || 'Unable to download Order History Excel');
+      toast.error(await parseBlobError(error, 'Unable to download Order History Excel'));
     }
   };
 
@@ -82,12 +98,22 @@ export function OrderHistory() {
   return (
     <div className="space-y-4" data-testid="order-history-page">
       <div className="rounded-xl border bg-white overflow-hidden shadow-sm">
-        <div className="flex items-center justify-between p-4 border-b">
+        <div className="p-4 border-b space-y-3">
           <h2 className="font-semibold text-gray-900">Saved Orders</h2>
-          <Button variant="outline" size="sm" onClick={loadHistory}>
-            <RefreshCw className="mr-2 h-4 w-4" />
-            Refresh
-          </Button>
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="text-xs font-semibold">From Date
+              <input type="date" className="mt-1 block h-10 rounded-xl border px-3" value={draft.date_from} onChange={(e)=>setDraft({...draft,date_from:e.target.value})}/>
+            </label>
+            <label className="text-xs font-semibold">To Date
+              <input type="date" className="mt-1 block h-10 rounded-xl border px-3" value={draft.date_to} onChange={(e)=>setDraft({...draft,date_to:e.target.value})}/>
+            </label>
+            <label className="text-xs font-semibold">Status
+              <select className="mt-1 block h-10 rounded-xl border px-3 min-w-[180px]" value={draft.status} onChange={(e)=>setDraft({...draft,status:e.target.value})}>
+                {ORDER_HISTORY_STATUSES.map((status)=><option key={status} value={status}>{status === 'All' ? 'All' : status}</option>)}
+              </select>
+            </label>
+            <Button onClick={loadHistory} disabled={loading}>{loading ? 'Loading…' : 'Enquiry'}</Button>
+          </div>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm min-w-[900px]">
@@ -250,7 +276,7 @@ export function OrderHistory() {
               {!loading && !orders.length && (
                 <tr>
                   <td colSpan={11} className="p-8 text-center text-slate-500">
-                    No saved orders
+                    {applied ? 'No saved orders for this enquiry.' : 'Set filters and click Enquiry.'}
                   </td>
                 </tr>
               )}

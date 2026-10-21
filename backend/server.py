@@ -51,6 +51,10 @@ try:
 except ImportError:
     import mobile_push
 try:
+    from . import mobile_request_cycle_scheduler
+except ImportError:
+    import mobile_request_cycle_scheduler
+try:
     from . import s3_storage
     from . import file_objects
     from . import archive_manifest
@@ -66,10 +70,12 @@ try:
     from . import hybrid_request_history
     from . import archive_keys as archive_keys
     from . import upload_scope
+    from . import product_upload_stream
     from . import order_desk_guards as odg
     from . import request_fulfillment as rff
     from . import request_in_transit_reminder
     from . import login_screen
+    from . import feature_flags
 except ImportError:
     import s3_storage
     import file_objects
@@ -86,10 +92,12 @@ except ImportError:
     import hybrid_request_history
     import archive_keys
     import upload_scope
+    import product_upload_stream
     import order_desk_guards as odg
     import request_fulfillment as rff
     import request_in_transit_reminder
     import login_screen
+    import feature_flags
 
 s3_storage.load_storage_dotenv()
 
@@ -358,13 +366,21 @@ def hash_password(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
+def validate_password_policy(password: str) -> str:
+    text = str(password or "").strip()
+    if len(text) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    return text
+
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
+    now = datetime.now(timezone.utc)
     if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
+        expire = now + expires_delta
     else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
+        expire = now + timedelta(minutes=15)
+    to_encode.update({"exp": expire, "iat": int(now.timestamp())})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -386,6 +402,25 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     user = await db.users.find_one({"id": user_id}, {"_id": 0})
     if user is None:
         raise credentials_exception
+    if str(user.get("status") or "").strip().lower() == "inactive":
+        raise credentials_exception
+    changed = user.get("password_changed_at")
+    iat = payload.get("iat")
+    if changed is not None and iat is not None:
+        if isinstance(changed, str):
+            try:
+                changed = datetime.fromisoformat(changed.replace("Z", "+00:00"))
+            except ValueError:
+                changed = None
+        if isinstance(changed, datetime):
+            if changed.tzinfo is None:
+                changed = changed.replace(tzinfo=timezone.utc)
+            try:
+                issued = datetime.fromtimestamp(float(iat), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                issued = None
+            if issued is not None and issued < changed:
+                raise credentials_exception
     _apply_testing_master_permissions(user)
     return UserResponse(**user)
 
@@ -595,8 +630,7 @@ async def get_me(current_user: UserResponse = Depends(get_current_user)):
 
 @api_router.get("/users", response_model=List[UserResponse])
 async def get_users(current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master(current_user)
     
     users = await db.users.find({}, {"_id": 0}).to_list(1000)
     return [UserResponse(**u) for u in users]
@@ -610,6 +644,9 @@ async def create_user(user_data: UserCreate, current_user: UserResponse = Depend
     elif current_user.role == "admin":
         if user_data.role != "user":
             raise HTTPException(status_code=403, detail="Admins can only create users")
+        user_data.brand = current_user.brand
+        user_data.group = current_user.group
+        user_data.permissions = {}
     else:
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -660,15 +697,53 @@ async def create_user(user_data: UserCreate, current_user: UserResponse = Depend
     
     return UserResponse(**user.model_dump())
 
+# Original Production Master + Testing Master (and any extra IDs from env).
+_DEFAULT_PROTECTED_MASTER_EMAILS = (
+    "admin@sleepingstock.in",
+    "testing.master@sleepingstock.in",
+)
+
+
+def _protected_master_ids() -> set[str]:
+    raw = os.environ.get("PROTECTED_MASTER_IDS") or ""
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _protected_master_emails() -> set[str]:
+    raw = os.environ.get("PROTECTED_MASTER_EMAILS") or ""
+    extras = {part.strip().casefold() for part in raw.split(",") if part.strip()}
+    return {e.casefold() for e in _DEFAULT_PROTECTED_MASTER_EMAILS} | extras
+
+
+async def _assert_user_not_protected_master(user_id: str) -> dict:
+    """Block deletion of original Production/Testing Master accounts."""
+    user = await db.users.find_one(
+        {"$or": [{"id": user_id}, {"userId": user_id}, {"user_id": user_id}]},
+        {"_id": 0, "id": 1, "email": 1, "role": 1, "is_testing_master": 1},
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    email = str(user.get("email") or "").strip().casefold()
+    uid = str(user.get("id") or "").strip()
+    if uid in _protected_master_ids() or email in _protected_master_emails():
+        raise HTTPException(
+            status_code=403,
+            detail="Protected master account cannot be deleted",
+        )
+    return user
+
+
 @api_router.delete("/users/{user_id}")
 async def delete_user(user_id: str, current_user: UserResponse = Depends(get_current_user)):
     if current_user.role != "master":
         raise HTTPException(status_code=403, detail="Only master can delete users")
-    
+
+    await _assert_user_not_protected_master(user_id)
+
     result = await db.users.delete_one({"id": user_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
     return {"message": "User deleted successfully"}
 
 # Update user permissions
@@ -677,8 +752,7 @@ class PermissionUpdate(BaseModel):
 
 @api_router.put("/users/{user_id}/permissions")
 async def update_user_permissions(user_id: str, data: PermissionUpdate, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master(current_user)
     
     result = await db.users.update_one(
         {"id": user_id},
@@ -692,8 +766,8 @@ async def update_user_permissions(user_id: str, data: PermissionUpdate, current_
 
 @api_router.get("/users/{user_id}/permissions")
 async def get_user_permissions(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master_or_admin(current_user)
+    await _ensure_can_view_user(current_user, user_id)
     
     user = await db.users.find_one({"id": user_id}, {"_id": 0})
     if not user:
@@ -705,13 +779,13 @@ async def get_user_permissions(user_id: str, current_user: UserResponse = Depend
 
 @api_router.get("/products")
 async def get_products(current_user: UserResponse = Depends(get_current_user)):
-    products = await db.products.find({}, {"_id": 0}).to_list(1000)
+    products = await db.products.find(_apply_role_scope_v2({}, current_user), {"_id": 0}).to_list(1000)
     # Return raw data to preserve all fields including location, branch, mav_value, etc.
     return products
 
 @api_router.get("/products/low-stock")
 async def get_low_stock(threshold: int = 10, current_user: UserResponse = Depends(get_current_user)):
-    products = await db.products.find({"quantity": {"$lte": threshold}}, {"_id": 0}).to_list(1000)
+    products = await db.products.find(_apply_role_scope_v2({"quantity": {"$lte": threshold}}, current_user), {"_id": 0}).to_list(1000)
     return products
 
 @api_router.get("/products/sleeping-stock")
@@ -720,7 +794,7 @@ async def get_sleeping_stock(days: int = 90, current_user: UserResponse = Depend
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
     
     # Get all products
-    all_products = await db.products.find({}, {"_id": 0}).to_list(1000)
+    all_products = await db.products.find(_apply_role_scope_v2({}, current_user), {"_id": 0}).to_list(1000)
     
     sleeping = []
     for product in all_products:
@@ -736,8 +810,7 @@ async def get_sleeping_stock(days: int = 90, current_user: UserResponse = Depend
 
 @api_router.post("/products", response_model=Product)
 async def create_product(product_data: ProductCreate, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master(current_user)
     
     # Check if part number exists
     existing = await db.products.find_one({"part_number": product_data.part_number})
@@ -754,8 +827,7 @@ async def create_product(product_data: ProductCreate, current_user: UserResponse
 
 @api_router.put("/products/{product_id}", response_model=Product)
 async def update_product(product_id: str, product_data: ProductUpdate, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master(current_user)
     
     update_data = {k: v for k, v in product_data.model_dump().items() if v is not None}
     if not update_data:
@@ -772,8 +844,7 @@ async def update_product(product_id: str, product_data: ProductUpdate, current_u
 
 @api_router.delete("/products/{product_id}")
 async def delete_product(product_id: str, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_master(current_user)
     
     result = await db.products.delete_one({"id": product_id})
     if result.deleted_count == 0:
@@ -1116,28 +1187,8 @@ async def get_uploads(
 
 @api_router.put("/uploads/{upload_id}/publish")
 async def publish_upload(upload_id: str, current_user: UserResponse = Depends(get_current_user)):
-    if current_user.role not in ["master", "admin"]:
-        raise HTTPException(status_code=403, detail="Only Master/Admin can publish uploads")
-
-    upload = await db.uploads.find_one({"id": upload_id}, {"_id": 0})
-    if not upload:
-        raise HTTPException(status_code=404, detail="Upload not found")
-
-    if current_user.role == "admin":
-        if upload.get("brand_name") != current_user.brand or upload.get("dealer_name") != current_user.group:
-            raise HTTPException(status_code=403, detail="Not allowed to publish this upload")
-
-    now = datetime.now(timezone.utc).isoformat()
-    await db.uploads.update_one(
-        {"id": upload_id},
-        {"$set": {
-            "publish_status": "Published",
-            "published_at": now,
-            "published_by": current_user.id,
-            "published_user_name": current_user.username,
-        }}
-    )
-    return {"message": "Upload published successfully"}
+    """Legacy path; marking Published without building product rows left stock missing."""
+    return await publish_upload_v2(upload_id, current_user)
 
 
 @api_router.delete("/uploads/reset")
@@ -1204,8 +1255,7 @@ async def export_uploaded_products(current_user: UserResponse = Depends(get_curr
     from fastapi.responses import StreamingResponse
     excel_permissions.require_excel_export(current_user)
     
-    # Fetch all products
-    products = await db.products.find({}, {"_id": 0}).to_list(10000)
+    products = await db.products.find(_apply_role_scope_v2({}, current_user), {"_id": 0}).to_list(10000)
     
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1839,9 +1889,7 @@ async def get_dashboard_metrics(current_user: UserResponse = Depends(get_current
 
 @api_router.get("/profile/{user_id}", response_model=UserResponse)
 async def get_user_profile(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    # Users can only view their own profile unless they're admin/master
-    if current_user.role not in ["master", "admin"] and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized to view this profile")
+    await _ensure_can_view_user(current_user, user_id)
     
     user = await db.users.find_one({"id": user_id}, {"_id": 0})
     if not user:
@@ -1855,15 +1903,28 @@ async def update_user_profile(
     update_data: UserUpdate,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    # Users can only edit their own profile unless they're admin/master
-    if current_user.role not in ["master", "admin"] and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized to edit this profile")
-    
-    update_dict = {k: v for k, v in update_data.model_dump().items() if v is not None}
-    if not update_dict:
+    if current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Self-profile edits are limited to your own account")
+    payload = update_data.model_dump()
+    allowed = {}
+    if payload.get("username") is not None:
+        allowed["username"] = str(payload["username"]).strip()
+    if payload.get("phone") is not None:
+        allowed["phone"] = str(payload["phone"]).strip()
+    if payload.get("email") is not None:
+        email = str(payload["email"]).strip().lower()
+        if not email:
+            raise HTTPException(status_code=400, detail="Email is required")
+        existing = await db.users.find_one(
+            {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}, "id": {"$ne": user_id}},
+            {"_id": 0, "id": 1},
+        )
+        if existing:
+            raise HTTPException(status_code=400, detail="Email is already in use")
+        allowed["email"] = email
+    if not allowed:
         raise HTTPException(status_code=400, detail="No data to update")
-    
-    result = await db.users.update_one({"id": user_id}, {"$set": update_dict})
+    result = await db.users.update_one({"id": user_id}, {"$set": allowed})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
     
@@ -1894,11 +1955,11 @@ async def change_password(
     if not verify_password(password_data.old_password, user["password"]):
         raise HTTPException(status_code=400, detail="Incorrect old password")
     
-    # Update password
-    new_hashed_password = hash_password(password_data.new_password)
+    new_password = validate_password_policy(password_data.new_password)
+    new_hashed_password = hash_password(new_password)
     await db.users.update_one(
         {"id": user_id},
-        {"$set": {"password": new_hashed_password}}
+        {"$set": {"password": new_hashed_password, "password_changed_at": datetime.now(timezone.utc)}}
     )
     
     # Log activity
@@ -1933,13 +1994,13 @@ async def reset_user_password(
         if target_user.get("brand") != current_user.brand or target_user.get("group") != current_user.group:
             raise HTTPException(status_code=403, detail="Not authorized for this user")
 
-    if not data.password or len(data.password.strip()) < 4:
-        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    password = validate_password_policy(data.password)
 
     await db.users.update_one(
         {"id": user_id},
         {"$set": {
-            "password": hash_password(data.password.strip()),
+            "password": hash_password(password),
+            "password_changed_at": datetime.now(timezone.utc),
             "passwordResetAt": datetime.now(timezone.utc).isoformat(),
             "passwordResetBy": current_user.id
         }}
@@ -1968,6 +2029,7 @@ async def toggle_user_status(user_id: str, current_user: UserResponse = Depends(
     user = await db.users.find_one({"id": user_id}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    _ensure_can_manage_user(current_user, user)
     
     new_status = "inactive" if user.get("status") == "active" else "active"
     await db.users.update_one(
@@ -1988,9 +2050,7 @@ async def toggle_user_status(user_id: str, current_user: UserResponse = Depends(
 
 @api_router.get("/profile/{user_id}/analytics")
 async def get_user_analytics(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    # Users can only view their own analytics unless they're admin/master
-    if current_user.role not in ["master", "admin"] and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_can_view_user(current_user, user_id)
     
     # Count total orders
     total_orders = await db.orders.count_documents({"created_by": user_id})
@@ -2014,18 +2074,14 @@ async def get_user_analytics(user_id: str, current_user: UserResponse = Depends(
 
 @api_router.get("/profile/{user_id}/orders")
 async def get_user_orders(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    # Users can only view their own orders unless they're admin/master
-    if current_user.role not in ["master", "admin"] and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_can_view_user(current_user, user_id)
     
     orders = await db.orders.find({"created_by": user_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
     return orders
 
 @api_router.get("/profile/{user_id}/activity-logs")
 async def get_user_activity_logs(user_id: str, current_user: UserResponse = Depends(get_current_user)):
-    # Users can view their own logs, admins can view anyone's
-    if current_user.role not in ["master", "admin"] and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await _ensure_can_view_user(current_user, user_id)
     
     logs = await db.activity_logs.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).limit(50).to_list(50)
     return logs
@@ -2218,6 +2274,32 @@ async def _ensure_master(current_user: UserResponse):
 async def _ensure_master_or_admin(current_user: UserResponse):
     if current_user.role not in ["master", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
+
+
+def _is_same_dealer(current_user: UserResponse, target: dict) -> bool:
+    return target.get("brand") == current_user.brand and target.get("group") == current_user.group
+
+
+async def _ensure_can_view_user(current_user: UserResponse, user_id: str):
+    if current_user.id == user_id or current_user.role == "master":
+        return
+    if current_user.role == "admin":
+        target = await db.users.find_one({"id": user_id}, {"_id": 0, "brand": 1, "group": 1})
+        if target and _is_same_dealer(current_user, target):
+            return
+    raise HTTPException(status_code=403, detail="Not authorized for this user")
+
+
+def _ensure_can_manage_user(current_user: UserResponse, target: dict):
+    """Admins manage only role=user accounts of their own brand and dealer."""
+    if current_user.role == "master":
+        return
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if target.get("role") != "user":
+        raise HTTPException(status_code=403, detail="Admin can manage only users")
+    if not _is_same_dealer(current_user, target):
+        raise HTTPException(status_code=403, detail="Not authorized for this user")
 
 
 def _clean_master_code(value: str) -> str:
@@ -2970,6 +3052,10 @@ async def update_hub_user(user_id: str, data: UserHubUpdate, current_user: UserR
             raise HTTPException(status_code=403, detail="Not authorized for this user")
         for locked in ("brand", "dealer", "group", "role", "state"):
             raw.pop(locked, None)
+        if raw.get("permissions") is not None:
+            allowed_permissions = set(_permission_list(current_user.permissions))
+            if not set(raw["permissions"]).issubset(allowed_permissions):
+                raise HTTPException(status_code=403, detail="Admin cannot assign permissions not given by Master")
 
     update_data = {}
     for key, value in raw.items():
@@ -2995,6 +3081,8 @@ async def update_hub_user(user_id: str, data: UserHubUpdate, current_user: UserR
 @api_router.delete("/users/hub/{user_id}")
 async def delete_hub_user(user_id: str, current_user: UserResponse = Depends(get_current_user)):
     await _ensure_master(current_user)
+
+    await _assert_user_not_protected_master(user_id)
 
     result = await db.users.delete_one({"$or": [{"id": user_id}, {"userId": user_id}, {"user_id": user_id}]})
     if result.deleted_count == 0:
@@ -3514,6 +3602,46 @@ def _apply_role_scope_v2(query: dict, current_user: UserResponse, brand=None, de
     return query
 
 
+async def _rollback_product_upload_items_v2(upload_id: str) -> int:
+    """Delete any upload_items written for a failed/aborted product upload job."""
+    if not upload_id:
+        return 0
+    result = await db.upload_items.delete_many({"upload_id": upload_id})
+    return int(getattr(result, "deleted_count", 0) or 0)
+
+
+async def _supersede_waiting_product_uploads_v2(context: dict, date_key: str, *, keep_upload_id: str = "") -> dict:
+    """Drop prior same-day Waiting product uploads for this branch so retries stay idempotent."""
+    query = {
+        "upload_type": "product",
+        "publish_status": "Waiting",
+        "date_key": date_key,
+        "brand_name": context.get("brand_name") or context.get("brand"),
+        "dealer_name": context.get("dealer_name"),
+        "branch": context.get("branch"),
+    }
+    prior = await db.uploads.find(query, {"_id": 0, "id": 1, "sha256": 1}).to_list(50)
+    removed_uploads = 0
+    removed_items = 0
+    for doc in prior:
+        uid = str(doc.get("id") or "")
+        if not uid or uid == keep_upload_id:
+            continue
+        removed_items += await _rollback_product_upload_items_v2(uid)
+        await db.uploads.update_one(
+            {"id": uid},
+            {"$set": {
+                "status": "Failed",
+                "publish_status": "Failed",
+                "processing_lock": False,
+                "error": "Superseded by a newer same-day upload for this branch",
+                "updated_at": _nmts_now().isoformat(),
+            }},
+        )
+        removed_uploads += 1
+    return {"removed_uploads": removed_uploads, "removed_items": removed_items}
+
+
 @api_router.post("/upload/v2")
 async def upload_product_center_v2(
     file: UploadFile = File(...),
@@ -3529,13 +3657,46 @@ async def upload_product_center_v2(
         raise HTTPException(status_code=400, detail="Only Excel files are allowed")
 
     now = _nmts_now()
+    date_key = _nmts_date_key(now)
     context = await _build_upload_context_v2(current_user)
     context = await _apply_selected_upload_scope(context, current_user, brand, dealer, branch)
-    upload_no = await generate_upload_no("product", context["brand_code"])
     raw_bytes = await file.read()
     file_size = len(raw_bytes)
+    file_sha = hashlib.sha256(raw_bytes).hexdigest()
 
-    # HARD REQUIRE: original Excel must land in private REAL S3 before upload succeeds.
+    # Idempotent retry: identical file already Uploaded/Waiting today for this branch.
+    existing = await db.uploads.find_one(
+        {
+            "upload_type": "product",
+            "sha256": file_sha,
+            "date_key": date_key,
+            "brand_name": context.get("brand_name") or context.get("brand"),
+            "dealer_name": context.get("dealer_name"),
+            "branch": context.get("branch"),
+            "publish_status": "Waiting",
+            "status": {"$nin": ["Failed", "Cancelled"]},
+        },
+        {"_id": 0, "raw_file_bytes": 0},
+    )
+    if existing:
+        return {
+            "message": "Upload already present for this file/branch/date (idempotent)",
+            "upload_no": existing.get("upload_no"),
+            "upload_id": existing.get("id"),
+            "rows_processed": existing.get("rows_processed"),
+            "rows_imported": existing.get("rows_imported"),
+            "failed_count": existing.get("failed_count") or 0,
+            "total_available_qty": existing.get("total_available_qty"),
+            "total_value": existing.get("total_value"),
+            "errors": existing.get("errors") or [],
+            "idempotent": True,
+        }
+
+    upload_no = await generate_upload_no("product", context["brand_code"])
+
+    # HARD REQUIRE: original Excel lands on private REAL S3 BEFORE any parse.
+    # Key includes upload_no so archives are never overwritten; s3_storage also
+    # refuses different-sha overwrites (allow_replace=False).
     storage = s3_storage.get_storage()
     if not storage.is_s3():
         s3_storage.ensure_s3()
@@ -3563,6 +3724,35 @@ async def upload_product_center_v2(
         archive_keys.MODULE_LABEL_UPLOAD,
         "xlsx",
     )
+
+    # Claim the job early so a crash mid-stream is visible as Failed, not a silent lock.
+    processing_doc = testing_runtime.stamp_testing_origin({
+        "id": upload_id,
+        "upload_no": upload_no,
+        "original_upload_no": upload_no,
+        "upload_type": "product",
+        "file_name": file.filename,
+        "file_size": file_size,
+        "sha256": file_sha,
+        "status": "Processing",
+        "publish_status": "Failed",
+        "processing_lock": True,
+        "rows_processed": 0,
+        "rows_imported": 0,
+        "failed_count": 0,
+        "item_count": 0,
+        "total_available_qty": 0.0,
+        "total_value": 0.0,
+        "errors": [],
+        "upload_date": _nmts_display_date(now),
+        "upload_time": _nmts_display_time(now),
+        "date_key": date_key,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        **context,
+    })
+    await db.uploads.insert_one(processing_doc)
+
     try:
         stored_excel = await file_objects.store_bytes(
             module="uploads",
@@ -3572,6 +3762,17 @@ async def upload_product_center_v2(
             content_type=file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     except Exception as exc:
+        await _rollback_product_upload_items_v2(upload_id)
+        await db.uploads.update_one(
+            {"id": upload_id},
+            {"$set": {
+                "status": "Failed",
+                "publish_status": "Failed",
+                "processing_lock": False,
+                "error": f"S3 store failed: {type(exc).__name__}",
+                "updated_at": _nmts_now().isoformat(),
+            }},
+        )
         logger.error("Product Excel S3 store failed (upload aborted): %s", exc)
         raise HTTPException(
             status_code=503,
@@ -3579,88 +3780,143 @@ async def upload_product_center_v2(
         )
     provider = str((stored_excel or {}).get("storage_provider") or "").lower()
     if not (stored_excel or {}).get("storage_key") or provider not in {"s3", "real s3"}:
+        await _rollback_product_upload_items_v2(upload_id)
+        await db.uploads.update_one(
+            {"id": upload_id},
+            {"$set": {
+                "status": "Failed",
+                "publish_status": "Failed",
+                "processing_lock": False,
+                "error": "Excel missing storage_key after S3 store",
+                "updated_at": _nmts_now().isoformat(),
+            }},
+        )
         raise HTTPException(
             status_code=503,
             detail="Upload failed: Excel was not stored on private REAL S3 (missing storage_key).",
         )
 
-    wb = openpyxl.load_workbook(BytesIO(raw_bytes), data_only=True)
-    # Prefer a worksheet explicitly named "Inventory" (case-insensitive) since that is
-    # the required worksheet name for the Product Hub inventory upload. Fall back to
-    # the active sheet for any older workbook that doesn't use that sheet name, so
-    # existing uploads never break.
-    ws = None
-    for sheet_name in wb.sheetnames:
-        if sheet_name.strip().lower() == "inventory":
-            ws = wb[sheet_name]
-            break
-    if ws is None:
-        ws = wb.active
+    # Persist S3 pointer on the processing row immediately (size + sha already set).
+    await db.uploads.update_one(
+        {"id": upload_id},
+        {"$set": {
+            "storage_provider": (stored_excel or {}).get("storage_provider"),
+            "storage_key": (stored_excel or {}).get("storage_key"),
+            "content_type": (stored_excel or {}).get("content_type"),
+            "sha256": (stored_excel or {}).get("sha256") or file_sha,
+            "file_size": file_size,
+            "archived_at": (stored_excel or {}).get("archived_at"),
+            "updated_at": _nmts_now().isoformat(),
+        }},
+    )
+
+    # Validate workbook only AFTER durable S3 store (off the event loop).
+    try:
+        def _probe_ok():
+            wb, _ws = product_upload_stream.open_inventory_worksheet(raw_bytes)
+            wb.close()
+            return True
+        await asyncio.to_thread(_probe_ok)
+    except Exception:
+        await db.uploads.update_one(
+            {"id": upload_id},
+            {"$set": {
+                "status": "Failed",
+                "publish_status": "Failed",
+                "processing_lock": False,
+                "error": "Excel unreadable after S3 store",
+                "updated_at": _nmts_now().isoformat(),
+            }},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to read this Excel file. Please save it as .xlsx (Excel Workbook) and upload again.",
+        )
 
     rows_processed = 0
     rows_imported = 0
     rejected = []
     total_available_qty = 0.0
     total_value = 0.0
-    item_docs = []
+    # Dedupe within the file by part+branch+date so a retry of a partial parse
+    # cannot insert the same part twice under this upload_id.
+    seen_parts = set()
 
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        if not any(row):
-            continue
-        rows_processed += 1
-        # Rule: reject a row ONLY when Part Number (column A) is missing. Part Name,
-        # Quantity, Category, Brand, Branch, and Dealer must never cause a row to be
-        # rejected — every other valid row is still imported.
-        part_no = str(row[0] or "").strip() if len(row) > 0 else ""
-        if not part_no:
-            rejected.append({"row": row_idx, "reason": "Part No Missing"})
-            continue
-        part_name = str(row[1] or "").strip() if len(row) > 1 else ""
-        loc = str(row[2] or "").strip() if len(row) > 2 else ""
-        qty = _safe_float(row[3] if len(row) > 3 else 0, 0.0)
-        last_receipt = _format_excel_date_v2(row[4] if len(row) > 4 else "")
-        last_sales = _format_excel_date_v2(row[5] if len(row) > 5 else "")
-        mav = _safe_float(row[6] if len(row) > 6 else 0, 0.0)
-        # Column H — Part Category. Never required; stored as-is (trimmed) even if
-        # it doesn't match one of the standard values below, so no row is ever
-        # rejected because of it.
-        part_category_raw = str(row[7] or "").strip() if len(row) > 7 else ""
-        part_category = _normalize_part_category(part_category_raw)
-        line_value = qty * mav
-        total_available_qty += qty
-        total_value += line_value
-        rows_imported += 1
-        item_docs.append(testing_runtime.stamp_testing_origin({
-            "id": str(uuid.uuid4()),
-            "upload_id": upload_id,
-            "upload_no": upload_no,
-            "upload_type": "product",
-            "part_number": part_no,
-            "item_name": part_name,
-            "loc": loc,
-            "bin_location": loc,
-            "quantity": qty,
-            "available_qty": qty,
-            "last_receipt_date": last_receipt,
-            "last_sales_date": last_sales,
-            "mav": mav,
-            "mav_value": mav,
-            "total_value": line_value,
-            "part_category": part_category,
-            # Explicit numeric fields (guaranteed float, never string) used for all
-            # summary/aggregation math so quantity/value can never be mis-summed
-            # due to string concatenation or mixed types coming from Excel.
-            "available_qty_number": float(qty),
-            "unit_value_number": float(mav),
-            "total_value_number": float(line_value),
-            "publish_status": "Waiting",
-            "active_date_key": _nmts_date_key(now),
-            "created_at": now.isoformat(),
-            **context,
-        }))
+    try:
+        stream_iter = product_upload_stream.stream_product_items(
+            raw_bytes,
+            upload_id=upload_id,
+            upload_no=upload_no,
+            now_iso=now.isoformat(),
+            active_date_key=date_key,
+            context=context,
+            format_excel_date=_format_excel_date_v2,
+            normalize_part_category=_normalize_part_category,
+            stamp=testing_runtime.stamp_testing_origin,
+            batch_size=product_upload_stream.UPLOAD_V2_BATCH_SIZE,
+        )
+        while True:
+            # openpyxl CPU off the event loop so /auth/me stays responsive.
+            item = await asyncio.to_thread(product_upload_stream.next_stream_batch, stream_iter)
+            if item is None:
+                break
+            batch, stats = item
+            rows_processed += int(stats.get("rows_processed") or 0)
+            rejected.extend(stats.get("rejected") or [])
+            unique_batch = []
+            for doc in batch:
+                part_key = (
+                    str(doc.get("part_number") or "").strip().upper(),
+                    str(doc.get("branch") or "").strip().lower(),
+                    str(doc.get("active_date_key") or date_key),
+                )
+                if not part_key[0] or part_key in seen_parts:
+                    continue
+                seen_parts.add(part_key)
+                unique_batch.append(doc)
+            if unique_batch:
+                await db.upload_items.insert_many(unique_batch)
+                for doc in unique_batch:
+                    qty = float(doc.get("available_qty_number") or 0)
+                    val = float(doc.get("total_value_number") or 0)
+                    total_available_qty += qty
+                    total_value += val
+                    rows_imported += 1
+            del batch, unique_batch
+            await asyncio.sleep(0)
+    except Exception as exc:
+        rolled = await _rollback_product_upload_items_v2(upload_id)
+        await db.uploads.update_one(
+            {"id": upload_id},
+            {"$set": {
+                "status": "Failed",
+                "publish_status": "Failed",
+                "processing_lock": False,
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                "rows_processed": rows_processed,
+                "rows_imported": 0,
+                "item_count": 0,
+                "failed_count": len(rejected),
+                "partial_rows_removed": rolled,
+                "storage_provider": (stored_excel or {}).get("storage_provider"),
+                "storage_key": (stored_excel or {}).get("storage_key"),
+                "updated_at": _nmts_now().isoformat(),
+            }},
+        )
+        logger.error("Product upload/v2 failed mid-stream for %s: %s", upload_id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Upload failed while processing rows; partial rows were rolled back. "
+                f"({type(exc).__name__})"
+            ),
+        )
 
-    if item_docs:
-        await db.upload_items.insert_many(item_docs)
+    # Only after a successful parse: replace prior same-day Waiting drafts for this
+    # branch. Prior Excel objects on S3 are never deleted (unique upload_no keys;
+    # Failed row keeps its storage_key). Published uploads are not touched.
+    if rows_imported:
+        await _supersede_waiting_product_uploads_v2(context, date_key, keep_upload_id=upload_id)
 
     status_text = "Uploaded" if rows_imported else "Failed"
     upload_doc = {
@@ -3671,16 +3927,16 @@ async def upload_product_center_v2(
         "file_name": file.filename,
         "file_size": file_size,
         # Do not embed multi-MB Excel blobs in MongoDB — they blow Atlas free-tier
-    # quotas and leave half-published Product Hub state when writes get blocked.
-    # Keep file metadata + S3/object-store pointer; legacy uploads without storage_key still work.
-    "raw_file_content_type": file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "storage_provider": (stored_excel or {}).get("storage_provider"),
-    "storage_key": (stored_excel or {}).get("storage_key"),
-    "original_filename": file.filename,
-    "content_type": (stored_excel or {}).get("content_type") or (file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-    "sha256": (stored_excel or {}).get("sha256"),
-    "archived_at": (stored_excel or {}).get("archived_at"),
-    "rows_processed": rows_processed,
+        # quotas and leave half-published Product Hub state when writes get blocked.
+        # Keep file metadata + S3/object-store pointer; legacy uploads without storage_key still work.
+        "raw_file_content_type": file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "storage_provider": (stored_excel or {}).get("storage_provider"),
+        "storage_key": (stored_excel or {}).get("storage_key"),
+        "original_filename": file.filename,
+        "content_type": (stored_excel or {}).get("content_type") or (file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "sha256": (stored_excel or {}).get("sha256") or file_sha,
+        "archived_at": (stored_excel or {}).get("archived_at"),
+        "rows_processed": rows_processed,
         "rows_imported": rows_imported,
         "failed_count": len(rejected),
         "item_count": rows_imported,
@@ -3688,14 +3944,20 @@ async def upload_product_center_v2(
         "total_value": total_value,
         "status": status_text,
         "publish_status": "Waiting" if rows_imported else "Failed",
+        "processing_lock": False,
         "errors": rejected,
         "upload_date": _nmts_display_date(now),
         "upload_time": _nmts_display_time(now),
-        "date_key": _nmts_date_key(now),
+        "date_key": date_key,
         "created_at": now.isoformat(),
+        "updated_at": _nmts_now().isoformat(),
         **context,
     }
-    await db.uploads.insert_one(testing_runtime.stamp_testing_origin(upload_doc))
+    await db.uploads.update_one(
+        {"id": upload_id},
+        {"$set": testing_runtime.stamp_testing_origin(upload_doc)},
+        upsert=True,
+    )
     try:
         await event_archive.maybe_enqueue_upload_stored(db, upload_doc)
     except Exception as exc:
@@ -4245,19 +4507,7 @@ async def product_hub_summary(
     ) or testing_runtime.is_testing_env()
 
     if not needs_product_scan:
-        batch_query = {"active_date_key": date_key}
-        if not _is_all_scope(brand):
-            batch_query["brand_name"] = brand
-        elif current_user.role != "master":
-            batch_query["brand_name"] = current_user.brand
-        if not _is_all_scope(dealer):
-            batch_query["dealer_name"] = dealer
-        elif current_user.role != "master":
-            batch_query["dealer_name"] = current_user.group
-        if not _is_all_scope(branch):
-            batch_query["branch"] = branch
-        elif current_user.role != "master":
-            batch_query["branch"] = current_user.location
+        batch_query = _apply_role_scope_v2({"active_date_key": date_key}, current_user, brand, dealer, branch)
 
         rows = await db.batch_summaries.find(batch_query, {"_id": 0}).to_list(10000)
         summary = {
@@ -4321,18 +4571,18 @@ async def product_hub_branch_summary(
     fast no matter how many lakhs of rows exist in the raw products collection."""
     date_key = _nmts_date_key()
     query = {"active_date_key": date_key}
-    if not _is_all_scope(brand):
-        query["brand_name"] = brand
-    elif current_user.role != "master":
+    if current_user.role == "master":
+        if not _is_all_scope(brand):
+            query["brand_name"] = brand
+        if not _is_all_scope(dealer):
+            query["dealer_name"] = dealer
+    else:
         query["brand_name"] = current_user.brand
-    if not _is_all_scope(dealer):
-        query["dealer_name"] = dealer
-    elif current_user.role != "master":
         query["dealer_name"] = current_user.group
-    if not _is_all_scope(branch):
-        query["branch"] = branch
-    elif current_user.role == "user":
+    if current_user.role == "user":
         query["branch"] = current_user.location
+    elif not _is_all_scope(branch):
+        query["branch"] = branch
     testing_runtime.merge_query(query, testing_runtime.origin_query(data_origin))
 
     if testing_runtime.is_testing_env():
@@ -4749,15 +4999,22 @@ def _aging_value_for_suggest(entry: dict, aging_type: str) -> float:
     return float(entry.get('purchase_aging_days') or entry.get('aging_days') or 0)
 
 
-def _auto_suggest_sort_key(entry: dict, aging_type: str):
-    """Highest Aging First; if equal, Highest Available Quantity first; if
-    still equal, Oldest Uploaded Stock first; if still equal, Alphabetical
-    Branch. Built as an ascending sort key (negate the descending fields)."""
-    aging = _aging_value_for_suggest(entry, aging_type)
-    qty = float(entry.get('net_available_qty', entry.get('available_qty', 0)) or 0)
-    last_upload = entry.get('last_upload') or ''
-    branch = _order_clean_text(entry.get('branch')).lower()
-    return (-aging, -qty, last_upload, branch)
+def _auto_suggest_sort_key(entry: dict, aging_type: str, *, need_qty: float = 0.0, order: dict = None):
+    """Approved Auto Suggest ranking for a single remaining line.
+
+    Full coverage → same-dealer preference → higher aging → higher available qty.
+    (Minimum pickup locations is applied when selecting one multi-line destination
+    in the sequential Auto Sourcing engine.)
+    """
+    try:
+        import order_auto_sourcing as oas
+        return oas.single_source_rank_key(entry, need_qty or 0.0, order or {}, aging_type)
+    except Exception:
+        aging = _aging_value_for_suggest(entry, aging_type)
+        qty = float(entry.get('net_available_qty', entry.get('available_qty', 0)) or 0)
+        last_upload = entry.get('last_upload') or ''
+        branch = _order_clean_text(entry.get('branch')).lower()
+        return (-aging, -qty, last_upload, branch)
 
 
 def _order_number_prefix(brand_code: str):
@@ -4786,7 +5043,10 @@ async def _generate_request_number(brand_code: str) -> dict:
     The counter is a per-brand, per-day atomic $inc (same pattern as
     _generate_order_number / generate_upload_no), so two simultaneous
     requests for the same brand/day can never receive the same number, and
-    the daily serial naturally restarts at 0001 for a new date or brand."""
+    the daily serial naturally restarts at 0001 for a new date or brand.
+
+    Official RQ numbers are minted only after supplier acceptance.
+    """
     date_key = datetime.now(timezone.utc).strftime('%y%m%d')
     clean_brand = re.sub(r'[^A-Za-z0-9]', '', str(brand_code or 'XX')).upper() or 'XX'
     counter_id = f'request_RQ_{clean_brand}_{date_key}'
@@ -4803,6 +5063,44 @@ async def _generate_request_number(brand_code: str) -> dict:
     return {
         'request_number': testing_runtime.prefix_business_id(f'RQ{clean_brand}{date_key}{seq:04d}'),
 
+        'brand_code': clean_brand, 'date_key': date_key, 'sequence': seq,
+    }
+
+
+async def _resolve_request_header(ref: str) -> dict:
+    """Lookup request header by official RQ, attempt_id, or group id."""
+    if not ref:
+        return {}
+    return await db.request_headers.find_one(
+        {'$or': [
+            {'request_number': ref},
+            {'attempt_id': ref},
+            {'id': ref},
+        ]},
+        {'_id': 0},
+    ) or {}
+
+
+async def _generate_attempt_id(brand_code: str) -> dict:
+    """Internal sourcing attempt / event ID used before official RQ minting.
+
+    Format: AT + BRAND + YYMMDD + 4-digit daily serial (Testing-prefixed when
+    APP_ENV=testing). Never used as the official Parts Transfer Request number.
+    """
+    date_key = datetime.now(timezone.utc).strftime('%y%m%d')
+    clean_brand = re.sub(r'[^A-Za-z0-9]', '', str(brand_code or 'XX')).upper() or 'XX'
+    counter_id = f'request_AT_{clean_brand}_{date_key}'
+    counter = await db.counters.find_one_and_update(
+        {'_id': counter_id},
+        {'$inc': {'seq': 1}, '$setOnInsert': {'date_key': date_key, 'brand_code': clean_brand, 'type': 'AT'}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    seq = int(counter.get('seq', 1))
+    if seq > 9999:
+        raise HTTPException(status_code=500, detail=f'Daily attempt sequence exhausted for brand {clean_brand}. Contact support.')
+    return {
+        'attempt_id': testing_runtime.prefix_business_id(f'AT{clean_brand}{date_key}{seq:04d}'),
         'brand_code': clean_brand, 'date_key': date_key, 'sequence': seq,
     }
 
@@ -5003,25 +5301,47 @@ async def _send_request_group_email(group_doc: dict, *, result: bool = False, fo
 
 def _send_requests_response(group_docs: list, duplicate: bool):
     groups = [g for g in group_docs if g]
-    request_numbers = [g.get('request_number') for g in groups]
+    request_numbers = [g.get('request_number') for g in groups if g.get('request_number')]
+    attempt_ids = [g.get('attempt_id') or g.get('id') for g in groups]
     any_email_sent = any(g.get('email_sent') for g in groups)
-    any_email_failed = any(not g.get('email_sent') for g in groups)
+    any_email_failed = any(
+        (not g.get('email_sent')) and g.get('email_status') not in ('pending', 'deferred_until_acceptance', None)
+        for g in groups
+    )
     errors = [g.get('email_error') for g in groups if g.get('email_error')]
+    deferred = any(
+        (not g.get('email_sent')) and (
+            not g.get('request_number') or g.get('email_status') == 'deferred_until_acceptance'
+        )
+        for g in groups
+    )
 
     if duplicate:
-        message = f'Request already created for this order ({len(request_numbers)} request number(s)). No duplicate was created.'
+        refs = request_numbers or attempt_ids
+        message = (
+            f'Request already created for this order ({len(refs)} attempt/request(s)). '
+            'No duplicate was created.'
+        )
     elif not groups:
         message = 'No requests were created.'
+    elif deferred and not any_email_sent:
+        message = (
+            f'{len(attempt_ids)} sourcing attempt(s) routed. '
+            'Official request number, email and PDF are created after supplier acceptance.'
+        )
     elif any_email_sent and not any_email_failed:
         message = f'{len(request_numbers)} request(s) created and emailed successfully.'
     elif any_email_sent and any_email_failed:
         message = f'{len(request_numbers)} request(s) created. Some emails failed to send.'
     else:
-        message = f'{len(request_numbers)} request(s) created successfully, but email could not be sent.'
+        message = f'{len(attempt_ids)} sourcing attempt(s) created successfully.'
 
     return {
-        'request_created': bool(groups), 'message': message, 'request_numbers': request_numbers,
+        'request_created': bool(groups), 'message': message,
+        'request_numbers': request_numbers,
+        'attempt_ids': attempt_ids,
         'email_sent': any_email_sent, 'email_error': errors[0] if errors else None,
+        'email_deferred_until_acceptance': deferred and not any_email_sent,
         'groups': groups, 'duplicate': duplicate,
     }
 
@@ -5219,8 +5539,28 @@ async def order_desk_paste(payload: dict, current_user: UserResponse = Depends(g
     return await _create_order_v2(clean_rows, current_user, 'Copy From Excel', scope={'brand': payload.get('brand'), 'dealer': payload.get('dealer'), 'branch': payload.get('branch')})
 
 
+ORDER_HISTORY_STATUSES = [
+    "Order Created",
+    "Availability Checked",
+    "Source Selected",
+    "Requested",
+    "Accepted",
+    "Partially Accepted",
+    "Completed",
+    "Finished",
+]
+
+
 @api_router.get('/order-desk/orders')
-async def order_desk_orders(brand: Optional[str] = None, dealer: Optional[str] = None, branch: Optional[str] = None, current_user: UserResponse = Depends(get_current_user)):
+async def order_desk_orders(
+    brand: Optional[str] = None,
+    dealer: Optional[str] = None,
+    branch: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
     role = (current_user.role or '').lower()
     query = {} if role == 'master' else ({'dealer_name': current_user.group} if role == 'admin' else {'created_by': current_user.id})
     if brand and not str(brand).startswith('All '): query['brand_name'] = brand
@@ -5228,6 +5568,30 @@ async def order_desk_orders(brand: Optional[str] = None, dealer: Optional[str] =
     if branch and not str(branch).startswith('All '): query['branch'] = branch
     if role == 'admin': query['dealer_name'] = current_user.group
     if role == 'user': query.update({'created_by': current_user.id, 'branch': current_user.location})
+    date_from_iso = None
+    date_to_iso = None
+    if date_from or date_to:
+        from zoneinfo import ZoneInfo
+        ist = ZoneInfo("Asia/Kolkata")
+        created = {}
+        try:
+            # created_at is stored as ISO-8601 *strings* in Mongo/DocumentDB.
+            # Comparing against BSON datetimes matches zero live TS rows and
+            # leaves only unfiltered S3 archive merges (old dates).
+            if date_from:
+                start = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=ist).astimezone(timezone.utc)
+                date_from_iso = start.isoformat()
+                created["$gte"] = date_from_iso
+            if date_to:
+                end = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=ist) + timedelta(days=1)
+                date_to_iso = end.astimezone(timezone.utc).isoformat()
+                created["$lt"] = date_to_iso
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date range")
+        if created:
+            query["created_at"] = created
+    if status and str(status).strip() and str(status).strip().lower() not in {"all", "all statuses"}:
+        query["status"] = str(status).strip()
     rows = await db.order_headers.find(query, {'_id': 0}).sort('created_at', -1).limit(1000).to_list(1000)
     # Enrich for Order History (batched — avoid N+1 that stalls the page).
     order_ids = [r.get('id') for r in rows if r.get('id')]
@@ -5256,6 +5620,8 @@ async def order_desk_orders(brand: Optional[str] = None, dealer: Optional[str] =
             brand=query.get('brand_name'),
             dealer=query.get('dealer_name') if role != 'user' else None,
             branch=query.get('branch') if role == 'user' or (branch and not str(branch).startswith('All ')) else None,
+            date_from=date_from_iso,
+            date_to=date_to_iso,
             limit=1000,
         )
         if archived:
@@ -5276,6 +5642,11 @@ async def order_desk_order_detail(
 ):
     order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
     if not order:
+        order = await db.order_headers.find_one(
+            {'order_number': {'$regex': f'^{re.escape(str(order_id).strip())}$', '$options': 'i'}},
+            {'_id': 0},
+        )
+    if not order:
         try:
             packed = await hybrid_order_history.read_order_package(db, order_id)
         except Exception:
@@ -5288,6 +5659,7 @@ async def order_desk_order_detail(
                 "archive_source": "s3",
             }
         raise HTTPException(status_code=404, detail='Order not found')
+    order_id = order.get('id') or order_id
     role = (current_user.role or '').lower()
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized')
@@ -5490,11 +5862,7 @@ async def order_desk_allocate(order_id: str, payload: dict, current_user: UserRe
         # Preserve already-sent allocations; only replace draft/unsent selections.
         preserved = [
             a for a in (item.get('allocations') or [])
-            if a.get('request_no') or a.get('request_number')
-            or str(a.get('status') or '').lower() in (
-                'request sent', 'requested', 'accepted', 'partially accepted',
-                'rejected', 'cancelled', 'completed', 'dispatched', 'received',
-            )
+            if odw.allocation_is_sent(a)
         ]
         preserved_keys = {
             (str(a.get('dealer_name') or '').lower(), str(a.get('branch') or '').lower())
@@ -5543,13 +5911,11 @@ async def order_desk_allocate(order_id: str, payload: dict, current_user: UserRe
             'allocations': cleaned, 'allocated_qty': total, 'balance_qty': max(0, required - total),
             'remaining_qty': max(0, required - float(wf.get('accepted_qty') or 0) - sum(
                 float(a.get('request_qty') or 0) for a in cleaned
-                if a.get('request_no') or a.get('request_number') or str(a.get('status') or '').lower() in (
-                    'request sent', 'requested', 'accepted', 'partially accepted', 'completed', 'dispatched', 'received',
-                )
+                if odw.allocation_is_sent(a)
             )),
             'status': 'Source Selected' if cleaned else 'Availability Checked', 'updated_at': now,
-            'allocation_source': 'manual' if any(not (a.get('request_no') or a.get('request_number')) for a in cleaned) else item.get('allocation_source'),
-            'request_status': odw.REQUEST_STATUS_READY if any(not (a.get('request_no') or a.get('request_number')) for a in cleaned) else wf.get('request_status'),
+            'allocation_source': 'manual' if any(not odw.allocation_is_sent(a) for a in cleaned) else item.get('allocation_source'),
+            'request_status': odw.REQUEST_STATUS_READY if any(not odw.allocation_is_sent(a) for a in cleaned) else wf.get('request_status'),
         }})
     await db.order_headers.update_one({'id': order_id}, {'$set': {'status': 'Source Selected', 'updated_at': now}})
     await odw.append_order_audit(db, order, 'Manual source selected / Qty changed', current_user)
@@ -5685,7 +6051,7 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
         pool = odw.eligible_pool(item, order, level, freezes, aging_type, min_aging_days)
         pool = [_with_reservation_adjustment(s, reserved_map) for s in pool]
         pool = [s for s in pool if s.get('net_available_qty', 0) > 0]
-        pool.sort(key=lambda s: _auto_suggest_sort_key(s, aging_type))
+        pool.sort(key=lambda s: _auto_suggest_sort_key(s, aging_type, need_qty=pending_qty, order=order))
         if level == 'own':
             pool = odw.partition_own_branch_first(pool, order)
 
@@ -5716,24 +6082,36 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
 
         kept = []
         for alloc in (item.get('allocations') or []):
-            sent = bool(alloc.get('request_no') or alloc.get('request_number')) or str(alloc.get('status') or '').lower() in (
-                'request sent', 'awaiting response', 'requested', 'accepted', 'partially accepted',
-                'rejected', 'cancelled', 'completed', 'dispatched', 'received', 'response time expired',
-            )
-            if sent or odw.allocation_level(alloc, order) != level:
+            if odw.allocation_is_sent(alloc) or odw.allocation_level(alloc, order) != level:
                 kept.append(alloc)
         new_allocations = kept + picked
 
         total_allocated = odw.sum_active_allocation_qty(new_allocations)
-        await db.order_items.update_one({'id': item['id']}, {'$set': {
+        remaining_after = max(0.0, pending_qty - sum(p['request_qty'] for p in picked))
+        update_fields = {
             'allocations': new_allocations, 'allocated_qty': total_allocated,
             'balance_qty': max(0.0, required_qty - total_allocated),
-            'remaining_qty': pending_qty - sum(p['request_qty'] for p in picked),
+            'remaining_qty': remaining_after,
             'status': 'Source Selected' if new_allocations else item.get('status', 'Availability Checked'),
             'allocation_source': 'auto', 'retry_required': False if picked else item.get('retry_required', False),
             'request_status': odw.REQUEST_STATUS_READY if picked else item.get('request_status'),
             'updated_at': now,
-        }})
+        }
+        # Issue 6: Dealer Auto Suggest remainder → Factory Order (no further network stock).
+        if level == 'dealer' and remaining_after > 0:
+            update_fields.update({
+                'factory_order_qty': remaining_after,
+                'no_further_stock': True,
+                'dealer_stage_exhausted': True,
+                'enquiry_stage': 'factory',
+            })
+            if not picked:
+                update_fields.update({
+                    'request_status': odw.REQUEST_STATUS_FACTORY,
+                    'status': odw.REQUEST_STATUS_FACTORY,
+                    'retry_required': False,
+                })
+        await db.order_items.update_one({'id': item['id']}, {'$set': update_fields})
         updated_item = await db.order_items.find_one({'id': item['id']}, {'_id': 0})
         result_items.append({
             **updated_item,
@@ -5755,6 +6133,469 @@ async def order_desk_auto_suggest(order_id: str, payload: dict, current_user: Us
     enriched = await odw.enrich_order_items(db, order, result_items, aging_type, min_aging_days, aging_type, min_aging_days)
     return {'order_number': order.get('order_number'), 'level': level, 'aging_type': aging_type,
             'min_aging_days': min_aging_days, 'items': enriched}
+
+
+async def _auto_source_continue_safe(order_id: str, reason: str = ''):
+    if not feature_flags.sequential_auto_sourcing_enabled():
+        return
+    try:
+        await _auto_source_advance(order_id, actor=_sla_system_actor(), reason=reason)
+    except Exception as exc:
+        logging.getLogger('nmts.order_auto_sourcing').exception(
+            'auto-source advance failed order=%s reason=%s err=%s', order_id, reason, exc
+        )
+
+
+async def _auto_source_claim_lock(order_id: str) -> bool:
+    """Concurrency protection: only one advance runs at a time per order."""
+    now = datetime.now(timezone.utc).isoformat()
+    res = await db.order_headers.find_one_and_update(
+        {
+            'id': order_id,
+            '$or': [
+                {'auto_sourcing_lock_until': {'$exists': False}},
+                {'auto_sourcing_lock_until': None},
+                {'auto_sourcing_lock_until': {'$lt': now}},
+            ],
+        },
+        {'$set': {
+            'auto_sourcing_lock_until': (datetime.now(timezone.utc) + timedelta(seconds=45)).isoformat(),
+            'auto_sourcing_lock_token': str(uuid.uuid4()),
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    return bool(res)
+
+
+async def _auto_source_release_lock(order_id: str):
+    await db.order_headers.update_one(
+        {'id': order_id},
+        {'$set': {'auto_sourcing_lock_until': None, 'auto_sourcing_lock_token': None}},
+    )
+
+
+async def _auto_source_send_destination(order: dict, destination: dict, current_user: UserResponse, *, last_chance: bool = False) -> dict:
+    """Allocate + send ONE destination request group (sequential, never broadcast)."""
+    import order_auto_sourcing as oas
+    now = datetime.now(timezone.utc).isoformat()
+    pairs = []
+    for line in destination.get('lines') or []:
+        item = line['item']
+        source = line['source']
+        take = float(line.get('take_qty') or 0)
+        if take <= 0:
+            continue
+        # Live stock check — refuse stale availability
+        stock_id = source.get('stock_id')
+        live_qty = float(source.get('net_available_qty', source.get('available_qty') or 0) or 0)
+        if stock_id:
+            reserved_map = await _reservation_qty_map([stock_id])
+            product = await db.products.find_one({'id': stock_id}, {'_id': 0, 'available_qty_number': 1, 'quantity': 1})
+            if product is not None:
+                live_qty = max(0.0, float(product.get('available_qty_number', product.get('quantity') or 0) or 0) - float(reserved_map.get(stock_id) or 0))
+        take = min(take, live_qty, float(item.get('remaining_qty') or 0))
+        if take <= 0:
+            continue
+        level = line.get('level') or destination.get('level') or 'branch'
+        alloc = {
+            'dealer_name': _order_clean_text(source.get('dealer_name')),
+            'branch': _order_clean_text(source.get('branch')),
+            'request_qty': take,
+            'available_qty_at_selection': float(source.get('available_qty') or live_qty or 0),
+            'purchase_aging_days': source.get('purchase_aging_days'),
+            'sales_aging_days': source.get('sales_aging_days'),
+            'aging_days': source.get('aging_days'),
+            'loc': source.get('loc', ''),
+            'stock_id': stock_id,
+            'status': odw.REQUEST_STATUS_READY,
+            'selected_at': now,
+            'level': level,
+            'origin': 'auto_source',
+            'source_type': level,
+            'source_dealer': _order_clean_text(source.get('dealer_name')),
+            'source_branch': _order_clean_text(source.get('branch')),
+            'requested_qty': take,
+            'accepted_qty': 0,
+            'remaining_qty': take,
+            'request_status': odw.REQUEST_STATUS_READY,
+            'last_chance': bool(last_chance),
+        }
+        fresh = await db.order_items.find_one({'id': item['id']}, {'_id': 0}) or item
+        kept = []
+        for a in (fresh.get('allocations') or []):
+            if odw.allocation_is_sent(a):
+                kept.append(a)
+        new_allocs = kept + [alloc]
+        await db.order_items.update_one({'id': item['id']}, {'$set': {
+            'allocations': new_allocs,
+            'allocated_qty': odw.sum_active_allocation_qty(new_allocs),
+            'allocation_source': 'auto_source',
+            'status': 'Source Selected',
+            'request_status': odw.REQUEST_STATUS_READY,
+            'updated_at': now,
+        }})
+        refreshed = await db.order_items.find_one({'id': item['id']}, {'_id': 0})
+        pairs.append((refreshed, alloc))
+
+    if not pairs:
+        return {'sent': False, 'reason': 'no_live_qty'}
+
+    try:
+        group_doc = await _create_request_group(order, pairs, current_user, now)
+    except RuntimeError as exc:
+        if str(exc).startswith('stock_reservation_conflict:'):
+            return {'sent': False, 'reason': 'stock_reservation_conflict', 'detail': str(exc)}
+        raise
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            return {'sent': False, 'reason': 'stock_reservation_conflict', 'detail': str(exc.detail)}
+        raise
+    attempt_id = (group_doc or {}).get('attempt_id') or (group_doc or {}).get('id')
+    request_number = (group_doc or {}).get('request_number')  # None until acceptance
+    routing_ref = request_number or attempt_id
+    for item, source in pairs:
+        stamped = odw.mark_allocations_sent(item, [source], request_number, now, attempt_id=attempt_id)
+        await db.order_items.update_one({'id': item['id']}, {'$set': {
+            'allocations': stamped,
+            'status': 'Requested',
+            'request_status': odw.REQUEST_STATUS_SENT,
+            'retry_required': False,
+            'updated_at': now,
+        }})
+    await db.order_headers.update_one({'id': order['id']}, {'$set': {
+        'auto_sourcing_state': oas.AUTO_SOURCE_LAST_CHANCE if last_chance else oas.AUTO_SOURCE_WAITING,
+        'auto_sourcing_active': True,
+        'auto_sourcing_current_request': routing_ref,
+        'auto_sourcing_current_attempt': attempt_id,
+        'auto_sourcing_last_chance': bool(last_chance),
+        'updated_at': now,
+    }})
+    await db.request_headers.update_one({'id': (group_doc or {}).get('id')}, {'$set': {
+        'auto_sourced': True,
+        'last_chance': bool(last_chance),
+    }})
+    await oas.append_sourcing_event(db, order, 'Last Chance alert routed' if last_chance else 'Auto Sourcing routed', {
+        'attempt_id': attempt_id,
+        'request_number': request_number,
+        'supplying_dealer': destination.get('dealer_name'),
+        'supplying_branch': destination.get('branch'),
+        'lines': len(pairs),
+        'last_chance': last_chance,
+        'rank': {
+            'full_coverage_count': destination.get('full_coverage_count'),
+            'lines_covered': len(destination.get('lines') or []),
+            'same_dealer': destination.get('same_dealer'),
+            'max_aging': destination.get('max_aging'),
+            'total_available': destination.get('total_available'),
+        },
+    }, current_user)
+    return {
+        'sent': True,
+        'attempt_id': attempt_id,
+        'request_number': request_number,
+        'group': group_doc,
+        'lines': len(pairs),
+    }
+
+
+async def _auto_source_advance(order_id: str, actor: UserResponse = None, reason: str = '') -> dict:
+    """Continue sequential Auto Sourcing for an order (idempotent / locked)."""
+    import order_auto_sourcing as oas
+    actor = actor or _sla_system_actor()
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        return {'ok': False, 'reason': 'order_missing'}
+    if order.get('auto_sourcing_state') in (oas.AUTO_SOURCE_COMPLETED, oas.AUTO_SOURCE_CANCELLED, oas.AUTO_SOURCE_FACTORY_DECISION):
+        if not order.get('auto_sourcing_active'):
+            return {'ok': True, 'state': order.get('auto_sourcing_state'), 'skipped': True}
+    if order.get('finished_at'):
+        return {'ok': False, 'reason': 'order_finished'}
+
+    if not await _auto_source_claim_lock(order_id):
+        return {'ok': False, 'reason': 'locked'}
+
+    try:
+        for _attempt in range(6):
+            order = await db.order_headers.find_one({'id': order_id}, {'_id': 0}) or order
+            # Wait if an active Requested header still exists
+            pending = await db.request_headers.find_one(
+                {'order_id': order_id, 'status': 'Requested', 'auto_sourced': True},
+                {'_id': 0, 'request_number': 1, 'attempt_id': 1, 'id': 1, 'status': 1},
+            )
+            if pending:
+                waiting_on = pending.get('request_number') or pending.get('attempt_id') or pending.get('id')
+                return {'ok': True, 'state': oas.AUTO_SOURCE_WAITING, 'waiting_on': waiting_on}
+
+            items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+            items = await odw.enrich_order_items(db, order, items)
+            remaining = oas.remaining_items(items)
+            if not remaining:
+                now = datetime.now(timezone.utc).isoformat()
+                await db.order_headers.update_one({'id': order_id}, {'$set': {
+                    'auto_sourcing_state': oas.AUTO_SOURCE_COMPLETED,
+                    'auto_sourcing_active': False,
+                    'auto_sourcing_message': 'Auto Sourcing Completed',
+                    'factory_decision_required': False,
+                    'updated_at': now,
+                }})
+                await oas.append_sourcing_event(db, order, 'Auto Sourcing Completed', {'reason': reason}, actor)
+                return {'ok': True, 'state': oas.AUTO_SOURCE_COMPLETED}
+
+            aging_type = order.get('auto_sourcing_aging_type') or order.get('branch_aging_type') or 'purchase'
+            min_aging = float(order.get('auto_sourcing_min_aging_days') or 0)
+            freezes = await odw.load_today_freezes(db, [i.get('part_number') for i in remaining], order.get('brand_name') or '')
+
+            # Adjust pools for live reservations
+            all_stock_ids = []
+            for item in remaining:
+                for field in ('same_dealer_sources', 'other_dealer_sources'):
+                    for s in item.get(field) or []:
+                        if s.get('stock_id'):
+                            all_stock_ids.append(s['stock_id'])
+            reserved_map = await _reservation_qty_map(all_stock_ids)
+            for item in remaining:
+                for field in ('same_dealer_sources', 'other_dealer_sources'):
+                    item[field] = [_with_reservation_adjustment(s, reserved_map) for s in (item.get(field) or [])]
+
+            # 1) Own Branch first
+            own_candidates = oas.build_destination_candidates(
+                remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging, levels=['own'],
+            )
+            best = oas.select_best_destination(own_candidates, prefer_own=True)
+            phase = 'own'
+            last_chance = False
+            if not best:
+                # 2) Same-dealer branches, then other dealers
+                normal = oas.build_destination_candidates(
+                    remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging, levels=['branch', 'dealer'],
+                )
+                best = oas.select_best_destination(normal, prefer_own=False)
+                phase = 'normal'
+            if not best:
+                # 3) Last Chance — unique holders only
+                unique = oas.find_unique_holder_candidates(
+                    remaining, order, freezes, aging_type=aging_type, min_aging_days=min_aging,
+                )
+                best = oas.select_best_destination(unique, prefer_own=False)
+                phase = 'last_chance'
+                last_chance = True
+            if not best:
+                result = await oas.mark_factory_decision_required(db, order, remaining, actor)
+                return {'ok': True, **result}
+
+            send = await _auto_source_send_destination(order, best, actor, last_chance=last_chance)
+            if not send.get('sent'):
+                # Exclude empty / conflicted destination and retry inside this lock.
+                for line in best.get('lines') or []:
+                    await db.order_items.update_one({'id': line['item']['id']}, {
+                        '$addToSet': {'excluded_sources': {
+                            'dealer_name': best.get('dealer_name'),
+                            'branch': best.get('branch'),
+                            'reason': send.get('reason') or 'stock_changed_during_response',
+                        }},
+                        '$set': {'updated_at': datetime.now(timezone.utc).isoformat()},
+                    })
+                await oas.append_sourcing_event(db, order, 'Auto Sourcing skipped destination (stock changed)', {
+                    'dealer': best.get('dealer_name'), 'branch': best.get('branch'), 'phase': phase,
+                    'reason': send.get('reason'),
+                }, actor)
+                continue
+
+            return {
+                'ok': True,
+                'state': oas.AUTO_SOURCE_WAITING if not last_chance else oas.AUTO_SOURCE_LAST_CHANCE,
+                **send,
+                'phase': phase,
+            }
+
+        result = await oas.mark_factory_decision_required(
+            db, order, await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000), actor,
+        )
+        return {'ok': True, **result}
+    finally:
+        await _auto_source_release_lock(order_id)
+
+
+@api_router.post('/order-desk/orders/{order_id}/auto-source/start')
+async def order_desk_auto_source_start(order_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
+    """Start sequential Auto Sourcing for an order (Own Branch → ranked suppliers → Last Chance → Factory Decision)."""
+    feature_flags.require_sequential_auto_sourcing()
+    import order_auto_sourcing as oas
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
+    odg.assert_order_not_finished(order)
+    role = (current_user.role or '').lower()
+    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not authorized for this order')
+    items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    if not items:
+        raise HTTPException(status_code=400, detail='Order has no items')
+    if not any(item.get('availability_checked_at') for item in items) and not order.get('availability_checked'):
+        raise HTTPException(status_code=400, detail='Run Check Availability before Auto Sourcing')
+    # Idempotent: if already waiting on a request, return current state
+    if order.get('auto_sourcing_active') and order.get('auto_sourcing_current_request'):
+        pending = await _resolve_request_header(order.get('auto_sourcing_current_request'))
+        if pending and pending.get('status') == 'Requested':
+            return {
+                'message': 'Auto Sourcing already awaiting response',
+                'state': order.get('auto_sourcing_state'),
+                'attempt_id': pending.get('attempt_id'),
+                'request_number': pending.get('request_number'),
+                'duplicate': True,
+            }
+    aging_type = str((payload or {}).get('aging_type') or 'purchase').strip().lower()
+    if aging_type not in ('purchase', 'sales'):
+        aging_type = 'purchase'
+    try:
+        min_aging = float((payload or {}).get('min_aging_days') or 0)
+    except (TypeError, ValueError):
+        min_aging = 0.0
+    now = datetime.now(timezone.utc).isoformat()
+    await db.order_headers.update_one({'id': order_id}, {'$set': {
+        'auto_sourcing_active': True,
+        'auto_sourcing_state': oas.AUTO_SOURCE_ACTIVE,
+        'auto_sourcing_aging_type': aging_type,
+        'auto_sourcing_min_aging_days': min_aging,
+        'auto_sourcing_started_at': now,
+        'auto_sourcing_started_by': current_user.id,
+        'factory_decision_required': False,
+        'auto_sourcing_message': None,
+        'updated_at': now,
+    }})
+    await oas.append_sourcing_event(db, order, 'Auto Sourcing started', {
+        'aging_type': aging_type, 'min_aging_days': min_aging,
+    }, current_user)
+    result = await _auto_source_advance(order_id, actor=current_user, reason='start')
+    refreshed = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    return {
+        'message': 'Auto Sourcing started',
+        'order': refreshed,
+        'result': result,
+        'state': (refreshed or {}).get('auto_sourcing_state'),
+        'message_banner': (refreshed or {}).get('auto_sourcing_message'),
+    }
+
+
+@api_router.post('/order-desk/orders/{order_id}/auto-source/continue')
+async def order_desk_auto_source_continue(order_id: str, current_user: UserResponse = Depends(get_current_user)):
+    """Manual / system continue after reject, timeout, or partial acceptance."""
+    feature_flags.require_sequential_auto_sourcing()
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
+    role = (current_user.role or '').lower()
+    if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not authorized')
+    result = await _auto_source_advance(order_id, actor=current_user, reason='continue')
+    refreshed = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    return {'result': result, 'order': refreshed, 'state': (refreshed or {}).get('auto_sourcing_state')}
+
+
+@api_router.post('/order-desk/orders/{order_id}/factory-decision')
+async def order_desk_factory_decision(order_id: str, payload: dict, current_user: UserResponse = Depends(get_current_user)):
+    """Order creator decision after Auto Sourcing is exhausted.
+
+    action: 'move_to_factory' | 'cancel_remaining'
+    Stops the response timer on any leftover open auto-sourced request and
+    closes the remaining sourcing flow.
+    """
+    import order_auto_sourcing as oas
+    order = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Order not found')
+    odg.assert_order_not_finished(order)
+    role = (current_user.role or '').lower()
+    is_creator = order.get('created_by') == current_user.id
+    if role != 'master' and not is_creator and order.get('dealer_name') != current_user.group:
+        raise HTTPException(status_code=403, detail='Only the order creator (or Master/Admin scope) can decide')
+    action = str((payload or {}).get('action') or '').strip().lower()
+    if action not in ('move_to_factory', 'cancel_remaining'):
+        raise HTTPException(status_code=400, detail="action must be 'move_to_factory' or 'cancel_remaining'")
+
+    now = datetime.now(timezone.utc).isoformat()
+    # Stop timers on any still-open auto-sourced requests
+    open_headers = await db.request_headers.find(
+        {'order_id': order_id, 'status': 'Requested'}, {'_id': 0},
+    ).to_list(500)
+    for header in open_headers:
+        await db.request_headers.update_one({'id': header['id']}, {'$set': {
+            **odw.freeze_response_timer(header, now, 'cancelled'),
+            'status': 'Cancelled',
+            'updated_at': now,
+            'factory_decision_stopped': True,
+        }})
+        line_or = [{'request_group_id': header.get('id')}]
+        if header.get('attempt_id'):
+            line_or.append({'request_attempt_id': header.get('attempt_id')})
+        if header.get('request_number'):
+            line_or.append({'request_number': header.get('request_number')})
+        await db.order_requests.update_many(
+            {'$and': [{'$or': line_or}, {'status': 'Requested'}]},
+            {'$set': {
+                'status': 'Cancelled',
+                'official_confirmed': False,
+                'audit_only_attempt': True,
+                'updated_at': now,
+                'approval_remarks': f'Closed by factory decision ({action})',
+            }},
+        )
+        await db.stock_reservations.update_many(
+            {'request_group_id': header.get('id'), 'status': 'active'},
+            {'$set': {'status': 'released', 'released_at': now}},
+        )
+
+    items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    for item in items:
+        rem = float(item.get('remaining_qty') or 0)
+        if rem <= 0 and not item.get('factory_decision_required'):
+            continue
+        if action == 'move_to_factory':
+            await db.order_items.update_one({'id': item['id']}, {'$set': {
+                'factory_order_qty': rem,
+                'no_further_stock': True,
+                'factory_decision_required': False,
+                'factory_decision_action': 'move_to_factory',
+                'request_status': odw.REQUEST_STATUS_FACTORY,
+                'status': odw.REQUEST_STATUS_FACTORY,
+                'auto_source_closed': True,
+                'retry_required': False,
+                'updated_at': now,
+            }})
+        else:
+            await db.order_items.update_one({'id': item['id']}, {'$set': {
+                'remaining_qty': 0,
+                'factory_order_qty': 0,
+                'no_further_stock': False,
+                'factory_decision_required': False,
+                'factory_decision_action': 'cancel_remaining',
+                'request_status': odw.REQUEST_STATUS_CANCELLED,
+                'status': 'Cancelled',
+                'auto_source_closed': True,
+                'retry_required': False,
+                'cancellation_reason': 'No Longer Required',
+                'updated_at': now,
+            }})
+
+    state = oas.AUTO_SOURCE_COMPLETED if action == 'move_to_factory' else oas.AUTO_SOURCE_CANCELLED
+    await db.order_headers.update_one({'id': order_id}, {'$set': {
+        'auto_sourcing_active': False,
+        'auto_sourcing_state': state,
+        'auto_sourcing_message': None,
+        'factory_decision_required': False,
+        'factory_decision_action': action,
+        'factory_decision_at': now,
+        'factory_decision_by': current_user.id,
+        'updated_at': now,
+    }})
+    await oas.append_sourcing_event(db, order, f'Factory decision: {action}', {'action': action}, current_user)
+    refreshed = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+    return {
+        'message': 'Moved balance to Factory' if action == 'move_to_factory' else 'Remaining requirement cancelled',
+        'action': action,
+        'order': refreshed,
+        'state': state,
+    }
 
 
 async def _active_recipients_for_scope(brand: str = None, dealer: str = None, branch: str = None, roles=('admin', 'master')):
@@ -5780,22 +6621,163 @@ async def _active_recipients_for_scope(brand: str = None, dealer: str = None, br
     return recipients
 
 
+async def _insert_reservations_atomic(reservation_docs: list) -> tuple:
+    """Insert reservations and roll back if any stock_id exceeds live qty.
+
+    Prevents two concurrent orders from over-allocating the same stock while a
+    supplier response is pending. Does not modify product available quantities.
+    Returns (ok, kept_docs_or_reason).
+    """
+    if not reservation_docs:
+        return True, []
+    kept = []
+    for doc in reservation_docs:
+        stock_id = doc.get('stock_id')
+        qty = float(doc.get('qty') or 0)
+        if not stock_id or qty <= 0:
+            continue
+        product = await db.products.find_one(
+            {'id': stock_id},
+            {'_id': 0, 'available_qty_number': 1, 'quantity': 1},
+        )
+        avail = float((product or {}).get('available_qty_number', (product or {}).get('quantity') or 0) or 0)
+        won = False
+        last_reason = f'over_allocated:{stock_id}'
+        for _spin in range(8):
+            reserved_before = float((await _reservation_qty_map([stock_id])).get(stock_id) or 0)
+            if reserved_before + qty > avail + 1e-9:
+                last_reason = f'over_allocated:{stock_id}'
+                break
+            try:
+                await db.stock_reservations.insert_one(dict(doc))
+            except DuplicateKeyError:
+                await asyncio.sleep(0.01 * (_spin + 1))
+                continue
+            reserved_after = float((await _reservation_qty_map([stock_id])).get(stock_id) or 0)
+            if reserved_after <= avail + 1e-9:
+                won = True
+                kept.append(doc)
+                break
+            # Lost the race — remove our row and retry so one winner can settle.
+            await db.stock_reservations.delete_one({'id': doc['id']})
+            last_reason = f'over_allocated:{stock_id}'
+            await asyncio.sleep(0.01 * (_spin + 1))
+        if not won:
+            if kept:
+                await db.stock_reservations.delete_many({'id': {'$in': [d['id'] for d in kept]}})
+            return False, last_reason
+    return True, kept
+
+
+async def _promote_attempt_to_official_request(group_doc: dict, *, now: str = None) -> dict:
+    """Mint official RQ + send email/PDF once after supplier acceptance.
+
+    Idempotent: if request_number already exists or official side-effects were
+    claimed, returns the current header without duplicating email/PDF/push.
+    """
+    if not group_doc:
+        return group_doc or {}
+    now = now or datetime.now(timezone.utc).isoformat()
+    group_id = group_doc.get('id')
+    attempt_id = group_doc.get('attempt_id') or group_doc.get('id')
+    if group_doc.get('request_number') and group_doc.get('official_confirmed'):
+        return group_doc
+
+    # Claim promotion so concurrent approve lines cannot double-mint / double-email.
+    claim = await db.request_headers.find_one_and_update(
+        {'id': group_id, 'official_side_effects_claimed': {'$ne': True}},
+        {'$set': {'official_side_effects_claimed': True, 'official_side_effects_claimed_at': now}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claim:
+        return await db.request_headers.find_one({'id': group_id}, {'_id': 0}) or group_doc
+
+    request_number = claim.get('request_number')
+    minted_now = False
+    if not request_number:
+        brand_code = claim.get('brand_code') or await resolve_brand_code_for_upload(
+            claim.get('requesting_brand') or claim.get('supplying_brand')
+        )
+        numbering = await _generate_request_number(brand_code)
+        request_number = numbering['request_number']
+        minted_now = True
+        await db.request_headers.update_one({'id': group_id}, {'$set': {
+            'request_number': request_number,
+            'request_number_date': numbering['date_key'],
+            'request_sequence': numbering['sequence'],
+            'brand_code': numbering['brand_code'],
+            'pdf_filename': f'{request_number}.pdf',
+            'official_confirmed': True,
+            'official_confirmed_at': now,
+            'sourcing_attempt': False,
+            'updated_at': now,
+        }})
+        await db.order_requests.update_many(
+            {'request_group_id': group_id},
+            {'$set': {
+                'request_number': request_number,
+                'official_confirmed': True,
+                'official_confirmed_at': now,
+                'sourcing_attempt': False,
+            }},
+        )
+        # Stamp official RQ onto order allocations previously keyed by attempt.
+        item_ids = list({
+            r.get('order_item_id')
+            for r in await db.order_requests.find({'request_group_id': group_id}, {'_id': 0, 'order_item_id': 1}).to_list(10000)
+            if r.get('order_item_id')
+        })
+        for item_id in item_ids:
+            item = await db.order_items.find_one({'id': item_id}, {'_id': 0})
+            if not item:
+                continue
+            stamped = odw.stamp_allocations_official_request(item, attempt_id, request_number)
+            await db.order_items.update_one({'id': item_id}, {'$set': {'allocations': stamped, 'updated_at': now}})
+        if claim.get('order_id'):
+            await db.order_headers.update_one(
+                {'id': claim.get('order_id'), 'auto_sourcing_current_request': attempt_id},
+                {'$set': {'auto_sourcing_current_request': request_number, 'updated_at': now}},
+            )
+
+    refreshed = await db.request_headers.find_one({'id': group_id}, {'_id': 0}) or claim
+    # Official email + PDF exactly once (create-time email is deferred).
+    if not refreshed.get('email_sent'):
+        await _send_request_group_email(refreshed)
+        refreshed = await db.request_headers.find_one({'id': group_id}, {'_id': 0}) or refreshed
+    # Official acceptance push once (attempt alert may already have been sent).
+    if not refreshed.get('mobile_push_sent', {}).get('official'):
+        try:
+            if await request_sla_scheduler.claim_push(db, refreshed, 'official'):
+                await mobile_push.notify_branch_request_push(db, refreshed, kind='new')
+                await db.request_headers.update_one(
+                    {'id': group_id},
+                    {'$set': {'mobile_push_sent.official': now}},
+                )
+        except Exception as exc:
+            logging.getLogger('nmts.mobile_push').warning('official request push failed: %s', exc)
+    if minted_now:
+        logging.getLogger('nmts.order_desk').info(
+            'Promoted attempt %s to official request %s', attempt_id, request_number,
+        )
+    return await db.request_headers.find_one({'id': group_id}, {'_id': 0}) or refreshed
+
+
 async def _create_request_group(order: dict, pairs: list, current_user: UserResponse, now: str):
-    """Create one Parts Transfer Request (one request_number, one PDF, one
-    email) for a single Requested-To destination (supplying dealer+branch).
-    `pairs` is the list of (order_item, allocation_source) tuples going to
-    that destination. Existing per-item order_requests rows are still
-    created — one per (item, source) — so Approve/Reject/Cancel and the
-    Request Center list continue to work exactly as before; they simply now
-    share a common request_number and request_group_id."""
+    """Create one sourcing attempt for a single Requested-To destination.
+
+    Before supplier acceptance this stores only an internal attempt_id (no
+    official RQ). Official request_number, email, and PDF are created on
+    acceptance via `_promote_attempt_to_official_request`. Stock is reserved
+    atomically at attempt time so concurrent orders cannot over-allocate.
+    """
     first_item, first_source = pairs[0]
     supplying_brand = order.get('brand_name')
     supplying_dealer = _order_clean_text(first_source.get('dealer_name'))
     supplying_branch = _order_clean_text(first_source.get('branch'))
 
     brand_code = await resolve_brand_code_for_upload(order.get('brand_name'))
-    numbering = await _generate_request_number(brand_code)
-    request_number = numbering['request_number']
+    attempt_meta = await _generate_attempt_id(brand_code)
+    attempt_id = attempt_meta['attempt_id']
     group_id = str(uuid.uuid4())
 
     line_items, order_request_ids = [], []
@@ -5830,7 +6812,12 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
             'status': 'Requested', 'remarks': '', 'approval_remarks': '',
             'requested_by': current_user.id, 'requested_user_name': current_user.username, 'requested_at': now,
             'requester_email': current_user.email, 'requester_mobile': getattr(current_user, 'phone', ''),
-            'request_number': request_number, 'request_group_id': group_id,
+            # Official RQ is deferred until acceptance.
+            'request_number': None,
+            'request_attempt_id': attempt_id,
+            'request_group_id': group_id,
+            'sourcing_attempt': True,
+            'official_confirmed': False,
         }
         await db.order_requests.insert_one(dict(request_doc))
         line_items.append({
@@ -5845,8 +6832,14 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         })
 
     group_doc = {
-        'id': group_id, 'request_number': request_number, 'request_number_date': numbering['date_key'],
-        'request_sequence': numbering['sequence'], 'brand_code': numbering['brand_code'],
+        'id': group_id,
+        'attempt_id': attempt_id,
+        'request_number': None,
+        'request_number_date': None,
+        'request_sequence': None,
+        'attempt_date': attempt_meta['date_key'],
+        'attempt_sequence': attempt_meta['sequence'],
+        'brand_code': attempt_meta['brand_code'],
         'order_id': order.get('id'), 'order_number': order.get('order_number'),
         'requesting_brand': order.get('brand_name'), 'requesting_dealer': order.get('dealer_name'),
         'requesting_branch': order.get('branch'),
@@ -5858,8 +6851,13 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         'order_request_ids': order_request_ids, 'items': line_items,
         'total_items': len(line_items), 'total_qty': total_qty, 'total_value': total_value,
         'status': 'Requested', 'created_at': now, 'updated_at': now, 'retry_count': 0,
-        'email_sent': False, 'email_status': 'pending', 'email_sent_at': None, 'email_error': None,
-        'receiver_email': '', 'pdf_filename': f'{request_number}.pdf', 'notification_log_id': None,
+        'email_sent': False, 'email_status': 'deferred_until_acceptance',
+        'email_sent_at': None, 'email_error': None,
+        'receiver_email': '', 'pdf_filename': None, 'notification_log_id': None,
+        'sourcing_attempt': True,
+        'official_confirmed': False,
+        'official_confirmed_at': None,
+        'official_side_effects_claimed': False,
     }
     # Response SLA timer — always a fresh full window for THIS destination
     # request. Never copy remaining time from a previous Branch request.
@@ -5871,8 +6869,6 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
     except DuplicateKeyError:
         # Concurrent duplicate ACTIVE request to the same destination
         # (partial unique index on status=Requested). Reuse the winner.
-        # Terminal history for the same destination is allowed and does not
-        # hit this path.
         existing = await db.request_headers.find_one(
             {
                 'order_id': order.get('id'),
@@ -5885,17 +6881,11 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         await db.order_requests.delete_many({'id': {'$in': order_request_ids}})
         if existing:
             return existing
-        # Fallback: any matching destination header (should be rare).
         return await db.request_headers.find_one(
             {'order_id': order.get('id'), 'supplying_dealer': supplying_dealer, 'supplying_branch': supplying_branch},
             {'_id': 0},
         )
 
-    # Reservation-aware allocation: only once the request group is durably
-    # saved (never on the DuplicateKeyError/retry path above) do we reserve
-    # the underlying stock rows, so the same physical stock can never be
-    # suggested or double-allocated again — by this order or any other —
-    # until it is released by a Reject/Cancel on this request.
     reservation_docs = []
     for (item, source), order_request_id in zip(pairs, order_request_ids):
         stock_id = source.get('stock_id')
@@ -5904,21 +6894,26 @@ async def _create_request_group(order: dict, pairs: list, current_user: UserResp
         reservation_docs.append({
             'id': str(uuid.uuid4()), 'order_id': order.get('id'), 'order_item_id': item.get('id'),
             'order_request_id': order_request_id, 'request_group_id': group_id,
+            'request_attempt_id': attempt_id,
             'part_number': item.get('part_number'), 'brand_name': order.get('brand_name'),
             'supplying_dealer': supplying_dealer, 'supplying_branch': supplying_branch,
             'stock_id': stock_id, 'qty': float(source.get('request_qty') or 0),
             'status': 'active', 'created_at': now, 'released_at': None,
         })
-    if reservation_docs:
-        await db.stock_reservations.insert_many(reservation_docs)
+    ok, reserve_result = await _insert_reservations_atomic(reservation_docs)
+    if not ok:
+        # Roll back the attempt — competing order won the stock.
+        await db.order_requests.delete_many({'id': {'$in': order_request_ids}})
+        await db.request_headers.delete_one({'id': group_id})
+        # Raise a dedicated error type so Auto Sourcing can skip/retry the
+        # destination instead of aborting the whole advance with HTTP 409.
+        raise RuntimeError(f'stock_reservation_conflict:{reserve_result}')
 
-    # Email is best-effort only: the request/request number/items above are
-    # already saved and must never be rolled back by a PDF or SMTP failure.
-    await _send_request_group_email(group_doc)
+    # Attempt alert only (no official email/PDF until acceptance).
     try:
         asyncio.create_task(_notify_new_request_push(group_doc))
     except Exception as exc:
-        logging.getLogger('nmts.mobile_push').warning('new request push schedule failed: %s', exc)
+        logging.getLogger('nmts.mobile_push').warning('attempt request push schedule failed: %s', exc)
     return await db.request_headers.find_one({'id': group_id}, {'_id': 0})
 
 
@@ -6012,19 +7007,51 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
         if matched:
             return _send_requests_response(matched, duplicate=True)
 
+    # Atomic claim closes the double-click/retry race before any request_headers insert.
+    claimed = await db.order_headers.find_one_and_update(
+        {
+            'id': order_id,
+            'send_requests_fingerprint': {'$ne': fingerprint},
+            'send_requests_fingerprints': {'$nin': [fingerprint]},
+        },
+        {'$addToSet': {'send_requests_fingerprints': fingerprint},
+         '$set': {'send_requests_fingerprint': fingerprint, 'send_requests_claim_at': now}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed:
+        existing_groups = await db.request_headers.find({'order_id': order_id}, {'_id': 0}).sort('created_at', 1).to_list(1000)
+        matched = [
+            g for g in existing_groups
+            if (_order_clean_text(g.get('supplying_dealer')), _order_clean_text(g.get('supplying_branch'))) in groups
+        ]
+        if matched:
+            return _send_requests_response(matched, duplicate=True)
+        # Claim lost to a concurrent sender that has not finished inserts yet.
+        raise HTTPException(status_code=409, detail='Request send already in progress for this selection')
+
     created_group_docs = []
     for _key, pairs in groups.items():
-        group_doc = await _create_request_group(order, pairs, current_user, now)
+        try:
+            group_doc = await _create_request_group(order, pairs, current_user, now)
+        except RuntimeError as exc:
+            if str(exc).startswith('stock_reservation_conflict:'):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f'Stock no longer available for reservation. {exc}',
+                ) from exc
+            raise
         created_group_docs.append(group_doc)
         request_number = (group_doc or {}).get('request_number')
+        attempt_id = (group_doc or {}).get('attempt_id') or (group_doc or {}).get('id')
+        group_id = (group_doc or {}).get('id')
         touched_item_ids = set()
         for item, source in pairs:
             touched_item_ids.add(item.get('id'))
-            # Stamp allocation rows with request number / Request Sent status
+            # Stamp allocation rows with attempt id / Request Sent status
             fresh = await db.order_items.find_one({'id': item.get('id')}, {'_id': 0})
             if not fresh:
                 continue
-            stamped = odw.mark_allocations_sent(fresh, [source], request_number, now)
+            stamped = odw.mark_allocations_sent(fresh, [source], request_number, now, attempt_id=attempt_id)
             await db.order_items.update_one({'id': item.get('id')}, {'$set': {
                 'allocations': stamped,
                 'status': 'Requested',
@@ -6038,7 +7065,7 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
         for item_id in touched_item_ids:
             # Store source_type on the underlying order_requests for this batch
             await db.order_requests.update_many(
-                {'order_item_id': item_id, 'request_number': request_number},
+                {'order_item_id': item_id, 'request_group_id': group_id},
                 {'$set': {'source_type': level or odw.allocation_level(
                     {'dealer_name': _key[0], 'branch': _key[1]}, order
                 ), 'level': level or odw.allocation_level(
@@ -6046,6 +7073,7 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
                 )}},
             )
 
+    prior_fps = set(claimed.get('send_requests_fingerprints') or [])
     prior_fps.add(fingerprint)
     await db.order_headers.update_one({'id': order_id}, {'$set': {
         'status': 'Requested', 'updated_at': now,
@@ -6057,7 +7085,11 @@ async def order_desk_send_requests_v2(order_id: str, payload: dict = None, curre
     await db.order_activity.insert_one({
         'id': str(uuid.uuid4()), 'order_id': order_id, 'order_number': order.get('order_number'),
         'action': action or 'Requests Sent', 'performed_by': current_user.id, 'performed_user_name': current_user.username,
-        'created_at': now, 'details': {'level': level or 'all', 'request_numbers': [g.get('request_number') for g in created_group_docs if g]},
+        'created_at': now, 'details': {
+            'level': level or 'all',
+            'attempt_ids': [g.get('attempt_id') for g in created_group_docs if g],
+            'request_numbers': [g.get('request_number') for g in created_group_docs if g and g.get('request_number')],
+        },
     })
 
     return _send_requests_response(created_group_docs, duplicate=False)
@@ -6194,11 +7226,7 @@ async def order_desk_re_enquire(order_id: str, payload: dict = None, current_use
             # Clear only unsent draft allocations so Auto Suggest can refill remaining.
             'allocations': [
                 a for a in (item.get('allocations') or [])
-                if a.get('request_no') or a.get('request_number')
-                or str(a.get('status') or '').lower() in (
-                    'request sent', 'requested', 'accepted', 'partially accepted',
-                    'rejected', 'cancelled', 'completed', 'dispatched', 'received',
-                )
+                if odw.allocation_is_sent(a)
             ],
             'updated_at': now,
         }})
@@ -6254,7 +7282,7 @@ async def order_desk_request_cancellation(order_id: str, item_id: str, payload: 
         raise HTTPException(status_code=400, detail='Accepted quantity is locked and cannot be cancelled')
 
     active_reservations = await db.stock_reservations.count_documents({'order_item_id': item_id, 'status': 'active'})
-    has_sent = any(r.get('status') not in (None, '') for r in item_reqs)
+    has_sent = any(r.get('status') not in (None, '', 'Rejected', 'Cancelled') for r in item_reqs)
     has_acceptance = any(float(r.get('accepted_qty') or r.get('approved_qty') or 0) > 0 for r in item_reqs)
     has_logistics = any(r.get('status') in ('Dispatched', 'Received', 'Completed') for r in item_reqs)
     safe_auto = (not has_sent) and active_reservations == 0 and (not has_acceptance) and (not has_logistics)
@@ -6310,7 +7338,7 @@ async def order_desk_request_cancellation(order_id: str, item_id: str, payload: 
         # Clear unsent draft allocations only; keep any historical allocations if somehow present
         item_update['allocations'] = [
             a for a in (item.get('allocations') or [])
-            if a.get('request_no') or a.get('request_number')
+            if odw.allocation_is_sent(a)
         ]
 
     await db.order_items.update_one({'id': item_id}, {'$set': item_update})
@@ -6343,6 +7371,8 @@ async def order_desk_decide_cancellation(cancellation_id: str, payload: dict, cu
     doc = await db.order_cancellation_requests.find_one({'id': cancellation_id}, {'_id': 0})
     if not doc:
         raise HTTPException(status_code=404, detail='Cancellation request not found')
+    if role == 'admin' and doc.get('dealer') != current_user.group:
+        raise HTTPException(status_code=403, detail='Not authorized for this cancellation')
     if doc.get('approval_status') != 'pending':
         return {'message': f'Already {doc.get("approval_status")}', 'cancellation': doc}
 
@@ -6405,11 +7435,16 @@ async def order_desk_decide_cancellation(cancellation_id: str, payload: dict, cu
 async def resend_request_group_email(request_number: str, current_user: UserResponse = Depends(get_current_user)):
     """Safe, explicit retry for a request whose email previously failed.
     Never creates a new request or a new request number."""
-    group_doc = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
+    group_doc = await _resolve_request_header(request_number)
     if not group_doc:
         raise HTTPException(status_code=404, detail='Request not found')
+    if not group_doc.get('request_number'):
+        raise HTTPException(
+            status_code=400,
+            detail='Official request email/PDF is available only after supplier acceptance.',
+        )
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or group_doc.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(group_doc, current_user)
     is_requester = group_doc.get('requested_by') == current_user.id or (role != 'user' and group_doc.get('requesting_dealer') == current_user.group)
     if not (is_supplier or is_requester):
         raise HTTPException(status_code=403, detail='Not authorized for this request')
@@ -6453,12 +7488,28 @@ async def _apply_request_group_timeout(group_doc: dict, actor: UserResponse):
     qty is marked retry_required so the existing next-source flow continues.
     """
     request_number = group_doc.get('request_number')
+    attempt_id = group_doc.get('attempt_id')
+    group_id = group_doc.get('id')
     now = datetime.now(timezone.utc).isoformat()
+    line_or = []
+    if group_id:
+        line_or.append({'request_group_id': group_id})
+    if attempt_id:
+        line_or.append({'request_attempt_id': attempt_id})
+    if request_number:
+        line_or.append({'request_number': request_number})
     pending = await db.order_requests.find(
-        {'request_number': request_number, 'status': 'Requested'}, {'_id': 0},
+        {'$and': [{'$or': line_or or [{'_id': None}]}, {'status': 'Requested'}]},
+        {'_id': 0},
     ).to_list(10000)
     if not pending:
-        return {'message': 'No unanswered items to cancel', 'cancelled': 0, 'cancel_allowed': False, 'request_number': request_number}
+        return {
+            'message': 'No unanswered items to cancel',
+            'cancelled': 0,
+            'cancel_allowed': False,
+            'request_number': request_number,
+            'attempt_id': attempt_id,
+        }
 
     cancelled = 0
     for req in pending:
@@ -6489,12 +7540,25 @@ async def _apply_request_group_timeout(group_doc: dict, actor: UserResponse):
         'timeout_cancelled': True,
         'timeout_cancelled_at': now,
         'mobile_expiry_status': 'EXPIRED – NO RESPONSE',
+        'official_confirmed': False,
+        'audit_only_attempt': True,
         'updated_at': now,
     }})
     order = await db.order_headers.find_one({'id': group_doc.get('order_id')}, {'_id': 0}) or {}
     await odw.append_order_audit(db, order, 'Cancelled – No Response', actor, {
         'request_number': request_number, 'cancelled': cancelled,
     })
+    try:
+        import order_auto_sourcing as oas
+        if order.get('auto_sourcing_active') or order.get('auto_sourcing_state') in (
+            oas.AUTO_SOURCE_WAITING, oas.AUTO_SOURCE_LAST_CHANCE, oas.AUTO_SOURCE_ACTIVE,
+        ):
+            await oas.append_sourcing_event(db, order, 'Auto Sourcing timeout – next supplier', {
+                'request_number': request_number, 'cancelled': cancelled,
+            }, actor)
+            asyncio.create_task(_auto_source_continue_safe(order.get('id'), reason='timeout'))
+    except Exception as exc:
+        logging.getLogger('nmts.order_auto_sourcing').warning('timeout auto-continue failed: %s', exc)
     return {
         'message': f'{cancelled} unanswered item(s) cancelled – no response.',
         'cancelled': cancelled,
@@ -6507,8 +7571,9 @@ async def _apply_request_group_timeout(group_doc: dict, actor: UserResponse):
 async def cancel_request_group_timeout(request_number: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     """Cancel unanswered items after response deadline. Does not unlock Accepted qty.
     Cancellation reason: Cancelled – No Response. Does NOT create a Rejected-Today freeze.
+    Path param accepts official RQ, attempt_id, or group id.
     """
-    group_doc = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
+    group_doc = await _resolve_request_header(request_number)
     if not group_doc:
         raise HTTPException(status_code=404, detail='Request not found')
     role = (current_user.role or '').lower()
@@ -6525,11 +7590,11 @@ async def cancel_request_group_timeout(request_number: str, payload: dict = None
 
 @api_router.get('/requests/group/{request_number}')
 async def request_group_detail(request_number: str, current_user: UserResponse = Depends(get_current_user)):
-    group_doc = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0})
+    group_doc = await _resolve_request_header(request_number)
     if not group_doc:
         raise HTTPException(status_code=404, detail='Request not found')
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or group_doc.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(group_doc, current_user)
     is_requester = group_doc.get('requested_by') == current_user.id or (role != 'user' and group_doc.get('requesting_dealer') == current_user.group)
     if not (is_supplier or is_requester):
         raise HTTPException(status_code=403, detail='Not authorized for this request')
@@ -6572,16 +7637,19 @@ async def save_factory_system_order(
     """Save generic System Order Number for Factory-stage remaining qty.
 
     Brand-agnostic (DPS / OEM / other). Closes remaining Factory sourcing qty.
-    Master Admin / Admin may save; Master may correct with audit reason.
+    The order creator, Admin, or Master may save; only Master may correct an
+    existing number with an audit reason.
     """
     role = (current_user.role or '').lower()
-    if role not in ('master', 'admin'):
-        raise HTTPException(status_code=403, detail='Only Master/Admin can save System Order Number')
+    if role not in ('master', 'admin', 'user'):
+        raise HTTPException(status_code=403, detail='Not authorized to save System Order Number')
     item = await db.order_items.find_one({'id': item_id}, {'_id': 0})
     if not item:
         raise HTTPException(status_code=404, detail='Order item not found')
     order = await db.order_headers.find_one({'id': item.get('order_id')}, {'_id': 0}) or {}
     odg.assert_order_not_finished(order)
+    if role == 'user' and order.get('created_by') != current_user.id:
+        raise HTTPException(status_code=403, detail='Only the order creator can save System Order Number')
     if role == 'admin' and order.get('dealer_name') and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not allowed for this dealer scope')
 
@@ -6740,14 +7808,17 @@ async def finish_order_desk_order(order_id: str, current_user: UserResponse = De
     role = (current_user.role or '').lower()
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized for this order')
+    if order.get('finished_at'):
+        return {'message': 'Order already finished', 'order': order, 'already_finished': True}
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    items = await odw.enrich_order_items(db, order, items)
     reqs_by_item = {}
     for req in await db.order_requests.find({'order_id': order_id}, {'_id': 0}).to_list(20000):
         reqs_by_item.setdefault(req.get('order_item_id'), []).append(req)
     readiness = odw.evaluate_finish_readiness(order, items, reqs_by_item)
     if not readiness.get('can_finish'):
-        raise HTTPException(status_code=400, detail={
-            'message': 'Order cannot be finished yet',
+        raise HTTPException(status_code=409, detail={
+            'message': odw.finish_block_reason(readiness),
             **readiness,
         })
     now = datetime.now(timezone.utc).isoformat()
@@ -6781,6 +7852,7 @@ async def _load_order_fulfillment(order_id: str, current_user: UserResponse):
     if role != 'master' and order.get('created_by') != current_user.id and order.get('dealer_name') != current_user.group:
         raise HTTPException(status_code=403, detail='Not authorized for this order')
     items = await db.order_items.find({'order_id': order_id}, {'_id': 0}).to_list(10000)
+    items = await odw.enrich_order_items(db, order, items)
     reqs_by_item = {}
     for req in await db.order_requests.find({'order_id': order_id}, {'_id': 0}).to_list(20000):
         reqs_by_item.setdefault(req.get('order_item_id'), []).append(req)
@@ -7091,7 +8163,7 @@ async def request_center_detail(request_id: str, current_user: UserResponse = De
         req = dict(req)
         req["archive_source"] = "s3"
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or req.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(req, current_user)
     is_requester = req.get('requested_by') == current_user.id or (role != 'user' and req.get('requesting_dealer') == current_user.group)
     if not (is_supplier or is_requester):
         raise HTTPException(status_code=403, detail='Not authorized for this request')
@@ -7107,7 +8179,7 @@ async def request_center_print_pdf(request_number: str, current_user: UserRespon
         raise HTTPException(status_code=404, detail='Request not found')
     sample = items[0] if items else header or {}
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or sample.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(sample, current_user)
     is_requester = (
         sample.get('requested_by') == current_user.id
         or (role != 'user' and sample.get('requesting_dealer') == current_user.group)
@@ -7156,12 +8228,28 @@ def _first_item_actor(items, name_keys, mobile_keys):
 
 async def _sync_request_header_after_item_decision(req: dict, now: str):
     """Keep the request header/PDF summary aligned with item-wise decisions."""
+    group_id = req.get('request_group_id')
+    attempt_id = req.get('request_attempt_id')
     request_number = req.get('request_number')
-    if not request_number:
+    if not group_id and not attempt_id and not request_number:
         return
-    items = await db.order_requests.find({'request_number': request_number}, {'_id': 0}).to_list(10000)
+    line_filter = {'request_group_id': group_id} if group_id else (
+        {'request_attempt_id': attempt_id} if attempt_id else {'request_number': request_number}
+    )
+    items = await db.order_requests.find(line_filter, {'_id': 0}).to_list(10000)
     if not items:
         return
+    header = await db.request_headers.find_one(
+        {'$or': [x for x in [
+            {'id': group_id} if group_id else None,
+            {'attempt_id': attempt_id} if attempt_id else None,
+            {'request_number': request_number} if request_number else None,
+        ] if x]},
+        {'_id': 0},
+    ) or {}
+    group_id = group_id or header.get('id')
+    attempt_id = attempt_id or header.get('attempt_id')
+    request_number = request_number or header.get('request_number')
     statuses = [i.get('status', 'Requested') for i in items]
     accepted_items = [i for i in items if float(i.get('accepted_qty', i.get('approved_qty', 0)) or 0) > 0]
     accepted_statuses = [i.get('status', 'Approved') for i in accepted_items]
@@ -7247,8 +8335,8 @@ async def _sync_request_header_after_item_decision(req: dict, now: str):
     if received_mobile:
         header_update['received_user_mobile'] = received_mobile
         header_update['completed_user_mobile'] = received_mobile
+    existing = header or {}
     if header_status != 'Requested':
-        existing = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0}) or {}
         if not existing.get('timer_frozen'):
             if existing.get('timeout_cancelled') or header_status == 'Cancelled':
                 freeze_status = 'timeout' if existing.get('timeout_cancelled') else 'cancelled'
@@ -7260,10 +8348,47 @@ async def _sync_request_header_after_item_decision(req: dict, now: str):
                 header_update['completed_at'] = now
             if header_status == 'Received' and not existing.get('received_at'):
                 header_update['received_at'] = now
-    await db.request_headers.update_one(
-        {'request_number': request_number},
-        {'$set': header_update},
+    if accepted_items:
+        header_update['official_confirmed'] = True
+        header_update['official_confirmed_at'] = now
+        header_update['sourcing_attempt'] = False
+    elif header_status in ('Rejected', 'Cancelled'):
+        header_update['official_confirmed'] = False
+        header_update['sourcing_attempt'] = True
+        header_update['audit_only_attempt'] = True
+    header_filter = {'id': group_id} if group_id else (
+        {'attempt_id': attempt_id} if attempt_id else {'request_number': request_number}
     )
+    await db.request_headers.update_one(header_filter, {'$set': header_update})
+    # Mint official RQ + email/PDF once on first acceptance.
+    if accepted_items and group_id:
+        promoted = await _promote_attempt_to_official_request(
+            {**existing, **header_update, 'id': group_id, 'attempt_id': attempt_id},
+            now=now,
+        )
+        request_number = (promoted or {}).get('request_number') or request_number
+    # Sequential Auto Sourcing: advance after a terminal response on the active attempt.
+    if header_status in ('Approved', 'Partially Approved', 'Rejected', 'Cancelled'):
+        try:
+            order_id = (req or {}).get('order_id') or (accepted_items[0].get('order_id') if accepted_items else None)
+            if order_id:
+                order_doc = await db.order_headers.find_one({'id': order_id}, {'_id': 0})
+                if order_doc and order_doc.get('auto_sourcing_active'):
+                    asyncio.create_task(_auto_source_continue_safe(order_id, reason=f'header_{header_status}'))
+        except Exception as exc:
+            logging.getLogger('nmts.order_auto_sourcing').warning('auto-source continue schedule failed: %s', exc)
+
+
+def _is_request_supplier(doc: dict, current_user: UserResponse) -> bool:
+    """Same scope as Request Center incoming: Admin by dealer, User by dealer + branch."""
+    role = (current_user.role or '').lower()
+    if role == 'master':
+        return True
+    if not doc or doc.get('supplying_dealer') != current_user.group:
+        return False
+    if role == 'admin':
+        return True
+    return str(doc.get('supplying_branch') or '').strip().casefold() == str(current_user.location or '').strip().casefold()
 
 
 async def _request_center_transition(request_id: str, new_status: str, remarks: str, current_user: UserResponse, accepted_qty=None):
@@ -7272,7 +8397,7 @@ async def _request_center_transition(request_id: str, new_status: str, remarks: 
         raise HTTPException(status_code=404, detail='Request not found')
 
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or req.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(req, current_user)
     if new_status != 'Cancelled' and not is_supplier:
         raise HTTPException(status_code=403, detail='Only the supplying Admin/Master can approve or reject a request')
     is_requester = req.get('requested_by') == current_user.id or (role != 'user' and req.get('requesting_dealer') == current_user.group)
@@ -7311,6 +8436,10 @@ async def _request_center_transition(request_id: str, new_status: str, remarks: 
         update['accepted_user_mobile'] = _actor_mobile(current_user)
         update['picked_user_name'] = _actor_name(current_user)
         update['picked_user_mobile'] = _actor_mobile(current_user)
+        # Official Request Number is confirmed only for finally accepted qty.
+        update['official_confirmed'] = True
+        update['official_confirmed_at'] = now
+        update['sourcing_attempt'] = False
     await db.order_requests.update_one({'id': request_id}, {'$set': update})
 
     if new_status in ('Rejected', 'Cancelled') or (new_status == 'Approved' and accepted < requested_qty):
@@ -7344,6 +8473,7 @@ async def _request_center_transition(request_id: str, new_status: str, remarks: 
     })
     updated = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
     await _sync_request_header_after_item_decision(updated, now)
+    updated = await db.order_requests.find_one({'id': request_id}, {'_id': 0})
     try:
         await event_archive.maybe_enqueue_request_terminal(db, updated or {}, actor_id=current_user.id)
     except Exception as exc:
@@ -7393,7 +8523,7 @@ async def _notify_request_status_change(req: dict, event: str, actor_id: str = "
 
 async def _require_supplier_for_request(req: dict, current_user: UserResponse):
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or req.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(req, current_user)
     if not is_supplier:
         raise HTTPException(status_code=403, detail='Only the supplying scope can update picking / dispatch')
     return is_supplier
@@ -7462,6 +8592,10 @@ async def request_center_group_picking_finished(request_number: str, current_use
     return {'message': f'Picking finished for {updated} item(s)', 'request_number': request_number}
 
 
+DISPATCH_DOCUMENT_EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg', '.xls', '.xlsx'}
+DISPATCH_DOCUMENT_MAX_BYTES = 10 * 1024 * 1024
+
+
 async def _ingest_dispatch_document(
     *,
     request_number: str,
@@ -7480,10 +8614,14 @@ async def _ingest_dispatch_document(
         float(str(document_value).replace(',', '').replace('₹', '').strip())
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail=rff.DISPATCH_INCOMPLETE_MESSAGE)
+    ext = Path(file.filename or '').suffix.lower()
+    if ext not in DISPATCH_DOCUMENT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail='Dispatch document must be PDF, JPG, PNG or Excel')
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail=rff.DISPATCH_INCOMPLETE_MESSAGE)
-    ext = Path(file.filename or 'document.bin').suffix or '.bin'
+    if len(content) > DISPATCH_DOCUMENT_MAX_BYTES:
+        raise HTTPException(status_code=400, detail='Dispatch document exceeds 10 MB limit')
     safe = f"{request_number}_{part_or_id}_{uuid.uuid4().hex[:8]}{ext}"
     stored = await file_objects.store_bytes(
         module='request-dispatch-documents',
@@ -7569,6 +8707,26 @@ async def request_center_group_dispatch_document(
     return {'message': 'Dispatch document saved', 'dispatch_document': payload}
 
 
+@api_router.get('/requests/group/{request_number}/dispatch-document')
+async def request_center_view_dispatch_document(request_number: str, current_user: UserResponse = Depends(get_current_user)):
+    header = await db.request_headers.find_one({'request_number': request_number}, {'_id': 0}) or {}
+    items = await db.order_requests.find({'request_number': request_number}, {'_id': 0}).to_list(10000)
+    if not header and not items:
+        raise HTTPException(status_code=404, detail='Request not found')
+    sample = items[0] if items else header
+    role = (current_user.role or '').lower()
+    is_requester = (
+        sample.get('requested_by') == current_user.id
+        or (role != 'user' and sample.get('requesting_dealer') == current_user.group)
+    )
+    if not (_is_request_supplier(sample, current_user) or is_requester):
+        raise HTTPException(status_code=403, detail='Not authorized for this request')
+    doc = header.get('dispatch_document') or next((i.get('dispatch_document') for i in items if i.get('dispatch_document')), None)
+    if not doc or not file_objects.meta_has_readable_bytes(doc):
+        raise HTTPException(status_code=404, detail='No dispatch document for this request')
+    return file_objects.streaming_response_from_meta(doc)
+
+
 @api_router.post('/requests/{request_id}/approve')
 async def request_center_approve(request_id: str, payload: dict = None, current_user: UserResponse = Depends(get_current_user)):
     remarks = (payload or {}).get('remarks', '') if payload else ''
@@ -7607,7 +8765,7 @@ async def _request_logistics_transition(request_id: str, new_status: str, remark
     if not req:
         raise HTTPException(status_code=404, detail='Request not found')
     role = (current_user.role or '').lower()
-    is_supplier = role == 'master' or req.get('supplying_dealer') == current_user.group
+    is_supplier = _is_request_supplier(req, current_user)
     is_requester = role == 'master' or req.get('requested_by') == current_user.id or (role != 'user' and req.get('requesting_dealer') == current_user.group)
     if new_status == 'Dispatched' and not is_supplier:
         raise HTTPException(status_code=403, detail='Only the supplying scope can dispatch accepted parts')
@@ -7720,9 +8878,11 @@ class StockVerificationSessionCreate(BaseModel):
 
 
 class StockVerificationCorrection(BaseModel):
-    correction_status: str = "pending"  # pending, corrected, not_required
+    correction_status: str = "pending"  # pending, corrected, no_correction_needed
     correction_method: str = ""  # system_corrected, physical_relocated, both, no_action
     correction_remarks: str = ""
+    physical_quantity: Optional[float] = None
+    correction_reason: Optional[str] = None
 
 
 def _mobile_dashboard_scope_query(
@@ -7761,6 +8921,15 @@ def _mobile_dashboard_scope_query(
 # ==================== Legacy /mobile pairing, device, and stock-search routes removed ====================
 # Superseded by the Mobile User + device-session model in mobile_api.py (see PART_26 rewrite).
 # Perpetual Stock (web-authenticated verification/correction workflow) below is preserved unchanged.
+
+
+async def _find_current_stock_product(query: dict) -> Optional[dict]:
+    # Older and superseded uploads keep their rows with is_active_today=False.
+    return await db.products.find_one(
+        {**query, "publish_status": "Published", "is_active_today": True},
+        {"_id": 0},
+        sort=[("updated_at", -1)],
+    )
 
 
 def _stock_snapshot_quantity(product: dict) -> float:
@@ -7808,7 +8977,7 @@ async def lookup_mobile_stock_snapshot(
 
     query = _mobile_dashboard_scope_query(current_user, brand, dealer, branch)
     query["part_number"] = {"$regex": f"^{re.escape(clean_part)}$", "$options": "i"}
-    product = await db.products.find_one(query, {"_id": 0}, sort=[("updated_at", -1)])
+    product = await _find_current_stock_product(query)
     if not product:
         raise HTTPException(
             status_code=404,
@@ -7919,7 +9088,7 @@ async def _build_verification_record(item, scope_query, current_user, session_id
         raise HTTPException(status_code=400, detail="Part number is required for every item")
     query = dict(scope_query)
     query["part_number"] = {"$regex": f"^{re.escape(clean_part)}$", "$options": "i"}
-    product = await db.products.find_one(query, {"_id": 0}, sort=[("updated_at", -1)])
+    product = await _find_current_stock_product(query)
     if not product:
         raise HTTPException(status_code=404, detail=f"Part {clean_part} not found in the selected Dashboard scope")
     system_qty = _stock_snapshot_quantity(product)
@@ -8085,6 +9254,7 @@ async def list_verification_history_records(
     mobile_user_id: str = None,
     verification_type: str = None,
     result_filter: str = None,
+    correction_status: str = None,
     part_number: str = None,
     loc: str = None,
     limit: int = 500,
@@ -8119,15 +9289,23 @@ async def list_verification_history_records(
         else:
             query["verification_type"] = vt
     if result_filter and result_filter.lower() != "all":
-        rf = result_filter.lower()
-        if rf == "match":
+        rf = result_filter.lower().replace(" ", "_")
+        if rf in {"match", "matched"}:
             query["quantity_status"] = "matched"
         elif rf == "shortage":
             query["quantity_status"] = "shortage"
         elif rf == "excess":
             query["quantity_status"] = "excess"
+        elif rf in {"location_mismatch", "loc_mismatch", "location"}:
+            query["location_status"] = {"$in": ["mismatch", "location_mismatch"]}
         elif rf == "damage":
             query["has_damage"] = True
+    if correction_status and str(correction_status).lower() not in {"", "all"}:
+        cs = str(correction_status).strip().lower().replace(" ", "_")
+        if cs in {"no_correction_needed", "not_required", "not_required".replace("-", "_")}:
+            query["correction_status"] = {"$in": ["no_correction_needed", "not_required"]}
+        else:
+            query["correction_status"] = cs
     rows = await db.stock_verification_history.find(query, {"_id": 0}).sort("verified_at", -1).limit(min(limit, 2000)).to_list(2000)
     return rows
 
@@ -8261,7 +9439,7 @@ async def create_mobile_stock_verification(payload: StockVerificationCreate, cur
     )
     clean_part = payload.part_number.strip()
     query["part_number"] = {"$regex": f"^{re.escape(clean_part)}$", "$options": "i"}
-    product = await db.products.find_one(query, {"_id": 0}, sort=[("updated_at", -1)])
+    product = await _find_current_stock_product(query)
     if not product:
         raise HTTPException(status_code=404, detail="Part not found in your permitted stock scope")
 
@@ -8349,29 +9527,100 @@ async def update_stock_verification_correction(
     payload: StockVerificationCorrection,
     current_user: UserResponse = Depends(get_current_user),
 ):
-    if current_user.role not in {"master", "admin"}:
-        raise HTTPException(status_code=403, detail="Only Master/Admin can update correction information")
     record = await db.stock_verifications.find_one({"id": verification_id}, {"_id": 0})
     if not record:
+        record = await db.stock_verification_history.find_one({"id": verification_id}, {"_id": 0})
+    if not record:
         raise HTTPException(status_code=404, detail="Verification record not found")
-    scope_query = _verification_scope_query(current_user)
-    if scope_query and not await db.stock_verifications.find_one({"id": verification_id, **scope_query}, {"_id": 0, "id": 1}):
-        raise HTTPException(status_code=403, detail="Verification is outside your permitted scope")
+    role = (current_user.role or "").lower()
+    if role not in {"master", "admin", "user"}:
+        raise HTTPException(status_code=403, detail="Not authorized to update correction information")
+    if role in {"admin", "user"}:
+        if current_user.brand and str(record.get("brand_name") or "").casefold() != str(current_user.brand).casefold():
+            raise HTTPException(status_code=403, detail="Verification is outside your permitted scope")
+        if current_user.group and str(record.get("dealer_name") or "").casefold() != str(current_user.group).casefold():
+            raise HTTPException(status_code=403, detail="Verification is outside your permitted scope")
+    if role == "user":
+        if current_user.location and str(record.get("branch") or "").casefold() != str(current_user.location).casefold():
+            raise HTTPException(status_code=403, detail="Verification is outside your permitted scope")
+    existing_status = str(record.get("correction_status") or "").strip().lower()
+    if existing_status in {"corrected", "no_correction_needed", "not_required"}:
+        raise HTTPException(status_code=409, detail="Correction is closed and cannot be repeated")
     correction_status = (payload.correction_status or "pending").strip().lower()
+    if correction_status in {"not_required", "not required"}:
+        correction_status = "no_correction_needed"
     correction_method = (payload.correction_method or "").strip().lower()
-    if correction_status not in {"pending", "corrected", "not_required"}:
+    remarks = (payload.correction_remarks or payload.correction_reason or "").strip()
+    if correction_status in {"corrected", "no_correction_needed"} and not remarks:
+        raise HTTPException(status_code=400, detail="Remarks are required")
+    if correction_status not in {"pending", "corrected", "no_correction_needed"}:
         raise HTTPException(status_code=400, detail="Invalid correction status")
     if correction_method not in {"", "system_corrected", "physical_relocated", "both", "no_action"}:
         raise HTTPException(status_code=400, detail="Invalid correction method")
     update = {
         "correction_status": correction_status,
         "correction_method": correction_method,
-        "correction_remarks": (payload.correction_remarks or "").strip(),
+        "correction_remarks": remarks,
         "correction_updated_by": current_user.id,
         "correction_updated_by_name": current_user.username,
         "correction_updated_at": datetime.now(timezone.utc),
+        "corrected_by": current_user.id,
+        "corrected_by_name": current_user.username,
+        "corrected_at": datetime.now(timezone.utc),
     }
+    if payload.physical_quantity is not None:
+        try:
+            new_qty = float(payload.physical_quantity)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Physical quantity must be a valid number")
+        prev_qty = float(record.get("physical_quantity") or 0)
+        if abs(prev_qty - new_qty) > 1e-9:
+            reason = (payload.correction_reason or payload.correction_remarks or "").strip()
+            if not reason:
+                raise HTTPException(status_code=400, detail="Correction reason is required to change physical quantity")
+            original = record.get("original_physical_quantity")
+            if original is None:
+                original = prev_qty
+            history = list(record.get("quantity_edit_history") or [])
+            edit_count = int(record.get("edit_count") or 0) + 1
+            edit_status = "Edited" if edit_count == 1 else "Re-edited"
+            history.append(
+                {
+                    "previous_quantity": prev_qty,
+                    "new_quantity": new_qty,
+                    "correction_reason": reason,
+                    "user_name": current_user.username,
+                    "mobile_user_id": record.get("mobile_user_id") or current_user.id,
+                    "device_id": record.get("device_id") or "",
+                    "edited_at": datetime.now(timezone.utc),
+                    "status": edit_status,
+                }
+            )
+            system_qty = float(record.get("system_quantity") or 0)
+            difference = new_qty - system_qty
+            mav = float(record.get("mav") or 0)
+            shortage_qty = abs(difference) if difference < 0 else 0.0
+            excess_qty = difference if difference > 0 else 0.0
+            update.update(
+                {
+                    "physical_quantity": new_qty,
+                    "difference": difference,
+                    "shortage_qty": shortage_qty,
+                    "excess_qty": excess_qty,
+                    "shortage_value": shortage_qty * mav,
+                    "excess_value": excess_qty * mav,
+                    "quantity_status": "matched" if difference == 0 else ("shortage" if difference < 0 else "excess"),
+                    "original_physical_quantity": original,
+                    "quantity_edit_history": history,
+                    "edit_count": edit_count,
+                    "quantity_edit_status": edit_status,
+                    "correction_reason": reason,
+                }
+            )
     await db.stock_verifications.update_one({"id": verification_id}, {"$set": update})
+    history_id = record.get("id")
+    if history_id:
+        await db.stock_verification_history.update_one({"id": history_id}, {"$set": update})
     return await db.stock_verifications.find_one({"id": verification_id}, {"_id": 0})
 
 
@@ -8660,8 +9909,12 @@ async def retry_failed_archive(archive_id: str, current_user: UserResponse = Dep
 
 
 @api_router.get("/storage/archives/{archive_id}/download")
-async def download_archive(archive_id: str, current_user: UserResponse = Depends(get_current_user)):
-    """Download archived dataset from REAL S3 (Master only). Local fallback is not offered as S3."""
+async def download_archive(archive_id: str, redirect: bool = True, current_user: UserResponse = Depends(get_current_user)):
+    """Download archived dataset from REAL S3 (Master only). Local fallback is not offered as S3.
+
+    redirect=false returns the presigned URL as JSON: the bucket has no CORS, so a
+    browser XHR cannot follow the 302, but it can navigate to the URL.
+    """
     await _ensure_master(current_user)
     from fastapi.responses import Response, RedirectResponse
     import archive_verify as av
@@ -8701,6 +9954,8 @@ async def download_archive(archive_id: str, current_user: UserResponse = Depends
             )
         except Exception:
             pass
+        if not redirect:
+            return {"url": url, "filename": key.split("/")[-1] or f"{archive_id}.jsonl.gz", "expires_seconds": 900}
         return RedirectResponse(url=url, status_code=302)
     try:
         data, ctype = storage.download_bytes(key)
@@ -8805,6 +10060,12 @@ async def storage_archive_delete_mongo(
     )
 
 
+@api_router.get("/features")
+async def public_feature_flags():
+    """Unauthenticated, non-secret feature flags resolved by the backend."""
+    return feature_flags.public_features()
+
+
 @api_router.get("/testing/runtime")
 async def testing_runtime_status():
     """Non-secret testing banner / filter status. Production returns is_testing=false."""
@@ -8821,6 +10082,11 @@ async def login_screen_image(image_id: str):
     return await login_screen.stream_image(db, image_id)
 
 
+@api_router.get("/login-screen/poster/{image_id}")
+async def login_screen_poster(image_id: str):
+    return await login_screen.stream_poster(db, image_id)
+
+
 @api_router.get("/login-screen/manage")
 async def login_screen_manage(current_user: UserResponse = Depends(get_current_user)):
     login_screen.require_master(current_user)
@@ -8830,11 +10096,23 @@ async def login_screen_manage(current_user: UserResponse = Depends(get_current_u
 @api_router.post("/login-screen/default")
 async def login_screen_upload_default(
     file: UploadFile = File(...),
+    poster: Optional[UploadFile] = File(default=None),
+    display_settings: Optional[str] = Form(default=None),
     current_user: UserResponse = Depends(get_current_user),
 ):
     login_screen.require_master(current_user)
     data = await file.read()
-    return await login_screen.save_default(db, data, file.content_type, file.filename)
+    poster_data = await poster.read() if poster is not None else None
+    return await login_screen.save_default(
+        db,
+        data,
+        file.content_type,
+        file.filename,
+        poster_data=poster_data,
+        poster_content_type=poster.content_type if poster is not None else None,
+        poster_filename=poster.filename if poster is not None else None,
+        display_settings=display_settings,
+    )
 
 
 @api_router.post("/login-screen/scheduled")
@@ -8842,11 +10120,25 @@ async def login_screen_upload_scheduled(
     file: UploadFile = File(...),
     start_at: str = Form(...),
     end_at: str = Form(...),
+    poster: Optional[UploadFile] = File(default=None),
+    display_settings: Optional[str] = Form(default=None),
     current_user: UserResponse = Depends(get_current_user),
 ):
     login_screen.require_master(current_user)
     data = await file.read()
-    return await login_screen.save_scheduled(db, data, file.content_type, file.filename, start_at, end_at)
+    poster_data = await poster.read() if poster is not None else None
+    return await login_screen.save_scheduled(
+        db,
+        data,
+        file.content_type,
+        file.filename,
+        start_at,
+        end_at,
+        poster_data=poster_data,
+        poster_content_type=poster.content_type if poster is not None else None,
+        poster_filename=poster.filename if poster is not None else None,
+        display_settings=display_settings,
+    )
 
 
 @api_router.get("/testing/deployment")
@@ -9050,6 +10342,15 @@ async def testing_overlay_reset(payload: dict = None, current_user: UserResponse
 app.include_router(api_router)
 
 @app.middleware("http")
+async def testing_routes_guard(request: Request, call_next):
+    """Default-deny /api/testing/* outside a positively detected Testing process."""
+    if feature_flags.testing_route_blocked(request.url.path, request.method):
+        from starlette.responses import JSONResponse
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def maintenance_guard(request: Request, call_next):
     """Block mutating APIs for non-master users during 23:00–04:00 IST.
 
@@ -9170,9 +10471,21 @@ async def ensure_product_hub_indexes():
         [("order_id", 1), ("supplying_dealer", 1), ("supplying_branch", 1), ("created_at", -1)],
         name="idx_request_headers_destination_history",
     )
-    await db.request_headers.create_index([("request_number", 1)], unique=True)
+    # Official RQ is unique when present; pre-acceptance attempts have null RQ.
+    try:
+        await db.request_headers.drop_index('request_number_1')
+    except Exception:
+        pass
+    await db.request_headers.create_index(
+        [("request_number", 1)],
+        unique=True,
+        name="uniq_request_number_official",
+        partialFilterExpression={"request_number": {"$type": "string"}},
+    )
+    await db.request_headers.create_index([("attempt_id", 1)], unique=True, sparse=True)
     await db.request_headers.create_index([("created_at", -1)])
     await db.order_requests.create_index([("request_number", 1)])
+    await db.order_requests.create_index([("request_attempt_id", 1)])
     await db.order_requests.create_index([("request_group_id", 1)])
     await db.products.create_index([("is_active_today", 1), ("active_date_key", 1)])
     await db.products.create_index([("publish_status", 1), ("active_date_key", 1)])
@@ -9266,6 +10579,13 @@ async def seed_master_user_on_startup():
         logger.info("Request SLA scheduler started")
         request_in_transit_reminder.start_in_transit_reminder_scheduler(db)
         logger.info("Request in-transit reminder scheduler started")
+        try:
+            from mobile_request_cycle import ensure_cycle_indexes
+            await ensure_cycle_indexes(db)
+        except Exception as exc:
+            logger.warning("mobile_request_cycles index creation failed: %s", exc)
+        mobile_request_cycle_scheduler.start_request_cycle_scheduler(db)
+        logger.info("Mobile request cycle scheduler started")
         exe = str(sys.executable or "").replace("\\", "/")
         if "/backend/venv/" not in exe:
             logger.warning(
@@ -9289,6 +10609,10 @@ async def seed_master_user_on_startup():
 async def shutdown_db_client():
     try:
         await archive_scheduler.stop_archive_scheduler()
+    except Exception:
+        pass
+    try:
+        await mobile_request_cycle_scheduler.stop_request_cycle_scheduler()
     except Exception:
         pass
     client.close()

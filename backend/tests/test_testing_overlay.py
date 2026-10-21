@@ -18,7 +18,7 @@ class FakeCursor:
         spec = [(key_or_list, direction)] if direction is not None else key_or_list
         pairs = ov._sort_pairs(spec)
         if pairs:
-            self._rows.sort(key=lambda row: ov._sort_key_tuple(row, pairs))
+            self._rows.sort(key=ov._doc_sort_cmp(pairs))
         return self
 
     def skip(self, count):
@@ -293,6 +293,50 @@ def test_overlay_count_and_pagination_beyond_previous_cap():
 def test_counters_remain_local_only():
     col = ov.OverlayCollection("counters", FakeCollection([{"_id": "x"}]), FakeCollection(), FakeCollection(), FakeCollection())
     assert col._local_only() is True
+
+
+def test_auto_perpetual_collections_are_local_only():
+    for name in (
+        "auto_perpetual_pool",
+        "auto_perpetual_assignments",
+        "auto_perpetual_suggestions",
+        "auto_perpetual_daily_runs",
+        "auto_perpetual_branch_planner",
+    ):
+        col = ov.OverlayCollection(name, FakeCollection([{"id": "prod"}]), FakeCollection(), FakeCollection(), FakeCollection())
+        assert col._local_only() is True
+
+
+def test_mobile_user_attendance_is_local_only_and_upserts():
+    prod = FakeCollection([{"id": "prod-att", "mobile_user_id": "MU1"}])
+    test = FakeCollection([])
+    col = ov.OverlayCollection("mobile_user_attendance", prod, test, FakeCollection(), FakeCollection())
+    assert col._local_only() is True
+
+    async def _go():
+        first = await col.update_one(
+            {"attendance_date": "2026-10-12", "mobile_user_id": "MU1"},
+            {"$set": {"status": "active", "branch": "Retteri"}, "$setOnInsert": {"created_at": "now"}},
+            upsert=True,
+        )
+        found = await col.find_one({"attendance_date": "2026-10-12", "mobile_user_id": "MU1"})
+        second = await col.update_one(
+            {"attendance_date": "2026-10-12", "mobile_user_id": "MU1"},
+            {"$set": {"status": "inactive"}},
+            upsert=True,
+        )
+        after = await col.find_one({"attendance_date": "2026-10-12", "mobile_user_id": "MU1"})
+        return first, found, second, after
+
+    first, found, second, after = asyncio.run(_go())
+    assert int(getattr(first, "matched_count", 0) or 0) in (0, 1)
+    assert found["status"] == "active"
+    assert found["branch"] == "Retteri"
+    assert after["status"] == "inactive"
+    assert after["attendance_date"] == "2026-10-12"
+    assert prod.rows == [{"id": "prod-att", "mobile_user_id": "MU1"}]
+    assert prod.writes == []
+    assert len(test.rows) == 1
 
 
 def test_unlisted_business_collection_overlays_production():
@@ -625,3 +669,134 @@ def test_stock_trend_and_aging_query_shapes_unchanged():
     assert ov._doc_matches(row, stock_q) is True
     assert ov._doc_matches(row, aging_q) is True
     assert ov._doc_matches({**row, "active_date_key": "20261010"}, stock_q) is False
+
+
+def test_strip_overlay_flags_reads_flag_nested_by_merge_query():
+    import testing_runtime as tr
+    query = {"publish_status": "Published", "branch": "Vanagaram"}
+    tr.merge_query(query, {ov.QUERY_TESTING_ONLY: True})
+    raw, base_only, testing_only = ov._strip_overlay_flags(query)
+    assert testing_only is True and base_only is False
+    assert raw == {"$and": [{"publish_status": "Published", "branch": "Vanagaram"}]}
+    assert ov.QUERY_TESTING_ONLY not in str(raw)
+
+
+def test_strip_overlay_flags_keeps_other_and_parts():
+    query = {"$and": [{"a": 1}, {ov.QUERY_BASE_ONLY: True}, {"b": 2}]}
+    raw, base_only, testing_only = ov._strip_overlay_flags(query)
+    assert base_only is True and testing_only is False
+    assert raw == {"$and": [{"a": 1}, {"b": 2}]}
+
+
+def test_attachment_metadata_keyed_by_file_id_is_readable():
+    prod = FakeCollection([{"file_id": "prod-file", "query_id": "q0"}])
+    test = FakeCollection([])
+    col = ov.OverlayCollection("query_attachments", prod, test, FakeCollection(), FakeCollection())
+
+    async def _go():
+        await col.insert_one({"file_id": "ts-file", "query_id": "q1"})
+        return await col.find_one({"file_id": "ts-file"}), await col.find_one({"file_id": "prod-file"})
+
+    created, base = asyncio.run(_go())
+    assert created and created["query_id"] == "q1"
+    assert base and base["query_id"] == "q0"
+
+
+def test_descending_sort_merges_production_and_testing_rows_newest_first():
+    prod = FakeCollection([
+        {"id": "p1", "created_at": "2026-09-19"},
+        {"id": "p2", "created_at": "2026-09-20"},
+    ])
+    created = FakeCollection([{"id": "TS-1", "created_at": "2026-10-17", "data_origin": "testing"}])
+    overlays = FakeCollection([
+        {"collection": "x_rows", "production_id": "p1", "payload": {"note": "edited"}},
+    ])
+    col = ov.OverlayCollection("x_rows", prod, created, overlays, FakeCollection())
+
+    async def _go():
+        return [row["id"] for row in await col.find({}).sort("created_at", -1).to_list(10)]
+
+    assert asyncio.run(_go()) == ["TS-1", "p2", "p1"]
+
+
+def test_extract_sort_limit_keeps_sort_that_feeds_a_group():
+    stages = [
+        {"$project": {"a": 1}},
+        {"$sort": {"published_at": -1}},
+        {"$group": {"_id": "$p", "doc": {"$first": "$$ROOT"}}},
+        {"$replaceRoot": {"newRoot": "$doc"}},
+        {"$sort": {"a": 1}},
+        {"$limit": 5},
+    ]
+    core, sort_spec, skip_n, limit_n = ov._extract_sort_limit(stages)
+    assert core == stages[:4]
+    assert sort_spec == {"a": 1} and limit_n == 5 and skip_n == 0
+
+
+def _overlap_collection():
+    prod = FakeCollection([
+        {"id": "p1", "day": "d1"},
+        {"id": "p2", "day": "d1"},
+        {"id": "p3", "day": "d2"},
+    ])
+    created = FakeCollection([
+        {"id": "p1", "day": "d1", "data_origin": "testing"},
+        {"id": "TS-1", "day": "d1", "data_origin": "testing"},
+    ])
+    return ov.OverlayCollection("x_counts", prod, created, FakeCollection(), FakeCollection())
+
+
+def test_count_overlap_by_production_scan_matches_in_query(monkeypatch):
+    col = _overlap_collection()
+    assert asyncio.run(col.count_documents({"day": "d1"})) == 3
+    assert asyncio.run(col.count_documents({})) == 4
+    monkeypatch.setattr(ov, "_OVERLAP_SCAN_LIMIT", 0)
+    col = _overlap_collection()
+    assert asyncio.run(col.count_documents({})) == 4
+
+
+class _CommandDb(dict):
+    def __init__(self):
+        super().__init__()
+        self.commands = []
+
+    def __missing__(self, name):
+        self[name] = FakeCollection()
+        return self[name]
+
+    async def command(self, command, *args, **kwargs):
+        self.commands.append((command, args))
+        return {"ok": 1, "storageSize": 10}
+
+
+def test_overlay_database_runs_stats_commands_on_testing_only():
+    prod, test = _CommandDb(), _CommandDb()
+    db = ov.OverlayDatabase(prod, test)
+    assert asyncio.run(db.command("dbStats"))["storageSize"] == 10
+    asyncio.run(db.command("collStats", "products"))
+    assert [c[0] for c in test.commands] == ["dbStats", "collStats"]
+    assert prod.commands == []
+    try:
+        asyncio.run(db.command({"dropDatabase": 1}))
+    except ov.ProductionWriteBlocked:
+        pass
+    else:
+        raise AssertionError("write command must be refused")
+    assert len(test.commands) == 2
+
+
+def test_find_one_returns_production_row_without_overlay_identity_fields():
+    prod = FakeCollection([{"archive_id": "a-1", "module": "orders"}])
+    created = FakeCollection([
+        {"id": "TS-1", "archive_id": "a-2", "data_origin": "testing"},
+        {"archive_id": "a-3", "module": "uploads", "data_origin": "testing"},
+    ])
+    col = ov.OverlayCollection("x_manifests", prod, created, FakeCollection(), FakeCollection())
+
+    async def _go():
+        return [await col.find_one({"archive_id": a}) for a in ("a-1", "a-2", "a-3")]
+
+    base, mine, anon = asyncio.run(_go())
+    assert base and base["module"] == "orders"
+    assert mine and mine["id"] == "TS-1"
+    assert anon and anon["module"] == "uploads"

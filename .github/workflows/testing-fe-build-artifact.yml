@@ -1,0 +1,50 @@
+name: Testing FE build artifact
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install and build Testing frontend
+        working-directory: frontend
+        env:
+          REACT_APP_BACKEND_URL: https://testing.sleepingstock.in
+          REACT_APP_APP_ENV: testing
+          REACT_APP_TESTING_PR: ""
+          REACT_APP_TESTING_BRANCH: testing-six-fixes
+          REACT_APP_TESTING_COMMIT: 88ac0dc
+          REACT_APP_TESTING_DEPLOYED_AT: "2026-10-18 20:07:44 IST"
+          GENERATE_SOURCEMAP: "false"
+          NODE_OPTIONS: --max-old-space-size=2048
+        run: |
+          npm ci --ignore-scripts || npm install --ignore-scripts
+          npm run build
+          cat > build/deployment.json <<JSON
+          {
+            "environment": "testing",
+            "app_env": "testing",
+            "pr_number": null,
+            "git_branch": "testing-six-fixes",
+            "commit": "88ac0dc1065705216f41c5a0fb1c811e0078b8e7",
+            "commit_short": "88ac0dc",
+            "deployed_at": "2026-10-18T14:37:44Z",
+            "deployed_at_ist": "2026-10-18 20:07:44 IST",
+            "backend_port": 8001,
+            "service": "nmts-backend-testing",
+            "built_on": "github-actions"
+          }
+          JSON
+          cp -f deploy/testing/robots.txt build/robots.txt 2>/dev/null || cp -f ../deploy/testing/robots.txt build/robots.txt
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: testing-frontend-88ac0dc
+          path: frontend/build
+          retention-days: 2

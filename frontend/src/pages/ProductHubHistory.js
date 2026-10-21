@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { useOutletContext } from 'react-router-dom';
+import { useWorkspaceScope } from '../workspaceScope';
 import axios from 'axios';
 import { API, useAuth } from '@/App';
 import { Button } from '@/components/ui/button';
@@ -25,7 +25,7 @@ async function downloadBlob(url,fallback){
 export function ProductHubHistory(){
   const { user } = useAuth();
   const canExport = canExportExcel(user);
-  const outlet=useOutletContext()||{};
+  const outlet=useWorkspaceScope();
   const [fromDate,setFromDate]=useState(firstOfMonthIso());
   const [toDate,setToDate]=useState(todayIso());
   const [appliedRange,setAppliedRange]=useState({from:firstOfMonthIso(),to:todayIso()});

@@ -18,7 +18,8 @@
 import * as SQLite from 'expo-sqlite';
 import NetInfo from '@react-native-community/netinfo';
 import * as Crypto from 'expo-crypto';
-import { submitStockVerification, ApiError } from '../api';
+import { submitStockVerification, ApiError, isBranchTransferredError } from '../api';
+import { getSessionToken } from './session';
 
 const DB_NAME = 'sleeping_stock_offline.db';
 const MAX_RETRY_BEFORE_BACKOFF = 3;
@@ -137,6 +138,12 @@ export async function getQueuedRecords() {
   return db.getAllAsync(`SELECT * FROM verification_queue ORDER BY created_at ASC`);
 }
 
+export async function clearQueuedRecords() {
+  const db = await getDb();
+  await db.execAsync(`DELETE FROM verification_queue`);
+  notifyListeners();
+}
+
 export async function getPendingCount() {
   const db = await getDb();
   const row = await db.getFirstAsync(
@@ -160,6 +167,10 @@ export async function syncQueue() {
     const netState = await NetInfo.fetch();
     if (!netState.isConnected || netState.isInternetReachable === false) {
       return { synced: 0, failed: 0, skipped: true, reason: 'offline' };
+    }
+    const token = await getSessionToken();
+    if (!token) {
+      return { synced: 0, failed: 0, skipped: true, reason: 'no_session' };
     }
 
     const db = await getDb();
@@ -212,7 +223,7 @@ export async function syncQueue() {
         console.log('[offlineQueue] sync failed for', row.client_id, message);
         // If the whole connection just dropped mid-loop, stop this pass —
         // remaining rows will retry on the next trigger.
-        if (error instanceof ApiError && (error.kind === 'network' || error.kind === 'timeout')) {
+        if (error instanceof ApiError && (error.kind === 'network' || error.kind === 'timeout' || isBranchTransferredError(error) || error.kind === 'auth')) {
           break;
         }
       }
