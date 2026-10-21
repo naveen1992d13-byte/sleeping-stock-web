@@ -256,6 +256,7 @@ echo "Building testing frontend (API=https://testing.sleepingstock.in APP_ENV=te
 cd "$ROOT/frontend"
 REACT_APP_BACKEND_URL=https://testing.sleepingstock.in \
   REACT_APP_APP_ENV=testing \
+  REACT_APP_BUILD_SHA="${RESOLVED_SHA}" \
   REACT_APP_TESTING_PR="${PR_NUMBER}" \
   REACT_APP_TESTING_BRANCH="${RESOLVED_BRANCH}" \
   REACT_APP_TESTING_COMMIT="${RESOLVED_SHORT}" \

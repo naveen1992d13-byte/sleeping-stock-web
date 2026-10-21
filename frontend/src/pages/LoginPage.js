@@ -7,6 +7,8 @@ import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { User, Key, ArrowRight, Eye, EyeOff } from 'lucide-react';
 import { LOGIN_PROMO_ASPECT, LOGIN_PROMO_FILL, loginDisplayStyle } from './loginPromoCrop';
+import { openInstalledApp, useInstalledApp } from '@/installApp';
+import { writeAuthItem } from '@/utils/sessionActivity';
 import './LoginPage.css';
 
 function seedHomeTab(user) {
@@ -26,8 +28,8 @@ function seedHomeTab(user) {
       }
     }
     if (tab) {
-      localStorage.setItem('openTabs', JSON.stringify([tab]));
-      localStorage.setItem('activeTab', tab.id);
+      writeAuthItem('openTabs', JSON.stringify([tab]));
+      writeAuthItem('activeTab', tab.id);
       return tab.path;
     }
   } catch {
@@ -57,6 +59,7 @@ export function LoginPage() {
   const [mediaNatural, setMediaNatural] = useState({ w: 0, h: 0 });
   const { login } = useAuth();
   const navigate = useNavigate();
+  const showOpenInApp = useInstalledApp();
 
   useEffect(() => {
     let cancelled = false;
@@ -221,8 +224,8 @@ export function LoginPage() {
           <div className="nmts-login-content">
             <div className="nmts-login-brand" data-testid="login-emblem">
               <img
-                src="/LoginPage Image.png"
-                alt="Sleeping Stock Logo"
+                src="/icons/sleepingstock-logo.png"
+                alt="Sleeping Stock"
                 className="nmts-login-logo"
                 data-testid="login-emblem-img"
               />
@@ -236,6 +239,7 @@ export function LoginPage() {
               <div className="nmts-title-accent" />
             </header>
 
+            <div className="nmts-login-bottom">
             {maintenance?.maintenance_active && (
               <div
                 className="rounded-lg border px-3 py-2 text-sm mb-3"
@@ -301,9 +305,16 @@ export function LoginPage() {
               </Button>
             </form>
 
+            {showOpenInApp && (
+              <button type="button" className="nmts-open-in-app" data-testid="open-in-app" onClick={openInstalledApp}>
+                Open in app
+              </button>
+            )}
+
             <footer className="nmts-login-footer">
               © 2026 NMTS. All rights reserved.
             </footer>
+            </div>
           </div>
         </section>
         </div>

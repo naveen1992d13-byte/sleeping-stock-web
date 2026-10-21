@@ -239,10 +239,10 @@
   border-radius: 0;
   background: transparent;
   box-shadow: none;
-  overflow: visible;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  justify-content: stretch;
   align-self: stretch;
 }
 
@@ -268,39 +268,42 @@
 .nmts-login-content {
   position: relative;
   z-index: 1;
-  flex: 0 0 auto;
+  flex: 1 1 auto;
   min-height: 0;
-  height: auto;
-  padding: 14px 16px 12px;
+  height: 100%;
+  padding: 14px 22px 12px;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  justify-content: flex-start;
   box-sizing: border-box;
+  overflow: hidden;
 }
 
 .nmts-login-brand {
-  height: 64px;
+  flex: 1 1 46%;
+  height: 46%;
+  max-height: 50%;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: visible;
-  flex-shrink: 0;
+  overflow: hidden;
 }
 
 .nmts-login-logo {
-  height: 56px;
+  display: block;
   width: auto;
+  height: 100%;
   max-width: 100%;
-  max-height: 56px;
+  max-height: 100%;
   object-fit: contain;
   object-position: center;
-  filter: drop-shadow(0 10px 14px rgba(0, 0, 0, 0.55));
 }
 
 .nmts-login-header {
   text-align: center;
-  margin-top: -4px;
-  margin-bottom: 12px;
+  margin-top: 2px;
+  margin-bottom: 0;
   flex-shrink: 0;
 }
 
@@ -331,9 +334,16 @@
 .nmts-title-accent {
   width: 48px;
   height: 2px;
-  margin: 12px auto 0;
+  margin: 6px auto 0;
   background: linear-gradient(90deg, transparent, #77c63d, transparent);
   box-shadow: 0 0 12px rgba(117, 201, 57, 0.45);
+}
+
+.nmts-login-bottom {
+  margin-top: auto;
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
 }
 
 .nmts-login-form {
@@ -422,14 +432,14 @@
   width: 100% !important;
   height: 40px !important;
   margin-top: 2px;
-  border: 1px solid rgba(153, 226, 89, 0.42) !important;
+  border: 0 !important;
   border-radius: 9px !important;
-  background: linear-gradient(110deg, #73c637 0%, #55aa23 52%, #4a991e 100%) !important;
-  color: white !important;
-  font-size: 14px !important;
-  font-weight: 600 !important;
-  box-shadow: 0 13px 30px rgba(55, 127, 14, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
-  transition: transform 180ms ease, filter 180ms ease, box-shadow 180ms ease !important;
+  background: #85c808 !important;
+  color: #14240c !important;
+  font-size: 15px !important;
+  font-weight: 700 !important;
+  box-shadow: none !important;
+  transition: filter 180ms ease !important;
   flex-shrink: 0;
 }
 
@@ -448,7 +458,8 @@
   right: 14px;
   width: 18px;
   height: 18px;
-  stroke-width: 1.8;
+  stroke-width: 2.2;
+  color: #14240c;
 }
 
 .nmts-login-footer {

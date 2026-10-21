@@ -9,10 +9,19 @@
   <meta name="robots" content="index,follow" />
   <meta name="theme-color" content="#14532d" />
 
-  <link rel="icon" href="/favicon.ico" sizes="any" />
-  <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png" />
-  <link rel="icon" type="image/png" sizes="192x192" href="/android-chrome-192x192.png" />
-  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="/icons/favicon-16.png" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="48x48" href="/icons/favicon-48.png" />
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+  <link rel="manifest" href="/manifest.json" />
+  <script>
+    window.__nmtsInstallPrompt = null;
+    window.addEventListener('beforeinstallprompt', function (event) {
+      event.preventDefault();
+      window.__nmtsInstallPrompt = event;
+      window.dispatchEvent(new Event('nmts-install-prompt'));
+    });
+  </script>
 
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="Sleeping Stock" />
@@ -41,7 +50,7 @@
         "url": "https://sleepingstock.in/",
         "logo": {
           "@type": "ImageObject",
-          "url": "https://sleepingstock.in/android-chrome-192x192.png",
+          "url": "https://sleepingstock.in/icons/icon-192.png",
           "width": 192,
           "height": 192
         }

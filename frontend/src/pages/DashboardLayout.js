@@ -23,7 +23,7 @@ import {
   DropdownMenuTrigger,
 } from '../components/ui/dropdown-menu';
 import { toast } from 'sonner';
-import { clearAuthStorage } from '../utils/sessionActivity';
+import { clearAuthStorage, readAuthItem, removeAuthItem, writeAuthItem } from '../utils/sessionActivity';
 import { NoticeLoginPopup } from '../components/NoticeLoginPopup';
 import {
   WorkspaceScopeProvider,
@@ -301,8 +301,8 @@ export function DashboardLayout() {
     fetchUnreadCount();
     const interval = setInterval(fetchUnreadCount, 30000);
 
-    const savedTabs = localStorage.getItem('openTabs');
-    const savedActiveTab = localStorage.getItem('activeTab');
+    const savedTabs = readAuthItem('openTabs');
+    const savedActiveTab = readAuthItem('activeTab');
 
     if (savedTabs) {
       try {
@@ -341,13 +341,13 @@ export function DashboardLayout() {
 
   useEffect(() => {
     if (tabs.length > 0) {
-      localStorage.setItem('openTabs', JSON.stringify(tabs));
+      writeAuthItem('openTabs', JSON.stringify(tabs));
       if (activeTabId) {
-        localStorage.setItem('activeTab', activeTabId);
+        writeAuthItem('activeTab', activeTabId);
       }
     } else {
-      localStorage.removeItem('openTabs');
-      localStorage.removeItem('activeTab');
+      removeAuthItem('openTabs');
+      removeAuthItem('activeTab');
     }
   }, [tabs, activeTabId]);
 
@@ -440,8 +440,8 @@ export function DashboardLayout() {
   const clearWorkspaceCache = () => {
     setTabs([]);
     setActiveTabId(null);
-    localStorage.removeItem('openTabs');
-    localStorage.removeItem('activeTab');
+    removeAuthItem('openTabs');
+    removeAuthItem('activeTab');
     setSessionEpoch((n) => n + 1);
   };
 

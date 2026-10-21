@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { resolveApiUrl } from '@/backendUrl';
 import { NmtsConfirmDialog } from '@/components/NmtsConfirmDialog';
 import { isTestingUiEnabled } from '@/testingUi';
+import { getAuthToken } from '@/utils/sessionActivity';
 
 const MERGE_PHRASE = 'MERGE AND CLEAR TEST DATA';
 const CLEAR_PHRASE = 'CLEAR TESTING DATA';
@@ -13,7 +14,7 @@ function shortSha(value) {
 }
 
 function authHeaders() {
-  const token = typeof localStorage !== 'undefined' ? localStorage.getItem('token') : '';
+  const token = getAuthToken();
   return token ? { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
 }
 

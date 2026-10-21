@@ -11,14 +11,18 @@ import { DashboardLayout } from './pages/DashboardLayout';
 import { SessionInactivityGuard } from './components/SessionInactivityGuard';
 import {
   touchSessionActivity,
-  clearSessionActivity,
   isSessionExpiredByInactivity,
   clearAuthStorage,
+  getAuthToken,
+  readAuthItem,
+  writeAuthItem,
+  removeAuthItem,
 } from './utils/sessionActivity';
 import { resolveApiUrl, resolveBackendUrl } from '@/backendUrl';
 import { getFirstAllowedMenuItem } from './config/menuConfig';
 import { isTestingUiEnabled } from './testingUi';
 import { TestingBanner } from './components/TestingBanner';
+import { InstallPrompt, LaunchScreen } from './installApp';
 
 const AuthContext = createContext(null);
 
@@ -89,12 +93,27 @@ export const BACKEND_URL = resolveBackendUrl();
 export const API = resolveApiUrl();
 
 axios.interceptors.request.use((config) => {
-  const token = localStorage.getItem('token');
+  const token = getAuthToken();
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
   }
   return config;
 });
+
+axios.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const status = error?.response?.status;
+    const url = String(error?.config?.url || '');
+    if (status === 401 && !url.includes('/auth/login')) {
+      clearAuthStorage();
+      if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+        window.location.assign('/login');
+      }
+    }
+    return Promise.reject(error);
+  },
+);
 
 function SessionBootstrapError({ message, onRetry }) {
   return (
@@ -138,9 +157,9 @@ function AuthProvider({ children }) {
       permissions: normalizePermissions(loggedUser?.permissions),
     };
 
-    localStorage.setItem('token', token);
-    localStorage.setItem('user', JSON.stringify(cleanUser));
-    localStorage.setItem('permissions', JSON.stringify(cleanUser.permissions));
+    writeAuthItem('token', token);
+    writeAuthItem('user', JSON.stringify(cleanUser));
+    writeAuthItem('permissions', JSON.stringify(cleanUser.permissions));
     touchSessionActivity();
     setUser(cleanUser);
     setAuthError(null);
@@ -158,16 +177,16 @@ function AuthProvider({ children }) {
       return undefined;
     }
 
-    const token = localStorage.getItem('token');
-    const storedUser = localStorage.getItem('user');
+    const token = getAuthToken();
+    const storedUser = readAuthItem('user');
 
     if (storedUser) {
       try {
         const parsedUser = JSON.parse(storedUser);
         setUser({ ...parsedUser, permissions: normalizePermissions(parsedUser.permissions) });
       } catch {
-        localStorage.removeItem('user');
-        localStorage.removeItem('permissions');
+        removeAuthItem('user');
+        removeAuthItem('permissions');
       }
     }
 
@@ -227,7 +246,7 @@ function AuthProvider({ children }) {
   };
 
   const refreshUser = async () => {
-    const token = localStorage.getItem('token');
+    const token = getAuthToken();
     if (!token) return null;
     const res = await axios.get(`${API}/auth/me`, { timeout: 15000 });
     return saveUserSession(token, res.data);
@@ -320,7 +339,7 @@ function PublicHome() {
     return <SessionBootstrapError message={authError} onRetry={retrySession} />;
   }
   if (user) return <HomeEntry />;
-  if (loading && typeof localStorage !== 'undefined' && localStorage.getItem('token')) {
+  if (loading && getAuthToken()) {
     return (
       <div className="p-8 text-sm text-center" style={{ color: '#6B7280' }} data-testid="session-loading">
         Checking session…
@@ -335,14 +354,22 @@ function TestingBannerWithAuth() {
   return <TestingBanner user={user} />;
 }
 
+function InstallPromptGate() {
+  const { user } = useAuth();
+  return <InstallPrompt user={user} />;
+}
+
 function App() {
   return (
     <ProcessingProvider>
     <AuthProvider>
       <BrowserRouter>
+        <LaunchScreen>
         {IS_TESTING_BUILD && <TestingBannerWithAuth />}
         <SessionInactivityGuard />
+        <InstallPromptGate />
         <Toaster position="top-right" richColors />
+        <div data-nmts-build={process.env.REACT_APP_BUILD_SHA || ''} hidden />
         <Routes>
           <Route path="/login" element={<LoginPage />} />
           <Route path="/" element={<PublicHome />} />
@@ -405,6 +432,7 @@ function App() {
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>
+        </LaunchScreen>
       </BrowserRouter>
     </AuthProvider>
     </ProcessingProvider>

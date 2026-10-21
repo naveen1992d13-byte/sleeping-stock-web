@@ -23,6 +23,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { useWorkspaceScope } from "../workspaceScope";
 import { Button } from "../components/ui/button";
 import { useAuth, API } from "../App";
+import { getAuthToken } from "../utils/sessionActivity";
 import { APPLICATION_PERMISSION_LABELS } from "../config/menuConfig";
 import NMTSMobile from "./NMTSMobile";
 import { toast } from "sonner";
@@ -167,12 +168,7 @@ export default function UsersPage() {
   const [showResetPasswordConfirm, setShowResetPasswordConfirm] = useState(false);
   const [resetSubmitting, setResetSubmitting] = useState(false);
 
- const token =
-  localStorage.getItem("token") ||
-  localStorage.getItem("access_token") ||
-  localStorage.getItem("accessToken") ||
-  localStorage.getItem("jwt") ||
-  "";
+ const token = getAuthToken();
   const headers = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${token}`,
